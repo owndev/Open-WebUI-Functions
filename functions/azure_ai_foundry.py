@@ -2,7 +2,7 @@
 title: Azure AI Foundry Function
 author: owndev
 author_url: https://github.com/owndev
-project_url: https://github.com/owndev/Open-WebUI
+project_url: https://github.com/owndev/Open-WebUI-Azure
 funding_url: btc:bc1qjkcp5acdnvnhyqtezwrqaeyq8542rgdcxx728z | eth:0x5bD03A83dD470568e56E465f1D4B0f0Ff930E49C
 version: 1.0.0
 license: MIT
