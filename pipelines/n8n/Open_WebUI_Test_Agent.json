@@ -1,0 +1,257 @@
+{
+  "name": "Open WebUI Test Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {
+          "frequencyPenalty": 0.2,
+          "temperature": 0.7
+        }
+      },
+      "id": "ea4a899a-ad2e-4c2f-992e-ffa3683f6288",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "position": [
+        2280,
+        1280
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "openAiApi": {
+          "id": "B5ESm3C8oApCbE39",
+          "name": "OpenAi ownadmin"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "agent": "openAiFunctionsAgent",
+        "text": "={{ $json.body.chatInput }}",
+        "options": {
+          "systemMessage": "={{ $json.body.systemPrompt }}"
+        }
+      },
+      "id": "fcec32e7-b6fb-45ca-9ac1-acf81dc53ee1",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "position": [
+        2380,
+        840
+      ],
+      "typeVersion": 1.1
+    },
+    {
+      "parameters": {
+        "sessionKey": "={{ $('Webhook').item.json.body.user_id }}_{{ $('Webhook').item.json.body.chat_id }}",
+        "contextWindowLength": 10
+      },
+      "id": "edc574f1-f176-4572-9c33-bc16855c0250",
+      "name": "Window Buffer Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "position": [
+        2440,
+        1100
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolWikipedia",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        1100
+      ],
+      "id": "cbf4bd61-81f4-4063-b5c9-db18d67ff46d",
+      "name": "Wikipedia"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolCalculator",
+      "typeVersion": 1,
+      "position": [
+        2720,
+        1100
+      ],
+      "id": "dc45541b-f295-41af-9c6b-9b66c3e20557",
+      "name": "Calculator"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "OpenWebUITestAgent",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        840
+      ],
+      "id": "2b9fa054-971a-4029-8d4e-865698b8f1f9",
+      "name": "Webhook",
+      "webhookId": "b3e7d885-0c39-4425-a239-ae065759dbb5",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mf995syl7J6pvo2L",
+          "name": "Header Auth: Open WebUI Test Agent"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2840,
+        840
+      ],
+      "id": "325974b4-e249-4eb3-81dc-26b392f0894e",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
+      "typeVersion": 1,
+      "position": [
+        2280,
+        1100
+      ],
+      "id": "f2e088e0-aa71-4b42-8eaa-e0197150b9ca",
+      "name": "Azure OpenAI Chat Model",
+      "credentials": {
+        "azureOpenAiApi": {
+          "id": "jSiXjq4A2WW6lQo5",
+          "name": "Azure Open AI: owndev"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Get current Time",
+        "url": "https://www.timeapi.io/api/time/current/zone",
+        "sendQuery": true,
+        "parametersQuery": {
+          "values": [
+            {
+              "name": "timeZone",
+              "valueProvider": "fieldValue",
+              "value": "Europe/Berlin"
+            }
+          ]
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [
+        2840,
+        1100
+      ],
+      "id": "28fe049c-6fd7-4bde-9b44-85100001284d",
+      "name": "Get Time"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        []
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Window Buffer Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wikipedia": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculator": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Time": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "d064c617-0d7f-4f1f-ad9f-753679fc7a07",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6350a4271a2777a60d73e3a3c6a9549015b6bfe8b8f285cb566cd69ef87215da"
+  },
+  "id": "9yJgWkcblWV7ftWb",
+  "tags": []
+}

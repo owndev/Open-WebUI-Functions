@@ -1,12 +1,12 @@
 """
-title: Azure AI Foundry Function
+title: Azure AI Foundry Pipeline
 author: owndev
 author_url: https://github.com/owndev
-project_url: https://github.com/owndev/Open-WebUI-Azure
-funding_url: btc:bc1qjkcp5acdnvnhyqtezwrqaeyq8542rgdcxx728z | eth:0x5bD03A83dD470568e56E465f1D4B0f0Ff930E49C
-version: 1.0.0
+project_url: https://github.com/owndev/Open-WebUI-Functions
+funding_url: https://github.com/owndev/Open-WebUI-Functions
+version: 1.0.1
 license: MIT
-description: A Python-based function for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
+description: A Python-based pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
@@ -16,25 +16,33 @@ features:
 """
 
 from typing import Union, Generator, Iterator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import requests
 import os
-
 
 class Pipe:
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
         # API key for Azure AI
-        AZURE_AI_API_KEY: str = os.getenv("AZURE_AI_API_KEY", "API_KEY")
+        AZURE_AI_API_KEY: str = Field(
+            default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
+            description="API key for Azure AI"
+        )
 
         # Endpoint for Azure AI (e.g. "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview" or "https://<your-endpoint>/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview")
-        AZURE_AI_ENDPOINT: str = os.getenv(
+        AZURE_AI_ENDPOINT: str = Field(
+            default=os.getenv(
             "AZURE_AI_ENDPOINT",
             "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview"
+            ),
+            description="Endpoint for Azure AI"
         )
 
         # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions")
-        AZURE_AI_MODEL: str = os.getenv("AZURE_AI_MODEL", "")
+        AZURE_AI_MODEL: str = Field(
+            default=os.getenv("AZURE_AI_MODEL", ""),
+            description="Optional model name for Azure AI"
+        )
 
     def __init__(self):
         self.name = "Azure AI"
