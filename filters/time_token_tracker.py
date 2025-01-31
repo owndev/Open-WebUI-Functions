@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.1.0
+version: 2.0.0
 license: MIT
 description: A Python-based filter for tracking the response time and token usage of a request.
 features:
@@ -23,19 +23,20 @@ global start_time, request_token_count, response_token_count
 class Filter:
     class Valves(BaseModel):
         CALCULATE_ALL_MESSAGES: bool = Field(
-            default=True, description="Calculate tokens for all messages or only the last one."
-        )
-        N_LAST_MESSAGES: int = Field(
-            default=1, description="Number of last messages to calculate tokens for."
+            default=True,
+            description="If true, calculate tokens for all messages. If false, only use the last user and assistant messages."
         )
         SHOW_AVERAGE_TOKENS: bool = Field(
-            default=False, description="Show average tokens per message."
+            default=False,
+            description="Show average tokens per message (only used if CALCULATE_ALL_MESSAGES is true)."
         )
         SHOW_RESPONSE_TIME: bool = Field(
-            default=True, description="Show the response time."
+            default=True,
+            description="Show the response time."
         )
         SHOW_TOKEN_COUNT: bool = Field(
-            default=True, description="Show the token count."
+            default=True,
+            description="Show the token count."
         )
 
     def __init__(self):
@@ -43,83 +44,113 @@ class Filter:
         self.valves = self.Valves()
 
     async def inlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None
     ) -> dict:
         global start_time, request_token_count
-
-        # Start the timer
         start_time = time.time()
 
-        # Get the model and messages from the body
         model = body.get("model", "default-model")
-        messages = body.get("messages", [])
+        all_messages = body.get("messages", [])
+
         try:
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")  # Fallback encoding
+            encoding = tiktoken.get_encoding("cl100k_base")
 
-        # Calculate the number of tokens for all or the last N messages
+        # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
-            request_token_count = sum(len(encoding.encode(message["content"])) for message in messages)
+            request_messages = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
         else:
-            messages = messages[-self.valves.N_LAST_MESSAGES:]
-            request_token_count = sum(len(encoding.encode(message["content"])) for message in messages)
+            # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
+            # (one user and one system), sum them both.
+            request_user_system = [m for m in all_messages if m.get("role") in ("user", "system")]
+            if len(request_user_system) == 2:
+                request_messages = request_user_system
+            else:
+                # Otherwise, take only the last "user" or "system" message if any
+                reversed_messages = list(reversed(all_messages))
+                last_user_system = next(
+                    (m for m in reversed_messages if m.get("role") in ("user", "system")), None
+                )
+                request_messages = [last_user_system] if last_user_system else []
+
+        request_token_count = sum(
+            len(encoding.encode(m["content"]))
+            for m in request_messages
+        )
 
         return body
 
     async def outlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None
     ) -> dict:
         global start_time, request_token_count, response_token_count
-
-        # Stop the timer and calculate the response time
         end_time = time.time()
         response_time = end_time - start_time
 
-        # Get the model and messages from the body
         model = body.get("model", "default-model")
-        messages = body.get("messages", [])
+        all_messages = body.get("messages", [])
+
         try:
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")  # Fallback encoding
+            encoding = tiktoken.get_encoding("cl100k_base")
 
-        # Calculate the number of tokens for all or the last N messages
+        # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
-            response_token_count = sum(len(encoding.encode(message["content"])) for message in messages)
+            assistant_messages = [
+                m for m in all_messages if m.get("role") == "assistant"
+            ]
         else:
-            messages = messages[-self.valves.N_LAST_MESSAGES:]
-            response_token_count = sum(len(encoding.encode(message["content"])) for message in messages)
+            # Take only the last "assistant" message if any
+            reversed_messages = list(reversed(all_messages))
+            last_assistant = next(
+                (m for m in reversed_messages if m.get("role") == "assistant"), None
+            )
+            assistant_messages = [last_assistant] if last_assistant else []
 
-        # Calculate the average number of tokens per message if enabled
+        response_token_count = sum(
+            len(encoding.encode(m["content"]))
+            for m in assistant_messages
+        )
+
+        # Calculate averages only if CALCULATE_ALL_MESSAGES is true
         avg_request_tokens = avg_response_tokens = 0
-        if self.valves.SHOW_AVERAGE_TOKENS:
-            num_messages = len(messages)
-            avg_request_tokens = request_token_count / num_messages if num_messages > 0 else 0
-            avg_response_tokens = response_token_count / num_messages if num_messages > 0 else 0
+        if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
+            # Count how many user/system messages were actually used
+            req_count = len([m for m in all_messages if m.get("role") in ("user", "system")])
+            
+            # Count how many assistant messages were actually used
+            resp_count = len([m for m in all_messages if m.get("role") == "assistant"])
+            avg_request_tokens = request_token_count / req_count if req_count else 0
+            avg_response_tokens = response_token_count / resp_count if resp_count else 0
 
-        # Create the description for the output
+        # Build the output description
         description = ""
         if self.valves.SHOW_RESPONSE_TIME:
             description += f"Response time: {response_time:.2f}s"
+
         if self.valves.SHOW_TOKEN_COUNT:
             if description:
                 description += ", "
             description += f"Request tokens: {request_token_count}"
-            if self.valves.SHOW_AVERAGE_TOKENS:
+            # Only show average if enabled and CALCULATE_ALL_MESSAGES is true
+            if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 description += f" (∅ {avg_request_tokens:.2f})"
             description += f", Response tokens: {response_token_count}"
-            if self.valves.SHOW_AVERAGE_TOKENS:
+            if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 description += f" (∅ {avg_response_tokens:.2f})"
 
-        # Send the status data
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": description,
-                    "done": True,
-                },
-            }
-        )
+        await __event_emitter__({
+            "type": "status",
+            "data": {"description": description, "done": True},
+        })
         return body
