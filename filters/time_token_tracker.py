@@ -4,9 +4,9 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.0.0
+version: 2.1.0
 license: MIT
-description: A Python-based filter for tracking the response time and token usage of a request.
+description: A filter for tracking the response time and token usage of a request.
 features:
   - Tracks the response time of a request.
   - Tracks Token Usage.
@@ -22,6 +22,9 @@ global start_time, request_token_count, response_token_count
 
 class Filter:
     class Valves(BaseModel):
+        priority: int = Field(
+            default=0, description="Priority level for the filter operations."
+        )
         CALCULATE_ALL_MESSAGES: bool = Field(
             default=True,
             description="If true, calculate tokens for all messages. If false, only use the last user and assistant messages."
@@ -127,7 +130,7 @@ class Filter:
         if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
             # Count how many user/system messages were actually used
             req_count = len([m for m in all_messages if m.get("role") in ("user", "system")])
-            
+
             # Count how many assistant messages were actually used
             resp_count = len([m for m in all_messages if m.get("role") == "assistant"])
             avg_request_tokens = request_token_count / req_count if req_count else 0
