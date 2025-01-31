@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.0
+version: 1.1.0
 license: MIT
 description: A Python-based filter for tracking the response time and token usage of a request.
 features:
@@ -30,6 +30,12 @@ class Filter:
         )
         SHOW_AVERAGE_TOKENS: bool = Field(
             default=False, description="Show average tokens per message."
+        )
+        SHOW_RESPONSE_TIME: bool = Field(
+            default=True, description="Show the response time."
+        )
+        SHOW_TOKEN_COUNT: bool = Field(
+            default=True, description="Show the token count."
         )
 
     def __init__(self):
@@ -93,15 +99,18 @@ class Filter:
             avg_response_tokens = response_token_count / num_messages if num_messages > 0 else 0
 
         # Create the description for the output
-        description = (
-            f"Response time: {response_time:.2f}s, "
-            f"Request tokens: {request_token_count}"
-        )
-        if self.valves.SHOW_AVERAGE_TOKENS:
-            description += f" (∅ {avg_request_tokens:.2f})"
-        description += f", Response tokens: {response_token_count}"
-        if self.valves.SHOW_AVERAGE_TOKENS:
-            description += f" (∅ {avg_response_tokens:.2f})"
+        description = ""
+        if self.valves.SHOW_RESPONSE_TIME:
+            description += f"Response time: {response_time:.2f}s"
+        if self.valves.SHOW_TOKEN_COUNT:
+            if description:
+                description += ", "
+            description += f"Request tokens: {request_token_count}"
+            if self.valves.SHOW_AVERAGE_TOKENS:
+                description += f" (∅ {avg_request_tokens:.2f})"
+            description += f", Response tokens: {response_token_count}"
+            if self.valves.SHOW_AVERAGE_TOKENS:
+                description += f" (∅ {avg_response_tokens:.2f})"
 
         # Send the status data
         await __event_emitter__(
