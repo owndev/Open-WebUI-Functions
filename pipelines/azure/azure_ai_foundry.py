@@ -90,31 +90,19 @@ class Pipe:
 
         # Filter allowed parameters
         allowed_params = {
+            "model",
             "messages",
-            "temperature",
-            "role",
-            "content",
-            "contentPart",
-            "contentPartImage",
-            "enhancements",
-            "dataSources",
-            "n",
-            "stream",
-            "stop",
+            "frequency_penalty",
             "max_tokens",
             "presence_penalty",
-            "frequency_penalty",
-            "logit_bias",
-            "user",
-            "function_call",
-            "funcions",
-            "tools",
-            "tool_choice",
-            "top_p",
-            "log_probs",
-            "top_logprobs",
             "response_format",
             "seed",
+            "stop",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
@@ -129,7 +117,7 @@ class Pipe:
                 json=filtered_body,
                 headers=headers,
                 stream=do_stream,
-                timeout=60 if do_stream else 30,  # Longer timeout for streaming
+                timeout=600 if do_stream else 300,  # Longer timeout for streaming
             )
             response.raise_for_status()
 
