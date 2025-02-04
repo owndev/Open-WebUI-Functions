@@ -4,14 +4,16 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.1
+n8n_template: https://github.com/owndev/Open-WebUI-Functions/tree/master/pipelines/n8n
+version: 1.1.0
 license: MIT
-description: A Python-based pipeline for interacting with N8N workflows, enabling seamless communication with various N8N workflows via configurable headers and robust error handling. This includes support for dynamic message handling and real-time interaction with N8N workflows.
+description: A pipeline for interacting with N8N workflows, enabling seamless communication with various N8N workflows via configurable headers and robust error handling. This includes support for dynamic message handling and real-time interaction with N8N workflows.
 features:
     - Integrates with N8N for seamless communication.
     - Supports dynamic message handling.
     - Enables real-time interaction with N8N workflows.
     - Provides configurable status emissions.
+    - Cloudflare Access support for secure communication.
 """
 
 from typing import Optional, Callable, Awaitable
@@ -45,6 +47,14 @@ class Pipe:
         enable_status_indicator: bool = Field(
             default=True,
             description="Enable or disable status indicator emissions"
+        )
+        CF_Access_Client_Id: str = Field(
+            default="",
+            description="Only if behind Cloudflare: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/"
+        )
+        CF_Access_Client_Secret: str = Field(
+            default="",
+            description="Only if behind Cloudflare: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/"
         )
 
     def __init__(self):
@@ -117,6 +127,8 @@ class Pipe:
                 headers = {
                     "Authorization": f"Bearer {self.valves.n8n_bearer_token}",
                     "Content-Type": "application/json",
+                    "CF-Access-Client-Id": self.valves.CF_Access_Client_Id,
+                    "CF-Access-Client-Secret": self.valves.CF_Access_Client_Secret
                 }
                 payload = {
                     "systemPrompt": f"{messages[0]['content'].split('Prompt: ')[-1]}",
