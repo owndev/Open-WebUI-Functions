@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.1
+version: 1.0.2
 license: MIT
 description: A Python-based pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -74,7 +74,7 @@ class Pipe:
         }
         # If the valve indicates that the model name should be in the body,
         # add it to the filtered body.
-        if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
+        if self.valves.AZURE_AI_MODEL and not self.valves.AZURE_AI_MODEL_IN_BODY:
             headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
@@ -154,7 +154,7 @@ class Pipe:
         Handles streaming responses line by line.
         """
         try:
-            for line in response.iter_lines(decode_unicode=True):
+            for line in response.iter_lines():
                 if line:  # Skip empty lines
                     yield line
         except Exception as e:

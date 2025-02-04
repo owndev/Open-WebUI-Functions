@@ -114,9 +114,9 @@ The repository includes functions specifically designed for **Azure AI**, suppor
 ### Environment Variables:
 For Azure AI-based functions, set the following:
 ```bash
-export AZURE_AI_API_KEY="your-api-key"
-export AZURE_AI_ENDPOINT="https://your-service.openai.azure.com/chat/completions?api-version=2024-05-01-preview"
-export AZURE_AI_MODEL="gpt-4o"  # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions").
+AZURE_AI_API_KEY="your-api-key"
+AZURE_AI_ENDPOINT="https://your-service.openai.azure.com/chat/completions?api-version=2024-05-01-preview"
+AZURE_AI_MODEL="gpt-4o"  # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions").
 ```
 
 For further details, check the [Azure AI Function in Open WebUI.](https://openwebui.com/f/owndev/).

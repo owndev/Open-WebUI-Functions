@@ -4,9 +4,9 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.0
+version: 1.0.1
 license: MIT
-description: A Python-based pipeline for interacting with Azure AI services for DeepSeek-R1.
+description: A pipeline for interacting with DeepSeek-R1 in Azure AI services.
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
@@ -29,10 +29,10 @@ class Pipe:
             description="API key for Azure AI"
         )
 
-        # Endpoint for Azure AI (e.g. "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions")
+        # Endpoint for DeepSeek-R1 in Azure AI (e.g. "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions")
         AZURE_AI_ENDPOINT: str = Field(
             default=os.getenv("AZURE_AI_ENDPOINT", "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions"),
-            description="Endpoint for Azure AI"
+            description="Endpoint for DeepSeek-R1 in Azure AI"
         )
 
     def __init__(self):
@@ -80,30 +80,17 @@ class Pipe:
         # Filter allowed parameters
         allowed_params = {
             "messages",
-            "temperature",
-            "role",
-            "content",
-            "contentPart",
-            "contentPartImage",
-            "enhancements",
-            "dataSources",
-            "n",
-            "stream",
-            "stop",
+            "frequency_penalty",
             "max_tokens",
             "presence_penalty",
-            "frequency_penalty",
-            "logit_bias",
-            "user",
-            "function_call",
-            "funcions",
-            "tools",
-            "tool_choice",
-            "top_p",
-            "log_probs",
-            "top_logprobs",
             "response_format",
             "seed",
+            "stop",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
@@ -142,7 +129,7 @@ class Pipe:
         Handles streaming responses line by line.
         """
         try:
-            for line in response.iter_lines(decode_unicode=True):
+            for line in response.iter_lines():
                 if line:  # Skip empty lines
                     yield line
         except Exception as e:
