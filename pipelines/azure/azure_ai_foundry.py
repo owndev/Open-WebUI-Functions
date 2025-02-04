@@ -43,6 +43,12 @@ class Pipe:
             default=os.getenv("AZURE_AI_MODEL", ""),
             description="Optional model name for Azure AI"
         )
+      
+        # Switch for sending model name in request body
+        AZURE_AI_MODEL_IN_BODY: bool = Field(
+            default=False,
+            description="If True, include the model name in the request body instead of as a header.",
+        )
 
     def __init__(self):
         self.name = "Azure AI"
@@ -66,7 +72,9 @@ class Pipe:
             "api-key": self.valves.AZURE_AI_API_KEY,
             "Content-Type": "application/json",
         }
-        if self.valves.AZURE_AI_MODEL:
+        # If the valve indicates that the model name should be in the body,
+        # add it to the filtered body.
+        if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
@@ -90,33 +98,26 @@ class Pipe:
 
         # Filter allowed parameters
         allowed_params = {
+            "model",
             "messages",
-            "temperature",
-            "role",
-            "content",
-            "contentPart",
-            "contentPartImage",
-            "enhancements",
-            "dataSources",
-            "n",
-            "stream",
-            "stop",
+            "frequency_penalty",
             "max_tokens",
             "presence_penalty",
-            "frequency_penalty",
-            "logit_bias",
-            "user",
-            "function_call",
-            "funcions",
-            "tools",
-            "tool_choice",
-            "top_p",
-            "log_probs",
-            "top_logprobs",
             "response_format",
             "seed",
+            "stop",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
+      
+        # If the valve indicates that the model name should be in the body,
+        # add it to the filtered body.
+        if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
+            filtered_body["model"] = self.valves.AZURE_AI_MODEL
 
         response = None
         try:
@@ -129,7 +130,7 @@ class Pipe:
                 json=filtered_body,
                 headers=headers,
                 stream=do_stream,
-                timeout=60 if do_stream else 30,  # Longer timeout for streaming
+                timeout=600 if do_stream else 300,  # Longer timeout for streaming
             )
             response.raise_for_status()
 
