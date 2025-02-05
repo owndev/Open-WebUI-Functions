@@ -4,12 +4,14 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.2.0
+version: 2.3.0
 license: MIT
 description: A filter for tracking the response time and token usage of a request.
 features:
   - Tracks the response time of a request.
   - Tracks Token Usage.
+  - Calculates the average tokens per message.
+  - Calculates the tokens per second.
 """
 
 import time
@@ -30,7 +32,7 @@ class Filter:
             description="If true, calculate tokens for all messages. If false, only use the last user and assistant messages."
         )
         SHOW_AVERAGE_TOKENS: bool = Field(
-            default=False,
+            default=True,
             description="Show average tokens per message (only used if CALCULATE_ALL_MESSAGES is true)."
         )
         SHOW_RESPONSE_TIME: bool = Field(
@@ -41,9 +43,9 @@ class Filter:
             default=True,
             description="Show the token count."
         )
-        SHORT_OUTPUT: bool = Field(
-            default=False,
-            description="If true, use a shorter output style. Otherwise, use the full text."
+        SHOW_TOKENS_PER_SECOND: bool = Field(
+            default=True,
+            description="Show tokens per second for the response."
         )
 
     def __init__(self):
@@ -97,12 +99,13 @@ class Filter:
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
 
+        reversed_messages = list(reversed(all_messages))
+
         # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
             assistant_messages = [m for m in all_messages if m.get("role") == "assistant"]
         else:
             # Take only the last "assistant" message if any
-            reversed_messages = list(reversed(all_messages))
             last_assistant = next(
                 (m for m in reversed_messages if m.get("role") == "assistant"),
                 None
@@ -110,6 +113,12 @@ class Filter:
             assistant_messages = [last_assistant] if last_assistant else []
 
         response_token_count = sum(len(encoding.encode(m["content"])) for m in assistant_messages)
+
+        # Calculate tokens per second (only for the last assistant response)
+        if self.valves.SHOW_TOKENS_PER_SECOND:
+            last_assistant_msg = next((m for m in reversed_messages if m.get("role") == "assistant"), None)
+            last_assistant_tokens = len(encoding.encode(last_assistant_msg["content"])) if last_assistant_msg else 0
+            resp_tokens_per_sec = 0 if response_time == 0 else last_assistant_tokens / response_time
 
         # Calculate averages only if CALCULATE_ALL_MESSAGES is true
         avg_request_tokens = avg_response_tokens = 0
@@ -119,36 +128,23 @@ class Filter:
             avg_request_tokens = request_token_count / req_count if req_count else 0
             avg_response_tokens = response_token_count / resp_count if resp_count else 0
 
-        if self.valves.SHORT_OUTPUT:
-            # Shorter style, e.g.: "10.90s, Req: 175 (Ø 87.50), Resp: 439 (Ø 219.50)"
-            description_parts = []
-            if self.valves.SHOW_RESPONSE_TIME:
-                description_parts.append(f"{response_time:.2f}s")
-            if self.valves.SHOW_TOKEN_COUNT:
-                if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
-                    # Add averages (Ø) into short output
-                    short_str = (
-                        f"Req: {request_token_count} (Ø {avg_request_tokens:.2f}), "
-                        f"Resp: {response_token_count} (Ø {avg_response_tokens:.2f})"
-                    )
-                else:
-                    short_str = f"Req: {request_token_count}, Resp: {response_token_count}"
-                description_parts.append(short_str)
-            description = ", ".join(description_parts)
-        else:
-            # Original full text
-            description = ""
-            if self.valves.SHOW_RESPONSE_TIME:
-                description += f"Response time: {response_time:.2f}s"
-            if self.valves.SHOW_TOKEN_COUNT:
-                if description:
-                    description += ", "
-                description += f"Request tokens: {request_token_count}"
-                if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
-                    description += f" (∅ {avg_request_tokens:.2f})"
-                description += f", Response tokens: {response_token_count}"
-                if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
-                    description += f" (∅ {avg_response_tokens:.2f})"
+        # Shorter style, e.g.: "10.90s | Req: 175 (Ø 87.50) | Resp: 439 (Ø 219.50) | 40.18 T/s"
+        description_parts = []
+        if self.valves.SHOW_RESPONSE_TIME:
+            description_parts.append(f"{response_time:.2f}s")
+        if self.valves.SHOW_TOKEN_COUNT:
+            if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
+                # Add averages (Ø) into short output
+                short_str = (
+                    f"Req: {request_token_count} (Ø {avg_request_tokens:.2f}) | "
+                    f"Resp: {response_token_count} (Ø {avg_response_tokens:.2f})"
+                )
+            else:
+                short_str = f"Req: {request_token_count} | Resp: {response_token_count}"
+            description_parts.append(short_str)
+        if self.valves.SHOW_TOKENS_PER_SECOND:
+            description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
+        description = " | ".join(description_parts)
 
         await __event_emitter__({
             "type": "status",
