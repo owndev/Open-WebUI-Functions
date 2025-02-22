@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.3
+version: 1.1.0
 license: MIT
 description: A Python-based pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -27,34 +27,38 @@ class Pipe:
         # API key for Azure AI
         AZURE_AI_API_KEY: str = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
-            description="API key for Azure AI",
+            description="API key for Azure AI"
         )
 
         # Endpoint for Azure AI (e.g. "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview" or "https://<your-endpoint>/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview")
         AZURE_AI_ENDPOINT: str = Field(
             default=os.getenv(
                 "AZURE_AI_ENDPOINT",
-                "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview",
+                "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview"
             ),
-            description="Endpoint for Azure AI",
+            description="Endpoint for Azure AI"
         )
 
         # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions")
         AZURE_AI_MODEL: str = Field(
             default=os.getenv("AZURE_AI_MODEL", ""),
-            description="Optional model name for Azure AI",
+            description="Optional model name for Azure AI"
         )
 
         # Switch for sending model name in request body
         AZURE_AI_MODEL_IN_BODY: bool = Field(
             default=False,
-            description="If True, include the model name in the request body instead of as a header.",
+            description="If True, include the model name in the request body instead of as a header."
+        )
+
+        # Flag to indicate if predefined Azure AI models should be used        
+        USE_PREDEFINED_AZURE_AI_MODELS: bool = Field(
+            default=True,
+            description="Flag to indicate if predefined Azure AI models should be used. (currently does not work with Azure OpenAI models)"
         )
 
     def __init__(self):
-        self.name = "Azure AI"
         self.valves = self.Valves()
-        self.validate_environment()
 
     def validate_environment(self):
         """
@@ -73,6 +77,7 @@ class Pipe:
             "api-key": self.valves.AZURE_AI_API_KEY,
             "Content-Type": "application/json",
         }
+
         # If the valve indicates that the model name should be in the body,
         # add it to the filtered body.
         if self.valves.AZURE_AI_MODEL and not self.valves.AZURE_AI_MODEL_IN_BODY:
@@ -94,31 +99,16 @@ class Pipe:
             {"id": "Cohere-command-r", "name": "Cohere Command R"},
             {"id": "Cohere-command-r-08-2024", "name": "Cohere Command R 08-2024"},
             {"id": "Cohere-command-r-plus", "name": "Cohere Command R+"},
-            {
-                "id": "Cohere-command-r-plus-08-2024",
-                "name": "Cohere Command R+ 08-2024",
-            },
+            {"id": "Cohere-command-r-plus-08-2024", "name": "Cohere Command R+ 08-2024"},
             {"id": "DeepSeek-R1", "name": "DeepSeek-R1"},
             {"id": "jais-30b-chat", "name": "JAIS 30b Chat"},
-            {
-                "id": "Llama-3.2-11B-Vision-Instruct",
-                "name": "Llama-3.2-11B-Vision-Instruct",
-            },
-            {
-                "id": "Llama-3.2-90B-Vision-Instruct",
-                "name": "Llama-3.2-90B-Vision-Instruct",
-            },
+            {"id": "Llama-3.2-11B-Vision-Instruct", "name": "Llama-3.2-11B-Vision-Instruct"},
+            {"id": "Llama-3.2-90B-Vision-Instruct", "name": "Llama-3.2-90B-Vision-Instruct"},
             {"id": "Llama-3.3-70B-Instruct", "name": "Llama-3.3-70B-Instruct"},
             {"id": "Meta-Llama-3-70B-Instruct", "name": "Meta-Llama-3-70B-Instruct"},
             {"id": "Meta-Llama-3-8B-Instruct", "name": "Meta-Llama-3-8B-Instruct"},
-            {
-                "id": "Meta-Llama-3.1-405B-Instruct",
-                "name": "Meta-Llama-3.1-405B-Instruct",
-            },
-            {
-                "id": "Meta-Llama-3.1-70B-Instruct",
-                "name": "Meta-Llama-3.1-70B-Instruct",
-            },
+            {"id": "Meta-Llama-3.1-405B-Instruct", "name": "Meta-Llama-3.1-405B-Instruct"},
+            {"id": "Meta-Llama-3.1-70B-Instruct", "name": "Meta-Llama-3.1-70B-Instruct"},
             {"id": "Meta-Llama-3.1-8B-Instruct", "name": "Meta-Llama-3.1-8B-Instruct"},
             {"id": "Ministral-3B", "name": "Ministral 3B"},
             {"id": "Mistral-large", "name": "Mistral Large"},
@@ -132,10 +122,7 @@ class Pipe:
             {"id": "o1-mini", "name": "OpenAI o1-mini"},
             {"id": "o1-preview", "name": "OpenAI o1-preview"},
             {"id": "o3-mini", "name": "OpenAI o3-mini"},
-            {
-                "id": "Phi-3-medium-128k-instruct",
-                "name": "Phi-3-medium instruct (128k)",
-            },
+            {"id": "Phi-3-medium-128k-instruct", "name": "Phi-3-medium instruct (128k)"},
             {"id": "Phi-3-medium-4k-instruct", "name": "Phi-3-medium instruct (4k)"},
             {"id": "Phi-3-mini-128k-instruct", "name": "Phi-3-mini instruct (128k)"},
             {"id": "Phi-3-mini-4k-instruct", "name": "Phi-3-mini instruct (4k)"},
@@ -144,11 +131,24 @@ class Pipe:
             {"id": "Phi-3.5-mini-instruct", "name": "Phi-3.5-mini instruct (128k)"},
             {"id": "Phi-3.5-MoE-instruct", "name": "Phi-3.5-MoE instruct (128k)"},
             {"id": "Phi-3.5-vision-instruct", "name": "Phi-3.5-vision instruct (128k)"},
-            {"id": "Phi-4", "name": "Phi-4"},
+            {"id": "Phi-4", "name": "Phi-4"}
         ]
 
     def pipes(self) -> List[dict]:
-        return self.get_azure_models()
+        self.validate_environment()
+    
+        # If a custom model is provided, use it exclusively.
+        if self.valves.AZURE_AI_MODEL:
+            self.name = f"Azure AI: {self.valves.AZURE_AI_MODEL}"
+            return [{"id": self.valves.AZURE_AI_MODEL, "name": self.valves.AZURE_AI_MODEL}]
+        
+        # If custom model is not provided but predefined models are enabled, return those.
+        if self.valves.USE_PREDEFINED_AZURE_AI_MODELS:
+            self.name = "Azure AI: "
+            return self.get_azure_models()
+        
+        # Otherwise, use a default name.
+        return [{"id": "Azure AI", "name": "Azure AI"}]
 
     def pipe(self, body: dict) -> Union[str, Generator, Iterator]:
         """
@@ -185,7 +185,7 @@ class Pipe:
             filtered_body["model"] = self.valves.AZURE_AI_MODEL
         elif filtered_body["model"]:
             filtered_body["model"] = filtered_body["model"].split(".")[-1]
-
+            
         response = None
         try:
             # Check for streaming support
