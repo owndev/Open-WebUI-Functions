@@ -120,3 +120,29 @@ AZURE_AI_MODEL="gpt-4o"  # Optional model name, only necessary if not Azure Open
 ```
 
 For further details, check the [Azure AI Function in Open WebUI.](https://openwebui.com/f/owndev/).
+
+## Contribute
+
+We welcome contributions from the community! To contribute, follow these steps:
+
+1. **Fork the Repository**: Click the "Fork" button at the top right corner of this page to create a copy of this repository in your GitHub account.
+2. **Clone Your Fork**: Clone your fork to your local machine using the following command:
+   ```bash
+   git clone https://github.com/<your-username>/Open-WebUI-Functions.git
+   ```
+3. **Create a New Branch**: Create a new branch for your changes:
+   ```bash
+   git checkout -b my-feature-branch
+   ```
+4. **Make Your Changes**: Make your changes to the code or documentation.
+5. **Commit Your Changes**: Commit your changes with a meaningful commit message:
+   ```bash
+   git commit -m "Add new feature or fix bug"
+   ```
+6. **Push to Your Fork**: Push your changes to your forked repository:
+   ```bash
+   git push origin my-feature-branch
+   ```
+7. **Create a Pull Request**: Open a pull request on the original repository, describing your changes and why they should be merged.
+
+Thank you for contributing!
