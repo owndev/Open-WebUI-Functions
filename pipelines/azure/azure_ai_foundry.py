@@ -54,7 +54,7 @@ class Pipe:
         # Flag to indicate if predefined Azure AI models should be used        
         USE_PREDEFINED_AZURE_AI_MODELS: bool = Field(
             default=True,
-            description="Flag to indicate if predefined Azure AI models should be used. (currently does not work with Azure OpenAI models)"
+            description="Flag to indicate if predefined Azure AI models should be used."
         )
 
     def __init__(self):
