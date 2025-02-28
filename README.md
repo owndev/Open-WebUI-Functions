@@ -61,6 +61,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
+- Predefined models for easy access.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai/)
 

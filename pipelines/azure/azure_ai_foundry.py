@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.1.0
+version: 1.2.0
 license: MIT
 description: A Python-based pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -13,12 +13,35 @@ features:
   - Handles streaming and non-streaming responses.
   - Provides flexible timeout and error handling mechanisms.
   - Compatible with Azure OpenAI and other Azure AI models.
+  - Predefined models for easy access.
 """
 
-from typing import List, Union, Generator, Iterator
+from typing import List, Union, Generator, Iterator, Optional, Dict, Any
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-import requests
+from starlette.background import BackgroundTask
+from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+import aiohttp
+import json
 import os
+import logging
+
+# Helper functions
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+) -> None:
+    """
+    Clean up the response and session objects.
+    
+    Args:
+        response: The ClientResponse object to close
+        session: The ClientSession object to close
+    """
+    if response:
+        response.close()
+    if session:
+        await session.close()
 
 
 class Pipe:
@@ -59,23 +82,30 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.name: str = "Azure AI"
 
-    def validate_environment(self):
+    def validate_environment(self) -> None:
         """
         Validates that required environment variables are set.
+        
+        Raises:
+            ValueError: If required environment variables are not set.
         """
         if not self.valves.AZURE_AI_API_KEY:
             raise ValueError("AZURE_AI_API_KEY is not set!")
         if not self.valves.AZURE_AI_ENDPOINT:
             raise ValueError("AZURE_AI_ENDPOINT is not set!")
 
-    def get_headers(self) -> dict:
+    def get_headers(self) -> Dict[str, str]:
         """
         Constructs the headers for the API request, including the model name if defined.
+        
+        Returns:
+            Dictionary containing the required headers for the API request.
         """
         headers = {
             "api-key": self.valves.AZURE_AI_API_KEY,
-            "Content-Type": "application/json",
+            "Content-Type": "application/json"
         }
 
         # If the valve indicates that the model name should be in the body,
@@ -84,14 +114,26 @@ class Pipe:
             headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
-    def validate_body(self, body: dict):
+    def validate_body(self, body: Dict[str, Any]) -> None:
         """
         Validates the request body to ensure required fields are present.
+        
+        Args:
+            body: The request body to validate
+            
+        Raises:
+            ValueError: If required fields are missing or invalid.
         """
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
 
-    def get_azure_models(self):
+    def get_azure_models(self) -> List[Dict[str, str]]:
+        """
+        Returns a list of predefined Azure AI models.
+        
+        Returns:
+            List of dictionaries containing model id and name.
+        """
         return [
             {"id": "AI21-Jamba-1.5-Large", "name": "AI21 Jamba 1.5 Large"},
             {"id": "AI21-Jamba-1.5-Mini", "name": "AI21 Jamba 1.5 Mini"},
@@ -134,12 +176,18 @@ class Pipe:
             {"id": "Phi-4", "name": "Phi-4"}
         ]
 
-    def pipes(self) -> List[dict]:
+    def pipes(self) -> List[Dict[str, str]]:
+        """
+        Returns a list of available pipes based on configuration.
+        
+        Returns:
+            List of dictionaries containing pipe id and name.
+        """
         self.validate_environment()
     
         # If a custom model is provided, use it exclusively.
         if self.valves.AZURE_AI_MODEL:
-            self.name = f"Azure AI: {self.valves.AZURE_AI_MODEL}"
+            self.name = "Azure AI: "
             return [{"id": self.valves.AZURE_AI_MODEL, "name": self.valves.AZURE_AI_MODEL}]
         
         # If custom model is not provided but predefined models are enabled, return those.
@@ -150,11 +198,20 @@ class Pipe:
         # Otherwise, use a default name.
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
-    def pipe(self, body: dict) -> Union[str, Generator, Iterator]:
+    async def pipe(self, body: Dict[str, Any]) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Azure AI endpoint.
         The model name is passed as a header if defined.
+        
+        Args:
+            body: The request body containing messages and other parameters
+            
+        Returns:
+            Response from Azure AI API, which could be a string, dictionary or streaming response
         """
+        log = logging.getLogger("azure_ai.pipe")
+        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+
         # Validate the request body
         self.validate_body(body)
 
@@ -183,46 +240,65 @@ class Pipe:
         # add it to the filtered body.
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             filtered_body["model"] = self.valves.AZURE_AI_MODEL
-        elif filtered_body["model"]:
-            filtered_body["model"] = filtered_body["model"].split(".")[-1]
-            
+        elif "model" in filtered_body and filtered_body["model"]:
+            # Safer model extraction with split
+            filtered_body["model"] = filtered_body["model"].split(".", 1)[1] if "." in filtered_body["model"] else filtered_body["model"]
+
+        # Convert the modified body back to JSON
+        payload = json.dumps(filtered_body)
+
+        request = None
+        session = None
+        streaming = False
         response = None
-        try:
-            # Check for streaming support
-            do_stream = filtered_body.get("stream", False)
 
-            # Send POST request to the endpoint
-            response = requests.post(
-                url=self.valves.AZURE_AI_ENDPOINT,
-                json=filtered_body,
-                headers=headers,
-                stream=do_stream,
-                timeout=600 if do_stream else 300,  # Longer timeout for streaming
+        try:
+            session = aiohttp.ClientSession(
+                trust_env=True,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
-            response.raise_for_status()
 
-            # Return streaming or full response
-            if do_stream:
-                return self.stream_response(response)
+            request = await session.request(
+                method="POST",
+                url=self.valves.AZURE_AI_ENDPOINT,
+                data=payload,
+                headers=headers,
+            )
+
+            # Check if response is SSE
+            if "text/event-stream" in request.headers.get("Content-Type", ""):
+                streaming = True
+                return StreamingResponse(
+                    request.content,
+                    status_code=request.status,
+                    headers=dict(request.headers),
+                    background=BackgroundTask(
+                        cleanup_response, response=request, session=session
+                    ),
+                )
             else:
-                return response.json()
+                try:
+                    response = await request.json()
+                except Exception as e:
+                    log.error(f"Error parsing JSON response: {e}")
+                    response = await request.text()
 
-        except requests.exceptions.Timeout:
-            return "Error: Request timed out. The server did not respond in time."
-        except requests.exceptions.ConnectionError:
-            return "Error: Failed to connect to the server. Check your network or endpoint."
-        except requests.exceptions.HTTPError as http_err:
-            return f"HTTP Error: {http_err.response.status_code} - {http_err.response.text}"
-        except Exception as e:
-            return f"Unexpected error: {e}"
+                request.raise_for_status()
+                return response
 
-    def stream_response(self, response):
-        """
-        Handles streaming responses line by line.
-        """
-        try:
-            for line in response.iter_lines():
-                if line:  # Skip empty lines
-                    yield line
         except Exception as e:
-            yield f"Error while streaming: {e}"
+            log.exception(f"Error in Azure AI request: {e}")
+
+            detail = f"Exception: {str(e)}"
+            if isinstance(response, dict):
+                if "error" in response:
+                    detail = f"{response['error']['message'] if 'message' in response['error'] else response['error']}"
+            elif isinstance(response, str):
+                detail = response
+
+            return f"Error: {detail}"
+        finally:
+            if not streaming and session:
+                if request:
+                    request.close()
+                await session.close()
