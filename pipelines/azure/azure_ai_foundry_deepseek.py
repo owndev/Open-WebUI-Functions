@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.0.1
+version: 1.1.0
 license: MIT
 description: A pipeline for interacting with DeepSeek-R1 in Azure AI services.
 features:
@@ -15,10 +15,32 @@ features:
   - Compatible with Azure AI DeepSeek-R1.
 """
 
-from typing import Union, Generator, Iterator
+from typing import List, Union, Generator, Iterator, Optional, Dict, Any
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-import requests
+from starlette.background import BackgroundTask
+from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+import aiohttp
+import json
 import os
+import logging
+
+# Helper functions
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+) -> None:
+    """
+    Clean up the response and session objects.
+    
+    Args:
+        response: The ClientResponse object to close
+        session: The ClientSession object to close
+    """
+    if response:
+        response.close()
+    if session:
+        await session.close()
 
 class Pipe:
     # Environment variables for API key, endpoint, and optional model
@@ -36,13 +58,16 @@ class Pipe:
         )
 
     def __init__(self):
-        self.name = "Azure AI"
         self.valves = self.Valves()
+        self.name: str = "Azure AI: DeepSeek-R1"
         self.validate_environment()
 
     def validate_environment(self):
         """
         Validates that required environment variables are set.
+        
+        Raises:
+            ValueError: If required environment variables are not set.
         """
         if not self.valves.AZURE_AI_API_KEY:
             raise ValueError("AZURE_AI_API_KEY is not set!")
@@ -52,25 +77,43 @@ class Pipe:
     def get_headers(self) -> dict:
         """
         Constructs the headers for the API request, including the model name if defined.
+        
+        Returns:
+            Dictionary containing the required headers for the API request.
         """
         headers = {
             "Authorization": "Bearer " + self.valves.AZURE_AI_API_KEY,
-            "Content-Type": "application/json",
+            "Content-Type": "application/json"
         }
         return headers
 
-    def validate_body(self, body: dict):
+    def validate_body(self, body: Dict[str, Any]) -> None:
         """
         Validates the request body to ensure required fields are present.
+        
+        Args:
+            body: The request body to validate
+            
+        Raises:
+            ValueError: If required fields are missing or invalid.
         """
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
 
-    def pipe(self, body: dict) -> Union[str, Generator, Iterator]:
+    async def pipe(self, body: Dict[str, Any]) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Azure AI endpoint.
         The model name is passed as a header if defined.
+        
+        Args:
+            body: The request body containing messages and other parameters
+            
+        Returns:
+            Response from Azure AI API, which could be a string, dictionary or streaming response
         """
+        log = logging.getLogger("azure_ai_deepseek_r1.pipe")
+        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+
         # Validate the request body
         self.validate_body(body)
 
@@ -94,43 +137,61 @@ class Pipe:
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
+        # Convert the modified body back to JSON
+        payload = json.dumps(filtered_body)
+
+        request = None
+        session = None
+        streaming = False
         response = None
-        try:
-            # Check for streaming support
-            do_stream = filtered_body.get("stream", False)
 
-            # Send POST request to the endpoint
-            response = requests.post(
-                url=self.valves.AZURE_AI_ENDPOINT,
-                json=filtered_body,
-                headers=headers,
-                stream=do_stream,
-                timeout=600 if do_stream else 300,  # Longer timeout for streaming
+        try:
+            session = aiohttp.ClientSession(
+                trust_env=True,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
-            response.raise_for_status()
 
-            # Return streaming or full response
-            if do_stream:
-                return self.stream_response(response)
+            request = await session.request(
+                method="POST",
+                url=self.valves.AZURE_AI_ENDPOINT,
+                data=payload,
+                headers=headers,
+            )
+
+            # Check if response is SSE
+            if "text/event-stream" in request.headers.get("Content-Type", ""):
+                streaming = True
+                return StreamingResponse(
+                    request.content,
+                    status_code=request.status,
+                    headers=dict(request.headers),
+                    background=BackgroundTask(
+                        cleanup_response, response=request, session=session
+                    ),
+                )
             else:
-                return response.json()
+                try:
+                    response = await request.json()
+                except Exception as e:
+                    log.error(f"Error parsing JSON response: {e}")
+                    response = await request.text()
 
-        except requests.exceptions.Timeout:
-            return "Error: Request timed out. The server did not respond in time."
-        except requests.exceptions.ConnectionError:
-            return "Error: Failed to connect to the server. Check your network or endpoint."
-        except requests.exceptions.HTTPError as http_err:
-            return f"HTTP Error: {http_err.response.status_code} - {http_err.response.text}"
-        except Exception as e:
-            return f"Unexpected error: {e}"
+                request.raise_for_status()
+                return response
 
-    def stream_response(self, response):
-        """
-        Handles streaming responses line by line.
-        """
-        try:
-            for line in response.iter_lines():
-                if line:  # Skip empty lines
-                    yield line
         except Exception as e:
-            yield f"Error while streaming: {e}"
+            log.exception(f"Error in Azure AI request: {e}")
+
+            detail = f"Exception: {str(e)}"
+            if isinstance(response, dict):
+                if "error" in response:
+                    detail = f"{response['error']['message'] if 'message' in response['error'] else response['error']}"
+            elif isinstance(response, str):
+                detail = response
+
+            return f"Error: {detail}"
+        finally:
+            if not streaming and session:
+                if request:
+                    request.close()
+                await session.close()

@@ -6,7 +6,7 @@ project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
 version: 1.2.0
 license: MIT
-description: A Python-based pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
+description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
