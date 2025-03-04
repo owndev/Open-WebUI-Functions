@@ -62,11 +62,16 @@ class Pipe:
             default=os.getenv("INFOMANIAK_BASE_URL", "https://api.infomaniak.com"),
             description="Base URL for Infomaniak API"
         )
+        # Prefix for model names
+        NAME_PREFIX: str = Field(
+            default="Infomaniak: ",
+            description="Prefix to be added before model names"
+        )
 
     def __init__(self):
         self.type = "manifold"
         self.valves = self.Valves()
-        self.name: str = "Infomaniak: "
+        self.name: str = self.valves.NAME_PREFIX
 
     def validate_environment(self) -> None:
         """
@@ -151,7 +156,12 @@ class Pipe:
                                     if item.get("type") == "llm":  # only include llm models
                                         models.append({
                                             "id": item.get("name", ""),
-                                            "name": item.get("description", item.get("name", ""))
+                                            "name": item.get("description", item.get("name", "")),
+                                            # Profile image and description are currently not working in Open WebUI
+                                            "meta": {
+                                                "profile_image_url": item.get("logo_url", ""),
+                                                "description": item.get("documentation_link", "")
+                                            }
                                         })
                                 return models
                             else:
