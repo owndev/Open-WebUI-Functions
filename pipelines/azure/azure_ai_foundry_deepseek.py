@@ -62,7 +62,7 @@ class Pipe:
             description="Endpoint for DeepSeek-R1 in Azure AI",
         )
 
-        # Model name, necessary by Azure OpenAI 
+        # Model name, necessary by Azure OpenAI
         # "Use parameter model = "DeepSeek-R1" to use this deployment in your request to use this deployment"
         # https://learn.microsoft.com/en-us/azure/ai-foundry/model-inference/concepts/endpoints?tabs=python#routing
         AZURE_AI_MODEL: str = Field(
