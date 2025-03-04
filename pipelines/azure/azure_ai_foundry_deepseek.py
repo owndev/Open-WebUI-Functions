@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.1.0
+version: 1.1.1
 license: MIT
 description: A pipeline for interacting with DeepSeek-R1 in Azure AI services.
 features:
@@ -25,6 +25,7 @@ import json
 import os
 import logging
 
+
 # Helper functions
 async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
@@ -32,7 +33,7 @@ async def cleanup_response(
 ) -> None:
     """
     Clean up the response and session objects.
-    
+
     Args:
         response: The ClientResponse object to close
         session: The ClientSession object to close
@@ -42,19 +43,31 @@ async def cleanup_response(
     if session:
         await session.close()
 
+
 class Pipe:
-    # Environment variables for API key, endpoint, and optional model
+    # Environment variables for API key, endpoint, and model name
     class Valves(BaseModel):
         # API key for Azure AI
         AZURE_AI_API_KEY: str = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
-            description="API key for Azure AI"
+            description="API key for Azure AI",
         )
 
         # Endpoint for DeepSeek-R1 in Azure AI (e.g. "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions")
         AZURE_AI_ENDPOINT: str = Field(
-            default=os.getenv("AZURE_AI_ENDPOINT", "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions"),
-            description="Endpoint for DeepSeek-R1 in Azure AI"
+            default=os.getenv(
+                "AZURE_AI_ENDPOINT",
+                "https://<your-endpoint>.eastus2.models.ai.azure.com/chat/completions",
+            ),
+            description="Endpoint for DeepSeek-R1 in Azure AI",
+        )
+
+        # Model name, necessary by Azure OpenAI 
+        # "Use parameter model = "DeepSeek-R1" to use this deployment in your request to use this deployment"
+        # https://learn.microsoft.com/en-us/azure/ai-foundry/model-inference/concepts/endpoints?tabs=python#routing
+        AZURE_AI_MODEL: str = Field(
+            default=os.getenv("AZURE_AI_MODEL", "DeepSeek-R1"),
+            description="Model name for Azure AI, needed to be passed to endpoint.",
         )
 
     def __init__(self):
@@ -65,7 +78,7 @@ class Pipe:
     def validate_environment(self):
         """
         Validates that required environment variables are set.
-        
+
         Raises:
             ValueError: If required environment variables are not set.
         """
@@ -77,37 +90,41 @@ class Pipe:
     def get_headers(self) -> dict:
         """
         Constructs the headers for the API request, including the model name if defined.
-        
+
         Returns:
             Dictionary containing the required headers for the API request.
         """
         headers = {
-            "Authorization": "Bearer " + self.valves.AZURE_AI_API_KEY,
-            "Content-Type": "application/json"
+            "api-key": self.valves.AZURE_AI_API_KEY,
+            "Content-Type": "application/json",
         }
+        if self.valves.AZURE_AI_MODEL:
+            headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
     def validate_body(self, body: Dict[str, Any]) -> None:
         """
         Validates the request body to ensure required fields are present.
-        
+
         Args:
             body: The request body to validate
-            
+
         Raises:
             ValueError: If required fields are missing or invalid.
         """
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
 
-    async def pipe(self, body: Dict[str, Any]) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
+    async def pipe(
+        self, body: Dict[str, Any]
+    ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Azure AI endpoint.
         The model name is passed as a header if defined.
-        
+
         Args:
             body: The request body containing messages and other parameters
-            
+
         Returns:
             Response from Azure AI API, which could be a string, dictionary or streaming response
         """
