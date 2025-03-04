@@ -65,15 +65,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai/)
 
-### **2. [Azure AI Foundry Pipeline for DeepSeek-R1](./pipelines/azure/azure_ai_foundry_deepseek.py)**
-
-- A specialized version of the **Azure AI Foundry Pipeline** for **DeepSeek-R1**.
-- Uses Azure’s **DeepSeek-R1** AI model for advanced text processing.
-- Includes the same error handling, parameter filtering, and request management as the standard Azure AI Foundry Pipeline.
-
-🔗 [Azure AI Pipeline for DeepSeek-R1 in Open WebUI](https://openwebui.com/f/owndev/azure_ai_deepseek_r1)
-
-### **3. [N8N Pipeline](./pipelines/n8n/n8n.py)**
+### **2. [N8N Pipeline](./pipelines/n8n/n8n.py)**
 
 - Integrates **Open WebUI** with **N8N**, an automation and workflow platform.
 - Sends messages from Open WebUI to an **N8N webhook**.
@@ -85,7 +77,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About N8N](https://n8n.io/)
 
-### **4. [Infomaniak](./pipelines/infomaniak/infomaniak.py)**
+### **3. [Infomaniak](./pipelines/infomaniak/infomaniak.py)**
 
 - Integrates **Open WebUI** with **Infomaniak**, a Swiss web hosting and cloud services provider.
 - Sends messages from Open WebUI to an **Infomaniak AI Tool**.
