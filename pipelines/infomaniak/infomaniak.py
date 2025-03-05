@@ -1,19 +1,18 @@
 """
-title: Infomaniak Pipeline
+title: Infomaniak AI Tools Pipeline
 author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
+infomaniak_url: https://www.infomaniak.com/en/hosting/ai-tools
 version: 1.0.0
 license: MIT
-description: A manifold pipeline for interacting with Infomaniak AI services, enabling seamless communication with various AI models via configurable headers and robust error handling.
+description: A manifold pipeline for interacting with Infomaniak AI Tools.
 features:
-  - Supports dynamic model specification via API parameters.
-  - Filters valid parameters to ensure clean requests.
-  - Handles streaming and non-streaming responses.
-  - Provides flexible timeout and error handling mechanisms.
-  - Compatible with Infomaniak AI models.
-  - Lists available models for easy access.
+  - Manifold pipeline for Infomaniak AI Tools
+  - Lists available models for easy access
+  - Robust error handling and logging
+  - Handles streaming and non-streaming responses
 """
 
 from typing import List, Union, Generator, Iterator, Optional, Dict, Any
@@ -42,7 +41,6 @@ async def cleanup_response(
         response.close()
     if session:
         await session.close()
-
 
 class Pipe:
     # Environment variables for API key, endpoint, and optional model
