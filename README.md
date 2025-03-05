@@ -77,6 +77,18 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About N8N](https://n8n.io/)
 
+### **3. [Infomaniak](./pipelines/infomaniak/infomaniak.py)**
+
+- Integrates **Open WebUI** with **Infomaniak**, a Swiss web hosting and cloud services provider.
+- Sends messages from Open WebUI to an **Infomaniak AI Tool**.
+
+> **Important**: The function ID in Open WebUI must not contain the name `infomaniak`. Because of a [bug](https://github.com/open-webui/open-webui/discussions/10914) in Open WebUI, the function will not work if the id contains `infomaniak`.
+
+
+🔗 [Infomaniak Pipeline in Open WebUI](https://openwebui.com/f/owndev/im_ai_tools/)
+
+🔗 [Learn More About Infomaniak](https://www.infomaniak.com/en/hosting/ai-tools)
+
 ---
 
 ## Filters
