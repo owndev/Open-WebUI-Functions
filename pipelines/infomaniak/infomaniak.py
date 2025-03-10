@@ -6,7 +6,7 @@ project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
 infomaniak_url: https://www.infomaniak.com/en/hosting/ai-tools
 version: 1.0.0
-license: MIT
+license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
 features:
   - Manifold pipeline for Infomaniak AI Tools

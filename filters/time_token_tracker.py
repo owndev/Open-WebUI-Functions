@@ -5,7 +5,7 @@ author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
 version: 2.3.0
-license: MIT
+license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request.
 features:
   - Tracks the response time of a request.

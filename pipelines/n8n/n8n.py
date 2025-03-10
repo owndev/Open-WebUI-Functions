@@ -5,8 +5,8 @@ author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
 n8n_template: https://github.com/owndev/Open-WebUI-Functions/tree/master/pipelines/n8n
-version: 1.1.0
-license: MIT
+version: 1.2.0
+license: Apache License 2.0
 description: A pipeline for interacting with N8N workflows, enabling seamless communication with various N8N workflows via configurable headers and robust error handling. This includes support for dynamic message handling and real-time interaction with N8N workflows.
 features:
     - Integrates with N8N for seamless communication.
