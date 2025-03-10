@@ -12,6 +12,7 @@
 - **N8N Workflow Integration**: Enable interactions with [N8N](https://n8n.io/) for automation.
 - **Flexible Configuration**: Use environment variables to adjust function settings dynamically.
 - **Streaming and Non-Streaming Support**: Handle both real-time and batch processing efficiently.
+- **Secure API Key Management**: Automatic encryption of sensitive information like API keys.
 
 ---
 
@@ -44,9 +45,29 @@ To install and configure functions in Open WebUI, follow these steps:
 
 5. **Set Environment Variables (if required)**:
    - Some functions require API keys or specific configurations via environment variables.
+   - Set `WEBUI_SECRET_KEY` for secure encryption of sensitive API keys.
 
 6. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
+
+---
+
+## Security Features
+
+### API Key Encryption
+
+The functions include a built-in encryption mechanism for sensitive information:
+
+- **Automatic Encryption**: API keys and other sensitive data are automatically encrypted when stored.
+- **Encrypted Storage**: Values are stored with an "encrypted:" prefix followed by the encrypted data.
+- **Transparent Usage**: The encryption/decryption happens automatically when values are accessed.
+- **No Configuration Required**: Works out-of-the-box when [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) is set.
+
+To enable encryption:
+```bash
+# Set this in your Open WebUI environment or .env file
+WEBUI_SECRET_KEY="your-secure-random-string"
+```
 
 ---
 
