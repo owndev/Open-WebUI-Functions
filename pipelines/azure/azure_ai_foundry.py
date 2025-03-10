@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 1.3.0
+version: 2.0.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -14,17 +14,99 @@ features:
   - Provides flexible timeout and error handling mechanisms.
   - Compatible with Azure OpenAI and other Azure AI models.
   - Predefined models for easy access.
+  - Encrypted storage of sensitive API keys
 """
 
 from typing import List, Union, Generator, Iterator, Optional, Dict, Any
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from starlette.background import BackgroundTask
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
 import json
 import os
 import logging
+import base64
+import hashlib
+from pydantic_core import core_schema
+
+# Simplified encryption implementation with automatic handling
+class EncryptedStr(str):
+    """A string type that automatically handles encryption/decryption"""
+    
+    @classmethod
+    def _get_encryption_key(cls) -> Optional[bytes]:
+        """
+        Generate encryption key from WEBUI_SECRET_KEY if available
+        Returns None if no key is configured
+        """
+        secret = os.getenv("WEBUI_SECRET_KEY")
+        if not secret:
+            return None
+            
+        hashed_key = hashlib.sha256(secret.encode()).digest()
+        return base64.urlsafe_b64encode(hashed_key)
+    
+    @classmethod
+    def encrypt(cls, value: str) -> str:
+        """
+        Encrypt a string value if a key is available
+        Returns the original value if no key is available
+        """
+        if not value or value.startswith("encrypted:"):
+            return value
+        
+        key = cls._get_encryption_key()
+        if not key:  # No encryption if no key
+            return value
+            
+        f = Fernet(key)
+        encrypted = f.encrypt(value.encode())
+        return f"encrypted:{encrypted.decode()}"
+    
+    @classmethod
+    def decrypt(cls, value: str) -> str:
+        """
+        Decrypt an encrypted string value if a key is available
+        Returns the original value if no key is available or decryption fails
+        """
+        if not value or not value.startswith("encrypted:"):
+            return value
+        
+        key = cls._get_encryption_key()
+        if not key:  # No decryption if no key
+            return value[len("encrypted:"):]  # Return without prefix
+        
+        try:
+            encrypted_part = value[len("encrypted:"):]
+            f = Fernet(key)
+            decrypted = f.decrypt(encrypted_part.encode())
+            return decrypted.decode()
+        except (InvalidToken, Exception):
+            return value
+            
+    # Pydantic integration
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, _handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return core_schema.union_schema([
+            core_schema.is_instance_schema(cls),
+            core_schema.chain_schema([
+                core_schema.str_schema(),
+                core_schema.no_info_plain_validator_function(
+                    lambda value: cls(cls.encrypt(value) if value else value)
+                ),
+            ]),
+        ],
+        serialization=core_schema.plain_serializer_function_ser_schema(lambda instance: str(instance))
+        )
+    
+    def get_decrypted(self) -> str:
+        """Get the decrypted value"""
+        return self.decrypt(self)
+
 
 # Helper functions
 async def cleanup_response(
@@ -48,7 +130,7 @@ class Pipe:
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
         # API key for Azure AI
-        AZURE_AI_API_KEY: str = Field(
+        AZURE_AI_API_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
             description="API key for Azure AI"
         )
@@ -91,7 +173,9 @@ class Pipe:
         Raises:
             ValueError: If required environment variables are not set.
         """
-        if not self.valves.AZURE_AI_API_KEY:
+        # Access the decrypted API key
+        api_key = self.valves.AZURE_AI_API_KEY.get_decrypted()
+        if not api_key:
             raise ValueError("AZURE_AI_API_KEY is not set!")
         if not self.valves.AZURE_AI_ENDPOINT:
             raise ValueError("AZURE_AI_ENDPOINT is not set!")
@@ -103,8 +187,10 @@ class Pipe:
         Returns:
             Dictionary containing the required headers for the API request.
         """
+        # Access the decrypted API key
+        api_key = self.valves.AZURE_AI_API_KEY.get_decrypted()
         headers = {
-            "api-key": self.valves.AZURE_AI_API_KEY,
+            "api-key": api_key,
             "Content-Type": "application/json"
         }
 
@@ -232,7 +318,7 @@ class Pipe:
             "temperature",
             "tool_choice",
             "tools",
-            "top_p",
+            "top_p"
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
