@@ -45,7 +45,7 @@ To install and configure functions in Open WebUI, follow these steps:
 
 5. **Set Environment Variables (if required)**:
    - Some functions require API keys or specific configurations via environment variables.
-   - Set `WEBUI_SECRET_KEY` for secure encryption of sensitive API keys.
+   - Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys.
 
 6. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
@@ -83,6 +83,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
 - Predefined models for easy access.
+- Supports encryption of sensitive information like API keys.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai/)
 
@@ -92,6 +93,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Sends messages from Open WebUI to an **N8N webhook**.
 - Supports real-time message processing with dynamic field handling.
 - Enables automation of AI-generated responses within an **N8N workflow**.
+- Supports encryption of sensitive information like API keys.
 - Here is an example [N8N workflow](./pipelines/n8n/Open_WebUI_Test_Agent.json) for [N8N Pipeline](./pipelines/n8n/n8n.py)
 
 🔗 [N8N Pipeline in Open WebUI](https://openwebui.com/f/owndev/n8n_pipeline/)
@@ -102,6 +104,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 - Integrates **Open WebUI** with **Infomaniak**, a Swiss web hosting and cloud services provider.
 - Sends messages from Open WebUI to an **Infomaniak AI Tool**.
+- Supports encryption of sensitive information like API keys.
 
 > **Important**: The function ID in Open WebUI must not contain the name `infomaniak`. Because of a [bug](https://github.com/open-webui/open-webui/discussions/10914) in Open WebUI, the function will not work if the id contains `infomaniak`.
 
@@ -121,7 +124,7 @@ Filters allow for **preprocessing and postprocessing** of data within Open WebUI
 - Measures **response time** and **token usage** for AI interactions.
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
-- Uses OpenAI's `tiktoken` library for accurate token counting.
+- Uses OpenAI's `tiktoken` library for token counting (only accurate for OpenAI models).
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 
@@ -145,7 +148,7 @@ AZURE_AI_ENDPOINT="https://your-service.openai.azure.com/chat/completions?api-ve
 AZURE_AI_MODEL="gpt-4o"  # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions").
 ```
 
-For further details, check the [Azure AI Function in Open WebUI.](https://openwebui.com/f/owndev/).
+---
 
 ## Contribute
 
