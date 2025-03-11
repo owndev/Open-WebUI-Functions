@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.0.0
+version: 2.1.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -152,14 +152,20 @@ class Pipe:
 
         # Switch for sending model name in request body
         AZURE_AI_MODEL_IN_BODY: bool = Field(
-            default=False,
+            default=os.getenv("AZURE_AI_MODEL_IN_BODY", False),
             description="If True, include the model name in the request body instead of as a header."
         )
 
         # Flag to indicate if predefined Azure AI models should be used        
         USE_PREDEFINED_AZURE_AI_MODELS: bool = Field(
-            default=True,
+            default=os.getenv("USE_PREDEFINED_AZURE_AI_MODELS", False),
             description="Flag to indicate if predefined Azure AI models should be used."
+        )
+
+        # If True, use Authorization header with Bearer token instead of api-key header.
+        USE_AUTHORIZATION_HEADER: bool = Field(
+            default=bool(os.getenv("AZURE_AI_USE_AUTHORIZATION_HEADER", False)),
+            description="Set to True to use Authorization header with Bearer token instead of api-key header."
         )
 
     def __init__(self):
@@ -189,10 +195,16 @@ class Pipe:
         """
         # Access the decrypted API key
         api_key = self.valves.AZURE_AI_API_KEY.get_decrypted()
-        headers = {
-            "api-key": api_key,
-            "Content-Type": "application/json"
-        }
+        if self.valves.USE_AUTHORIZATION_HEADER:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+        else:
+            headers = {
+                "api-key": api_key,
+                "Content-Type": "application/json"
+            }
 
         # If the valve indicates that the model name should be in the body,
         # add it to the filtered body.
