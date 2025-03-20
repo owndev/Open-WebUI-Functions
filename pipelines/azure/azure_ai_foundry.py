@@ -241,6 +241,7 @@ class Pipe:
             {"id": "Cohere-command-r-plus", "name": "Cohere Command R+"},
             {"id": "Cohere-command-r-plus-08-2024", "name": "Cohere Command R+ 08-2024"},
             {"id": "DeepSeek-R1", "name": "DeepSeek-R1"},
+            {"id": "DeepSeek-V3", "name": "DeepSeek-V3"},
             {"id": "jais-30b-chat", "name": "JAIS 30b Chat"},
             {"id": "Llama-3.2-11B-Vision-Instruct", "name": "Llama-3.2-11B-Vision-Instruct"},
             {"id": "Llama-3.2-90B-Vision-Instruct", "name": "Llama-3.2-90B-Vision-Instruct"},
