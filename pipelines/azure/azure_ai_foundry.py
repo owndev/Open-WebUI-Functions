@@ -257,6 +257,7 @@ class Pipe:
             {"id": "Mistral-Large-2411", "name": "Mistral Large 24.11"},
             {"id": "Mistral-Nemo", "name": "Mistral Nemo"},
             {"id": "Mistral-small", "name": "Mistral Small"},
+            {"id": "mistral-small-2503", "name": "Mistral Small 3.1"},
             {"id": "gpt-4o", "name": "OpenAI GPT-4o"},
             {"id": "gpt-4o-mini", "name": "OpenAI GPT-4o mini"},
             {"id": "o1", "name": "OpenAI o1"},
@@ -272,7 +273,9 @@ class Pipe:
             {"id": "Phi-3.5-mini-instruct", "name": "Phi-3.5-mini instruct (128k)"},
             {"id": "Phi-3.5-MoE-instruct", "name": "Phi-3.5-MoE instruct (128k)"},
             {"id": "Phi-3.5-vision-instruct", "name": "Phi-3.5-vision instruct (128k)"},
-            {"id": "Phi-4", "name": "Phi-4"}
+            {"id": "Phi-4", "name": "Phi-4"},
+            {"id": "Phi-4-mini-instruct", "name": "Phi-4 mini instruct"},
+            {"id": "Phi-4-multimodal-instruct", "name": "Phi-4 multimodal instruct"}
         ]
 
     def pipes(self) -> List[Dict[str, str]]:
