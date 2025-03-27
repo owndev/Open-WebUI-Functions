@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.4.0
+version: 2.4.1
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request.
 features:
@@ -82,7 +82,11 @@ class Filter:
                 )
                 request_messages = [last_user_system] if last_user_system else []
 
-        request_token_count = sum(len(encoding.encode(m["content"])) for m in request_messages)
+        request_token_count = sum(
+            len(encoding.encode(m.get("content", "")))
+            for m in request_messages
+            if m and isinstance(m.get("content"), str)
+        )
 
         return body
 
@@ -112,13 +116,26 @@ class Filter:
             )
             assistant_messages = [last_assistant] if last_assistant else []
 
-        response_token_count = sum(len(encoding.encode(m["content"])) for m in assistant_messages)
+        response_token_count = sum(
+            len(encoding.encode(m.get("content", "")))
+            for m in assistant_messages
+            if m and isinstance(m.get("content"), str)
+        )
 
         # Calculate tokens per second (only for the last assistant response)
         if self.valves.SHOW_TOKENS_PER_SECOND:
-            last_assistant_msg = next((m for m in reversed_messages if m.get("role") == "assistant"), None)
-            last_assistant_tokens = len(encoding.encode(last_assistant_msg["content"])) if last_assistant_msg else 0
-            resp_tokens_per_sec = 0 if response_time == 0 else last_assistant_tokens / response_time
+            last_assistant_msg = next(
+                (m for m in reversed_messages if m.get("role") == "assistant"), None
+            )
+            last_assistant_tokens = (
+                len(encoding.encode(last_assistant_msg.get("content", "")))
+                if last_assistant_msg
+                and isinstance(last_assistant_msg.get("content"), str)
+                else 0
+            )
+            resp_tokens_per_sec = (
+                0 if response_time == 0 else last_assistant_tokens / response_time
+            )
 
         # Calculate averages only if CALCULATE_ALL_MESSAGES is true
         avg_request_tokens = avg_response_tokens = 0
@@ -146,8 +163,10 @@ class Filter:
             description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
         description = " | ".join(description_parts)
 
-        await __event_emitter__({
-            "type": "status",
-            "data": {"description": description, "done": True},
-        })
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description": description, "done": True},
+            }
+        )
         return body
