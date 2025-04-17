@@ -151,9 +151,11 @@ class Pipe:
         )
 
         # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions")
+        # Multiple models can be specified as a semicolon-separated list (e.g. "gpt-4o;gpt-4o-mini")
+        # or a comma-separated list (e.g. "gpt-4o,gpt-4o-mini").
         AZURE_AI_MODEL: str = Field(
             default=os.getenv("AZURE_AI_MODEL", ""),
-            description="Optional model name for Azure AI",
+            description="Optional model names for Azure AI (e.g. gpt-4o, gpt-4o-mini)",
         )
 
         # Switch for sending model name in request body
@@ -192,9 +194,12 @@ class Pipe:
         if not self.valves.AZURE_AI_ENDPOINT:
             raise ValueError("AZURE_AI_ENDPOINT is not set!")
 
-    def get_headers(self) -> Dict[str, str]:
+    def get_headers(self, model_name: str = None) -> Dict[str, str]:
         """
         Constructs the headers for the API request, including the model name if defined.
+
+        Args:
+            model_name: Optional model name to use instead of the default one
 
         Returns:
             Dictionary containing the required headers for the API request.
@@ -209,10 +214,14 @@ class Pipe:
         else:
             headers = {"api-key": api_key, "Content-Type": "application/json"}
 
-        # If the valve indicates that the model name should be in the body,
-        # add it to the filtered body.
-        if self.valves.AZURE_AI_MODEL and not self.valves.AZURE_AI_MODEL_IN_BODY:
-            headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
+        # If we have a model name and it shouldn't be in the body, add it to headers
+        if not self.valves.AZURE_AI_MODEL_IN_BODY:
+            # If specific model name provided, use it
+            if model_name:
+                headers["x-ms-model-mesh-model-name"] = model_name
+            # Otherwise, if AZURE_AI_MODEL has a single value, use that
+            elif self.valves.AZURE_AI_MODEL and ";" not in self.valves.AZURE_AI_MODEL and "," not in self.valves.AZURE_AI_MODEL and " " not in self.valves.AZURE_AI_MODEL:
+                headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
     def validate_body(self, body: Dict[str, Any]) -> None:
@@ -227,6 +236,27 @@ class Pipe:
         """
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
+
+    def parse_models(self, models_str: str) -> List[str]:
+        """
+        Parses a string of models separated by commas, semicolons, or spaces.
+
+        Args:
+            models_str: String containing model names separated by commas, semicolons, or spaces
+
+        Returns:
+            List of individual model names
+        """
+        if not models_str:
+            return []
+            
+        # Replace semicolons and commas with spaces, then split by spaces and filter empty strings
+        models = []
+        for model in models_str.replace(';', ' ').replace(',', ' ').split():
+            if model.strip():
+                models.append(model.strip())
+                
+        return models
 
     def get_azure_models(self) -> List[Dict[str, str]]:
         """
@@ -296,12 +326,15 @@ class Pipe:
         """
         self.validate_environment()
 
-        # If a custom model is provided, use it exclusively.
+        # If custom models are provided, parse them and return as pipes
         if self.valves.AZURE_AI_MODEL:
             self.name = "Azure AI: "
-            return [
-                {"id": self.valves.AZURE_AI_MODEL, "name": self.valves.AZURE_AI_MODEL}
-            ]
+            models = self.parse_models(self.valves.AZURE_AI_MODEL)
+            if models:
+                return [{"id": model, "name": model} for model in models]
+            else:
+                # Fallback for backward compatibility
+                return [{"id": self.valves.AZURE_AI_MODEL, "name": self.valves.AZURE_AI_MODEL}]
 
         # If custom model is not provided but predefined models are enabled, return those.
         if self.valves.USE_PREDEFINED_AZURE_AI_MODELS:
@@ -329,9 +362,15 @@ class Pipe:
 
         # Validate the request body
         self.validate_body(body)
+        selected_model = None
 
-        # Construct headers
-        headers = self.get_headers()
+        if "model" in body and body["model"]:
+            selected_model = body["model"]
+            # Safer model extraction with split
+            selected_model = selected_model.split(".", 1)[1] if "." in selected_model else selected_model
+        
+        # Construct headers with selected model
+        headers = self.get_headers(selected_model)
 
         # Filter allowed parameters
         allowed_params = {
@@ -350,11 +389,20 @@ class Pipe:
             "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
-
-        # If the valve indicates that the model name should be in the body,
-        # add it to the filtered body.
+        
+        
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
-            filtered_body["model"] = self.valves.AZURE_AI_MODEL
+            # If a model was explicitly selected in the request, use that
+            if selected_model:
+                filtered_body["model"] = selected_model
+            else:
+                # Otherwise, if AZURE_AI_MODEL contains multiple models, only use the first one to avoid errors
+                models = self.parse_models(self.valves.AZURE_AI_MODEL)
+                if models and len(models) > 0:
+                    filtered_body["model"] = models[0]
+                else:
+                    # Fallback to the original value
+                    filtered_body["model"] = self.valves.AZURE_AI_MODEL
         elif "model" in filtered_body and filtered_body["model"]:
             # Safer model extraction with split
             filtered_body["model"] = (
