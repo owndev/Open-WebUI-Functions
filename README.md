@@ -78,7 +78,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 ### **1. [Azure AI Foundry Pipeline](./pipelines/azure/azure_ai_foundry.py)**
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
-- Supports dynamic model selection via `x-ms-model-mesh-model-name` headers.
+- Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o, gpt-4o-mini`).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
@@ -86,6 +86,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Supports encryption of sensitive information like API keys.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai/)
+
 
 ### **2. [N8N Pipeline](./pipelines/n8n/n8n.py)**
 
@@ -100,16 +101,14 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About N8N](https://n8n.io/)
 
+
 ### **3. [Infomaniak](./pipelines/infomaniak/infomaniak.py)**
 
 - Integrates **Open WebUI** with **Infomaniak**, a Swiss web hosting and cloud services provider.
 - Sends messages from Open WebUI to an **Infomaniak AI Tool**.
 - Supports encryption of sensitive information like API keys.
 
-> **Important**: The function ID in Open WebUI must not contain the name `infomaniak`. Because of a [bug](https://github.com/open-webui/open-webui/discussions/10914) in Open WebUI, the function will not work if the id contains `infomaniak`.
-
-
-🔗 [Infomaniak Pipeline in Open WebUI](https://openwebui.com/f/owndev/im_ai_tools/)
+🔗 [Infomaniak Pipeline in Open WebUI](https://openwebui.com/f/owndev/infomaniak_ai_tools)
 
 🔗 [Learn More About Infomaniak](https://www.infomaniak.com/en/hosting/ai-tools)
 
@@ -135,9 +134,8 @@ Filters allow for **preprocessing and postprocessing** of data within Open WebUI
 The repository includes functions specifically designed for **Azure AI**, supporting both **Azure OpenAI** models and general **Azure AI** services.
 
 ### Features:
-- **Azure OpenAI API Support**: Access models like **GPT-4, GPT-3.5**, and **other fine-tuned AI models** via Azure.
+- **Azure OpenAI API Support**: Access models like **GPT-4o, o3**, and **other fine-tuned AI models** via Azure.
 - **Azure AI Model Deployment**: Connect to **custom models** hosted on Azure AI.
-- **Dynamic Model Selection**: Choose models via the `x-ms-model-mesh-model-name` header or environment variables.
 - **Secure API Requests**: Supports API key authentication and environment variable configurations.
 
 ### Environment Variables:
@@ -145,7 +143,7 @@ For Azure AI-based functions, set the following:
 ```bash
 AZURE_AI_API_KEY="your-api-key"
 AZURE_AI_ENDPOINT="https://your-service.openai.azure.com/chat/completions?api-version=2024-05-01-preview"
-AZURE_AI_MODEL="gpt-4o"  # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions").
+AZURE_AI_MODEL="gpt-4o, gpt-4o-mini"  # Optional model name, only necessary if not Azure OpenAI or if model name not in URL (e.g. "https://<your-endpoint>/openai/deployments/<model-name>/chat/completions").
 ```
 
 ---

@@ -25,23 +25,6 @@
     },
     {
       "parameters": {
-        "agent": "openAiFunctionsAgent",
-        "text": "={{ $json.body.chatInput }}",
-        "options": {
-          "systemMessage": "={{ $json.body.systemPrompt }}"
-        }
-      },
-      "id": "fcec32e7-b6fb-45ca-9ac1-acf81dc53ee1",
-      "name": "AI Agent",
-      "type": "@n8n/n8n-nodes-langchain.agent",
-      "position": [
-        2380,
-        840
-      ],
-      "typeVersion": 1.1
-    },
-    {
-      "parameters": {
         "sessionKey": "={{ $('Webhook').item.json.body.user_id }}_{{ $('Webhook').item.json.body.chat_id }}",
         "contextWindowLength": 10
       },
@@ -151,26 +134,54 @@
       "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
       "typeVersion": 1.1,
       "position": [
-        2840,
+        2960,
         1100
       ],
       "id": "28fe049c-6fd7-4bde-9b44-85100001284d",
       "name": "Get Time"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.body.chatInput }}",
+        "options": {
+          "systemMessage": "={{ $json.body.systemPrompt }}"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.8,
+      "position": [
+        2380,
+        840
+      ],
+      "id": "d7d5e7d0-9e85-4c81-8b5e-d56b0ecbe15a",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "includeTime": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Include_Current_Time', ``, 'boolean') }}",
+        "options": {
+          "timezone": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Timezone', ``, 'string') }}"
+        }
+      },
+      "type": "n8n-nodes-base.dateTimeTool",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        1100
+      ],
+      "id": "b9f40873-67cc-48a6-b19a-28400805ca6a",
+      "name": "Date & Time"
     }
   ],
   "pinData": {},
   "connections": {
     "OpenAI Chat Model": {
       "ai_languageModel": [
-        []
-      ]
-    },
-    "AI Agent": {
-      "main": [
         [
           {
-            "node": "Respond to Webhook",
-            "type": "main",
+            "node": "AI Agent",
+            "type": "ai_languageModel",
             "index": 0
           }
         ]
@@ -222,16 +233,26 @@
     },
     "Azure OpenAI Chat Model": {
       "ai_languageModel": [
+        []
+      ]
+    },
+    "Get Time": {
+      "ai_tool": [
+        []
+      ]
+    },
+    "AI Agent": {
+      "main": [
         [
           {
-            "node": "AI Agent",
-            "type": "ai_languageModel",
+            "node": "Respond to Webhook",
+            "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Get Time": {
+    "Date & Time": {
       "ai_tool": [
         [
           {
@@ -247,7 +268,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "d064c617-0d7f-4f1f-ad9f-753679fc7a07",
+  "versionId": "f8929012-f276-4c61-84e2-108146802a55",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "6350a4271a2777a60d73e3a3c6a9549015b6bfe8b8f285cb566cd69ef87215da"
