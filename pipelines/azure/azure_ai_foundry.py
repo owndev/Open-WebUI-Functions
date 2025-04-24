@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.2.0
+version: 2.2.1
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -315,6 +315,7 @@ class Pipe:
             {"id": "Phi-4", "name": "Phi-4"},
             {"id": "Phi-4-mini-instruct", "name": "Phi-4 mini instruct"},
             {"id": "Phi-4-multimodal-instruct", "name": "Phi-4 multimodal instruct"},
+            {"id": "MAI-DS-R1", "name": "Microsoft Deepseek R1"},
         ]
 
     def pipes(self) -> List[Dict[str, str]]:
@@ -379,6 +380,7 @@ class Pipe:
             "frequency_penalty",
             "max_tokens",
             "presence_penalty",
+            "reasoning_effort",
             "response_format",
             "seed",
             "stop",
