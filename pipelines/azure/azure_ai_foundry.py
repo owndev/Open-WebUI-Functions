@@ -315,6 +315,7 @@ class Pipe:
             {"id": "Phi-4", "name": "Phi-4"},
             {"id": "Phi-4-mini-instruct", "name": "Phi-4 mini instruct"},
             {"id": "Phi-4-multimodal-instruct", "name": "Phi-4 multimodal instruct"},
+            {"id": "MAI-DS-R1", "name": "Microsoft Deepseek R1"},
         ]
 
     def pipes(self) -> List[Dict[str, str]]:
