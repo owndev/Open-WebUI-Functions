@@ -8,8 +8,8 @@ body:
       value: |
         **Hello Contributors!** Thank you for taking the time to suggest a new feature for the project. Please provide as much detail as possible to help us understand your request.
 
-        * Before submitting this request, ensure you've reviewed the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md).
-        * Check if a similar request already exists in the [issues](https://github.com/owndev/Open-WebUI-Functions/issues).
+        * Before submitting this request, ensure you've reviewed the [Contributing Guide](https://own.dev/github-owndev-open-webui-functions-contributing).
+        * Check if a similar request already exists in the [issues](https://own.dev/github-owndev-open-webui-functions-issues).
 
   - type: checkboxes
     id: agreement
@@ -17,7 +17,7 @@ body:
       label: Contribution Terms
       description: Please confirm that you have read and understood the project's contribution guidelines.
       options:
-        - label: I have reviewed the project’s [Code of Conduct](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CODE_OF_CONDUCT.md) and contribution guidelines.
+        - label: I have reviewed the project’s [Code of Conduct](https://own.dev/github-owndev-open-webui-functions-code-of-conduct) and contribution guidelines.
           required: true
 
   - type: input

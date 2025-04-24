@@ -12,7 +12,7 @@ body:
 
         Please fill out all relevant sections to help the maintainers review and integrate your work efficiently.
 
-        - Make sure you’ve read the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md).
+        - Make sure you’ve read the [Contributing Guide](https://own.dev/github-owndev-open-webui-functions-contributing).
         - Before proceeding, open this issue to **coordinate with maintainers** and avoid duplicate work.
 
   - type: checkboxes
@@ -21,7 +21,7 @@ body:
       label: Contribution Terms
       description: Confirm that you've reviewed the necessary guidelines and intend to contribute code.
       options:
-        - label: I have reviewed the project’s [Code of Conduct](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CODE_OF_CONDUCT.md) and contribution guidelines.
+        - label: I have reviewed the project’s [Code of Conduct](https://own.dev/github-owndev-open-webui-functions-code-of-conduct) and contribution guidelines.
           required: true
         - label: I plan to implement this feature myself and submit a pull request.
           required: true

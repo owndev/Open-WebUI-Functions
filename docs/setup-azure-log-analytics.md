@@ -1,6 +1,6 @@
 # Setup Azure Log Analytics Workspace
 ## Installation
-- [Create Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/quick-create-workspace)
+- [Create Workspace](https://own.dev/learn-microsoft-com-en-us-azure-azure-monitor-logs-quick-create-workspace)
 
 ## Get Shared Key
 To send data from Time Token Tracker to Azure Log Analytics, a shared key is required. This can be found under `Settings` > `Agents` > `Primary key`.

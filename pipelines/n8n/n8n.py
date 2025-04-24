@@ -1,10 +1,10 @@
 """
 title: n8n Pipeline
 author: owndev
-author_url: https://github.com/owndev
-project_url: https://github.com/owndev/Open-WebUI-Functions
-funding_url: https://github.com/owndev/Open-WebUI-Functions
-n8n_template: https://github.com/owndev/Open-WebUI-Functions/tree/master/pipelines/n8n
+author_url: https://own.dev/github
+project_url: https://own.dev/github-owndev-open-webui-functions
+funding_url: https://own.dev/github-owndev-open-webui-functions
+n8n_template: https://own.dev/github-owndev-open-webui-functions-open-webui-test-agent
 version: 2.0.0
 license: Apache License 2.0
 description: A pipeline for interacting with N8N workflows, enabling seamless communication with various N8N workflows via configurable headers and robust error handling. This includes support for dynamic message handling and real-time interaction with N8N workflows.
