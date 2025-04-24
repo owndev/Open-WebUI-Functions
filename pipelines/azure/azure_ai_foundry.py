@@ -1,9 +1,9 @@
 """
 title: Azure AI Foundry Pipeline
 author: owndev
-author_url: https://github.com/owndev
-project_url: https://github.com/owndev/Open-WebUI-Functions
-funding_url: https://github.com/owndev/Open-WebUI-Functions
+author_url: https://own.dev/github
+project_url: https://own.dev/github-owndev-open-webui-functions
+funding_url: https://own.dev/github-owndev-open-webui-functions
 version: 2.2.1
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.

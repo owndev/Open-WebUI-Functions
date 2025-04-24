@@ -1,0 +1,25 @@
+name: Documentation update
+description: Suggest improvements or changes to the documentation.
+labels:
+  - documentation
+body:
+  - type: input
+    attributes:
+      label: Documentation area
+      description: What part of the documentation needs improvement? (e.g., README, API docs, Setup guide)
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Suggested improvement
+      description: Describe what should be changed or clarified and why.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Add references, links, or examples to help understand your suggestion.
+    validations:
+      required: false

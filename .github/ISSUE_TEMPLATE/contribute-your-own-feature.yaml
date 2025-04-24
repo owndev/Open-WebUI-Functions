@@ -1,0 +1,78 @@
+name: Contribute your own feature
+description: Propose and contribute a self-implemented feature for this project.
+labels:
+  - enhancement
+  - contribution
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Thank you for contributing to this project!**  
+        This template is intended for contributors who plan to **submit their own implementation** of a new feature or improvement.
+
+        Please fill out all relevant sections to help the maintainers review and integrate your work efficiently.
+
+        - Make sure you’ve read the [Contributing Guide](https://own.dev/github-owndev-open-webui-functions-contributing).
+        - Before proceeding, open this issue to **coordinate with maintainers** and avoid duplicate work.
+
+  - type: checkboxes
+    id: agreement
+    attributes:
+      label: Contribution Terms
+      description: Confirm that you've reviewed the necessary guidelines and intend to contribute code.
+      options:
+        - label: I have reviewed the project’s [Code of Conduct](https://own.dev/github-owndev-open-webui-functions-code-of-conduct) and contribution guidelines.
+          required: true
+        - label: I plan to implement this feature myself and submit a pull request.
+          required: true
+
+  - type: input
+    attributes:
+      label: Feature title
+      description: A short, clear name for the feature you're implementing.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Feature overview
+      description: |
+        Briefly describe the feature you're planning to implement:
+        - What problem does it solve or what benefit does it bring?
+        - Who are the target users or use cases?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Implementation details
+      description: |
+        Describe your planned approach or architecture for implementing this feature.
+        Include:
+        - Which components/modules will be affected
+        - APIs, libraries, or technologies you intend to use
+        - Any design decisions or constraints
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Tasks and milestones
+      description: Break down the work into actionable steps or milestones. This will help with tracking progress.
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Questions or areas for feedback
+      description: |
+        Do you have any uncertainties, decisions to validate, or places where you'd like early feedback from maintainers?
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Additional context or references
+      description: Link related discussions, documents, code snippets, or external resources.
+    validations:
+      required: false
