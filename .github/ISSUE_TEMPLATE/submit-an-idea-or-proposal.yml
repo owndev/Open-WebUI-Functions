@@ -1,0 +1,45 @@
+name: Submit an idea or proposal
+description: Suggest a general idea or concept for discussion, not necessarily planned for immediate implementation.
+labels:
+  - idea
+  - discussion
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Have an idea to share?**  
+        Use this form to submit general proposals, conceptual ideas, or directions for future development. This is a space for open-ended discussions that might not yet be tied to a concrete implementation.
+
+        > If you're planning to contribute code for your idea, please use the **"Contribute your own feature"** template instead.
+
+  - type: input
+    attributes:
+      label: Idea title
+      description: A clear and concise title for your idea or proposal.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Describe your idea
+      description: |
+        Describe your idea or proposal in detail. Consider including:
+        - What problem or opportunity you're addressing
+        - How this could improve the project
+        - Any inspiration or background
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Possible directions or next steps
+      description: What could be explored next? Are there any potential ways this idea could be evaluated or tested?
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Add any links, discussions, screenshots, or references to support your idea.
+    validations:
+      required: false

@@ -1,0 +1,53 @@
+name: Suggest a new feature
+description: Submit a request for a new feature or improvement for the project.
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Hello Contributors!** Thank you for taking the time to suggest a new feature for the project. Please provide as much detail as possible to help us understand your request.
+
+        * Before submitting this request, ensure you've reviewed the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md).
+        * Check if a similar request already exists in the [issues](https://github.com/owndev/Open-WebUI-Functions/issues).
+
+  - type: checkboxes
+    id: agreement
+    attributes:
+      label: Contribution Terms
+      description: Please confirm that you have read and understood the project's contribution guidelines.
+      options:
+        - label: I have reviewed the project’s [Code of Conduct](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CODE_OF_CONDUCT.md) and contribution guidelines.
+          required: true
+
+  - type: input
+    attributes:
+      label: Feature title
+      description: Provide a short and descriptive title for the feature you'd like to propose.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Feature description
+      description: |
+        Please describe the feature in detail. Include:
+        - The problem it solves or the improvement it adds.
+        - Why it is important or useful.
+        - Any relevant use cases or examples.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Potential implementation ideas
+      description: Share any ideas, approaches, or examples for implementing this feature. (Optional)
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Additional context or information
+      description: Add any additional context, references, or related links that might be helpful.
+    validations:
+      required: false

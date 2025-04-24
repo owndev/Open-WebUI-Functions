@@ -1,0 +1,32 @@
+name: Question or Support
+description: Ask a question or request help using the project.
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Need help or have a question?**  
+        This form is for general usage questions or support requests.  
+        Please check the [documentation](https://github.com/owndev/Open-WebUI-Functions) and existing [issues](https://github.com/owndev/Open-WebUI-Functions/issues) before submitting.
+
+  - type: input
+    attributes:
+      label: Question summary
+      description: Briefly describe your question or what you need help with.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Details
+      description: Please describe the question or issue in more detail. Include context, logs, error messages, etc. if applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: What have you tried?
+      description: Share what you've already tried to solve the issue on your own.
+    validations:
+      required: false

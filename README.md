@@ -124,7 +124,9 @@ Filters allow for **preprocessing and postprocessing** of data within Open WebUI
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
 - Uses OpenAI's `tiktoken` library for token counting (only accurate for OpenAI models).
+- Optional: Can send logs to [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview).
 
+🔗 [How to Setup](./docs/setup-azure-log-analytics.md)
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 
 ---
@@ -150,26 +152,5 @@ AZURE_AI_MODEL="gpt-4o, gpt-4o-mini"  # Optional model name, only necessary if n
 
 ## Contribute
 
-We welcome contributions from the community! To contribute, follow these steps:
-
-1. **Fork the Repository**: Click the "Fork" button at the top right corner of this page to create a copy of this repository in your GitHub account.
-2. **Clone Your Fork**: Clone your fork to your local machine using the following command:
-   ```bash
-   git clone https://github.com/<your-username>/Open-WebUI-Functions.git
-   ```
-3. **Create a New Branch**: Create a new branch for your changes:
-   ```bash
-   git checkout -b my-feature-branch
-   ```
-4. **Make Your Changes**: Make your changes to the code or documentation.
-5. **Commit Your Changes**: Commit your changes with a meaningful commit message:
-   ```bash
-   git commit -m "Add new feature or fix bug"
-   ```
-6. **Push to Your Fork**: Push your changes to your forked repository:
-   ```bash
-   git push origin my-feature-branch
-   ```
-7. **Create a Pull Request**: Open a pull request on the original repository, describing your changes and why they should be merged.
-
-Thank you for contributing!
+We accept different types of contributions, including some that don't require you to write a single line of code. 
+For detailed instructions on how to get started with our project, see [About contributing to Open-WebUI-Functions](./.github/CONTRIBUTING.md).
