@@ -4,23 +4,33 @@ author: owndev
 author_url: https://github.com/owndev
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/owndev/Open-WebUI-Functions
-version: 2.4.1
+version: 2.5.0
 license: Apache License 2.0
-description: A filter for tracking the response time and token usage of a request.
+description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
 features:
   - Tracks the response time of a request.
   - Tracks Token Usage.
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
+  - Sends metrics to Azure Log Analytics.
 """
 
 import time
+import json
+import uuid
+import hmac
+import base64
+import hashlib
+import datetime
+import requests
+import os
 from typing import Optional
 import tiktoken
 from pydantic import BaseModel, Field
 
 # Global variables to track start time and token counts
 global start_time, request_token_count, response_token_count
+
 
 class Filter:
     class Valves(BaseModel):
@@ -29,30 +39,101 @@ class Filter:
         )
         CALCULATE_ALL_MESSAGES: bool = Field(
             default=True,
-            description="If true, calculate tokens for all messages. If false, only use the last user and assistant messages."
+            description="If true, calculate tokens for all messages. If false, only use the last user and assistant messages.",
         )
         SHOW_AVERAGE_TOKENS: bool = Field(
             default=True,
-            description="Show average tokens per message (only used if CALCULATE_ALL_MESSAGES is true)."
+            description="Show average tokens per message (only used if CALCULATE_ALL_MESSAGES is true).",
         )
         SHOW_RESPONSE_TIME: bool = Field(
-            default=True,
-            description="Show the response time."
+            default=True, description="Show the response time."
         )
         SHOW_TOKEN_COUNT: bool = Field(
-            default=True,
-            description="Show the token count."
+            default=True, description="Show the token count."
         )
         SHOW_TOKENS_PER_SECOND: bool = Field(
-            default=True,
-            description="Show tokens per second for the response."
+            default=True, description="Show tokens per second for the response."
+        )
+        SEND_TO_LOG_ANALYTICS: bool = os.getenv("SEND_TO_LOG_ANALYTICS", "False")
+        LOG_ANALYTICS_WORKSPACE_ID: str = os.getenv("LOG_ANALYTICS_WORKSPACE_ID", "")
+        LOG_ANALYTICS_SHARED_KEY: str = os.getenv("LOG_ANALYTICS_SHARED_KEY", "")
+        LOG_ANALYTICS_LOG_TYPE: str = Field(
+            default="OpenWebuiMetrics", description="Log Analytics log type name."
         )
 
     def __init__(self):
         self.name = "Time Token Tracker"
         self.valves = self.Valves()
 
-    async def inlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
+    def _build_signature(self, date, content_length, method, content_type, resource):
+        """Build the signature for Log Analytics authentication."""
+        x_headers = "x-ms-date:" + date
+        string_to_hash = (
+            method
+            + "\n"
+            + str(content_length)
+            + "\n"
+            + content_type
+            + "\n"
+            + x_headers
+            + "\n"
+            + resource
+        )
+        bytes_to_hash = string_to_hash.encode("utf-8")
+        decoded_key = base64.b64decode(self.valves.LOG_ANALYTICS_SHARED_KEY)
+        encoded_hash = base64.b64encode(
+            hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()
+        ).decode("utf-8")
+        authorization = (
+            f"SharedKey {self.valves.LOG_ANALYTICS_WORKSPACE_ID}:{encoded_hash}"
+        )
+        return authorization
+
+    def _send_to_log_analytics(self, data):
+        """Send data to Azure Log Analytics."""
+        if (
+            not self.valves.SEND_TO_LOG_ANALYTICS
+            or not self.valves.LOG_ANALYTICS_WORKSPACE_ID
+            or not self.valves.LOG_ANALYTICS_SHARED_KEY
+        ):
+            return False
+
+        method = "POST"
+        content_type = "application/json"
+        resource = "/api/logs"
+        rfc1123date = datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        content_length = len(json.dumps(data))
+
+        signature = self._build_signature(
+            rfc1123date, content_length, method, content_type, resource
+        )
+
+        uri = f"https://{self.valves.LOG_ANALYTICS_WORKSPACE_ID}.ods.opinsights.azure.com{resource}?api-version=2016-04-01"
+
+        headers = {
+            "Content-Type": content_type,
+            "Authorization": signature,
+            "Log-Type": self.valves.LOG_ANALYTICS_LOG_TYPE,
+            "x-ms-date": rfc1123date,
+            "time-generated-field": "timestamp",
+        }
+
+        try:
+            response = requests.post(uri, json=data, headers=headers)
+            if response.status_code == 200:
+                return True
+            else:
+                print(
+                    f"Error sending to Log Analytics: {response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            print(f"Exception when sending to Log Analytics: {str(e)}")
+            return False
+
+    async def inlet(
+        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+    ) -> dict:
         global start_time, request_token_count
         start_time = time.time()
 
@@ -66,19 +147,27 @@ class Filter:
 
         # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
-            request_messages = [m for m in all_messages if m.get("role") in ("user", "system")]
+            request_messages = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
         else:
             # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
             # (one user and one system), sum them both.
-            request_user_system = [m for m in all_messages if m.get("role") in ("user", "system")]
+            request_user_system = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
             if len(request_user_system) == 2:
                 request_messages = request_user_system
             else:
                 # Otherwise, take only the last "user" or "system" message if any
                 reversed_messages = list(reversed(all_messages))
                 last_user_system = next(
-                    (m for m in reversed_messages if m.get("role") in ("user", "system")),
-                    None
+                    (
+                        m
+                        for m in reversed_messages
+                        if m.get("role") in ("user", "system")
+                    ),
+                    None,
                 )
                 request_messages = [last_user_system] if last_user_system else []
 
@@ -90,7 +179,9 @@ class Filter:
 
         return body
 
-    async def outlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
+    async def outlet(
+        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+    ) -> dict:
         global start_time, request_token_count, response_token_count
         end_time = time.time()
         response_time = end_time - start_time
@@ -107,12 +198,13 @@ class Filter:
 
         # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
-            assistant_messages = [m for m in all_messages if m.get("role") == "assistant"]
+            assistant_messages = [
+                m for m in all_messages if m.get("role") == "assistant"
+            ]
         else:
             # Take only the last "assistant" message if any
             last_assistant = next(
-                (m for m in reversed_messages if m.get("role") == "assistant"),
-                None
+                (m for m in reversed_messages if m.get("role") == "assistant"), None
             )
             assistant_messages = [last_assistant] if last_assistant else []
 
@@ -123,6 +215,7 @@ class Filter:
         )
 
         # Calculate tokens per second (only for the last assistant response)
+        resp_tokens_per_sec = 0
         if self.valves.SHOW_TOKENS_PER_SECOND:
             last_assistant_msg = next(
                 (m for m in reversed_messages if m.get("role") == "assistant"), None
@@ -140,7 +233,9 @@ class Filter:
         # Calculate averages only if CALCULATE_ALL_MESSAGES is true
         avg_request_tokens = avg_response_tokens = 0
         if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
-            req_count = len([m for m in all_messages if m.get("role") in ("user", "system")])
+            req_count = len(
+                [m for m in all_messages if m.get("role") in ("user", "system")]
+            )
             resp_count = len([m for m in all_messages if m.get("role") == "assistant"])
             avg_request_tokens = request_token_count / req_count if req_count else 0
             avg_response_tokens = response_token_count / resp_count if resp_count else 0
@@ -163,10 +258,52 @@ class Filter:
             description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
         description = " | ".join(description_parts)
 
+        # Send event with description
         await __event_emitter__(
             {
                 "type": "status",
                 "data": {"description": description, "done": True},
             }
         )
+
+        # If Log Analytics integration is enabled, send the data
+        if self.valves.SEND_TO_LOG_ANALYTICS:
+            # Create chat and message IDs for tracking
+            chat_id = body.get("chat_id", str(uuid.uuid4()))
+            message_id = str(uuid.uuid4())
+            # User ID if available
+            user_id = __user__.get("id", "unknown") if __user__ else "unknown"
+
+            # Create log data for Log Analytics
+            log_data = [
+                {
+                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                    "chatId": chat_id,
+                    "messageId": message_id,
+                    "model": model,
+                    "userId": user_id,
+                    "responseTime": response_time,
+                    "requestTokens": request_token_count,
+                    "responseTokens": response_token_count,
+                    "tokensPerSecond": resp_tokens_per_sec,
+                }
+            ]
+
+            # Add averages if calculated
+            if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
+                log_data[0]["avgRequestTokens"] = avg_request_tokens
+                log_data[0]["avgResponseTokens"] = avg_response_tokens
+
+            # Send to Log Analytics asynchronously (non-blocking)
+            # For true async, you might want to use asyncio or threading
+            try:
+                import threading
+
+                threading.Thread(
+                    target=self._send_to_log_analytics, args=(log_data,)
+                ).start()
+            except:
+                # Fallback to synchronous if threading fails
+                self._send_to_log_analytics(log_data)
+
         return body
