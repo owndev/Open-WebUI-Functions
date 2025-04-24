@@ -22,15 +22,119 @@ import hmac
 import base64
 import hashlib
 import datetime
-import requests
 import os
-from typing import Optional
+import logging
+import aiohttp
+from typing import Optional, Any
+from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+from cryptography.fernet import Fernet, InvalidToken
 import tiktoken
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, GetCoreSchemaHandler
+from pydantic_core import core_schema
 
 # Global variables to track start time and token counts
 global start_time, request_token_count, response_token_count
+start_time = 0
+request_token_count = 0
+response_token_count = 0
 
+# Simplified encryption implementation with automatic handling
+class EncryptedStr(str):
+    """A string type that automatically handles encryption/decryption"""
+
+    @classmethod
+    def _get_encryption_key(cls) -> Optional[bytes]:
+        """
+        Generate encryption key from WEBUI_SECRET_KEY if available
+        Returns None if no key is configured
+        """
+        secret = os.getenv("WEBUI_SECRET_KEY")
+        if not secret:
+            return None
+
+        hashed_key = hashlib.sha256(secret.encode()).digest()
+        return base64.urlsafe_b64encode(hashed_key)
+
+    @classmethod
+    def encrypt(cls, value: str) -> str:
+        """
+        Encrypt a string value if a key is available
+        Returns the original value if no key is available
+        """
+        if not value or value.startswith("encrypted:"):
+            return value
+
+        key = cls._get_encryption_key()
+        if not key:  # No encryption if no key
+            return value
+
+        f = Fernet(key)
+        encrypted = f.encrypt(value.encode())
+        return f"encrypted:{encrypted.decode()}"
+
+    @classmethod
+    def decrypt(cls, value: str) -> str:
+        """
+        Decrypt an encrypted string value if a key is available
+        Returns the original value if no key is available or decryption fails
+        """
+        if not value or not value.startswith("encrypted:"):
+            return value
+
+        key = cls._get_encryption_key()
+        if not key:  # No decryption if no key
+            return value[len("encrypted:") :]  # Return without prefix
+
+        try:
+            encrypted_part = value[len("encrypted:") :]
+            f = Fernet(key)
+            decrypted = f.decrypt(encrypted_part.encode())
+            return decrypted.decode()
+        except (InvalidToken, Exception):
+            return value
+
+    # Pydantic integration
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, _handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return core_schema.union_schema(
+            [
+                core_schema.is_instance_schema(cls),
+                core_schema.chain_schema(
+                    [
+                        core_schema.str_schema(),
+                        core_schema.no_info_plain_validator_function(
+                            lambda value: cls(cls.encrypt(value) if value else value)
+                        ),
+                    ]
+                ),
+            ],
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda instance: str(instance)
+            ),
+        )
+
+    def get_decrypted(self) -> str:
+        """Get the decrypted value"""
+        return self.decrypt(self)
+
+# Helper functions
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+) -> None:
+    """
+    Clean up the response and session objects.
+
+    Args:
+        response: The ClientResponse object to close
+        session: The ClientSession object to close
+    """
+    if response:
+        response.close()
+    if session:
+        await session.close()
 
 class Filter:
     class Valves(BaseModel):
@@ -54,9 +158,15 @@ class Filter:
         SHOW_TOKENS_PER_SECOND: bool = Field(
             default=True, description="Show tokens per second for the response."
         )
-        SEND_TO_LOG_ANALYTICS: bool = os.getenv("SEND_TO_LOG_ANALYTICS", "False")
-        LOG_ANALYTICS_WORKSPACE_ID: str = os.getenv("LOG_ANALYTICS_WORKSPACE_ID", "")
-        LOG_ANALYTICS_SHARED_KEY: str = os.getenv("LOG_ANALYTICS_SHARED_KEY", "")
+        SEND_TO_LOG_ANALYTICS: bool = Field(
+            default=bool(os.getenv("SEND_TO_LOG_ANALYTICS", False)), description="Send logs to Azure Log Analytics workspace"
+        )
+        LOG_ANALYTICS_WORKSPACE_ID: str = Field(
+            default=os.getenv("LOG_ANALYTICS_WORKSPACE_ID", ""), description="Azure Log Analytics Workspace ID"
+        )
+        LOG_ANALYTICS_SHARED_KEY: EncryptedStr = Field(
+            default=os.getenv("LOG_ANALYTICS_SHARED_KEY", ""), description="Azure Log Analytics Workspace Shared Key"
+        )
         LOG_ANALYTICS_LOG_TYPE: str = Field(
             default="OpenWebuiMetrics", description="Log Analytics log type name."
         )
@@ -80,7 +190,7 @@ class Filter:
             + resource
         )
         bytes_to_hash = string_to_hash.encode("utf-8")
-        decoded_key = base64.b64decode(self.valves.LOG_ANALYTICS_SHARED_KEY)
+        decoded_key = base64.b64decode(self.valves.LOG_ANALYTICS_SHARED_KEY.get_decrypted())        
         encoded_hash = base64.b64encode(
             hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()
         ).decode("utf-8")
@@ -88,22 +198,25 @@ class Filter:
             f"SharedKey {self.valves.LOG_ANALYTICS_WORKSPACE_ID}:{encoded_hash}"
         )
         return authorization
-
-    def _send_to_log_analytics(self, data):
-        """Send data to Azure Log Analytics."""
+            
+    async def _send_to_log_analytics_async(self, data):
+        """Send data to Azure Log Analytics asynchronously using aiohttp."""
         if (
             not self.valves.SEND_TO_LOG_ANALYTICS
             or not self.valves.LOG_ANALYTICS_WORKSPACE_ID
             or not self.valves.LOG_ANALYTICS_SHARED_KEY
         ):
             return False
+        
+        log = logging.getLogger("time_token_tracker._send_to_log_analytics_async")
+        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
 
         method = "POST"
         content_type = "application/json"
         resource = "/api/logs"
-        rfc1123date = datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        rfc1123date = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         content_length = len(json.dumps(data))
-
+        
         signature = self._build_signature(
             rfc1123date, content_length, method, content_type, resource
         )
@@ -118,18 +231,36 @@ class Filter:
             "time-generated-field": "timestamp",
         }
 
+        session = None
+        response = None
+        
         try:
-            response = requests.post(uri, json=data, headers=headers)
-            if response.status_code == 200:
+            session = aiohttp.ClientSession(
+                trust_env=True,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+            )
+            
+            response = await session.request(
+                method="POST",
+                url=uri,
+                json=data,
+                headers=headers,
+            )
+            
+            if response.status == 200:
                 return True
             else:
-                print(
-                    f"Error sending to Log Analytics: {response.status_code} - {response.text}"
+                response_text = await response.text()
+                log.error(
+                    f"Error sending to Log Analytics: {response.status} - {response_text}"
                 )
                 return False
+                
         except Exception as e:
-            print(f"Exception when sending to Log Analytics: {str(e)}")
+            log.error(f"Exception when sending to Log Analytics asynchronously: {str(e)}")
             return False
+        finally:
+            await cleanup_response(response, session)
 
     async def inlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
@@ -172,16 +303,61 @@ class Filter:
                 request_messages = [last_user_system] if last_user_system else []
 
         request_token_count = sum(
-            len(encoding.encode(m.get("content", "")))
+            len(encoding.encode(self._get_message_content(m)))
             for m in request_messages
-            if m and isinstance(m.get("content"), str)
+            if m
         )
 
         return body
 
+    def _get_message_content(self, message):
+        """Extract content from a message, handling different formats."""
+        content = message.get("content", "")
+        
+        # Handle None content
+        if content is None:
+            content = ""
+            
+        # Handle string content
+        if isinstance(content, str):
+            return content
+            
+        # Handle list content (e.g., for messages with multiple content parts)
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                else:
+                    # Try to convert other types to string
+                    try:
+                        text_parts.append(str(part))
+                    except:
+                        pass
+            return " ".join(text_parts)
+            
+        # Handle function_call in message
+        if message.get("function_call"):
+            try:
+                func_call = message["function_call"]
+                func_str = f"function: {func_call.get('name', '')}, arguments: {func_call.get('arguments', '')}"
+                return func_str
+            except:
+                return ""
+                
+        # If nothing else works, try converting to string or return empty
+        try:
+            return str(content)
+        except:
+            return ""
+
     async def outlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
+        log = logging.getLogger("time_token_tracker.outlet")
+        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+
         global start_time, request_token_count, response_token_count
         end_time = time.time()
         response_time = end_time - start_time
@@ -194,9 +370,7 @@ class Filter:
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
 
-        reversed_messages = list(reversed(all_messages))
-
-        # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
+        reversed_messages = list(reversed(all_messages))        # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
             assistant_messages = [
                 m for m in all_messages if m.get("role") == "assistant"
@@ -209,22 +383,18 @@ class Filter:
             assistant_messages = [last_assistant] if last_assistant else []
 
         response_token_count = sum(
-            len(encoding.encode(m.get("content", "")))
+            len(encoding.encode(self._get_message_content(m)))
             for m in assistant_messages
-            if m and isinstance(m.get("content"), str)
-        )
-
-        # Calculate tokens per second (only for the last assistant response)
+            if m
+        )        # Calculate tokens per second (only for the last assistant response)
         resp_tokens_per_sec = 0
         if self.valves.SHOW_TOKENS_PER_SECOND:
             last_assistant_msg = next(
                 (m for m in reversed_messages if m.get("role") == "assistant"), None
             )
             last_assistant_tokens = (
-                len(encoding.encode(last_assistant_msg.get("content", "")))
-                if last_assistant_msg
-                and isinstance(last_assistant_msg.get("content"), str)
-                else 0
+                len(encoding.encode(self._get_message_content(last_assistant_msg)))
+                if last_assistant_msg else 0
             )
             resp_tokens_per_sec = (
                 0 if response_time == 0 else last_assistant_tokens / response_time
@@ -292,18 +462,17 @@ class Filter:
             # Add averages if calculated
             if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 log_data[0]["avgRequestTokens"] = avg_request_tokens
-                log_data[0]["avgResponseTokens"] = avg_response_tokens
-
+                log_data[0]["avgResponseTokens"] = avg_response_tokens            
+            
             # Send to Log Analytics asynchronously (non-blocking)
-            # For true async, you might want to use asyncio or threading
             try:
-                import threading
-
-                threading.Thread(
-                    target=self._send_to_log_analytics, args=(log_data,)
-                ).start()
-            except:
-                # Fallback to synchronous if threading fails
-                self._send_to_log_analytics(log_data)
-
+                result = await self._send_to_log_analytics_async(log_data)
+                if result:
+                    log.info(f"Log Analytics data sent successfully")
+                else:
+                    log.warning(f"Failed to send data to Log Analytics")
+            except Exception as e:
+                # Handle exceptions during sending to Log Analytics                
+                log.error(f"Error sending to Log Analytics: {e}")
+                
         return body
