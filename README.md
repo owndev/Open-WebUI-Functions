@@ -8,6 +8,7 @@
 
 **Open-WebUI-Functions** is a collection of Python-based functions designed to extend the capabilities of [Open WebUI](https://own.dev/github-com-open-webui-open-webui) with additional **pipelines**, **filters**, and **integrations**. These functions allow users to interact with various AI models, process data efficiently, and customize the Open WebUI experience.
 
+<br>
 
 ## Features ⭐
 
@@ -25,6 +26,7 @@
 
 - 🛡️ **Secure API Key Management**: Automatic encryption of sensitive information like API keys.
 
+<br>
 
 ## Prerequisites 🔗
 
@@ -36,6 +38,7 @@ To use these functions, ensure the following:
 
 3. **Admin Access**: To install functions in Open WebUI, you must have administrator privileges.
 
+<br>
 
 ## Installation 🚀
 
@@ -61,6 +64,7 @@ To install and configure functions in Open WebUI, follow these steps:
 6. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
 
+<br>
 
 ## Security Features 🛡️
 
@@ -80,6 +84,8 @@ The functions include a built-in encryption mechanism for sensitive information:
 WEBUI_SECRET_KEY="your-secure-random-string"
 ```
 
+<br>
+
 ## Pipelines 🧩
 
 Pipelines are processing functions that extend Open WebUI with **custom AI models**, **external integrations**, and **data manipulation logic**.
@@ -98,6 +104,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About Azure AI](https://own.dev/azure-microsoft-com-en-us-solutions-ai)
 
+<br>
 
 ### **2. [N8N Pipeline](https://own.dev/github-owndev-open-webui-functions-n8n-pipeline)**
 
@@ -112,6 +119,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About N8N](https://own.dev/n8n-io)
 
+<br>
 
 ### **3. [Infomaniak](https://own.dev/github-owndev-open-webui-functions-infomaniak)**
 
@@ -123,6 +131,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 🔗 [Learn More About Infomaniak](https://own.dev/infomaniak-com-en-hosting-ai-tools)
 
+<br>
 
 ## Filters 🔍
 
@@ -140,6 +149,8 @@ Filters allow for **preprocessing and postprocessing** of data within Open WebUI
 
 🔗 [How to Setup Azure Log Analytics](https://own.dev/github-owndev-open-webui-functions-setup-azure-log-analytics)
 
+<br>
+
 ## Integrations 🤝
 
 ### Azure AI
@@ -156,6 +167,7 @@ Look here for [N8N Integration](https://own.dev/github-owndev-open-webui-functio
 
 Look here for [Infomaniak Integration](https://own.dev/github-owndev-open-webui-functions-infomaniak-integration-md).
 
+<br>
 
 ## Contribute 💪
 
