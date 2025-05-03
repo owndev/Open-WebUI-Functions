@@ -14,4 +14,4 @@ To view these logs, go to `Logs` > `Custom Logs`. All logs will be listed there.
  <img src="./images/azure-log-analytics-show-logs.png" />
 
 ## PowerBI Dashboard
-- [PowerBI Dashboard](https://github.com/owndev/Open-WebUI-Functions/discussions/26) from @zic04
+- [PowerBI Dashboard](https://github.com/owndev/Open-WebUI-Functions/discussions/26) from [@zic04](https://github.com/zic04)

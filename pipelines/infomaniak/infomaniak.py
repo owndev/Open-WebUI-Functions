@@ -1,9 +1,9 @@
 """
 title: Infomaniak AI Tools Pipeline
 author: owndev
-author_url: https://own.dev/github
-project_url: https://own.dev/github-owndev-open-webui-functions
-funding_url: https://own.dev/github-owndev-open-webui-functions
+author_url: https://github.com/owndev/
+project_url: https://github.com/owndev/Open-WebUI-Functions
+funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
 version: 2.0.0
 license: Apache License 2.0

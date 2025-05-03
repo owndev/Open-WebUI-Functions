@@ -1,10 +1,10 @@
 """
 title: Azure AI Foundry Pipeline
 author: owndev
-author_url: https://own.dev/github
-project_url: https://own.dev/github-owndev-open-webui-functions
-funding_url: https://own.dev/github-owndev-open-webui-functions
-version: 2.2.1
+author_url: https://github.com/owndev/
+project_url: https://github.com/owndev/Open-WebUI-Functions
+funding_url: https://github.com/sponsors/owndev
+version: 2.2.2
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -315,6 +315,8 @@ class Pipe:
             {"id": "Phi-4", "name": "Phi-4"},
             {"id": "Phi-4-mini-instruct", "name": "Phi-4 mini instruct"},
             {"id": "Phi-4-multimodal-instruct", "name": "Phi-4 multimodal instruct"},
+            {"id": "Phi-4-reasoning", "name": "Phi-4 Reasoning"},
+            {"id": "Phi-4-mini-reasoning", "name": "Phi-4 Mini Reasoning"},
             {"id": "MAI-DS-R1", "name": "Microsoft Deepseek R1"},
         ]
 

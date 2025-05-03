@@ -133,6 +133,20 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 <br>
 
+### **4. [Google Gemini](https://own.dev/github-owndev-open-webui-functions-google-gemini)**
+
+- Integrates **Open WebUI** with **Google Gemini**, a generative AI model by Google.
+- Sends messages from Open WebUI to **Google Gemini**.
+- Supports encryption of sensitive information like API keys.
+- Supports both streaming and non-streaming responses.
+- Provides configurable error handling and timeouts.
+
+🔗 [Google Gemini Pipeline in Open WebUI](https://own.dev/openwebui-com-f-owndev-google-gemini)
+
+🔗 [Learn More About Google Gemini](https://own.dev/ai-google-dev-gemini-api-docs)
+
+<br>
+
 ## Filters 🔍
 
 Filters allow for **preprocessing and postprocessing** of data within Open WebUI.
@@ -166,6 +180,11 @@ Look here for [N8N Integration](https://own.dev/github-owndev-open-webui-functio
 ### Infomaniak
 
 Look here for [Infomaniak Integration](https://own.dev/github-owndev-open-webui-functions-infomaniak-integration-md).
+
+
+### Google
+
+Look here for [Google Gemini Integration](https://own.dev/github-owndev-open-webui-functions-google-gemini-integration-md).
 
 <br>
 
