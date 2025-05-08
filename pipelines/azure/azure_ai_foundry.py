@@ -348,7 +348,7 @@ class Pipe:
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
     async def pipe(
-        self, body: Dict[str, Any]
+        self, body: Dict[str, Any], __event_emitter__=None
     ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Azure AI endpoint.
@@ -356,6 +356,7 @@ class Pipe:
 
         Args:
             body: The request body containing messages and other parameters
+            __event_emitter__: Optional event emitter function for status updates
 
         Returns:
             Response from Azure AI API, which could be a string, dictionary or streaming response
@@ -370,8 +371,12 @@ class Pipe:
         if "model" in body and body["model"]:
             selected_model = body["model"]
             # Safer model extraction with split
-            selected_model = selected_model.split(".", 1)[1] if "." in selected_model else selected_model
-        
+            selected_model = (
+                selected_model.split(".", 1)[1]
+                if "." in selected_model
+                else selected_model
+            )
+
         # Construct headers with selected model
         headers = self.get_headers(selected_model)
 
@@ -418,6 +423,16 @@ class Pipe:
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
 
+        # Send status update via event emitter if available
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {
+                    "description": "Sending request to Azure AI...",
+                    "done": False
+                }
+            })
+
         request = None
         session = None
         streaming = False
@@ -439,6 +454,17 @@ class Pipe:
             # Check if response is SSE
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
+                
+                # Send status update for successful streaming connection
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": "Streaming response from Azure AI...",
+                            "done": False
+                        }
+                    })
+                    
                 return StreamingResponse(
                     request.content,
                     status_code=request.status,
@@ -455,6 +481,17 @@ class Pipe:
                     response = await request.text()
 
                 request.raise_for_status()
+                
+                # Send completion status update
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": "Request completed",
+                            "done": True
+                        }
+                    })
+                    
                 return response
 
         except Exception as e:
@@ -467,6 +504,16 @@ class Pipe:
             elif isinstance(response, str):
                 detail = response
 
+            # Send error status update
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": f"Error: {detail}",
+                        "done": True
+                    }
+                })
+                
             return f"Error: {detail}"
         finally:
             if not streaming and session:
