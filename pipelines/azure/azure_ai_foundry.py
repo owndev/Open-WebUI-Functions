@@ -17,7 +17,7 @@ features:
   - Encrypted storage of sensitive API keys
 """
 
-from typing import List, Union, Generator, Iterator, Optional, Dict, Any
+from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from starlette.background import BackgroundTask
@@ -347,6 +347,48 @@ class Pipe:
         # Otherwise, use a default name.
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
+    async def stream_processor(
+        self, 
+        content: aiohttp.StreamReader, 
+        __event_emitter__=None
+    ) -> AsyncIterator[bytes]:
+        """
+        Process streaming content and properly handle completion status updates.
+        
+        Args:
+            content: The streaming content from the response
+            __event_emitter__: Optional event emitter for status updates
+            
+        Yields:
+            Bytes from the streaming content
+        """
+        try:
+            async for chunk in content:
+                yield chunk
+                
+            # Send completion status update when streaming is done
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": "Streaming completed",
+                        "done": True
+                    }
+                })
+        except Exception as e:
+            log = logging.getLogger("azure_ai.stream_processor")
+            log.error(f"Error processing stream: {e}")
+            
+            # Send error status update
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": f"Error: {str(e)}",
+                        "done": True
+                    }
+                })
+
     async def pipe(
         self, body: Dict[str, Any], __event_emitter__=None
     ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
@@ -466,7 +508,7 @@ class Pipe:
                     })
                     
                 return StreamingResponse(
-                    request.content,
+                    self.stream_processor(request.content, __event_emitter__),
                     status_code=request.status,
                     headers=dict(request.headers),
                     background=BackgroundTask(
