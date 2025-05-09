@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.2.2
+version: 2.3.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -17,7 +17,7 @@ features:
   - Encrypted storage of sensitive API keys
 """
 
-from typing import List, Union, Generator, Iterator, Optional, Dict, Any
+from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from starlette.background import BackgroundTask
@@ -347,8 +347,50 @@ class Pipe:
         # Otherwise, use a default name.
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
+    async def stream_processor(
+        self, 
+        content: aiohttp.StreamReader, 
+        __event_emitter__=None
+    ) -> AsyncIterator[bytes]:
+        """
+        Process streaming content and properly handle completion status updates.
+        
+        Args:
+            content: The streaming content from the response
+            __event_emitter__: Optional event emitter for status updates
+            
+        Yields:
+            Bytes from the streaming content
+        """
+        try:
+            async for chunk in content:
+                yield chunk
+                
+            # Send completion status update when streaming is done
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": "Streaming completed",
+                        "done": True
+                    }
+                })
+        except Exception as e:
+            log = logging.getLogger("azure_ai.stream_processor")
+            log.error(f"Error processing stream: {e}")
+            
+            # Send error status update
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": f"Error: {str(e)}",
+                        "done": True
+                    }
+                })
+
     async def pipe(
-        self, body: Dict[str, Any]
+        self, body: Dict[str, Any], __event_emitter__=None
     ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Azure AI endpoint.
@@ -356,6 +398,7 @@ class Pipe:
 
         Args:
             body: The request body containing messages and other parameters
+            __event_emitter__: Optional event emitter function for status updates
 
         Returns:
             Response from Azure AI API, which could be a string, dictionary or streaming response
@@ -370,8 +413,12 @@ class Pipe:
         if "model" in body and body["model"]:
             selected_model = body["model"]
             # Safer model extraction with split
-            selected_model = selected_model.split(".", 1)[1] if "." in selected_model else selected_model
-        
+            selected_model = (
+                selected_model.split(".", 1)[1]
+                if "." in selected_model
+                else selected_model
+            )
+
         # Construct headers with selected model
         headers = self.get_headers(selected_model)
 
@@ -393,7 +440,6 @@ class Pipe:
             "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
-        
         
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             # If a model was explicitly selected in the request, use that
@@ -418,6 +464,16 @@ class Pipe:
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
 
+        # Send status update via event emitter if available
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {
+                    "description": "Sending request to Azure AI...",
+                    "done": False
+                }
+            })
+
         request = None
         session = None
         streaming = False
@@ -439,8 +495,19 @@ class Pipe:
             # Check if response is SSE
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
+                
+                # Send status update for successful streaming connection
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": "Streaming response from Azure AI...",
+                            "done": False
+                        }
+                    })
+                    
                 return StreamingResponse(
-                    request.content,
+                    self.stream_processor(request.content, __event_emitter__),
                     status_code=request.status,
                     headers=dict(request.headers),
                     background=BackgroundTask(
@@ -455,6 +522,17 @@ class Pipe:
                     response = await request.text()
 
                 request.raise_for_status()
+                
+                # Send completion status update
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": "Request completed",
+                            "done": True
+                        }
+                    })
+                    
                 return response
 
         except Exception as e:
@@ -467,6 +545,16 @@ class Pipe:
             elif isinstance(response, str):
                 detail = response
 
+            # Send error status update
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": f"Error: {detail}",
+                        "done": True
+                    }
+                })
+                
             return f"Error: {detail}"
         finally:
             if not streaming and session:
