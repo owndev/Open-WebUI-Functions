@@ -27,14 +27,15 @@ import asyncio
 import base64
 import hashlib
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.genai import errors as genai_errors
 from typing import List, Union, Iterator, Optional, Dict, Any, Tuple, cast
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
 from open_webui.env import SRC_LOG_LEVELS
-from google.generativeai.types import GenerationConfig
-from google.api_core.exceptions import InvalidArgument, PermissionDenied, ResourceExhausted, ServiceUnavailable
+from google.api_core.exceptions import ServiceUnavailable # Keep for retry logic if not covered by genai_errors
 
 
 # Simplified encryption implementation with automatic handling
@@ -159,14 +160,6 @@ class Pipe:
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
         
-        # Configure genai upon initialization if API key is present
-        if self.valves.GOOGLE_API_KEY:
-            try:
-                genai.configure(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
-                self.log.debug("Google Generative AI configured successfully")
-            except Exception as e:
-                self.log.warning(f"Warning: Error configuring Google Generative AI during init: {e}")
-                # Allow initialization to continue, pipe method will re-attempt or handle the error
 
     def validate_api_key(self) -> None:
         """
@@ -210,11 +203,10 @@ class Pipe:
             
         self.validate_api_key()  # Ensure API key is validated before proceeding
         try:
-            # Ensure genai is configured before listing models
-            genai.configure(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+            client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
             self.log.debug("Fetching models from Google API")
 
-            models = genai.list_models()
+            models = client.models.list()
             available_models = [
                 {
                     "id": self.strip_prefix(model.name),
@@ -382,15 +374,16 @@ class Pipe:
         
         return parts
 
-    def _configure_generation(self, body: Dict[str, Any]) -> Tuple[GenerationConfig, Optional[Dict[str, Any]]]:
+    def _configure_generation(self, body: Dict[str, Any], system_instruction: Optional[str] = None) -> Tuple[types.GenerateContentConfig, Optional[List[types.SafetySetting]]]:
         """
         Configure generation parameters and safety settings.
         
         Args:
             body: The request body containing generation parameters
+            system_instruction: Optional system instruction string
             
         Returns:
-            Tuple of (generation config, safety settings or None)
+            Tuple of (types.GenerateContentConfig, safety settings or None)
         """
         # Filter out None values for generation config
         gen_config_params = {
@@ -399,20 +392,20 @@ class Pipe:
             "top_k": body.get("top_k"),
             "max_output_tokens": body.get("max_tokens"),
             "stop_sequences": body.get("stop") or None,
+            "system_instruction": system_instruction,
         }
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
-        generation_config = GenerationConfig(**filtered_params)
+        generation_config = types.GenerateContentConfig(**filtered_params)
 
         # Configure safety settings
+        safety_settings: Optional[List[types.SafetySetting]] = None
         if self.valves.USE_PERMISSIVE_SAFETY:
-            safety_settings = {
-                genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-                genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: genai.types.HarmBlockThreshold.BLOCK_NONE,
-                genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-                genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-            }
-        else:
-            safety_settings = None  # Use default settings
+            safety_settings = [
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+            ]
         
         return generation_config, safety_settings
 
@@ -463,7 +456,7 @@ class Pipe:
         
         # Check candidate finish reason
         candidate = response.candidates[0]
-        if candidate.finish_reason == genai.types.Candidate.FinishReason.SAFETY:
+        if candidate.finish_reason == types.FinishReason.SAFETY:
             # Try to get specific safety rating info
             blocking_rating = next((r for r in candidate.safety_ratings if r.blocked), None)
             reason = f" ({blocking_rating.category.name})" if blocking_rating else ""
@@ -497,7 +490,7 @@ class Pipe:
         while retry_count <= max_retries:
             try:
                 return await func(*args, **kwargs)
-            except (ServiceUnavailable, ResourceExhausted) as e:
+            except (ServiceUnavailable, genai_errors.ResourceExhausted) as e:
                 # These errors might be temporary, so retry
                 retry_count += 1
                 last_exception = e
@@ -540,8 +533,7 @@ class Pipe:
             return f"Error: {e}"
 
         try:
-            # Configure genai API
-            genai.configure(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+            sdk_client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
             
             # Parse and validate model ID
             model_id = body.get("model", "")
@@ -561,29 +553,17 @@ class Pipe:
                 return "Error: No valid message content found"
                 
             # Configure generation parameters and safety settings
-            generation_config, safety_settings = self._configure_generation(body)
-            
-            # Initialize the model with system instruction
-            client = genai.GenerativeModel(
-                model_name=model_id,
-                system_instruction=system_instruction
-            )
+            generation_config, safety_settings_list = self._configure_generation(body, system_instruction)
             
             # Make the API call
             if stream:
-                # For streaming response we'll still use the synchronous method but wrap it
-                # in an async call using a thread pool executor (handled by retry_with_backoff)
                 try:
                     async def get_streaming_response():
-                        loop = asyncio.get_event_loop()
-                        return await loop.run_in_executor(
-                            None,
-                            lambda: client.generate_content(
-                                contents,
-                                generation_config=generation_config,
-                                safety_settings=safety_settings,
-                                stream=True,
-                            )
+                        return await sdk_client.aio.models.generate_content_stream(
+                            model=model_id,
+                            contents=contents,
+                            generation_config=generation_config,
+                            safety_settings=safety_settings_list,
                         )
                     
                     response_iterator = await self._retry_with_backoff(get_streaming_response)
@@ -594,45 +574,15 @@ class Pipe:
                     self.log.exception(f"Error in streaming request {request_id}: {e}")
                     return f"Error during streaming: {e}"
             else:
-                # For non-streaming, use the async method if available
                 try:
-                    # Use the async method with retry
                     async def get_response():
-                        # If the Google library has async methods, use those instead
-                        try:
-                            # Try to use async method if available
-                            if hasattr(client, 'generate_content_async'):
-                                return await client.generate_content_async(
-                                    contents,
-                                    generation_config=generation_config,
-                                    safety_settings=safety_settings
-                                )
-                            else:
-                                # Fall back to synchronous method in a thread pool
-                                loop = asyncio.get_event_loop()
-                                return await loop.run_in_executor(
-                                    None,
-                                    lambda: client.generate_content(
-                                        contents,
-                                        generation_config=generation_config,
-                                        safety_settings=safety_settings,
-                                        stream=False
-                                    )
-                                )
-                        except AttributeError:
-                            # Fall back if generate_content_async doesn't exist
-                            loop = asyncio.get_event_loop()
-                            return await loop.run_in_executor(
-                                None,
-                                lambda: client.generate_content(
-                                    contents, 
-                                    generation_config=generation_config,
-                                    safety_settings=safety_settings,
-                                    stream=False
-                                )
-                            )
+                        return await sdk_client.aio.models.generate_content(
+                            model=model_id,
+                            contents=contents,
+                            generation_config=generation_config,
+                            safety_settings=safety_settings_list,
+                        )
                     
-                    # Get response with retry
                     response = await self._retry_with_backoff(get_response)
                     self.log.debug(f"Request {request_id}: Got non-streaming response")
                     return self._handle_standard_response(response)
@@ -641,19 +591,24 @@ class Pipe:
                     self.log.exception(f"Error in non-streaming request {request_id}: {e}")
                     return f"Error generating content: {e}"
 
-        except PermissionDenied as pe:
+        except genai_errors.PermissionDenied as pe:
             error_msg = f"Permission denied: {pe}. Please check your API key and permissions."
             self.log.error(f"Permission error: {pe}")
             return error_msg
             
-        except InvalidArgument as ia:
+        except genai_errors.InvalidArgument as ia:
             error_msg = f"Invalid argument: {ia}. Please check your request parameters."
             self.log.error(f"Invalid argument error: {ia}")
             return error_msg
             
-        except ResourceExhausted as re:
+        except genai_errors.ResourceExhausted as re:
             error_msg = f"Resource exhausted: {re}. You may have exceeded your quota or rate limits."
             self.log.error(f"Resource exhausted error: {re}")
+            return error_msg
+        
+        except genai_errors.APIError as apie:
+            error_msg = f"Google API Error: {apie.message} (Code: {apie.code if hasattr(apie, 'code') else 'N/A'})"
+            self.log.error(error_msg)
             return error_msg
             
         except ValueError as ve:
