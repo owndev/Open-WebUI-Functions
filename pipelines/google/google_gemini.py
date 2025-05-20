@@ -29,13 +29,12 @@ import hashlib
 import logging
 from google import genai
 from google.genai import types
-from google.genai import errors as genai_errors
+from google.genai.errors import ClientError, ServerError, APIError
 from typing import List, Union, Iterator, Optional, Dict, Any, Tuple, cast
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
 from open_webui.env import SRC_LOG_LEVELS
-from google.api_core.exceptions import ServiceUnavailable # Keep for retry logic if not covered by genai_errors
 
 
 # Simplified encryption implementation with automatic handling
@@ -159,10 +158,7 @@ class Pipe:
     def __init__(self):
         """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
-        if self.valves.USE_VERTEX_AI:
-            self.name: str = "Google Vertex AI: "
-        else:
-            self.name: str = "Google Gemini: "
+        self.name: str = "Google Gemini: "
         
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
@@ -176,7 +172,7 @@ class Pipe:
         """
         Validates API credentials and returns a genai.Client instance.
         """
-        self._validate_api_key()  # Validate credentials first
+        self._validate_api_key()
 
         if self.valves.USE_VERTEX_AI:
             self.log.debug(f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})")
@@ -215,15 +211,14 @@ class Pipe:
 
     def strip_prefix(self, model_name: str) -> str:
         """
-        Extract the model identifier, typically the last segment of a path-like model name.
+        Extract the model identifier using regex, handling various naming conventions.
+        e.g., 'google_gemini_pipeline.gemini-2.5-flash-preview-04-17' -> 'gemini-2.5-flash-preview-04-17'
+        e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
+        e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
         """
-        if '/' in model_name:
-            # If the name contains slashes, split by slash and take the last part.
-            # e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
-            # e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
-            return model_name.split('/')[-1]
-        # If no slashes, assume it's the direct model ID (e.g., "gemini-pro")
-        return model_name
+        # Use non-greedy regex to remove everything up to and including the first '.' or '/'
+        stripped = re.sub(r"^(?:.*_pipeline\.|.*/)", "", model_name)
+        return stripped
 
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
         """
@@ -263,7 +258,6 @@ class Pipe:
             # Update cache
             self._model_cache = list(filtered_models.values())
             self._model_cache_time = current_time
-
             self.log.debug(f"Found {len(self._model_cache)} Gemini models")
             return self._model_cache
 
@@ -412,7 +406,7 @@ class Pipe:
         
         return parts
 
-    def _configure_generation(self, body: Dict[str, Any], system_instruction: Optional[str] = None) -> Tuple[types.GenerateContentConfig, Optional[List[types.SafetySetting]]]:
+    def _configure_generation(self, body: Dict[str, Any], system_instruction: Optional[str] = None) -> types.GenerateContentConfig:
         """
         Configure generation parameters and safety settings.
         
@@ -421,9 +415,8 @@ class Pipe:
             system_instruction: Optional system instruction string
             
         Returns:
-            Tuple of (types.GenerateContentConfig, safety settings or None)
+            types.GenerateContentConfig
         """
-        # Filter out None values for generation config
         gen_config_params = {
             "temperature": body.get("temperature"),
             "top_p": body.get("top_p"),
@@ -432,9 +425,6 @@ class Pipe:
             "stop_sequences": body.get("stop") or None,
             "system_instruction": system_instruction,
         }
-        filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
-        generation_config = types.GenerateContentConfig(**filtered_params)
-
         # Configure safety settings
         safety_settings: Optional[List[types.SafetySetting]] = None
         if self.valves.USE_PERMISSIVE_SAFETY:
@@ -444,8 +434,11 @@ class Pipe:
                 types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
                 types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
             ]
-        
-        return generation_config, safety_settings
+            gen_config_params |= {"safety_settings": safety_settings},
+
+        # Filter out None values for generation config
+        filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
+        return types.GenerateContentConfig(**filtered_params)
 
     def _handle_streaming_response(self, response_iterator: Any) -> Iterator[str]:
         """
@@ -528,7 +521,7 @@ class Pipe:
         while retry_count <= max_retries:
             try:
                 return await func(*args, **kwargs)
-            except (ServiceUnavailable, genai_errors.ResourceExhausted) as e:
+            except ServerError as e:
                 # These errors might be temporary, so retry
                 retry_count += 1
                 last_exception = e
@@ -565,7 +558,6 @@ class Pipe:
         self.log.debug(f"Processing request {request_id}")
 
         try:
-            sdk_client = self._get_client()
 
             # Parse and validate model ID
             model_id = body.get("model", "")
@@ -585,17 +577,17 @@ class Pipe:
                 return "Error: No valid message content found"
                 
             # Configure generation parameters and safety settings
-            generation_config, safety_settings_list = self._configure_generation(body, system_instruction)
+            generation_config = self._configure_generation(body, system_instruction)
             
             # Make the API call
+            client = self._get_client()
             if stream:
                 try:
                     async def get_streaming_response():
-                        return await sdk_client.aio.models.generate_content_stream(
+                        return await client.aio.models.generate_content_stream(
                             model=model_id,
                             contents=contents,
-                            generation_config=generation_config,
-                            safety_settings=safety_settings_list,
+                            config=generation_config,
                         )
                     
                     response_iterator = await self._retry_with_backoff(get_streaming_response)
@@ -608,11 +600,10 @@ class Pipe:
             else:
                 try:
                     async def get_response():
-                        return await sdk_client.aio.models.generate_content(
+                        return await client.aio.models.generate_content(
                             model=model_id,
                             contents=contents,
-                            generation_config=generation_config,
-                            safety_settings=safety_settings_list,
+                            config=generation_config,
                         )
                     
                     response = await self._retry_with_backoff(get_response)
@@ -623,23 +614,18 @@ class Pipe:
                     self.log.exception(f"Error in non-streaming request {request_id}: {e}")
                     return f"Error generating content: {e}"
 
-        except genai_errors.PermissionDenied as pe:
-            error_msg = f"Permission denied: {pe}. Please check your API key and permissions."
-            self.log.error(f"Permission error: {pe}")
+        except ClientError as ce:
+            error_msg = f"Client error raised by the GenAI API: {ce}."
+            self.log.error(f"Client error: {ce}")
             return error_msg
             
-        except genai_errors.InvalidArgument as ia:
-            error_msg = f"Invalid argument: {ia}. Please check your request parameters."
-            self.log.error(f"Invalid argument error: {ia}")
-            return error_msg
-            
-        except genai_errors.ResourceExhausted as re:
-            error_msg = f"Resource exhausted: {re}. You may have exceeded your quota or rate limits."
-            self.log.error(f"Resource exhausted error: {re}")
+        except ServerError as se:
+            error_msg = f"Server error raised by the GenAI API: {se}"
+            self.log.error(f"Server error raised by the GenAI API.: {se}")
             return error_msg
         
-        except genai_errors.APIError as apie:
-            error_msg = f"Google API Error: {apie.message} (Code: {apie.code if hasattr(apie, 'code') else 'N/A'})"
+        except APIError as apie:
+            error_msg = f"Google API Error: {apie}"
             self.log.error(error_msg)
             return error_msg
             
