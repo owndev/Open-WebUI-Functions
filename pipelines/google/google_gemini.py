@@ -212,12 +212,12 @@ class Pipe:
     def strip_prefix(self, model_name: str) -> str:
         """
         Extract the model identifier using regex, handling various naming conventions.
-        e.g., 'google_gemini_pipeline.gemini-2.5-flash-preview-04-17' -> 'gemini-2.5-flash-preview-04-17'
+        e.g., "google_gemini_pipeline.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
         e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
         e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
         """
-        # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-        stripped = re.sub(r"^(?:.*_pipeline\.|.*/)", "", model_name)
+        # Use regex to remove everything up to and including the last '/' or the first '.'
+        stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
