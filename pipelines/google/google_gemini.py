@@ -171,9 +171,25 @@ class Pipe:
         # Model cache
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
-        
 
-    def validate_api_key(self) -> None:
+    def _get_client(self) -> genai.Client:
+        """
+        Validates API credentials and returns a genai.Client instance.
+        """
+        self._validate_api_key()  # Validate credentials first
+
+        if self.valves.USE_VERTEX_AI:
+            self.log.debug(f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})")
+            return genai.Client(
+                vertexai=True,
+                project=self.valves.VERTEX_PROJECT,
+                location=self.valves.VERTEX_LOCATION,
+            )
+        else:
+            self.log.debug("Initializing Google Generative AI client with API Key")
+            return genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+
+    def _validate_api_key(self) -> None:
         """
         Validates that the necessary Google API credentials are set.
 
@@ -228,19 +244,8 @@ class Pipe:
             self.log.debug("Using cached model list")
             return self._model_cache
             
-        self.validate_api_key()  # Ensure credentials are validated before proceeding
         try:
-            if self.valves.USE_VERTEX_AI:
-                client = genai.Client(
-                    vertexai=True,
-                    project=self.valves.VERTEX_PROJECT,
-                    location=self.valves.VERTEX_LOCATION,
-                )
-                self.log.debug(f"Fetching models from Vertex AI (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})")
-            else:
-                client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
-                self.log.debug("Fetching models from Google Generative AI API")
-            
+            client = self._get_client()
             models = client.models.list()
             available_models = []
             for model in models:
@@ -559,24 +564,8 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
 
-        # Validate API key
         try:
-            self.validate_api_key()
-        except ValueError as e:
-            self.log.error(f"Credential validation failed: {e}")
-            return f"Error: {e}"
-
-        try:
-            if self.valves.USE_VERTEX_AI:
-                sdk_client = genai.Client(
-                    vertexai=True,
-                    project=self.valves.VERTEX_PROJECT,
-                    location=self.valves.VERTEX_LOCATION,
-                )
-                self.log.debug(f"Vertex AI client initialized for request {request_id}")
-            else:
-                sdk_client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
-                self.log.debug(f"Google GenAI client initialized for request {request_id}")
+            sdk_client = self._get_client()
 
             # Parse and validate model ID
             model_id = body.get("model", "")
