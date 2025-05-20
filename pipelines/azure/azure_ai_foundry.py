@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.3.0
+version: 2.3.1
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -293,6 +293,8 @@ class Pipe:
             {"id": "Mistral-Nemo", "name": "Mistral Nemo"},
             {"id": "Mistral-small", "name": "Mistral Small"},
             {"id": "mistral-small-2503", "name": "Mistral Small 3.1"},
+            {"id": "mistral-medium-2505", "name": "Mistral Medium 3 (25.05)"},
+            {"id": "grok-3", "name": "Grok 3"},
             {"id": "gpt-4o", "name": "OpenAI GPT-4o"},
             {"id": "gpt-4o-mini", "name": "OpenAI GPT-4o mini"},
             {"id": "gpt-4.1", "name": "OpenAI GPT-4.1"},
@@ -319,6 +321,7 @@ class Pipe:
             {"id": "Phi-4-reasoning", "name": "Phi-4 Reasoning"},
             {"id": "Phi-4-mini-reasoning", "name": "Phi-4 Mini Reasoning"},
             {"id": "MAI-DS-R1", "name": "Microsoft Deepseek R1"},
+            {"id": "model-router", "name": "Model Router"},
         ]
 
     def pipes(self) -> List[Dict[str, str]]:
