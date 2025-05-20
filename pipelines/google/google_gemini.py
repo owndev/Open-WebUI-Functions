@@ -129,28 +129,40 @@ class Pipe:
     class Valves(BaseModel):
         GOOGLE_API_KEY: EncryptedStr = Field(
             default=os.getenv("GOOGLE_API_KEY", ""),
-            description="API key for Google Generative AI",
+            description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
         )
-
+        USE_VERTEX_AI: bool = Field(
+            default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
+            description="Whether to use Google Cloud Vertex AI instead of the Google Generative AI API.",
+        )
+        VERTEX_PROJECT: str | None = Field(
+            default=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            description="The Google Cloud project ID to use with Vertex AI.",
+        )
+        VERTEX_LOCATION: str = Field(
+            default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
+            description="The Google Cloud region to use with Vertex AI.",
+        )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("USE_PERMISSIVE_SAFETY", False),
+            default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
             description="Use permissive safety settings for content generation.",
         )
-        
         MODEL_CACHE_TTL: int = Field(
             default=int(os.getenv("GOOGLE_MODEL_CACHE_TTL", "600")),
             description="Time in seconds to cache the model list before refreshing",
         )
-        
         RETRY_COUNT: int = Field(
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
         )
 
     def __init__(self):
-        """Initializes the Pipe instance and configures the genai library if the API key is available."""
+        """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
-        self.name: str = "Google Gemini: "
+        if self.valves.USE_VERTEX_AI:
+            self.name: str = "Google Vertex AI: "
+        else:
+            self.name: str = "Google Gemini: "
         
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
@@ -163,24 +175,39 @@ class Pipe:
 
     def validate_api_key(self) -> None:
         """
-        Validates that the Google API key is set.
+        Validates that the necessary Google API credentials are set.
 
         Raises:
-            ValueError: If the API key is not set.
+            ValueError: If the required credentials are not set.
         """
-        if not self.valves.GOOGLE_API_KEY:
-            self.log.error("GOOGLE_API_KEY is not set")
-            raise ValueError(
-                "GOOGLE_API_KEY is not set. Please provide the API key in the environment variables or valves."
-            )
+        if self.valves.USE_VERTEX_AI:
+            if not self.valves.VERTEX_PROJECT:
+                self.log.error("USE_VERTEX_AI is true, but VERTEX_PROJECT is not set.")
+                raise ValueError(
+                    "VERTEX_PROJECT is not set. Please provide the Google Cloud project ID."
+                )
+            # For Vertex AI, location has a default, so project is the main thing to check.
+            # Actual authentication will be handled by ADC or environment.
+            self.log.debug("Using Vertex AI. Ensure ADC or service account is configured.")
+        else:
+            if not self.valves.GOOGLE_API_KEY:
+                self.log.error("GOOGLE_API_KEY is not set (and not using Vertex AI).")
+                raise ValueError(
+                    "GOOGLE_API_KEY is not set. Please provide the API key in the environment variables or valves."
+                )
+            self.log.debug("Using Google Generative AI API with API Key.")
 
     def strip_prefix(self, model_name: str) -> str:
         """
-        Strip any prefix from the model name up to and including the first '.' or '/'.
+        Extract the model identifier, typically the last segment of a path-like model name.
         """
-        # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-        stripped = re.sub(r"^.*?[./]", "", model_name)
-        return stripped
+        if '/' in model_name:
+            # If the name contains slashes, split by slash and take the last part.
+            # e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
+            # e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
+            return model_name.split('/')[-1]
+        # If no slashes, assume it's the direct model ID (e.g., "gemini-pro")
+        return model_name
 
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
         """
@@ -201,21 +228,27 @@ class Pipe:
             self.log.debug("Using cached model list")
             return self._model_cache
             
-        self.validate_api_key()  # Ensure API key is validated before proceeding
+        self.validate_api_key()  # Ensure credentials are validated before proceeding
         try:
-            client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
-            self.log.debug("Fetching models from Google API")
-
+            if self.valves.USE_VERTEX_AI:
+                client = genai.Client(
+                    vertexai=True,
+                    project=self.valves.VERTEX_PROJECT,
+                    location=self.valves.VERTEX_LOCATION,
+                )
+                self.log.debug(f"Fetching models from Vertex AI (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})")
+            else:
+                client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+                self.log.debug("Fetching models from Google Generative AI API")
+            
             models = client.models.list()
-            available_models = [
-                {
-                    "id": self.strip_prefix(model.name),
-                    "name": model.display_name,
-                }
-                for model in models
-                if "generateContent" in model.supported_generation_methods
-                and model.name.startswith("models/") # Ensure we only get standard models
-            ]
+            available_models = []
+            for model in models:
+                if methods := model.supported_generation_methods and "generateContent" in methods:
+                    available_models.append({
+                        "id": self.strip_prefix(model.name),
+                        "name": model.display_name or self.strip_prefix(model.name),
+                    })
 
             model_map = {model['id']: model for model in available_models}
 
@@ -225,7 +258,7 @@ class Pipe:
             # Update cache
             self._model_cache = list(filtered_models.values())
             self._model_cache_time = current_time
-            
+
             self.log.debug(f"Found {len(self._model_cache)} Gemini models")
             return self._model_cache
 
@@ -530,11 +563,21 @@ class Pipe:
         try:
             self.validate_api_key()
         except ValueError as e:
+            self.log.error(f"Credential validation failed: {e}")
             return f"Error: {e}"
 
         try:
-            sdk_client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
-            
+            if self.valves.USE_VERTEX_AI:
+                sdk_client = genai.Client(
+                    vertexai=True,
+                    project=self.valves.VERTEX_PROJECT,
+                    location=self.valves.VERTEX_LOCATION,
+                )
+                self.log.debug(f"Vertex AI client initialized for request {request_id}")
+            else:
+                sdk_client = genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+                self.log.debug(f"Google GenAI client initialized for request {request_id}")
+
             # Parse and validate model ID
             model_id = body.get("model", "")
             try:
