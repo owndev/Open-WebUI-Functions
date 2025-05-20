@@ -249,7 +249,7 @@ class Pipe:
             models = client.models.list()
             available_models = []
             for model in models:
-                if methods := model.supported_generation_methods and "generateContent" in methods:
+                if actions := model.supported_actions is None or "generateContent" in actions :
                     available_models.append({
                         "id": self.strip_prefix(model.name),
                         "name": model.display_name or self.strip_prefix(model.name),
