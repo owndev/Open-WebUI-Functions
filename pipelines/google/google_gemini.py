@@ -241,6 +241,7 @@ class Pipe:
             
         try:
             client = self._get_client()
+            self.log.debug("Fetching models from Google API")
             models = client.models.list()
             available_models = []
             for model in models:
@@ -426,7 +427,6 @@ class Pipe:
             "system_instruction": system_instruction,
         }
         # Configure safety settings
-        safety_settings: Optional[List[types.SafetySetting]] = None
         if self.valves.USE_PERMISSIVE_SAFETY:
             safety_settings = [
                 types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
