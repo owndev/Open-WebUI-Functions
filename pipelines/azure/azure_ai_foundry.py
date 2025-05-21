@@ -220,7 +220,12 @@ class Pipe:
             if model_name:
                 headers["x-ms-model-mesh-model-name"] = model_name
             # Otherwise, if AZURE_AI_MODEL has a single value, use that
-            elif self.valves.AZURE_AI_MODEL and ";" not in self.valves.AZURE_AI_MODEL and "," not in self.valves.AZURE_AI_MODEL and " " not in self.valves.AZURE_AI_MODEL:
+            elif (
+                self.valves.AZURE_AI_MODEL
+                and ";" not in self.valves.AZURE_AI_MODEL
+                and "," not in self.valves.AZURE_AI_MODEL
+                and " " not in self.valves.AZURE_AI_MODEL
+            ):
                 headers["x-ms-model-mesh-model-name"] = self.valves.AZURE_AI_MODEL
         return headers
 
@@ -249,13 +254,13 @@ class Pipe:
         """
         if not models_str:
             return []
-            
+
         # Replace semicolons and commas with spaces, then split by spaces and filter empty strings
         models = []
-        for model in models_str.replace(';', ' ').replace(',', ' ').split():
+        for model in models_str.replace(";", " ").replace(",", " ").split():
             if model.strip():
                 models.append(model.strip())
-                
+
         return models
 
     def get_azure_models(self) -> List[Dict[str, str]]:
@@ -272,19 +277,34 @@ class Pipe:
             {"id": "Cohere-command-r", "name": "Cohere Command R"},
             {"id": "Cohere-command-r-08-2024", "name": "Cohere Command R 08-2024"},
             {"id": "Cohere-command-r-plus", "name": "Cohere Command R+"},
-            {"id": "Cohere-command-r-plus-08-2024", "name": "Cohere Command R+ 08-2024"},
+            {
+                "id": "Cohere-command-r-plus-08-2024",
+                "name": "Cohere Command R+ 08-2024",
+            },
             {"id": "cohere-command-a", "name": "Cohere Command A"},
             {"id": "DeepSeek-R1", "name": "DeepSeek-R1"},
             {"id": "DeepSeek-V3", "name": "DeepSeek-V3"},
             {"id": "DeepSeek-V3-0324", "name": "DeepSeek-V3-0324"},
             {"id": "jais-30b-chat", "name": "JAIS 30b Chat"},
-            {"id": "Llama-3.2-11B-Vision-Instruct", "name": "Llama-3.2-11B-Vision-Instruct"},
-            {"id": "Llama-3.2-90B-Vision-Instruct", "name": "Llama-3.2-90B-Vision-Instruct"},
+            {
+                "id": "Llama-3.2-11B-Vision-Instruct",
+                "name": "Llama-3.2-11B-Vision-Instruct",
+            },
+            {
+                "id": "Llama-3.2-90B-Vision-Instruct",
+                "name": "Llama-3.2-90B-Vision-Instruct",
+            },
             {"id": "Llama-3.3-70B-Instruct", "name": "Llama-3.3-70B-Instruct"},
             {"id": "Meta-Llama-3-70B-Instruct", "name": "Meta-Llama-3-70B-Instruct"},
             {"id": "Meta-Llama-3-8B-Instruct", "name": "Meta-Llama-3-8B-Instruct"},
-            {"id": "Meta-Llama-3.1-405B-Instruct", "name": "Meta-Llama-3.1-405B-Instruct"},
-            {"id": "Meta-Llama-3.1-70B-Instruct", "name": "Meta-Llama-3.1-70B-Instruct"},
+            {
+                "id": "Meta-Llama-3.1-405B-Instruct",
+                "name": "Meta-Llama-3.1-405B-Instruct",
+            },
+            {
+                "id": "Meta-Llama-3.1-70B-Instruct",
+                "name": "Meta-Llama-3.1-70B-Instruct",
+            },
             {"id": "Meta-Llama-3.1-8B-Instruct", "name": "Meta-Llama-3.1-8B-Instruct"},
             {"id": "Ministral-3B", "name": "Ministral 3B"},
             {"id": "Mistral-large", "name": "Mistral Large"},
@@ -306,7 +326,10 @@ class Pipe:
             {"id": "o3", "name": "OpenAI o3"},
             {"id": "o3-mini", "name": "OpenAI o3-mini"},
             {"id": "o4-mini", "name": "OpenAI o4-mini"},
-            {"id": "Phi-3-medium-128k-instruct", "name": "Phi-3-medium instruct (128k)"},
+            {
+                "id": "Phi-3-medium-128k-instruct",
+                "name": "Phi-3-medium instruct (128k)",
+            },
             {"id": "Phi-3-medium-4k-instruct", "name": "Phi-3-medium instruct (4k)"},
             {"id": "Phi-3-mini-128k-instruct", "name": "Phi-3-mini instruct (128k)"},
             {"id": "Phi-3-mini-4k-instruct", "name": "Phi-3-mini instruct (4k)"},
@@ -341,7 +364,12 @@ class Pipe:
                 return [{"id": model, "name": model} for model in models]
             else:
                 # Fallback for backward compatibility
-                return [{"id": self.valves.AZURE_AI_MODEL, "name": self.valves.AZURE_AI_MODEL}]
+                return [
+                    {
+                        "id": self.valves.AZURE_AI_MODEL,
+                        "name": self.valves.AZURE_AI_MODEL,
+                    }
+                ]
 
         # If custom model is not provided but predefined models are enabled, return those.
         if self.valves.USE_PREDEFINED_AZURE_AI_MODELS:
@@ -352,46 +380,42 @@ class Pipe:
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
     async def stream_processor(
-        self, 
-        content: aiohttp.StreamReader, 
-        __event_emitter__=None
+        self, content: aiohttp.StreamReader, __event_emitter__=None
     ) -> AsyncIterator[bytes]:
         """
         Process streaming content and properly handle completion status updates.
-        
+
         Args:
             content: The streaming content from the response
             __event_emitter__: Optional event emitter for status updates
-            
+
         Yields:
             Bytes from the streaming content
         """
         try:
             async for chunk in content:
                 yield chunk
-                
+
             # Send completion status update when streaming is done
             if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "Streaming completed",
-                        "done": True
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": "Streaming completed", "done": True},
                     }
-                })
+                )
         except Exception as e:
             log = logging.getLogger("azure_ai.stream_processor")
             log.error(f"Error processing stream: {e}")
-            
+
             # Send error status update
             if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"Error: {str(e)}",
-                        "done": True
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"Error: {str(e)}", "done": True},
                     }
-                })
+                )
 
     async def pipe(
         self, body: Dict[str, Any], __event_emitter__=None
@@ -444,7 +468,7 @@ class Pipe:
             "top_p",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
-        
+
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             # If a model was explicitly selected in the request, use that
             if selected_model:
@@ -470,13 +494,15 @@ class Pipe:
 
         # Send status update via event emitter if available
         if __event_emitter__:
-            await __event_emitter__({
-                "type": "status",
-                "data": {
-                    "description": "Sending request to Azure AI...",
-                    "done": False
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Sending request to Azure AI...",
+                        "done": False,
+                    },
                 }
-            })
+            )
 
         request = None
         session = None
@@ -499,17 +525,19 @@ class Pipe:
             # Check if response is SSE
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
-                
+
                 # Send status update for successful streaming connection
                 if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": "Streaming response from Azure AI...",
-                            "done": False
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "Streaming response from Azure AI...",
+                                "done": False,
+                            },
                         }
-                    })
-                    
+                    )
+
                 return StreamingResponse(
                     self.stream_processor(request.content, __event_emitter__),
                     status_code=request.status,
@@ -526,17 +554,16 @@ class Pipe:
                     response = await request.text()
 
                 request.raise_for_status()
-                
+
                 # Send completion status update
                 if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": "Request completed",
-                            "done": True
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": "Request completed", "done": True},
                         }
-                    })
-                    
+                    )
+
                 return response
 
         except Exception as e:
@@ -551,14 +578,13 @@ class Pipe:
 
             # Send error status update
             if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"Error: {detail}",
-                        "done": True
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"Error: {detail}", "done": True},
                     }
-                })
-                
+                )
+
             return f"Error: {detail}"
         finally:
             if not streaming and session:
