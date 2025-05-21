@@ -94,9 +94,7 @@ class EncryptedStr(str):
 
     # Pydantic integration
     @classmethod
-    def __get_pydantic_core_schema__(
-        cls, _source_type: Any, _handler: GetCoreSchemaHandler
-    ) -> core_schema.CoreSchema:
+    def __get_pydantic_core_schema__(cls, _source_type: Any, _handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
         return core_schema.union_schema(
             [
                 core_schema.is_instance_schema(cls),
@@ -109,9 +107,7 @@ class EncryptedStr(str):
                     ]
                 ),
             ],
-            serialization=core_schema.plain_serializer_function_ser_schema(
-                lambda instance: str(instance)
-            ),
+            serialization=core_schema.plain_serializer_function_ser_schema(lambda instance: str(instance)),
         )
 
     def get_decrypted(self) -> str:
@@ -159,11 +155,11 @@ class Pipe:
         """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
         self.name: str = "Google Gemini: "
-        
+
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
-        
+
         # Model cache
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
@@ -175,7 +171,9 @@ class Pipe:
         self._validate_api_key()
 
         if self.valves.USE_VERTEX_AI:
-            self.log.debug(f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})")
+            self.log.debug(
+                f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})"
+            )
             return genai.Client(
                 vertexai=True,
                 project=self.valves.VERTEX_PROJECT,
@@ -195,9 +193,7 @@ class Pipe:
         if self.valves.USE_VERTEX_AI:
             if not self.valves.VERTEX_PROJECT:
                 self.log.error("USE_VERTEX_AI is true, but VERTEX_PROJECT is not set.")
-                raise ValueError(
-                    "VERTEX_PROJECT is not set. Please provide the Google Cloud project ID."
-                )
+                raise ValueError("VERTEX_PROJECT is not set. Please provide the Google Cloud project ID.")
             # For Vertex AI, location has a default, so project is the main thing to check.
             # Actual authentication will be handled by ADC or environment.
             self.log.debug("Using Vertex AI. Ensure ADC or service account is configured.")
@@ -233,12 +229,14 @@ class Pipe:
         """
         # Check cache first
         current_time = time.time()
-        if (not force_refresh and 
-            self._model_cache is not None and 
-            (current_time - self._model_cache_time) < self.valves.MODEL_CACHE_TTL):
+        if (
+            not force_refresh
+            and self._model_cache is not None
+            and (current_time - self._model_cache_time) < self.valves.MODEL_CACHE_TTL
+        ):
             self.log.debug("Using cached model list")
             return self._model_cache
-            
+
         try:
             client = self._get_client()
             self.log.debug("Fetching models from Google API")
@@ -247,16 +245,18 @@ class Pipe:
             for model in models:
                 actions = model.supported_actions
                 if actions is None or "generateContent" in actions:
-                    available_models.append({
-                        "id": self.strip_prefix(model.name),
-                        "name": model.display_name or self.strip_prefix(model.name),
-                    })
+                    available_models.append(
+                        {
+                            "id": self.strip_prefix(model.name),
+                            "name": model.display_name or self.strip_prefix(model.name),
+                        }
+                    )
 
-            model_map = {model['id']: model for model in available_models}
+            model_map = {model["id"]: model for model in available_models}
 
             # Filter map to only include models starting with 'gemini-'
             filtered_models = {k: v for k, v in model_map.items() if k.startswith("gemini-")}
-            
+
             # Update cache
             self._model_cache = list(filtered_models.values())
             self._model_cache_time = current_time
@@ -266,9 +266,7 @@ class Pipe:
         except Exception as e:
             self.log.exception(f"Could not fetch models from Google: {str(e)}")
             # Return a specific error entry for the UI
-            return [
-                {"id": "error", "name": f"Could not fetch models: {str(e)}"}
-            ]
+            return [{"id": "error", "name": f"Could not fetch models: {str(e)}"}]
 
     def pipes(self) -> List[Dict[str, str]]:
         """
@@ -292,13 +290,13 @@ class Pipe:
     def _prepare_model_id(self, model_id: str) -> str:
         """
         Prepare and validate the model ID for use with the API.
-        
+
         Args:
             model_id: The original model ID from the user
-            
+
         Returns:
             Properly formatted model ID
-            
+
         Raises:
             ValueError: If the model ID is invalid or unsupported
         """
@@ -308,7 +306,7 @@ class Pipe:
         # If the model ID doesn't look like a Gemini model, try to find it by name
         if not model_id.startswith("gemini-"):
             models_list = self.get_google_models()
-            found_model = next((m['id'] for m in models_list if m['name'] == original_model_id), None)
+            found_model = next((m["id"] for m in models_list if m["name"] == original_model_id), None)
             if found_model and found_model.startswith("gemini-"):
                 model_id = found_model
                 self.log.debug(f"Mapped model name '{original_model_id}' to model ID '{model_id}'")
@@ -317,16 +315,16 @@ class Pipe:
                 if not model_id.startswith("gemini-"):
                     self.log.error(f"Invalid or unsupported model ID: '{original_model_id}'")
                     raise ValueError(f"Invalid or unsupported Google model ID or name: '{original_model_id}'")
-        
+
         return model_id
 
     def _prepare_content(self, messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
-        
+
         Args:
             messages: List of message objects from the request
-            
+
         Returns:
             Tuple of (prepared content list, system message string or None)
         """
@@ -345,7 +343,7 @@ class Pipe:
 
             content = message.get("content", "")
             parts = []
-            
+
             # Handle different content types
             if isinstance(content, list):  # Multimodal content
                 parts.extend(self._process_multimodal_content(content))
@@ -365,39 +363,41 @@ class Pipe:
     def _process_multimodal_content(self, content_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Process multimodal content (text and images).
-        
+
         Args:
             content_list: List of content items
-            
+
         Returns:
             List of processed parts for the Gemini API
         """
         parts = []
-        
+
         for item in content_list:
             if item.get("type") == "text":
                 parts.append({"text": item.get("text", "")})
             elif item.get("type") == "image_url":
                 image_url = item.get("image_url", {}).get("url", "")
-                
+
                 if image_url.startswith("data:image"):
                     # Handle base64 encoded image data
                     try:
                         header, encoded = image_url.split(",", 1)
                         mime_type = header.split(":")[1].split(";")[0]
-                        
+
                         # Basic validation for image types
                         if mime_type not in ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]:
                             self.log.warning(f"Unsupported image mime type: {mime_type}")
                             parts.append({"text": f"[Image type {mime_type} not supported]"})
                             continue
-                            
-                        parts.append({
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": encoded,
+
+                        parts.append(
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": encoded,
+                                }
                             }
-                        })
+                        )
                     except Exception as img_ex:
                         self.log.exception(f"Could not parse image data URL: {img_ex}")
                         parts.append({"text": "[Image data could not be processed]"})
@@ -405,17 +405,19 @@ class Pipe:
                     # Gemini API doesn't directly support image URLs
                     self.log.warning(f"Direct image URLs not supported: {image_url}")
                     parts.append({"text": f"[Image URL not processed: {image_url}]"})
-        
+
         return parts
 
-    def _configure_generation(self, body: Dict[str, Any], system_instruction: Optional[str] = None) -> types.GenerateContentConfig:
+    def _configure_generation(
+        self, body: Dict[str, Any], system_instruction: Optional[str] = None
+    ) -> types.GenerateContentConfig:
         """
         Configure generation parameters and safety settings.
-        
+
         Args:
             body: The request body containing generation parameters
             system_instruction: Optional system instruction string
-            
+
         Returns:
             types.GenerateContentConfig
         """
@@ -435,7 +437,7 @@ class Pipe:
                 types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
                 types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
             ]
-            gen_config_params |= {"safety_settings": safety_settings},
+            gen_config_params |= {"safety_settings": safety_settings}
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -444,10 +446,10 @@ class Pipe:
     async def _handle_streaming_response(self, response_iterator: Any) -> AsyncIterator[str]:
         """
         Handle streaming response from Gemini API.
-        
+
         Args:
             response_iterator: Iterator from generate_content
-            
+
         Returns:
             Generator yielding text chunks
         """
@@ -461,7 +463,7 @@ class Pipe:
                     else:
                         yield "[Blocked by safety settings]"
                     return  # Stop generation
-                
+
                 if chunk.text:
                     yield chunk.text
         except Exception as e:
@@ -471,21 +473,21 @@ class Pipe:
     def _handle_standard_response(self, response: Any) -> str:
         """
         Handle non-streaming response from Gemini API.
-        
+
         Args:
             response: Response from generate_content
-            
+
         Returns:
             Generated text or error message
         """
         # Check for prompt safety blocks
         if response.prompt_feedback and response.prompt_feedback.block_reason:
             return f"[Blocked due to Prompt Safety: {response.prompt_feedback.block_reason.name}]"
-            
+
         # Check for missing candidates
         if not response.candidates:
             return "[Blocked by safety settings or no candidates generated]"
-        
+
         # Check candidate finish reason
         candidate = response.candidates[0]
         if candidate.finish_reason == types.FinishReason.SAFETY:
@@ -493,32 +495,32 @@ class Pipe:
             blocking_rating = next((r for r in candidate.safety_ratings if r.blocked), None)
             reason = f" ({blocking_rating.category.name})" if blocking_rating else ""
             return f"[Blocked by safety settings{reason}]"
-        
+
         # Process content parts
         if candidate.content and candidate.content.parts:
             # Combine text from all parts
-            return "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+            return "".join(part.text for part in candidate.content.parts if hasattr(part, "text"))
         else:
             return "[No content generated or unexpected response structure]"
 
     async def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
         """
         Retry a function with exponential backoff.
-        
+
         Args:
             func: Async function to retry
             *args, **kwargs: Arguments to pass to the function
-            
+
         Returns:
             Result from the function
-            
+
         Raises:
             The last exception encountered after all retries
         """
         max_retries = self.valves.RETRY_COUNT
         retry_count = 0
         last_exception = None
-        
+
         while retry_count <= max_retries:
             try:
                 return await func(*args, **kwargs)
@@ -526,11 +528,13 @@ class Pipe:
                 # These errors might be temporary, so retry
                 retry_count += 1
                 last_exception = e
-                
+
                 if retry_count <= max_retries:
                     # Calculate backoff time (exponential with jitter)
-                    wait_time = min(2 ** retry_count + (0.1 * retry_count), 10)
-                    self.log.warning(f"Temporary error from Google API: {e}. Retrying in {wait_time:.1f}s ({retry_count}/{max_retries})")
+                    wait_time = min(2**retry_count + (0.1 * retry_count), 10)
+                    self.log.warning(
+                        f"Temporary error from Google API: {e}. Retrying in {wait_time:.1f}s ({retry_count}/{max_retries})"
+                    )
                     await asyncio.sleep(wait_time)
                 else:
                     raise
@@ -542,9 +546,7 @@ class Pipe:
         assert last_exception is not None
         raise last_exception
 
-    async def pipe(
-        self, body: Dict[str, Any]
-    ) -> Union[str, AsyncIterator[str]]:
+    async def pipe(self, body: Dict[str, Any]) -> Union[str, AsyncIterator[str]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
@@ -570,46 +572,48 @@ class Pipe:
             # Get stream flag
             stream = body.get("stream", False)
             messages = body.get("messages", [])
-            
+
             # Prepare content and extract system message
             contents, system_instruction = self._prepare_content(messages)
             if not contents:
                 return "Error: No valid message content found"
-                
+
             # Configure generation parameters and safety settings
             generation_config = self._configure_generation(body, system_instruction)
-            
+
             # Make the API call
             client = self._get_client()
             if stream:
                 try:
+
                     async def get_streaming_response():
                         return await client.aio.models.generate_content_stream(
                             model=model_id,
                             contents=contents,
                             config=generation_config,
                         )
-                    
+
                     response_iterator = await self._retry_with_backoff(get_streaming_response)
                     self.log.debug(f"Request {request_id}: Got streaming response")
                     return self._handle_streaming_response(response_iterator)
-                    
+
                 except Exception as e:
                     self.log.exception(f"Error in streaming request {request_id}: {e}")
                     return f"Error during streaming: {e}"
             else:
                 try:
+
                     async def get_response():
                         return await client.aio.models.generate_content(
                             model=model_id,
                             contents=contents,
                             config=generation_config,
                         )
-                    
+
                     response = await self._retry_with_backoff(get_response)
                     self.log.debug(f"Request {request_id}: Got non-streaming response")
                     return self._handle_standard_response(response)
-                    
+
                 except Exception as e:
                     self.log.exception(f"Error in non-streaming request {request_id}: {e}")
                     return f"Error generating content: {e}"
@@ -618,27 +622,28 @@ class Pipe:
             error_msg = f"Client error raised by the GenAI API: {ce}."
             self.log.error(f"Client error: {ce}")
             return error_msg
-            
+
         except ServerError as se:
             error_msg = f"Server error raised by the GenAI API: {se}"
-            self.log.error(f"Server error raised by the GenAI API.: {se}")
+            self.log.error(f"Server error raised by the GenAI API: {se}")
             return error_msg
-        
+
         except APIError as apie:
             error_msg = f"Google API Error: {apie}"
             self.log.error(error_msg)
             return error_msg
-            
+
         except ValueError as ve:
             error_msg = f"Configuration error: {ve}"
             self.log.error(f"Value error: {ve}")
             return error_msg
-            
+
         except Exception as e:
             # Log the full error with traceback
             import traceback
+
             error_trace = traceback.format_exc()
             self.log.exception(f"Unexpected error: {e}\n{error_trace}")
-            
+
             # Return a user-friendly error message
             return f"An error occurred while processing your request: {e}"
