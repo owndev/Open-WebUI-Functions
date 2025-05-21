@@ -14,7 +14,7 @@ features:
   - Streaming response handling with safety checks
   - Support for multimodal input (text and images)
   - Flexible error handling and logging
-  - Integration with Google Generative AI API for content generation
+  - Integration with Google Generative AI or Vertex AI API for content generation
   - Support for various generation parameters (temperature, max tokens, etc.)
   - Customizable safety settings based on environment variables
   - Encrypted storage of sensitive API keys
@@ -30,7 +30,7 @@ import logging
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError, APIError
-from typing import List, Union, Iterator, Optional, Dict, Any, Tuple, cast
+from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -440,7 +440,7 @@ class Pipe:
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
         return types.GenerateContentConfig(**filtered_params)
 
-    def _handle_streaming_response(self, response_iterator: Any) -> Iterator[str]:
+    async def _handle_streaming_response(self, response_iterator: Any) -> AsyncIterator[str]:
         """
         Handle streaming response from Gemini API.
         
@@ -451,7 +451,7 @@ class Pipe:
             Generator yielding text chunks
         """
         try:
-            for chunk in response_iterator:
+            async for chunk in response_iterator:
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
                     # Check prompt feedback
@@ -543,7 +543,7 @@ class Pipe:
 
     async def pipe(
         self, body: Dict[str, Any]
-    ) -> Union[str, Iterator[str]]:
+    ) -> Union[str, AsyncIterator[str]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
@@ -558,7 +558,6 @@ class Pipe:
         self.log.debug(f"Processing request {request_id}")
 
         try:
-
             # Parse and validate model ID
             model_id = body.get("model", "")
             try:
