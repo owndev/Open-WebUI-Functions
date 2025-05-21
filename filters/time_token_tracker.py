@@ -38,6 +38,7 @@ start_time = 0
 request_token_count = 0
 response_token_count = 0
 
+
 # Simplified encryption implementation with automatic handling
 class EncryptedStr(str):
     """A string type that automatically handles encryption/decryption"""
@@ -119,6 +120,7 @@ class EncryptedStr(str):
         """Get the decrypted value"""
         return self.decrypt(self)
 
+
 # Helper functions
 async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
@@ -135,6 +137,7 @@ async def cleanup_response(
         response.close()
     if session:
         await session.close()
+
 
 class Filter:
     class Valves(BaseModel):
@@ -159,13 +162,16 @@ class Filter:
             default=True, description="Show tokens per second for the response."
         )
         SEND_TO_LOG_ANALYTICS: bool = Field(
-            default=bool(os.getenv("SEND_TO_LOG_ANALYTICS", False)), description="Send logs to Azure Log Analytics workspace"
+            default=bool(os.getenv("SEND_TO_LOG_ANALYTICS", False)),
+            description="Send logs to Azure Log Analytics workspace",
         )
         LOG_ANALYTICS_WORKSPACE_ID: str = Field(
-            default=os.getenv("LOG_ANALYTICS_WORKSPACE_ID", ""), description="Azure Log Analytics Workspace ID"
+            default=os.getenv("LOG_ANALYTICS_WORKSPACE_ID", ""),
+            description="Azure Log Analytics Workspace ID",
         )
         LOG_ANALYTICS_SHARED_KEY: EncryptedStr = Field(
-            default=os.getenv("LOG_ANALYTICS_SHARED_KEY", ""), description="Azure Log Analytics Workspace Shared Key"
+            default=os.getenv("LOG_ANALYTICS_SHARED_KEY", ""),
+            description="Azure Log Analytics Workspace Shared Key",
         )
         LOG_ANALYTICS_LOG_TYPE: str = Field(
             default="OpenWebuiMetrics", description="Log Analytics log type name."
@@ -190,7 +196,9 @@ class Filter:
             + resource
         )
         bytes_to_hash = string_to_hash.encode("utf-8")
-        decoded_key = base64.b64decode(self.valves.LOG_ANALYTICS_SHARED_KEY.get_decrypted())        
+        decoded_key = base64.b64decode(
+            self.valves.LOG_ANALYTICS_SHARED_KEY.get_decrypted()
+        )
         encoded_hash = base64.b64encode(
             hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()
         ).decode("utf-8")
@@ -198,7 +206,7 @@ class Filter:
             f"SharedKey {self.valves.LOG_ANALYTICS_WORKSPACE_ID}:{encoded_hash}"
         )
         return authorization
-            
+
     async def _send_to_log_analytics_async(self, data):
         """Send data to Azure Log Analytics asynchronously using aiohttp."""
         if (
@@ -207,16 +215,18 @@ class Filter:
             or not self.valves.LOG_ANALYTICS_SHARED_KEY
         ):
             return False
-        
+
         log = logging.getLogger("time_token_tracker._send_to_log_analytics_async")
         log.setLevel(SRC_LOG_LEVELS["OPENAI"])
 
         method = "POST"
         content_type = "application/json"
         resource = "/api/logs"
-        rfc1123date = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        rfc1123date = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%a, %d %b %Y %H:%M:%S GMT"
+        )
         content_length = len(json.dumps(data))
-        
+
         signature = self._build_signature(
             rfc1123date, content_length, method, content_type, resource
         )
@@ -233,20 +243,20 @@ class Filter:
 
         session = None
         response = None
-        
+
         try:
             session = aiohttp.ClientSession(
                 trust_env=True,
                 timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
-            
+
             response = await session.request(
                 method="POST",
                 url=uri,
                 json=data,
                 headers=headers,
             )
-            
+
             if response.status == 200:
                 return True
             else:
@@ -255,9 +265,11 @@ class Filter:
                     f"Error sending to Log Analytics: {response.status} - {response_text}"
                 )
                 return False
-                
+
         except Exception as e:
-            log.error(f"Exception when sending to Log Analytics asynchronously: {str(e)}")
+            log.error(
+                f"Exception when sending to Log Analytics asynchronously: {str(e)}"
+            )
             return False
         finally:
             await cleanup_response(response, session)
@@ -313,15 +325,15 @@ class Filter:
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""
         content = message.get("content", "")
-        
+
         # Handle None content
         if content is None:
             content = ""
-            
+
         # Handle string content
         if isinstance(content, str):
             return content
-            
+
         # Handle list content (e.g., for messages with multiple content parts)
         if isinstance(content, list):
             text_parts = []
@@ -333,23 +345,23 @@ class Filter:
                     # Try to convert other types to string
                     try:
                         text_parts.append(str(part))
-                    except:
+                    except:  # noqa: E722
                         pass
             return " ".join(text_parts)
-            
+
         # Handle function_call in message
         if message.get("function_call"):
             try:
                 func_call = message["function_call"]
                 func_str = f"function: {func_call.get('name', '')}, arguments: {func_call.get('arguments', '')}"
                 return func_str
-            except:
+            except:  # noqa: E722
                 return ""
-                
+
         # If nothing else works, try converting to string or return empty
         try:
             return str(content)
-        except:
+        except:  # noqa: E722
             return ""
 
     async def outlet(
@@ -370,7 +382,9 @@ class Filter:
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
 
-        reversed_messages = list(reversed(all_messages))        # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
+        reversed_messages = list(
+            reversed(all_messages)
+        )  # If CALCULATE_ALL_MESSAGES is true, use all "assistant" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
             assistant_messages = [
                 m for m in all_messages if m.get("role") == "assistant"
@@ -386,7 +400,7 @@ class Filter:
             len(encoding.encode(self._get_message_content(m)))
             for m in assistant_messages
             if m
-        )        # Calculate tokens per second (only for the last assistant response)
+        )  # Calculate tokens per second (only for the last assistant response)
         resp_tokens_per_sec = 0
         if self.valves.SHOW_TOKENS_PER_SECOND:
             last_assistant_msg = next(
@@ -394,7 +408,8 @@ class Filter:
             )
             last_assistant_tokens = (
                 len(encoding.encode(self._get_message_content(last_assistant_msg)))
-                if last_assistant_msg else 0
+                if last_assistant_msg
+                else 0
             )
             resp_tokens_per_sec = (
                 0 if response_time == 0 else last_assistant_tokens / response_time
@@ -462,17 +477,17 @@ class Filter:
             # Add averages if calculated
             if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 log_data[0]["avgRequestTokens"] = avg_request_tokens
-                log_data[0]["avgResponseTokens"] = avg_response_tokens            
-            
+                log_data[0]["avgResponseTokens"] = avg_response_tokens
+
             # Send to Log Analytics asynchronously (non-blocking)
             try:
                 result = await self._send_to_log_analytics_async(log_data)
                 if result:
-                    log.info(f"Log Analytics data sent successfully")
+                    log.info("Log Analytics data sent successfully")
                 else:
-                    log.warning(f"Failed to send data to Log Analytics")
+                    log.warning("Failed to send data to Log Analytics")
             except Exception as e:
-                # Handle exceptions during sending to Log Analytics                
+                # Handle exceptions during sending to Log Analytics
                 log.error(f"Error sending to Log Analytics: {e}")
-                
+
         return body
