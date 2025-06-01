@@ -98,20 +98,6 @@ GOOGLE_CLOUD_LOCATION="your-gcp-location"
 
 Grounding with Google search is enabled/disabled with the `google_search_tool` feature, which can be switched on/off in a Filter.
 
-For instance, the following Filter will replace Open Web UI default web search function with google search grounding
-
-```python
-class Filter:
-    def inlet(self, body: dict) -> dict:
-        features = body.get("features", {})
-
-        metadata = body.setdefault("metadata", {})
-        metadata_features = metadata.setdefault("features", {})
-
-        if features.pop("web_search"):
-            metadata_features["google_search_tool"] = True
-        
-        return body
-```
+For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with google search grounding.
 
 When enabled, sources and google queries used by Gemini will be displayed with the response.

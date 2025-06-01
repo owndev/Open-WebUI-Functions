@@ -141,6 +141,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Supports encryption of sensitive information like API keys.
 - Supports both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
+- Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://own.dev/openwebui-com-f-owndev-google-gemini)
 
