@@ -1,10 +1,10 @@
 """
 title: Google Gemini Pipeline
-author: owndev
+author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.1.1
+version: 1.2.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Google Gemini models, including dynamic model specification, streaming responses, and flexible error handling.
 features:
@@ -18,6 +18,7 @@ features:
   - Support for various generation parameters (temperature, max tokens, etc.)
   - Customizable safety settings based on environment variables
   - Encrypted storage of sensitive API keys
+  - Grounding with Google search
 """
 
 import os
@@ -30,7 +31,7 @@ import logging
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError, APIError
-from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator
+from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -443,7 +444,10 @@ class Pipe:
         return parts
 
     def _configure_generation(
-        self, body: Dict[str, Any], system_instruction: Optional[str] = None
+        self,
+        body: Dict[str, Any],
+        system_instruction: Optional[str],
+        features: Dict[str, Any],
     ) -> types.GenerateContentConfig:
         """
         Configure generation parameters and safety settings.
@@ -481,12 +485,46 @@ class Pipe:
             ]
             gen_config_params |= ({"safety_settings": safety_settings},)
 
+        if features.get("google_search_tool", False):
+            self.log.debug("Enabling Google search grounding")
+            gen_config_params.setdefault("tools", []).append(
+                types.Tool(google_search=types.GoogleSearch())
+            )
+
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
         return types.GenerateContentConfig(**filtered_params)
 
+    @staticmethod
+    def _format_grounding_chunks_as_sources(
+        grounding_chunks: list[types.GroundingChunk],
+    ):
+        formatted_sources = []
+        for chunk in grounding_chunks:
+            context = chunk.web or chunk.retrieved_context
+            if not context:
+                continue
+
+            uri = context.uri
+            title = context.title or "Source"
+
+            formatted_sources.append(
+                {
+                    "source": {
+                        "name": title,
+                        "type": "web_search_results",
+                        "url": uri,
+                    },
+                    "document": ["Click the link to view the content."],
+                    "metadata": [{"source": title}],
+                }
+            )
+        return formatted_sources
+
     async def _handle_streaming_response(
-        self, response_iterator: Any
+        self,
+        response_iterator: Any,
+        __event_emitter__: Callable,
     ) -> AsyncIterator[str]:
         """
         Handle streaming response from Gemini API.
@@ -497,6 +535,8 @@ class Pipe:
         Returns:
             Generator yielding text chunks
         """
+        web_search_queries = []
+        grounding_chunks = []
         try:
             async for chunk in response_iterator:
                 # Check for safety feedback or empty chunks
@@ -511,8 +551,39 @@ class Pipe:
                         yield "[Blocked by safety settings]"
                     return  # Stop generation
 
+                grounding_metadata = chunk.candidates[0].grounding_metadata
+                if grounding_metadata and grounding_metadata.grounding_chunks:
+                    grounding_chunks.extend(grounding_metadata.grounding_chunks)
+                if grounding_metadata and grounding_metadata.web_search_queries:
+                    web_search_queries.extend(grounding_metadata.web_search_queries)
+
                 if chunk.text:
                     yield chunk.text
+
+            # After processing all chunks, handle grounding data
+            # Add sources to the response
+            if grounding_chunks and __event_emitter__:
+                sources = self._format_grounding_chunks_as_sources(grounding_chunks)
+                await __event_emitter__(
+                    {"type": "chat:completion", "data": {"sources": sources}}
+                )
+
+            # Add status specifying google queries used for grounding
+            if web_search_queries and __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": "This response was grounded with Google Search",
+                            "urls": [
+                                f"https://www.google.com/search?q={query}"
+                                for query in web_search_queries
+                            ],
+                        },
+                    }
+                )
+
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
             yield f"Error during streaming: {e}"
@@ -597,7 +668,12 @@ class Pipe:
         assert last_exception is not None
         raise last_exception
 
-    async def pipe(self, body: Dict[str, Any]) -> Union[str, AsyncIterator[str]]:
+    async def pipe(
+        self,
+        body: Dict[str, Any],
+        __metadata__: dict[str, Any],
+        __event_emitter__: Callable,
+    ) -> Union[str, AsyncIterator[str]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
@@ -630,7 +706,10 @@ class Pipe:
                 return "Error: No valid message content found"
 
             # Configure generation parameters and safety settings
-            generation_config = self._configure_generation(body, system_instruction)
+            features = __metadata__.get("features", {})
+            generation_config = self._configure_generation(
+                body, system_instruction, features
+            )
 
             # Make the API call
             client = self._get_client()
@@ -648,7 +727,9 @@ class Pipe:
                         get_streaming_response
                     )
                     self.log.debug(f"Request {request_id}: Got streaming response")
-                    return self._handle_streaming_response(response_iterator)
+                    return self._handle_streaming_response(
+                        response_iterator, __event_emitter__
+                    )
 
                 except Exception as e:
                     self.log.exception(f"Error in streaming request {request_id}: {e}")
