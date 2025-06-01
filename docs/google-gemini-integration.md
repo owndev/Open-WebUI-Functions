@@ -40,6 +40,9 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Customizable Generation Settings**  
   Use environment variables to configure token limits, temperature, etc.
 
+- **Grounding with Google search**
+  Improve the accuracy and recency of Gemini responses with Google search grounding   
+
 ## Environment Variables
 
 Set the following environment variables to configure the Google Gemini integration.
@@ -90,3 +93,25 @@ GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
 # Defaults to "global" if not set.
 GOOGLE_CLOUD_LOCATION="your-gcp-location"
 ```
+
+## Grounding with Google search
+
+Grounding with Google search is enabled/disabled with the `google_search_tool` feature, which can be switched on/off in a Filter.
+
+For instance, the following Filter will replace Open Web UI default web search function with google search grounding
+
+```python
+class Filter:
+    def inlet(self, body: dict) -> dict:
+        features = body.get("features", {})
+
+        metadata = body.setdefault("metadata", {})
+        metadata_features = metadata.setdefault("features", {})
+
+        if features.pop("web_search"):
+            metadata_features["google_search_tool"] = True
+        
+        return body
+```
+
+When enabled, sources and google queries used by Gemini will be displayed with the response.
