@@ -25,13 +25,13 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions.
 
-- **Flexible Error Handling**
+- **Flexible Error Handling**  
   Retries failed requests and logs errors for transparency.
 
-- **Integration with Google Generative AI or Vertex AI API**
+- **Integration with Google Generative AI or Vertex AI API**  
   Connect using either the Google Generative AI API or Google Cloud Vertex AI for content generation.
 
-- **Secure API Key Storage**
+- **Secure API Key Storage**  
   API keys (for the Google Generative AI API method) are encrypted and never exposed in plaintext.
 
 - **Safety Configuration**  
@@ -40,8 +40,8 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Customizable Generation Settings**  
   Use environment variables to configure token limits, temperature, etc.
 
-- **Grounding with Google search**
-  Improve the accuracy and recency of Gemini responses with Google search grounding   
+- **Grounding with Google search**  
+  Improve the accuracy and recency of Gemini responses with Google search grounding.
 
 ## Environment Variables
 

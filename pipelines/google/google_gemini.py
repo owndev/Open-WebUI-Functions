@@ -18,6 +18,7 @@ features:
   - Support for various generation parameters (temperature, max tokens, etc.)
   - Customizable safety settings based on environment variables
   - Encrypted storage of sensitive API keys
+  - Grounding with Google search
 """
 
 import os
