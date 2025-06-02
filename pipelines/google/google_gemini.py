@@ -537,6 +537,8 @@ class Pipe:
             )
 
         if __metadata__.get("function_calling") == "native":
+            if __tools__ is None:
+                __tools__ = {}
             for name, tool_def in __tools__.items():
                 tool = self._create_tool(tool_def)
                 self.log.debug(
