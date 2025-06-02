@@ -43,6 +43,9 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Grounding with Google search**  
   Improve the accuracy and recency of Gemini responses with Google search grounding.
 
+- **Native tool calling support**
+  Leverage Google genai native function calling to orchestrate the use of tools
+
 ## Environment Variables
 
 Set the following environment variables to configure the Google Gemini integration.
@@ -101,3 +104,7 @@ Grounding with Google search is enabled/disabled with the `google_search_tool` f
 For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with google search grounding.
 
 When enabled, sources and google queries used by Gemini will be displayed with the response.
+
+## Native tool calling support
+
+Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.

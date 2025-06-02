@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.2.0
+version: 1.3.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Google Gemini models, including dynamic model specification, streaming responses, and flexible error handling.
 features:
@@ -19,9 +19,12 @@ features:
   - Customizable safety settings based on environment variables
   - Encrypted storage of sensitive API keys
   - Grounding with Google search
+  - Native tool calling support
 """
 
 import os
+import inspect
+from functools import update_wrapper
 import re
 import time
 import asyncio
@@ -443,11 +446,52 @@ class Pipe:
 
         return parts
 
+    @staticmethod
+    def _create_tool(tool_def):
+        """OpenwebUI tool is a functools.partial coroutine, which genai does not support directly.
+        See https://github.com/googleapis/python-genai/issues/907
+
+        This function wraps the tool into a callable that can be used with genai.
+        In particular, it sets the signature of the function properly,
+        removing any frozen keyword arguments (extra_params).
+        """
+        bound_callable = tool_def["callable"]
+
+        # Create a wrapper for bound_callable, which is always async
+        async def wrapper(*args, **kwargs):
+            return await bound_callable(*args, **kwargs)
+
+        # Remove 'frozen' keyword arguments (extra_params) from the signature
+        original_sig = inspect.signature(bound_callable)
+        frozen_kwargs = bound_callable.keywords
+        new_parameters = []
+
+        for name, parameter in original_sig.parameters.items():
+            # Exclude keyword arguments that are frozen
+            if name in frozen_kwargs and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                continue
+            # Keep remaining parameters
+            new_parameters.append(parameter)
+
+        new_sig = inspect.Signature(
+            parameters=new_parameters, return_annotation=original_sig.return_annotation
+        )
+
+        # Ensure name, docstring and signature are properly set
+        update_wrapper(wrapper, bound_callable)
+        wrapper.__signature__ = new_sig
+
+        return wrapper
+
     def _configure_generation(
         self,
         body: Dict[str, Any],
         system_instruction: Optional[str],
-        features: Dict[str, Any],
+        __metadata__: Dict[str, Any],
+        __tools__: dict[str, Any] | None = None,
     ) -> types.GenerateContentConfig:
         """
         Configure generation parameters and safety settings.
@@ -485,11 +529,23 @@ class Pipe:
             ]
             gen_config_params |= ({"safety_settings": safety_settings},)
 
+        features = __metadata__.get("features", {})
         if features.get("google_search_tool", False):
             self.log.debug("Enabling Google search grounding")
             gen_config_params.setdefault("tools", []).append(
                 types.Tool(google_search=types.GoogleSearch())
             )
+
+        if __metadata__.get("function_calling") == "native":
+            if __tools__ is None:
+                __tools__ = {}
+            for name, tool_def in __tools__.items():
+                tool = self._create_tool(tool_def)
+                self.log.debug(
+                    f"Adding tool '{name}' with signature {tool.__signature__}"
+                )
+
+                gen_config_params.setdefault("tools", []).append(tool)
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -673,6 +729,7 @@ class Pipe:
         body: Dict[str, Any],
         __metadata__: dict[str, Any],
         __event_emitter__: Callable,
+        __tools__: dict[str, Any] | None,
     ) -> Union[str, AsyncIterator[str]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
@@ -706,9 +763,8 @@ class Pipe:
                 return "Error: No valid message content found"
 
             # Configure generation parameters and safety settings
-            features = __metadata__.get("features", {})
             generation_config = self._configure_generation(
-                body, system_instruction, features
+                body, system_instruction, __metadata__, __tools__
             )
 
             # Make the API call
