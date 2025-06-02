@@ -463,7 +463,14 @@ class Pipe:
 
         # Remove 'frozen' keyword arguments (extra_params) from the signature
         original_sig = inspect.signature(bound_callable)
-        frozen_kwargs = bound_callable.keywords
+        frozen_kwargs = {
+            "__event_emitter__",
+            "__event_call__",
+            "__user__",
+            "__metadata__",
+            "__request__",
+            "__model__",
+        }
         new_parameters = []
 
         for name, parameter in original_sig.parameters.items():
@@ -536,9 +543,7 @@ class Pipe:
                 types.Tool(google_search=types.GoogleSearch())
             )
 
-        if __metadata__.get("function_calling") == "native":
-            if __tools__ is None:
-                __tools__ = {}
+        if __tools__ is not None and __metadata__.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
                 tool = self._create_tool(tool_def)
                 self.log.debug(
