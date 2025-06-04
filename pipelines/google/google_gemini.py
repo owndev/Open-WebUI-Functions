@@ -598,6 +598,8 @@ class Pipe:
         """
         web_search_queries = []
         grounding_chunks = []
+        grounding_supports = []
+        text_chunks = []
         try:
             async for chunk in response_iterator:
                 # Check for safety feedback or empty chunks
@@ -617,8 +619,11 @@ class Pipe:
                     grounding_chunks.extend(grounding_metadata.grounding_chunks)
                 if grounding_metadata and grounding_metadata.web_search_queries:
                     web_search_queries.extend(grounding_metadata.web_search_queries)
+                if grounding_metadata and grounding_metadata.grounding_supports:
+                    grounding_supports.extend(grounding_metadata.grounding_supports)
 
                 if chunk.text:
+                    text_chunks.append(chunk.text)
                     yield chunk.text
 
             # After processing all chunks, handle grounding data
@@ -642,6 +647,42 @@ class Pipe:
                                 for query in web_search_queries
                             ],
                         },
+                    }
+                )
+
+            # Add citations in the text body
+            if grounding_supports and __event_emitter__:
+                text = "".join(text_chunks)
+                # Citation indexes are in bytes
+                ENCODING = "utf-8"
+                text_bytes = text.encode(ENCODING)
+                last_byte_index = 0
+                cited_chunks = []
+
+                for support in grounding_supports:
+                    cited_chunks.append(
+                        text_bytes[last_byte_index : support.segment.end_index].decode(
+                            ENCODING
+                        )
+                    )
+
+                    # Generate and append citations (e.g., "[1][2]")
+                    footnotes = "".join(
+                        [f"[{i + 1}]" for i in support.grounding_chunk_indices]
+                    )
+                    cited_chunks.append(f" {footnotes}")
+
+                    # Update index for the next segment
+                    last_byte_index = support.segment.end_index
+
+                # Append any remaining text after the last citation
+                if last_byte_index < len(text_bytes):
+                    cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
+
+                await __event_emitter__(
+                    {
+                        "type": "replace",
+                        "data": {"content": "".join(cited_chunks)},
                     }
                 )
 
