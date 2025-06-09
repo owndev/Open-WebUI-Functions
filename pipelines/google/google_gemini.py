@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.3.1
+version: 1.3.2
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Google Gemini models, including dynamic model specification, streaming responses, and flexible error handling.
 features:
@@ -534,7 +534,7 @@ class Pipe:
                     category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
                 ),
             ]
-            gen_config_params |= ({"safety_settings": safety_settings},)
+            gen_config_params |= {"safety_settings": safety_settings}
 
         features = __metadata__.get("features", {})
         if features.get("google_search_tool", False):
