@@ -534,7 +534,7 @@ class Pipe:
                     category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
                 ),
             ]
-            gen_config_params |= ({"safety_settings": safety_settings},)
+            gen_config_params |= {"safety_settings": safety_settings}
 
         features = __metadata__.get("features", {})
         if features.get("google_search_tool", False):
