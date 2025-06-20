@@ -582,6 +582,83 @@ class Pipe:
             )
         return formatted_sources
 
+    async def _process_grounding_metadata(
+        self,
+        grounding_metadata_list: List[types.GroundingMetadata],
+        text: str,
+        __event_emitter__: Callable,
+    ):
+        """Process and emit grounding metadata events."""
+        grounding_chunks = []
+        web_search_queries = []
+        grounding_supports = []
+
+        for metadata in grounding_metadata_list:
+            if metadata.grounding_chunks:
+                grounding_chunks.extend(metadata.grounding_chunks)
+            if metadata.web_search_queries:
+                web_search_queries.extend(metadata.web_search_queries)
+            if metadata.grounding_supports:
+                grounding_supports.extend(metadata.grounding_supports)
+
+        # Add sources to the response
+        if grounding_chunks:
+            sources = self._format_grounding_chunks_as_sources(grounding_chunks)
+            await __event_emitter__(
+                {"type": "chat:completion", "data": {"sources": sources}}
+            )
+
+        # Add status specifying google queries used for grounding
+        if web_search_queries:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "web_search",
+                        "description": "This response was grounded with Google Search",
+                        "urls": [
+                            f"https://www.google.com/search?q={query}"
+                            for query in web_search_queries
+                        ],
+                    },
+                }
+            )
+
+        # Add citations in the text body
+        if grounding_supports:
+            # Citation indexes are in bytes
+            ENCODING = "utf-8"
+            text_bytes = text.encode(ENCODING)
+            last_byte_index = 0
+            cited_chunks = []
+
+            for support in grounding_supports:
+                cited_chunks.append(
+                    text_bytes[last_byte_index : support.segment.end_index].decode(
+                        ENCODING
+                    )
+                )
+
+                # Generate and append citations (e.g., "[1][2]")
+                footnotes = "".join(
+                    [f"[{i + 1}]" for i in support.grounding_chunk_indices]
+                )
+                cited_chunks.append(f" {footnotes}")
+
+                # Update index for the next segment
+                last_byte_index = support.segment.end_index
+
+            # Append any remaining text after the last citation
+            if last_byte_index < len(text_bytes):
+                cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
+
+            await __event_emitter__(
+                {
+                    "type": "replace",
+                    "data": {"content": "".join(cited_chunks)},
+                }
+            )
+
     async def _handle_streaming_response(
         self,
         response_iterator: Any,
@@ -596,9 +673,7 @@ class Pipe:
         Returns:
             Generator yielding text chunks
         """
-        web_search_queries = []
-        grounding_chunks = []
-        grounding_supports = []
+        grounding_metadata_list = []
         text_chunks = []
         try:
             async for chunk in response_iterator:
@@ -614,76 +689,26 @@ class Pipe:
                         yield "[Blocked by safety settings]"
                     return  # Stop generation
 
-                grounding_metadata = chunk.candidates[0].grounding_metadata
-                if grounding_metadata and grounding_metadata.grounding_chunks:
-                    grounding_chunks.extend(grounding_metadata.grounding_chunks)
-                if grounding_metadata and grounding_metadata.web_search_queries:
-                    web_search_queries.extend(grounding_metadata.web_search_queries)
-                if grounding_metadata and grounding_metadata.grounding_supports:
-                    grounding_supports.extend(grounding_metadata.grounding_supports)
+                if chunk.candidates[0].grounding_metadata:
+                    grounding_metadata_list.append(
+                        chunk.candidates[0].grounding_metadata
+                    )
 
                 if chunk.text:
                     text_chunks.append(chunk.text)
-                    yield chunk.text
+                    await __event_emitter__(
+                        {
+                            "type": "chat:message:delta",
+                            "data": {
+                                "content": chunk.text,
+                            },
+                        }
+                    )
 
             # After processing all chunks, handle grounding data
-            # Add sources to the response
-            if grounding_chunks and __event_emitter__:
-                sources = self._format_grounding_chunks_as_sources(grounding_chunks)
-                await __event_emitter__(
-                    {"type": "chat:completion", "data": {"sources": sources}}
-                )
-
-            # Add status specifying google queries used for grounding
-            if web_search_queries and __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "action": "web_search",
-                            "description": "This response was grounded with Google Search",
-                            "urls": [
-                                f"https://www.google.com/search?q={query}"
-                                for query in web_search_queries
-                            ],
-                        },
-                    }
-                )
-
-            # Add citations in the text body
-            if grounding_supports and __event_emitter__:
-                text = "".join(text_chunks)
-                # Citation indexes are in bytes
-                ENCODING = "utf-8"
-                text_bytes = text.encode(ENCODING)
-                last_byte_index = 0
-                cited_chunks = []
-
-                for support in grounding_supports:
-                    cited_chunks.append(
-                        text_bytes[last_byte_index : support.segment.end_index].decode(
-                            ENCODING
-                        )
-                    )
-
-                    # Generate and append citations (e.g., "[1][2]")
-                    footnotes = "".join(
-                        [f"[{i + 1}]" for i in support.grounding_chunk_indices]
-                    )
-                    cited_chunks.append(f" {footnotes}")
-
-                    # Update index for the next segment
-                    last_byte_index = support.segment.end_index
-
-                # Append any remaining text after the last citation
-                if last_byte_index < len(text_bytes):
-                    cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
-
-                await __event_emitter__(
-                    {
-                        "type": "replace",
-                        "data": {"content": "".join(cited_chunks)},
-                    }
+            if grounding_metadata_list and __event_emitter__:
+                await self._process_grounding_metadata(
+                    grounding_metadata_list, "".join(text_chunks), __event_emitter__
                 )
 
         except Exception as e:
