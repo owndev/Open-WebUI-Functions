@@ -187,11 +187,6 @@ class Pipe:
             description="Azure Search index name for RAG",
         )
 
-        AZURE_SEARCH_PROJECT_RESOURCE_ID: str = Field(
-            default=os.getenv("AZURE_SEARCH_PROJECT_RESOURCE_ID", ""),
-            description="Azure Search project resource ID",
-        )
-
         AZURE_SEARCH_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_SEARCH_KEY", ""),
             description="Azure Search API key",
@@ -207,16 +202,6 @@ class Pipe:
         AZURE_SEARCH_SEMANTIC_CONFIGURATION: str = Field(
             default=os.getenv("AZURE_SEARCH_SEMANTIC_CONFIGURATION", "azureml-default"),
             description="Azure Search semantic configuration name",
-        )
-
-        AZURE_SEARCH_EMBEDDING_ENDPOINT: str = Field(
-            default=os.getenv("AZURE_SEARCH_EMBEDDING_ENDPOINT", ""),
-            description="Azure Search embedding endpoint URL",
-        )
-
-        AZURE_SEARCH_EMBEDDING_KEY: EncryptedStr = Field(
-            default=os.getenv("AZURE_SEARCH_EMBEDDING_KEY", ""),
-            description="Azure Search embedding API key",
         )
 
         AZURE_SEARCH_QUERY_TYPE: str = Field(
@@ -339,7 +324,7 @@ class Pipe:
         ):
             auth_config["key"] = self.valves.AZURE_SEARCH_KEY.get_decrypted()
 
-        # Build the data source configuration
+        # Build the data source configuration with only officially supported parameters
         data_source = {
             "type": "azure_search",
             "parameters": {
@@ -355,39 +340,11 @@ class Pipe:
             },
         }
 
-        # Add optional project resource ID if configured
-        if self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID:
-            data_source["parameters"]["project_resource_id"] = (
-                self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID
-            )
-
         # Add semantic configuration if configured
         if self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION:
             data_source["parameters"]["semantic_configuration"] = (
                 self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION
             )
-
-        # Add embedding configuration if configured
-        if self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT:
-            data_source["parameters"]["embeddingEndpoint"] = (
-                self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT
-            )
-            data_source["parameters"]["embedding_dependency"] = None
-
-        if self.valves.AZURE_SEARCH_EMBEDDING_KEY:
-            data_source["parameters"]["embeddingKey"] = (
-                self.valves.AZURE_SEARCH_EMBEDDING_KEY.get_decrypted()
-            )
-
-        # Add additional Azure Search parameters if using API key
-        if (
-            self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE == "api_key"
-            and self.valves.AZURE_SEARCH_KEY
-        ):
-            data_source["parameters"]["key"] = (
-                self.valves.AZURE_SEARCH_KEY.get_decrypted()
-            )
-            data_source["parameters"]["indexName"] = self.valves.AZURE_SEARCH_INDEX_NAME
 
         return [data_source]
 
