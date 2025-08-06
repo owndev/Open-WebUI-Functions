@@ -2,8 +2,3 @@
 # pixi environments
 .pixi
 *.egg-info
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
