@@ -55,6 +55,9 @@ AZURE_SEARCH_ENDPOINT="https://your-search-service.search.windows.net"
 # Azure Search index name containing the documents
 AZURE_SEARCH_INDEX_NAME="your-index-name"
 
+# Azure Search project resource ID (optional)
+AZURE_SEARCH_PROJECT_RESOURCE_ID="your-project-resource-id"
+
 # Azure Search API key (if using api_key authentication)
 AZURE_SEARCH_KEY="your-search-api-key"
 
@@ -63,6 +66,12 @@ AZURE_SEARCH_AUTHENTICATION_TYPE="system_assigned_managed_identity"
 
 # Semantic configuration name for Azure Search
 AZURE_SEARCH_SEMANTIC_CONFIGURATION="azureml-default"
+
+# Azure Search embedding endpoint (optional)
+AZURE_SEARCH_EMBEDDING_ENDPOINT="your-embedding-endpoint"
+
+# Azure Search embedding API key (optional)
+AZURE_SEARCH_EMBEDDING_KEY="your-embedding-key"
 
 # Query type for Azure Search
 AZURE_SEARCH_QUERY_TYPE="vectorSimpleHybrid"
@@ -95,43 +104,15 @@ Configure Azure Search by setting the following environment variables:
 
 #### Optional Settings:
 
+- **AZURE_SEARCH_PROJECT_RESOURCE_ID**: Project resource ID
 - **AZURE_SEARCH_SEMANTIC_CONFIGURATION**: Semantic configuration name
+- **AZURE_SEARCH_EMBEDDING_ENDPOINT**: Embedding service endpoint
+- **AZURE_SEARCH_EMBEDDING_KEY**: Embedding service API key
 - **AZURE_SEARCH_QUERY_TYPE**: Query type (`vectorSimpleHybrid`, `vector`, `semantic`)
 - **AZURE_SEARCH_IN_SCOPE**: Limit to indexed documents only
 - **AZURE_SEARCH_ROLE_INFORMATION**: Role information for responses
 - **AZURE_SEARCH_STRICTNESS**: Strictness level (1-5)
 - **AZURE_SEARCH_TOP_N_DOCUMENTS**: Number of documents to retrieve
-
-#### Example Generated Data Sources Configuration:
-
-When Azure Search is configured, requests to Azure AI will automatically include:
-
-```json
-{
-  "model": "gpt-4o",
-  "messages": [...],
-  "data_sources": [
-    {
-      "type": "azure_search",
-      "parameters": {
-        "filter": null,
-        "endpoint": "https://your-search-service.search.windows.net",
-        "index_name": "your-index-name",
-        "authentication": {
-          "type": "system_assigned_managed_identity",
-          "key": null
-        },
-        "query_type": "vectorSimpleHybrid",
-        "in_scope": false,
-        "role_information": "You are an AI assistant.",
-        "strictness": 5,
-        "top_n_documents": 20,
-        "semantic_configuration": "azureml-default"
-      }
-    }
-  ]
-}
-```
 
 > [!TIP]  
 > To use **Azure OpenAI** and other **Azure AI** models **simultaneously**, you can use the following URL: `https://<your project>.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview`
