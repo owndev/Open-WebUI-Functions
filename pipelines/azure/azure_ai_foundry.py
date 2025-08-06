@@ -469,6 +469,8 @@ class Pipe:
             {"id": "gpt-4.1", "name": "OpenAI GPT-4.1"},
             {"id": "gpt-4.1-mini", "name": "OpenAI GPT-4.1 Mini"},
             {"id": "gpt-4.1-nano", "name": "OpenAI GPT-4.1 Nano"},
+            {"id": "gpt-oss-20b", "name": "OpenAI GPT-OSS 20B"},
+            {"id": "gpt-oss-120b", "name": "OpenAI GPT-OSS 120B"},
             {"id": "o1", "name": "OpenAI o1"},
             {"id": "o1-mini", "name": "OpenAI o1-mini"},
             {"id": "o1-preview", "name": "OpenAI o1-preview"},
