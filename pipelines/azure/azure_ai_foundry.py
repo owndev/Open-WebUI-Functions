@@ -474,7 +474,9 @@ class Pipe:
             {"id": "gpt-4.1", "name": "OpenAI GPT-4.1"},
             {"id": "gpt-4.1-mini", "name": "OpenAI GPT-4.1 Mini"},
             {"id": "gpt-4.1-nano", "name": "OpenAI GPT-4.1 Nano"},
+            {"id": "gpt-4.5-preview", "name": "OpenAI GPT-4.5 Preview"},
             {"id": "gpt-5", "name": "OpenAI GPT-5"},
+            {"id": "gpt-5-mini", "name": "OpenAI GPT-5 Mini"},
             {"id": "gpt-5-nano", "name": "OpenAI GPT-5 Nano"},
             {"id": "gpt-5-chat", "name": "OpenAI GPT-5 Chat"},
             {"id": "gpt-oss-20b", "name": "OpenAI GPT-OSS 20B"},
@@ -483,6 +485,7 @@ class Pipe:
             {"id": "o1-mini", "name": "OpenAI o1-mini"},
             {"id": "o1-preview", "name": "OpenAI o1-preview"},
             {"id": "o3", "name": "OpenAI o3"},
+            {"id": "o3-pro", "name": "OpenAI o3 Pro"},
             {"id": "o3-mini", "name": "OpenAI o3-mini"},
             {"id": "o4-mini", "name": "OpenAI o4-mini"},
             {
