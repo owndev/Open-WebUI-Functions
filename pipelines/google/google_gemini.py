@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.3.3
+version: 1.4.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Google Gemini models, including dynamic model specification, streaming responses, and flexible error handling.
 features:
@@ -518,6 +518,19 @@ class Pipe:
             "stop_sequences": body.get("stop") or None,
             "system_instruction": system_instruction,
         }
+
+        # Enable Gemini "Thinking" when requested (default: on). Models that do not support
+        # thinking will simply ignore this flag.
+        include_thoughts = body.get("include_thoughts", True)
+        if include_thoughts:
+            try:
+                gen_config_params["thinking_config"] = types.ThinkingConfig(
+                    include_thoughts=True
+                )
+            except Exception:
+                # Fall back silently if SDK/model does not support ThinkingConfig
+                pass
+
         # Configure safety settings
         if self.valves.USE_PERMISSIVE_SAFETY:
             safety_settings = [
@@ -587,6 +600,8 @@ class Pipe:
         grounding_metadata_list: List[types.GroundingMetadata],
         text: str,
         __event_emitter__: Callable,
+        *,
+        emit_replace: bool = True,
     ):
         """Process and emit grounding metadata events."""
         grounding_chunks = []
@@ -625,6 +640,7 @@ class Pipe:
             )
 
         # Add citations in the text body
+        replaced_text: Optional[str] = None
         if grounding_supports:
             # Citation indexes are in bytes
             ENCODING = "utf-8"
@@ -652,12 +668,18 @@ class Pipe:
             if last_byte_index < len(text_bytes):
                 cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
 
-            await __event_emitter__(
-                {
-                    "type": "replace",
-                    "data": {"content": "".join(cited_chunks)},
-                }
-            )
+            replaced_text = "".join(cited_chunks)
+            if emit_replace:
+                await __event_emitter__(
+                    {
+                        "type": "replace",
+                        "data": {"content": replaced_text},
+                    }
+                )
+
+        # Return the transformed text when requested by caller
+        if not emit_replace:
+            return replaced_text if replaced_text is not None else text
 
     async def _handle_streaming_response(
         self,
@@ -674,7 +696,10 @@ class Pipe:
             Generator yielding text chunks
         """
         grounding_metadata_list = []
-        text_chunks = []
+        # Accumulate content separately for answer and thoughts
+        answer_chunks: list[str] = []
+        thought_chunks: list[str] = []
+        thinking_started_at: Optional[float] = None
         try:
             async for chunk in response_iterator:
                 # Check for safety feedback or empty chunks
@@ -693,22 +718,92 @@ class Pipe:
                     grounding_metadata_list.append(
                         chunk.candidates[0].grounding_metadata
                     )
+                # Prefer fine-grained parts to split thoughts vs. normal text
+                parts = []
+                try:
+                    parts = chunk.candidates[0].content.parts or []
+                except Exception:
+                    # Fallback: use aggregated text if parts aren't accessible
+                    if chunk.text:
+                        answer_chunks.append(chunk.text)
+                        await __event_emitter__(
+                            {
+                                "type": "chat:message:delta",
+                                "data": {"content": chunk.text},
+                            }
+                        )
+                    continue
 
-                if chunk.text:
-                    text_chunks.append(chunk.text)
-                    await __event_emitter__(
-                        {
-                            "type": "chat:message:delta",
-                            "data": {
-                                "content": chunk.text,
-                            },
-                        }
-                    )
+                for part in parts:
+                    # Thought parts (internal reasoning)
+                    if getattr(part, "thought", False) and getattr(part, "text", None):
+                        if thinking_started_at is None:
+                            thinking_started_at = time.time()
+                        thought_chunks.append(part.text)
+                        # Emit a live preview of what is currently being thought
+                        preview = part.text.replace("\n", " ").strip()
+                        MAX_PREVIEW = 120
+                        if len(preview) > MAX_PREVIEW:
+                            preview = preview[:MAX_PREVIEW].rstrip() + "…"
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "thinking",
+                                    "description": f"Thinking… {preview}",
+                                    "done": False,
+                                    "hidden": False,
+                                },
+                            }
+                        )
+                    # Regular answer text
+                    elif getattr(part, "text", None):
+                        answer_chunks.append(part.text)
+                        await __event_emitter__(
+                            {
+                                "type": "chat:message:delta",
+                                "data": {"content": part.text},
+                            }
+                        )
 
             # After processing all chunks, handle grounding data
+            final_answer_text = "".join(answer_chunks)
             if grounding_metadata_list and __event_emitter__:
-                await self._process_grounding_metadata(
-                    grounding_metadata_list, "".join(text_chunks), __event_emitter__
+                # Don't emit replace here; we'll compose final content below
+                cited = await self._process_grounding_metadata(
+                    grounding_metadata_list,
+                    final_answer_text,
+                    __event_emitter__,
+                    emit_replace=False,
+                )
+                final_answer_text = cited or final_answer_text
+
+            # If we captured thoughts, wrap them in a collapsible <details> section
+            if thought_chunks:
+                duration_s = int(
+                    max(0, time.time() - (thinking_started_at or time.time()))
+                )
+                details_block = f"""<details>
+<summary>Thinking ({duration_s}s)</summary>
+{''.join(thought_chunks)}
+</details>""".strip()
+                await __event_emitter__(
+                    {
+                        "type": "replace",
+                        "data": {"content": details_block + final_answer_text},
+                    }
+                )
+                # Clear the thinking status without a summary in the status emitter
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"action": "thinking", "done": True, "hidden": True},
+                    }
+                )
+            elif grounding_metadata_list:
+                # If no thoughts but we have grounding, ensure final answer (with citations) is reflected
+                await __event_emitter__(
+                    {"type": "replace", "data": {"content": final_answer_text}}
                 )
 
         except Exception as e:
@@ -871,9 +966,78 @@ class Pipe:
                             config=generation_config,
                         )
 
+                    # Measure duration for non-streaming path (no status to avoid false indicators)
+                    start_ts = time.time()
+
                     response = await self._retry_with_backoff(get_response)
                     self.log.debug(f"Request {request_id}: Got non-streaming response")
-                    return self._handle_standard_response(response)
+
+                    # Handle "Thinking" and produce final formatted content
+                    # Safety / prompt feedback checks (reuse existing logic)
+                    if (
+                        response.prompt_feedback
+                        and response.prompt_feedback.block_reason
+                    ):
+                        return f"[Blocked due to Prompt Safety: {response.prompt_feedback.block_reason.name}]"
+                    if not response.candidates:
+                        return "[Blocked by safety settings or no candidates generated]"
+
+                    candidate = response.candidates[0]
+                    if candidate.finish_reason == types.FinishReason.SAFETY:
+                        blocking_rating = next(
+                            (r for r in candidate.safety_ratings if r.blocked), None
+                        )
+                        reason = (
+                            f" ({blocking_rating.category.name})"
+                            if blocking_rating
+                            else ""
+                        )
+                        return f"[Blocked by safety settings{reason}]"
+
+                    # Partition content into thoughts and answer
+                    parts = (
+                        getattr(getattr(candidate, "content", None), "parts", []) or []
+                    )
+                    if not parts:
+                        # Fallback to legacy handler
+                        return self._handle_standard_response(response)
+
+                    answer_segments: list[str] = []
+                    thought_segments: list[str] = []
+
+                    for part in parts:
+                        if getattr(part, "thought", False) and getattr(
+                            part, "text", None
+                        ):
+                            thought_segments.append(part.text)
+                        elif getattr(part, "text", None):
+                            answer_segments.append(part.text)
+
+                    final_answer = "".join(answer_segments)
+
+                    # Apply grounding (if available) and send sources/status as needed
+                    grounding_metadata_list = []
+                    if getattr(candidate, "grounding_metadata", None):
+                        grounding_metadata_list.append(candidate.grounding_metadata)
+                    if grounding_metadata_list:
+                        cited = await self._process_grounding_metadata(
+                            grounding_metadata_list,
+                            final_answer,
+                            __event_emitter__,
+                            emit_replace=False,
+                        )
+                        final_answer = cited or final_answer
+
+                    # If we have thoughts, wrap them using <details>
+                    if thought_segments:
+                        duration_s = int(max(0, time.time() - start_ts))
+                        details_block = f"""<details>
+<summary>Thinking ({duration_s}s)</summary>
+{''.join(thought_segments)}
+</details>""".strip()
+                        return details_block + final_answer
+                    else:
+                        return final_answer
 
                 except Exception as e:
                     self.log.exception(
