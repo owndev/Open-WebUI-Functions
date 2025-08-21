@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.3.1
+version: 2.3.2
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -315,15 +315,24 @@ class Pipe:
             {"id": "mistral-small-2503", "name": "Mistral Small 3.1"},
             {"id": "mistral-medium-2505", "name": "Mistral Medium 3 (25.05)"},
             {"id": "grok-3", "name": "Grok 3"},
+            {"id": "grok-3-mini", "name": "Grok 3 Mini"},
             {"id": "gpt-4o", "name": "OpenAI GPT-4o"},
             {"id": "gpt-4o-mini", "name": "OpenAI GPT-4o mini"},
             {"id": "gpt-4.1", "name": "OpenAI GPT-4.1"},
             {"id": "gpt-4.1-mini", "name": "OpenAI GPT-4.1 Mini"},
             {"id": "gpt-4.1-nano", "name": "OpenAI GPT-4.1 Nano"},
+            {"id": "gpt-4.5-preview", "name": "OpenAI GPT-4.5 Preview"},
+            {"id": "gpt-5", "name": "OpenAI GPT-5"},
+            {"id": "gpt-5-mini", "name": "OpenAI GPT-5 Mini"},
+            {"id": "gpt-5-nano", "name": "OpenAI GPT-5 Nano"},
+            {"id": "gpt-5-chat", "name": "OpenAI GPT-5 Chat"},
+            {"id": "gpt-oss-20b", "name": "OpenAI GPT-OSS 20B"},
+            {"id": "gpt-oss-120b", "name": "OpenAI GPT-OSS 120B"},
             {"id": "o1", "name": "OpenAI o1"},
             {"id": "o1-mini", "name": "OpenAI o1-mini"},
             {"id": "o1-preview", "name": "OpenAI o1-preview"},
             {"id": "o3", "name": "OpenAI o3"},
+            {"id": "o3-pro", "name": "OpenAI o3 Pro"},
             {"id": "o3-mini", "name": "OpenAI o3-mini"},
             {"id": "o4-mini", "name": "OpenAI o4-mini"},
             {
