@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.3.2
+version: 2.3.3
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -389,7 +389,11 @@ class Pipe:
         return [{"id": "Azure AI", "name": "Azure AI"}]
 
     async def stream_processor(
-        self, content: aiohttp.StreamReader, __event_emitter__=None
+        self,
+        content: aiohttp.StreamReader,
+        __event_emitter__=None,
+        response: Optional[aiohttp.ClientResponse] = None,
+        session: Optional[aiohttp.ClientSession] = None,
     ) -> AsyncIterator[bytes]:
         """
         Process streaming content and properly handle completion status updates.
@@ -425,6 +429,19 @@ class Pipe:
                         "data": {"description": f"Error: {str(e)}", "done": True},
                     }
                 )
+        finally:
+            # Always attempt to close response and session to avoid resource leaks
+            try:
+                if response:
+                    response.close()
+            except Exception:
+                pass
+            try:
+                if session:
+                    await session.close()
+            except Exception:
+                # Suppress close-time errors (e.g., SSL shutdown timeouts)
+                pass
 
     async def pipe(
         self, body: Dict[str, Any], __event_emitter__=None
@@ -531,8 +548,29 @@ class Pipe:
                 headers=headers,
             )
 
-            # Check if response is SSE
-            if "text/event-stream" in request.headers.get("Content-Type", ""):
+            # If the server returned an error status, parse and raise before streaming logic
+            if request.status >= 400:
+                err_ct = (request.headers.get("Content-Type") or "").lower()
+                if "json" in err_ct:
+                    try:
+                        response = await request.json()
+                    except Exception as e:
+                        # In error status, provider may mislabel content-type; keep log at debug to avoid noise
+                        log.debug(
+                            f"Failed to parse JSON error body despite JSON content-type: {e}"
+                        )
+                        response = await request.text()
+                else:
+                    response = await request.text()
+
+                request.raise_for_status()
+
+            # Auto-detect streaming: either requested via body or indicated by response headers
+            content_type_header = (request.headers.get("Content-Type") or "").lower()
+            wants_stream = bool(filtered_body.get("stream", False))
+            is_sse_header = "text/event-stream" in content_type_header
+
+            if wants_stream or is_sse_header:
                 streaming = True
 
                 # Send status update for successful streaming connection
@@ -547,19 +585,32 @@ class Pipe:
                         }
                     )
 
+                # Ensure correct SSE headers are set for downstream consumers
+                sse_headers = dict(request.headers)
+                sse_headers["Content-Type"] = "text/event-stream"
+                sse_headers.pop("Content-Length", None)
+
                 return StreamingResponse(
-                    self.stream_processor(request.content, __event_emitter__),
-                    status_code=request.status,
-                    headers=dict(request.headers),
-                    background=BackgroundTask(
-                        cleanup_response, response=request, session=session
+                    self.stream_processor(
+                        request.content,
+                        __event_emitter__=__event_emitter__,
+                        response=request,
+                        session=session,
                     ),
+                    status_code=request.status,
+                    headers=sse_headers,
                 )
             else:
-                try:
-                    response = await request.json()
-                except Exception as e:
-                    log.error(f"Error parsing JSON response: {e}")
+                # Parse non-stream response based on content-type without noisy error logs
+                if "json" in content_type_header:
+                    try:
+                        response = await request.json()
+                    except Exception as e:
+                        log.debug(
+                            f"Failed to parse JSON response despite JSON content-type: {e}"
+                        )
+                        response = await request.text()
+                else:
                     response = await request.text()
 
                 request.raise_for_status()
