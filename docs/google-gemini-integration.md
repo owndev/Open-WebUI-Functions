@@ -22,6 +22,9 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Streaming Response Support**  
   Handles token-by-token responses with built-in safety enforcement.
 
+- **Thinking Support**  
+  Support reasoning and thinking steps, allowing models to break down complex tasks.
+
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions.
 
