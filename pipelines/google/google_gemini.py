@@ -28,6 +28,8 @@ features:
   - Native tool calling support with automatic signature management
   - Unified image processing with consolidated helper methods
   - Optimized payload creation for image generation models
+  - Configurable image processing parameters (size, quality, compression)
+  - Flexible upload fallback options and optimization controls
 """
 
 import os
@@ -173,6 +175,29 @@ class Pipe:
         RETRY_COUNT: int = Field(
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
+        )
+
+        # Image Processing Configuration
+        IMAGE_MAX_SIZE_MB: float = Field(
+            default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
+            description="Maximum image size in MB before compression is applied",
+        )
+        IMAGE_MAX_DIMENSION: int = Field(
+            default=int(os.getenv("GOOGLE_IMAGE_MAX_DIMENSION", "2048")),
+            description="Maximum width or height in pixels before resizing",
+        )
+        IMAGE_COMPRESSION_QUALITY: int = Field(
+            default=int(os.getenv("GOOGLE_IMAGE_COMPRESSION_QUALITY", "85")),
+            description="JPEG compression quality (1-100, higher = better quality but larger size)",
+        )
+        IMAGE_ENABLE_OPTIMIZATION: bool = Field(
+            default=os.getenv("GOOGLE_IMAGE_ENABLE_OPTIMIZATION", "true").lower()
+            == "true",
+            description="Enable intelligent image optimization for API compatibility",
+        )
+        IMAGE_PNG_COMPRESSION_THRESHOLD_MB: float = Field(
+            default=float(os.getenv("GOOGLE_IMAGE_PNG_THRESHOLD_MB", "0.5")),
+            description="PNG files above this size (MB) will be converted to JPEG for better compression",
         )
 
     def __init__(self):
@@ -605,20 +630,26 @@ class Pipe:
                                     return self._optimize_image_for_api(b64)
         return None
 
-    def _optimize_image_for_api(
-        self, image_data: str, max_size_mb: float = 15.0, max_dimension: int = 2048
-    ) -> str:
+    def _optimize_image_for_api(self, image_data: str) -> str:
         """
-        Optimize image data for Gemini API by reducing size and quality if needed.
-
-        Args:
-            image_data: Base64 data URL or raw base64 string
-            max_size_mb: Maximum file size in MB before compression
-            max_dimension: Maximum width or height in pixels
+        Optimize image data for Gemini API using configurable parameters.
 
         Returns:
             Optimized base64 data URL
         """
+        # Check if optimization is enabled
+        if not self.valves.IMAGE_ENABLE_OPTIMIZATION:
+            self.log.debug("Image optimization disabled via configuration")
+            return image_data
+
+        max_size_mb = self.valves.IMAGE_MAX_SIZE_MB
+        max_dimension = self.valves.IMAGE_MAX_DIMENSION
+        base_quality = self.valves.IMAGE_COMPRESSION_QUALITY
+        png_threshold = self.valves.IMAGE_PNG_COMPRESSION_THRESHOLD_MB
+
+        self.log.debug(
+            f"Image optimization config: max_size={max_size_mb}MB, max_dim={max_dimension}px, quality={base_quality}, png_threshold={png_threshold}MB"
+        )
         try:
             # Parse the data URL
             if image_data.startswith("data:"):
@@ -643,8 +674,8 @@ class Pipe:
                 reasons.append(f"size > {max_size_mb} MB")
             if base64_size_mb > max_size_mb * 1.4:
                 reasons.append("base64 overhead")
-            if mime_type == "image/png" and original_size_mb > 0.5:
-                reasons.append("PNG > 512KB")
+            if mime_type == "image/png" and original_size_mb > png_threshold:
+                reasons.append(f"PNG > {png_threshold}MB")
 
             # Always check dimensions
             with Image.open(io.BytesIO(image_bytes)) as img:
@@ -680,20 +711,41 @@ class Pipe:
                     )
                     img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-                # Determine quality levels based on original size
+                # Determine quality levels based on original size and user configuration
                 if original_size_mb > 5.0:
-                    quality_levels = [75, 65, 55, 45, 35, 25]
+                    quality_levels = [
+                        base_quality,
+                        base_quality - 10,
+                        base_quality - 20,
+                        base_quality - 30,
+                        base_quality - 40,
+                        max(base_quality - 50, 25),
+                    ]
                 elif original_size_mb > 2.0:
-                    quality_levels = [85, 75, 65, 55, 45]
+                    quality_levels = [
+                        base_quality,
+                        base_quality - 5,
+                        base_quality - 15,
+                        base_quality - 25,
+                        max(base_quality - 35, 35),
+                    ]
                 else:
-                    quality_levels = [90, 80, 70, 60]
+                    quality_levels = [
+                        min(base_quality + 5, 95),
+                        base_quality,
+                        base_quality - 10,
+                        max(base_quality - 20, 50),
+                    ]
+
+                # Ensure quality levels are within valid range (1-100)
+                quality_levels = [max(1, min(100, q)) for q in quality_levels]
 
                 # Try compression levels
                 for quality in quality_levels:
                     output_buffer = io.BytesIO()
                     format_type = (
                         "JPEG"
-                        if original_size_mb > 0.1 or "jpeg" in mime_type
+                        if original_size_mb > png_threshold or "jpeg" in mime_type
                         else "PNG"
                     )
                     output_mime = f"image/{format_type.lower()}"
