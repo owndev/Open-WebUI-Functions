@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.5.0
+version: 1.5.1
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -1385,6 +1385,8 @@ class Pipe:
             )
             reason = f" ({blocking_rating.category.name})" if blocking_rating else ""
             return f"[Blocked by safety settings{reason}]"
+        elif candidate.finish_reason == types.FinishReason.PROHIBITED_CONTENT:
+            return "[Content blocked due to prohibited content policy violation]"
 
         return None
 
