@@ -2,13 +2,11 @@
 
 This integration enables Open WebUI to interact with **Infomaniak AI Tools**, using their public API for secure and scalable AI model access.
 
-🔗 [Learn More About N8N](https://own.dev/n8n-io)
-
+🔗 [Learn More About Infomaniak](https://www.infomaniak.com/en/hosting/ai-tools)
 
 ## Pipeline
 
-- 🧩 [Infomaniak AI Tools Pipeline](https://own.dev/github-owndev-open-webui-functions-infomaniak)
-
+- 🧩 [Infomaniak AI Tools Pipeline](../pipelines/infomaniak/infomaniak.py)
 
 ## Features
 
@@ -23,7 +21,6 @@ This integration enables Open WebUI to interact with **Infomaniak AI Tools**, us
 
 - **Model Name Prefixing**  
   Automatically add a prefix to distinguish models from other providers.
-
 
 ## Environment Variables
 
@@ -44,4 +41,4 @@ NAME_PREFIX="Infomaniak: "
 ```
 
 > [!TIP]  
-> You can find your API key and product ID in your [Infomaniak Manager](https://own.dev/manager-infomaniak-com).
+> You can find your API key and product ID in your [Infomaniak Manager](https://manager.infomaniak.com/).

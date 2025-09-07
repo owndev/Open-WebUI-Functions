@@ -2,14 +2,13 @@
 
 The repository includes functions specifically designed for **Azure AI**, supporting both **Azure OpenAI** models and general **Azure AI** services.
 
-🔗 [Learn More About Azure AI](https://own.dev/azure-microsoft-com-en-us-solutions-ai)
-
+🔗 [Learn More About Azure AI](https://azure.microsoft.com/en-us/solutions/ai)
 
 ## Pipeline
-- 🧩 [Azure AI Foundry Pipeline](https://own.dev/github-owndev-open-webui-functions-azure-ai-foundry)
 
+- 🧩 [Azure AI Foundry Pipeline](../pipelines/azure/azure_ai_foundry.py)
 
-### Features:
+### Features
 
 - **Azure OpenAI API Support**  
   Access models like **GPT-4o, o3**, and **other fine-tuned AI models** via Azure.
@@ -20,8 +19,7 @@ The repository includes functions specifically designed for **Azure AI**, suppor
 - **Secure API Requests**  
   Supports API key authentication and environment variable configurations.
 
-
-### Environment Variables:
+### Environment Variables
 
 Configure the following environment variables to enable Azure AI support:
 

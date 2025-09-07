@@ -2,19 +2,27 @@
 
 This integration allows Open WebUI to communicate with workflows created in **n8n**, a powerful workflow automation tool. Messages are sent and received via webhook endpoints, making it easy to plug Open WebUI into your existing automation pipelines.
 
-🔗 [Learn More About N8N](https://own.dev/n8n-io)
+> [!NOTE]  
+> **Recent Improvements (v2.1.0)**: Enhanced streaming support with consistent response handling, automatic systemPrompt deduplication, simplified configuration, and improved error messaging.
 
+🔗 [Learn More About N8N](https://n8n.io/)
 
 ## Pipeline
-- 🧩 [N8N Pipeline](https://own.dev/github-owndev-open-webui-functions-n8n-pipeline)
 
+- 🧩 [N8N Pipeline](../pipelines/n8n/n8n.py)
 
 ## Template Workflow
 
-- 🧩 [N8N Open WebUI Test Agent (Template)](https://own.dev/github-owndev-open-webui-functions-open-webui-test-agent)
-
+- 🧩 [N8N Open WebUI Test Agent (Streaming)](../pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json)
+- 🧩 [N8N Open WebUI Test Agent (Non-Streaming)](../pipelines/n8n/Open_WebUI_Test_Agent.json)
 
 ## Features
+
+- **Streaming & Non-Streaming Support**  
+  Automatic detection and handling of both streaming and non-streaming responses with consistent output formatting.
+
+- **SystemPrompt Deduplication**  
+  Intelligent removal of duplicate system prompts to prevent redundant instructions.
 
 - **Webhook Communication**  
   Send messages directly to an n8n workflow via a webhook URL.
@@ -25,9 +33,8 @@ This integration allows Open WebUI to communicate with workflows created in **n8
 - **Flexible Input/Output Mapping**  
   Customize which fields in the request/response payload are used for communication.
 
-- **Live Status Feedback**  
-  Optionally emit status updates at a configurable interval.
-
+- **Robust Error Handling**  
+  All errors are displayed as user-friendly English messages in the chat interface.
 
 ## Environment Variables
 
@@ -47,12 +54,6 @@ INPUT_FIELD="chatInput"
 # Payload output field (used by Open WebUI to read the response)
 RESPONSE_FIELD="output"
 
-# Interval (in seconds) between emitting status updates to the UI
-EMIT_INTERVAL=2.0
-
-# Enable or disable live status indicators
-ENABLE_STATUS_INDICATOR=true
-
 # Optional: Cloudflare Access tokens (if behind Cloudflare Zero Trust)
 CF_ACCESS_CLIENT_ID="your-cloudflare-access-client-id"
 CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
@@ -60,4 +61,4 @@ CF_ACCESS_CLIENT_SECRET="your-cloudflare-access-client-secret"
 
 > [!TIP]  
 > If your n8n instance is protected behind Cloudflare Zero Trust, you can use service tokens for authentication.
-> Learn more: [Cloudflare Access Service Tokens](https://own.dev/developers-cloudflare-com-cloudflare-one-identity-service-tokens)
+> Learn more: [Cloudflare Access Service Tokens](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/)
