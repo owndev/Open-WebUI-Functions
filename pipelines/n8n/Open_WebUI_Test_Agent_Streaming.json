@@ -1,5 +1,5 @@
 {
-  "name": "Open WebUI Test Agent",
+  "name": "Open WebUI Test Agent Streaming",
   "nodes": [
     {
       "parameters": {
@@ -8,12 +8,12 @@
           "temperature": 0.7
         }
       },
-      "id": "ea4a899a-ad2e-4c2f-992e-ffa3683f6288",
+      "id": "baa17623-4b91-4aad-938f-a4dbaa173580",
       "name": "OpenAI Chat Model",
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "position": [
-        2288,
-        1248
+        32,
+        416
       ],
       "typeVersion": 1
     },
@@ -21,12 +21,12 @@
       "parameters": {
         "sessionKey": "={{ $('Webhook').item.json.body.user_id }}_{{ $('Webhook').item.json.body.chat_id }}"
       },
-      "id": "edc574f1-f176-4572-9c33-bc16855c0250",
+      "id": "5c11a401-5dbb-4edd-bd1e-7df6d0844083",
       "name": "Window Buffer Memory",
       "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
       "position": [
-        2416,
-        1072
+        160,
+        240
       ],
       "typeVersion": 1
     },
@@ -35,10 +35,10 @@
       "type": "@n8n/n8n-nodes-langchain.toolWikipedia",
       "typeVersion": 1,
       "position": [
-        2544,
-        1072
+        288,
+        240
       ],
-      "id": "cbf4bd61-81f4-4063-b5c9-db18d67ff46d",
+      "id": "01a2e9b2-0e01-48eb-91ac-628432c5d1a8",
       "name": "Wikipedia"
     },
     {
@@ -46,39 +46,24 @@
       "type": "@n8n/n8n-nodes-langchain.toolCalculator",
       "typeVersion": 1,
       "position": [
-        2672,
-        1072
+        416,
+        240
       ],
-      "id": "dc45541b-f295-41af-9c6b-9b66c3e20557",
+      "id": "6ec76a25-8339-4c61-88b1-aab1a861c9e3",
       "name": "Calculator"
     },
     {
       "parameters": {
-        "respondWith": "text",
-        "responseBody": "={{ $json.output }}",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        3008,
-        848
-      ],
-      "id": "325974b4-e249-4eb3-81dc-26b392f0894e",
-      "name": "Respond to Webhook"
-    },
-    {
-      "parameters": {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-mini",
         "options": {}
       },
       "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
       "typeVersion": 1,
       "position": [
-        2288,
-        1072
+        32,
+        240
       ],
-      "id": "f2e088e0-aa71-4b42-8eaa-e0197150b9ca",
+      "id": "18b4d85b-a797-40d2-b3e3-22fe8985a872",
       "name": "Azure OpenAI Chat Model"
     },
     {
@@ -91,10 +76,10 @@
       "type": "n8n-nodes-base.dateTimeTool",
       "typeVersion": 2,
       "position": [
-        2800,
-        1072
+        544,
+        240
       ],
-      "id": "b9f40873-67cc-48a6-b19a-28400805ca6a",
+      "id": "5968806c-44bb-42bc-a2d5-f9532954e2e5",
       "name": "Date & Time"
     },
     {
@@ -103,60 +88,58 @@
         "text": "={{ $json.body.chatInput }}",
         "options": {
           "systemMessage": "={{ $json.body.systemPrompt }}",
-          "enableStreaming": false
+          "enableStreaming": true
         }
       },
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 2.2,
       "position": [
-        2480,
-        848
+        224,
+        16
       ],
-      "id": "4d13b272-5ca8-4f43-90d9-afdf050c061f",
+      "id": "e6590efc-0593-4f30-9586-5dc17466bdd7",
       "name": "AI Agent",
+      "alwaysOutputData": false,
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "respondWith": "text",
         "responseBody": "={{ $json.error }}",
-        "options": {}
+        "options": {
+          "responseCode": 500
+        }
       },
       "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
+      "typeVersion": 1.1,
       "position": [
-        3008,
-        1008
+        688,
+        32
       ],
-      "id": "114d81bd-4573-43b4-bbfe-80b784cd467e",
+      "id": "184ac106-3444-43e7-a312-c359d6db33a0",
       "name": "Respond error to Webhook"
     },
     {
       "parameters": {
         "httpMethod": "POST",
-        "path": "OpenWebUITestAgent",
+        "path": "OpenWebUITestAgentStream",
         "authentication": "headerAuth",
-        "responseMode": "responseNode",
+        "responseMode": "streaming",
         "options": {}
       },
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2.1,
       "position": [
-        2064,
-        848
+        -192,
+        16
       ],
-      "id": "b5e9d507-92e1-45aa-8f48-3629f802bafc",
+      "id": "e680d51f-ffb3-459b-b765-0d86881bcc80",
       "name": "Webhook",
-      "webhookId": "d3b1cfa8-8f3c-48ca-b1c8-87c40e3dcf76"
+      "webhookId": "852c394d-2b99-4688-9045-87aafbd721d1"
     }
   ],
   "pinData": {},
   "connections": {
-    "OpenAI Chat Model": {
-      "ai_languageModel": [
-        []
-      ]
-    },
     "Window Buffer Memory": {
       "ai_memory": [
         [
@@ -214,13 +197,7 @@
     },
     "AI Agent": {
       "main": [
-        [
-          {
-            "node": "Respond to Webhook",
-            "type": "main",
-            "index": 0
-          }
-        ],
+        [],
         [
           {
             "node": "Respond error to Webhook",
@@ -240,17 +217,22 @@
           }
         ]
       ]
+    },
+    "Respond error to Webhook": {
+      "main": [
+        []
+      ]
     }
   },
   "active": true,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "72ba3fa2-7d33-475f-bf0d-9dcdc5a44bb7",
+  "versionId": "753266e4-fd13-4b7c-be46-30bf91bd4517",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "6350a4271a2777a60d73e3a3c6a9549015b6bfe8b8f285cb566cd69ef87215da"
   },
-  "id": "9yJgWkcblWV7ftWb",
+  "id": "a4p2CPxpxCgkmTsd",
   "tags": []
 }
