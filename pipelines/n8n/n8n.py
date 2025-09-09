@@ -43,6 +43,8 @@ import json
 import asyncio
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from pydantic_core import core_schema
+import time
+import re
 
 
 # Simplified encryption implementation with automatic handling
@@ -586,6 +588,7 @@ class Pipe:
                         self.log.info("Processing streaming response from N8N")
                         n8n_response = ""
                         buffer = ""
+                        completed_thoughts: list[str] = []
 
                         try:
                             async for chunk in response.content.iter_any():
@@ -625,8 +628,13 @@ class Pipe:
                                     # Parse N8N streaming chunk
                                     content = self.parse_n8n_streaming_chunk(json_chunk)
                                     if content:
+                                        # Normalize escaped newlines to actual newlines (like non-streaming)
+                                        content = content.replace("\\n", "\n")
+
+                                        # Just accumulate content without processing think blocks yet
                                         n8n_response += content
 
+                                        # Emit delta without think block processing
                                         if __event_emitter__:
                                             await __event_emitter__(
                                                 {
@@ -644,7 +652,15 @@ class Pipe:
                                     self.extract_content_from_mixed_stream(buffer)
                                 )
                                 if remaining_content:
+                                    # Normalize escaped newlines to actual newlines (like non-streaming)
+                                    remaining_content = remaining_content.replace(
+                                        "\\n", "\n"
+                                    )
+
+                                    # Accumulate final buffer content
                                     n8n_response += remaining_content
+
+                                    # Emit final buffer delta
                                     if __event_emitter__:
                                         await __event_emitter__(
                                             {
@@ -656,8 +672,45 @@ class Pipe:
                                             }
                                         )
 
-                            # Emit final complete message
-                            if n8n_response and __event_emitter__:
+                            # NOW process all think blocks in the complete response
+                            if n8n_response and "<think>" in n8n_response.lower():
+                                # Use regex to find and replace all think blocks at once
+                                think_pattern = re.compile(
+                                    r"<think>\s*(.*?)\s*</think>",
+                                    re.IGNORECASE | re.DOTALL,
+                                )
+
+                                think_counter = 0
+
+                                def replace_think_block(match):
+                                    nonlocal think_counter
+                                    think_counter += 1
+                                    thought_content = match.group(1).strip()
+                                    if thought_content:
+                                        completed_thoughts.append(thought_content)
+
+                                        # Format each line with > for blockquote while preserving formatting
+                                        quoted_lines = []
+                                        for line in thought_content.split("\n"):
+                                            quoted_lines.append(f"> {line}")
+                                        quoted_content = "\n".join(quoted_lines)
+
+                                        # Return details block with custom thought formatting
+                                        return f"""<details>
+<summary>Thought {think_counter}</summary>
+
+{quoted_content}
+
+</details>"""
+                                    return ""
+
+                                # Replace all think blocks with details blocks in the complete response
+                                n8n_response = think_pattern.sub(
+                                    replace_think_block, n8n_response
+                                )
+
+                            # Emit final complete message with processed think blocks
+                            if __event_emitter__:
                                 await __event_emitter__(
                                     {
                                         "type": "chat:message",
@@ -667,6 +720,18 @@ class Pipe:
                                         },
                                     }
                                 )
+                                if completed_thoughts:
+                                    # Clear any thinking status indicator
+                                    await __event_emitter__(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "action": "thinking",
+                                                "done": True,
+                                                "hidden": True,
+                                            },
+                                        }
+                                    )
 
                         except Exception as e:
                             self.log.error(f"Streaming error: {e}")
@@ -783,6 +848,47 @@ class Pipe:
                         if not n8n_response:
                             n8n_response = (
                                 "(Received empty response or unknown format from N8N)"
+                            )
+
+                        # Post-process for <think> blocks (non-streaming mode)
+                        try:
+                            if n8n_response and "<think>" in n8n_response.lower():
+                                # First, normalize escaped newlines to actual newlines
+                                normalized_response = n8n_response.replace("\\n", "\n")
+
+                                # Use case-insensitive patterns to find and replace each think block
+                                think_pattern = re.compile(
+                                    r"<think>\s*(.*?)\s*</think>",
+                                    re.IGNORECASE | re.DOTALL,
+                                )
+
+                                think_counter = 0
+
+                                def replace_think_block(match):
+                                    nonlocal think_counter
+                                    think_counter += 1
+                                    thought_content = match.group(1).strip()
+
+                                    # Format each line with > for blockquote while preserving formatting
+                                    quoted_lines = []
+                                    for line in thought_content.split("\n"):
+                                        quoted_lines.append(f"> {line}")
+                                    quoted_content = "\n".join(quoted_lines)
+
+                                    return f"""<details>
+<summary>Thought {think_counter}</summary>
+
+{quoted_content}
+
+</details>"""
+
+                                # Replace each <think>...</think> with its own details block
+                                n8n_response = think_pattern.sub(
+                                    replace_think_block, normalized_response
+                                )
+                        except Exception as post_e:
+                            self.log.debug(
+                                f"Non-streaming thinking parse failed: {post_e}"
                             )
 
                         # Cleanup
