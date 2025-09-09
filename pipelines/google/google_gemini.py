@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.5.1
+version: 1.5.2
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -1329,9 +1329,18 @@ class Pipe:
                 duration_s = int(
                     max(0, time.time() - (thinking_started_at or time.time()))
                 )
+                # Format each line with > for blockquote while preserving formatting
+                thought_content = ''.join(thought_chunks).strip()
+                quoted_lines = []
+                for line in thought_content.split('\n'):
+                    quoted_lines.append(f"> {line}")
+                quoted_content = '\n'.join(quoted_lines)
+                
                 details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_chunks)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
 
                 # Combine thoughts and answer (images not processed in streaming mode)
@@ -1711,9 +1720,18 @@ class Pipe:
                     # If we have thoughts, wrap them using <details>
                     if thought_segments:
                         duration_s = int(max(0, time.time() - start_ts))
+                        # Format each line with > for blockquote while preserving formatting
+                        thought_content = ''.join(thought_segments).strip()
+                        quoted_lines = []
+                        for line in thought_content.split('\n'):
+                            quoted_lines.append(f"> {line}")
+                        quoted_content = '\n'.join(quoted_lines)
+                        
                         details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_segments)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
                         full_response += details_block
 
