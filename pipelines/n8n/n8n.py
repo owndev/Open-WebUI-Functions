@@ -369,7 +369,7 @@ class Pipe:
             data = json.loads(chunk_text.strip())
 
             if isinstance(data, dict):
-                # Skip N8N metadata chunks
+                # Skip N8N metadata chunks but be more selective
                 chunk_type = data.get("type", "")
                 if chunk_type in ["begin", "end", "error", "metadata"]:
                     self.log.debug(f"Skipping N8N metadata chunk: {chunk_type}")
@@ -387,6 +387,8 @@ class Pipe:
                     or data.get("message")
                     or data.get("delta")
                     or data.get("data")
+                    or data.get("response")
+                    or data.get("result")
                 )
 
                 # Handle OpenAI-style streaming format
@@ -397,18 +399,35 @@ class Pipe:
                         content = delta.get("content", "")
 
                 if content:
+                    self.log.debug(
+                        f"Extracted content from JSON: {repr(content[:100])}"
+                    )
                     return str(content)
 
-                # Return non-metadata objects as strings
+                # Return non-metadata objects as strings (be more permissive)
                 if not any(
-                    key in data for key in ["type", "metadata", "nodeId", "nodeName"]
+                    key in data
+                    for key in [
+                        "type",
+                        "metadata",
+                        "nodeId",
+                        "nodeName",
+                        "timestamp",
+                        "id",
+                    ]
                 ):
+                    # For smaller models, return the entire object if it's simple
+                    self.log.debug(
+                        f"Returning entire object as content: {repr(str(data)[:100])}"
+                    )
                     return str(data)
 
         except json.JSONDecodeError:
-            # Handle plain text content
-            if not chunk_text.startswith("{"):
-                return chunk_text.strip()
+            # Handle plain text content - be more permissive
+            stripped = chunk_text.strip()
+            if stripped and not stripped.startswith("{"):
+                self.log.debug(f"Returning plain text content: {repr(stripped[:100])}")
+                return stripped
 
         return None
 
@@ -416,19 +435,32 @@ class Pipe:
         """Extract content from mixed stream containing both metadata and content"""
         content_parts = []
 
-        # Handle concatenated JSON objects
-        parts = raw_text.split("}{")
+        # First try to handle concatenated JSON objects
+        if "{" in raw_text and "}" in raw_text:
+            parts = raw_text.split("}{")
 
-        for i, part in enumerate(parts):
-            # Reconstruct valid JSON
-            if i > 0:
-                part = "{" + part
-            if i < len(parts) - 1:
-                part = part + "}"
+            for i, part in enumerate(parts):
+                # Reconstruct valid JSON
+                if i > 0:
+                    part = "{" + part
+                if i < len(parts) - 1:
+                    part = part + "}"
 
-            extracted = self.parse_n8n_streaming_chunk(part)
-            if extracted:
-                content_parts.append(extracted)
+                extracted = self.parse_n8n_streaming_chunk(part)
+                if extracted:
+                    content_parts.append(extracted)
+
+        # If no JSON content found, treat as plain text
+        if not content_parts:
+            # Remove common streaming artifacts but preserve actual content
+            cleaned = raw_text.strip()
+            if (
+                cleaned
+                and not cleaned.startswith("data:")
+                and not cleaned.startswith(":")
+            ):
+                self.log.debug(f"Using raw text as content: {repr(cleaned[:100])}")
+                return cleaned
 
         return "".join(content_parts)
 
@@ -598,59 +630,98 @@ class Pipe:
                                 text = chunk.decode(errors="ignore")
                                 buffer += text
 
-                                # Process complete JSON objects like in stream-example.py
-                                while True:
-                                    start_idx = buffer.find("{")
-                                    if start_idx == -1:
-                                        break
+                                # Handle different streaming formats
+                                if "{" in buffer and "}" in buffer:
+                                    # Process complete JSON objects like in stream-example.py
+                                    while True:
+                                        start_idx = buffer.find("{")
+                                        if start_idx == -1:
+                                            break
 
-                                    # Find matching closing brace
-                                    brace_count = 0
-                                    end_idx = -1
+                                        # Find matching closing brace
+                                        brace_count = 0
+                                        end_idx = -1
 
-                                    for i in range(start_idx, len(buffer)):
-                                        if buffer[i] == "{":
-                                            brace_count += 1
-                                        elif buffer[i] == "}":
-                                            brace_count -= 1
-                                            if brace_count == 0:
-                                                end_idx = i
-                                                break
+                                        for i in range(start_idx, len(buffer)):
+                                            if buffer[i] == "{":
+                                                brace_count += 1
+                                            elif buffer[i] == "}":
+                                                brace_count -= 1
+                                                if brace_count == 0:
+                                                    end_idx = i
+                                                    break
 
-                                    if end_idx == -1:
-                                        # Incomplete JSON, wait for more data
-                                        break
+                                        if end_idx == -1:
+                                            # Incomplete JSON, wait for more data
+                                            break
 
-                                    # Extract and process the JSON chunk
-                                    json_chunk = buffer[start_idx : end_idx + 1]
-                                    buffer = buffer[end_idx + 1 :]
+                                        # Extract and process the JSON chunk
+                                        json_chunk = buffer[start_idx : end_idx + 1]
+                                        buffer = buffer[end_idx + 1 :]
 
-                                    # Parse N8N streaming chunk
-                                    content = self.parse_n8n_streaming_chunk(json_chunk)
-                                    if content:
-                                        # Normalize escaped newlines to actual newlines (like non-streaming)
-                                        content = content.replace("\\n", "\n")
+                                        # Parse N8N streaming chunk
+                                        content = self.parse_n8n_streaming_chunk(
+                                            json_chunk
+                                        )
+                                        if content:
+                                            # Normalize escaped newlines to actual newlines (like non-streaming)
+                                            content = content.replace("\\n", "\n")
 
-                                        # Just accumulate content without processing think blocks yet
-                                        n8n_response += content
+                                            # Just accumulate content without processing think blocks yet
+                                            n8n_response += content
 
-                                        # Emit delta without think block processing
-                                        if __event_emitter__:
-                                            await __event_emitter__(
-                                                {
-                                                    "type": "chat:message:delta",
-                                                    "data": {
-                                                        "role": "assistant",
-                                                        "content": content,
-                                                    },
-                                                }
+                                            # Emit delta without think block processing
+                                            if __event_emitter__:
+                                                await __event_emitter__(
+                                                    {
+                                                        "type": "chat:message:delta",
+                                                        "data": {
+                                                            "role": "assistant",
+                                                            "content": content,
+                                                        },
+                                                    }
+                                                )
+                                else:
+                                    # Handle plain text streaming (for smaller models)
+                                    # Process line by line for plain text
+                                    while "\n" in buffer:
+                                        line, buffer = buffer.split("\n", 1)
+                                        if line.strip():  # Only process non-empty lines
+                                            self.log.debug(
+                                                f"Processing plain text line: {repr(line[:100])}"
                                             )
 
-                            # Process any remaining content in buffer
+                                            # Normalize content
+                                            content = line.replace("\\n", "\n")
+                                            n8n_response += content + "\n"
+
+                                            # Emit delta for plain text
+                                            if __event_emitter__:
+                                                await __event_emitter__(
+                                                    {
+                                                        "type": "chat:message:delta",
+                                                        "data": {
+                                                            "role": "assistant",
+                                                            "content": content + "\n",
+                                                        },
+                                                    }
+                                                )
+
+                            # Process any remaining content in buffer (CRITICAL FIX)
                             if buffer.strip():
+                                self.log.debug(
+                                    f"Processing remaining buffer content: {repr(buffer[:100])}"
+                                )
+
+                                # Try to extract from mixed content first
                                 remaining_content = (
                                     self.extract_content_from_mixed_stream(buffer)
                                 )
+
+                                # If that doesn't work, use buffer as-is
+                                if not remaining_content:
+                                    remaining_content = buffer.strip()
+
                                 if remaining_content:
                                     # Normalize escaped newlines to actual newlines (like non-streaming)
                                     remaining_content = remaining_content.replace(
@@ -709,8 +780,15 @@ class Pipe:
                                     replace_think_block, n8n_response
                                 )
 
-                            # Emit final complete message with processed think blocks
+                            # ALWAYS emit final complete message (critical for UI update)
                             if __event_emitter__:
+                                # Ensure we have some response to show
+                                if not n8n_response.strip():
+                                    n8n_response = "(Empty response received from N8N)"
+                                    self.log.warning(
+                                        "Empty response received from N8N, using fallback message"
+                                    )
+
                                 await __event_emitter__(
                                     {
                                         "type": "chat:message",
@@ -733,9 +811,42 @@ class Pipe:
                                         }
                                     )
 
+                            self.log.info(
+                                f"Streaming completed successfully. Total response length: {len(n8n_response)}"
+                            )
+
                         except Exception as e:
                             self.log.error(f"Streaming error: {e}")
-                            n8n_response = f"Streaming error: {str(e)}"
+
+                            # In case of streaming errors, try to emit whatever we have
+                            if n8n_response:
+                                self.log.info(
+                                    f"Emitting partial response due to error: {len(n8n_response)} chars"
+                                )
+                                if __event_emitter__:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "chat:message",
+                                            "data": {
+                                                "role": "assistant",
+                                                "content": n8n_response,
+                                            },
+                                        }
+                                    )
+                            else:
+                                # If no response was accumulated, provide error message
+                                error_msg = f"Streaming error occurred: {str(e)}"
+                                n8n_response = error_msg
+                                if __event_emitter__:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "chat:message",
+                                            "data": {
+                                                "role": "assistant",
+                                                "content": error_msg,
+                                            },
+                                        }
+                                    )
                         finally:
                             await cleanup_response(response, session)
 
