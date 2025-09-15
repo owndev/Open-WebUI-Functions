@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.3.3
+version: 2.4.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
 features:
@@ -176,6 +176,92 @@ class Pipe:
             description="Set to True to use Authorization header with Bearer token instead of api-key header.",
         )
 
+        # Azure Search / RAG Configuration
+        AZURE_SEARCH_ENDPOINT: str = Field(
+            default=os.getenv("AZURE_SEARCH_ENDPOINT", ""),
+            description="Azure Search endpoint URL (e.g., https://xxx.search.windows.net)",
+        )
+
+        AZURE_SEARCH_INDEX_NAME: str = Field(
+            default=os.getenv("AZURE_SEARCH_INDEX_NAME", ""),
+            description="Azure Search index name for RAG",
+        )
+
+        AZURE_SEARCH_FILTER: str = Field(
+            default=os.getenv("AZURE_SEARCH_FILTER", ""),
+            description="Azure Search filter expression (optional)",
+        )
+
+        AZURE_SEARCH_PROJECT_RESOURCE_ID: str = Field(
+            default=os.getenv("AZURE_SEARCH_PROJECT_RESOURCE_ID", ""),
+            description="Azure Search project resource ID",
+        )
+
+        AZURE_SEARCH_KEY: EncryptedStr = Field(
+            default=os.getenv("AZURE_SEARCH_KEY", ""),
+            description="Azure Search API key",
+        )
+
+        AZURE_SEARCH_AUTHENTICATION_TYPE: str = Field(
+            default=os.getenv(
+                "AZURE_SEARCH_AUTHENTICATION_TYPE", "system_assigned_managed_identity"
+            ),
+            description="Azure Search authentication type (system_assigned_managed_identity, api_key)",
+        )
+
+        AZURE_SEARCH_SEMANTIC_CONFIGURATION: str = Field(
+            default=os.getenv("AZURE_SEARCH_SEMANTIC_CONFIGURATION", "azureml-default"),
+            description="Azure Search semantic configuration name",
+        )
+
+        AZURE_SEARCH_EMBEDDING_ENDPOINT: str = Field(
+            default=os.getenv("AZURE_SEARCH_EMBEDDING_ENDPOINT", ""),
+            description="Azure Search embedding endpoint URL",
+        )
+
+        AZURE_SEARCH_EMBEDDING_KEY: EncryptedStr = Field(
+            default=os.getenv("AZURE_SEARCH_EMBEDDING_KEY", ""),
+            description="Azure Search embedding API key",
+        )
+
+        AZURE_SEARCH_EMBEDDING_DEPENDENCY: str = Field(
+            default=os.getenv("AZURE_SEARCH_EMBEDDING_DEPENDENCY", ""),
+            description="Azure Search embedding dependency configuration (optional)",
+        )
+
+        AZURE_SEARCH_QUERY_TYPE: str = Field(
+            default=os.getenv("AZURE_SEARCH_QUERY_TYPE", "vectorSimpleHybrid"),
+            description="Azure Search query type (vectorSimpleHybrid, vector, semantic)",
+        )
+
+        AZURE_SEARCH_IN_SCOPE: bool = Field(
+            default=bool(os.getenv("AZURE_SEARCH_IN_SCOPE", False)),
+            description="Whether to limit search to indexed documents only",
+        )
+
+        AZURE_SEARCH_ROLE_INFORMATION: str = Field(
+            default=os.getenv(
+                "AZURE_SEARCH_ROLE_INFORMATION", "You are an AI assistant."
+            ),
+            description="Role information for Azure Search responses",
+        )
+
+        AZURE_SEARCH_STRICTNESS: int = Field(
+            default=int(os.getenv("AZURE_SEARCH_STRICTNESS", 5)),
+            description="Azure Search strictness level (1-5)",
+        )
+
+        AZURE_SEARCH_TOP_N_DOCUMENTS: int = Field(
+            default=int(os.getenv("AZURE_SEARCH_TOP_N_DOCUMENTS", 20)),
+            description="Number of top documents to retrieve from Azure Search",
+        )
+
+        # Raw Azure Search data sources configuration (overrides individual settings if provided)
+        AZURE_SEARCH_RAW_DATA_SOURCES: str = Field(
+            default=os.getenv("AZURE_SEARCH_RAW_DATA_SOURCES", ""),
+            description="Raw JSON configuration for data_sources (overrides individual Azure Search settings if provided). Example: '[{\"type\":\"azure_search\",\"parameters\":{...}}]'",
+        )
+
     def __init__(self):
         self.valves = self.Valves()
         self.name: str = "Azure AI"
@@ -241,6 +327,74 @@ class Pipe:
         """
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
+
+    def get_azure_search_data_sources(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Builds Azure Search data sources configuration if Azure Search is configured.
+        If AZURE_SEARCH_RAW_DATA_SOURCES is provided, it takes precedence over individual settings.
+
+        Returns:
+            List containing Azure Search data source configuration, or None if not configured.
+        """
+        # Check if raw data sources configuration is provided first
+        if self.valves.AZURE_SEARCH_RAW_DATA_SOURCES:
+            try:
+                import json
+                raw_data_sources = json.loads(self.valves.AZURE_SEARCH_RAW_DATA_SOURCES)
+                if isinstance(raw_data_sources, list):
+                    return raw_data_sources
+                else:
+                    # If it's a single object, wrap it in a list
+                    return [raw_data_sources]
+            except json.JSONDecodeError as e:
+                # Log error but continue with individual parameter approach
+                log = logging.getLogger("azure_ai.get_azure_search_data_sources")
+                log.error(f"Error parsing AZURE_SEARCH_RAW_DATA_SOURCES: {e}")
+
+        # Check if Azure Search is configured (at minimum endpoint and index are required)
+        if (
+            not self.valves.AZURE_SEARCH_ENDPOINT
+            or not self.valves.AZURE_SEARCH_INDEX_NAME
+        ):
+            return None
+
+        # Build authentication configuration
+        auth_config = {
+            "type": self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE,
+            "key": None,
+        }
+
+        # If using API key authentication, include the decrypted key
+        if (
+            self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE == "api_key"
+            and self.valves.AZURE_SEARCH_KEY
+        ):
+            auth_config["key"] = self.valves.AZURE_SEARCH_KEY.get_decrypted()
+
+        # Build minimal data source configuration matching exact JSON structure
+        data_source = {
+            "type": "azure_search",
+            "parameters": {
+                "filter": self.valves.AZURE_SEARCH_FILTER if self.valves.AZURE_SEARCH_FILTER else None,
+                "endpoint": self.valves.AZURE_SEARCH_ENDPOINT if self.valves.AZURE_SEARCH_ENDPOINT else None,
+                "index_name": self.valves.AZURE_SEARCH_INDEX_NAME if self.valves.AZURE_SEARCH_INDEX_NAME else None,
+                "project_resource_id": self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID if self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID else None,
+                "semantic_configuration": self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION if self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION else "azureml-default",
+                "authentication": auth_config,
+                "embedding_dependency": self.valves.AZURE_SEARCH_EMBEDDING_DEPENDENCY if self.valves.AZURE_SEARCH_EMBEDDING_DEPENDENCY else None,
+                "embeddingEndpoint": self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT if self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT else None,
+                "embeddingKey": self.valves.AZURE_SEARCH_EMBEDDING_KEY.get_decrypted() if self.valves.AZURE_SEARCH_EMBEDDING_KEY else None,
+                "query_type": self.valves.AZURE_SEARCH_QUERY_TYPE if self.valves.AZURE_SEARCH_QUERY_TYPE else "vectorSimpleHybrid",
+                "in_scope": self.valves.AZURE_SEARCH_IN_SCOPE,
+                "role_information": self.valves.AZURE_SEARCH_ROLE_INFORMATION if self.valves.AZURE_SEARCH_ROLE_INFORMATION else "You are an AI assistant.",
+                "strictness": self.valves.AZURE_SEARCH_STRICTNESS if self.valves.AZURE_SEARCH_STRICTNESS else 5,
+                "top_n_documents": self.valves.AZURE_SEARCH_TOP_N_DOCUMENTS if self.valves.AZURE_SEARCH_TOP_N_DOCUMENTS else 20,
+                "key": self.valves.AZURE_SEARCH_KEY.get_decrypted() if (self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE == "api_key" and self.valves.AZURE_SEARCH_KEY) else None,
+                "indexName": self.valves.AZURE_SEARCH_INDEX_NAME if self.valves.AZURE_SEARCH_INDEX_NAME else None,
+            },
+        }
+
+        return [data_source]
 
     def parse_models(self, models_str: str) -> List[str]:
         """
@@ -480,8 +634,10 @@ class Pipe:
         allowed_params = {
             "model",
             "messages",
+            "deployment", 
             "frequency_penalty",
             "max_tokens",
+            "max_citations",
             "presence_penalty",
             "reasoning_effort",
             "response_format",
@@ -492,6 +648,7 @@ class Pipe:
             "tool_choice",
             "tools",
             "top_p",
+            "data_sources",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
@@ -514,6 +671,12 @@ class Pipe:
                 if "." in filtered_body["model"]
                 else filtered_body["model"]
             )
+
+        # Add Azure Search data sources if configured and not already present in request
+        if "data_sources" not in filtered_body:
+            azure_search_data_sources = self.get_azure_search_data_sources()
+            if azure_search_data_sources:
+                filtered_body["data_sources"] = azure_search_data_sources
 
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
