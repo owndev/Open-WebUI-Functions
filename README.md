@@ -124,9 +124,11 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Integration with Google Generative AI or Vertex AI API for content generation.
 - Sends messages from Open WebUI to **Google Gemini**.
 - Supports encryption of sensitive information like API keys.
-- Supports both streaming and non-streaming responses.
+- Supports both streaming and non-streaming responses (streaming automatically disabled for image generation models).
 - Supports thinking and reasoning capabilities.
 - Provides configurable error handling and timeouts.
+- **Advanced Image Processing**: Optimized image handling with configurable compression, resizing, and quality settings.
+- **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
 - Native tool calling support
 
