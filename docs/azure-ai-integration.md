@@ -2,14 +2,13 @@
 
 The repository includes functions specifically designed for **Azure AI**, supporting both **Azure OpenAI** models and general **Azure AI** services.
 
-🔗 [Learn More About Azure AI](https://own.dev/azure-microsoft-com-en-us-solutions-ai)
-
+🔗 [Learn More About Azure AI](https://azure.microsoft.com/en-us/solutions/ai)
 
 ## Pipeline
-- 🧩 [Azure AI Foundry Pipeline](https://own.dev/github-owndev-open-webui-functions-azure-ai-foundry)
 
+- 🧩 [Azure AI Foundry Pipeline](../pipelines/azure/azure_ai_foundry.py)
 
-### Features:
+### Features
 
 - **Azure OpenAI API Support**  
   Access models like **GPT-4o, o3**, and **other fine-tuned AI models** via Azure.
@@ -20,8 +19,7 @@ The repository includes functions specifically designed for **Azure AI**, suppor
 - **Secure API Requests**  
   Supports API key authentication and environment variable configurations.
 
-
-### Environment Variables:
+### Environment Variables
 
 Configure the following environment variables to enable Azure AI support:
 
@@ -93,7 +91,7 @@ AZURE_SEARCH_TOP_N_DOCUMENTS=20
 
 The pipeline now supports **Azure Search** integration for **Retrieval-Augmented Generation (RAG)**. When configured, the pipeline will automatically include a `data_sources` field in requests to Azure AI, enabling document-based AI responses.
 
-#### Configuration:
+#### Configuration
 
 Configure Azure Search by setting the following environment variables:
 
@@ -102,7 +100,7 @@ Configure Azure Search by setting the following environment variables:
 - **AZURE_SEARCH_AUTHENTICATION_TYPE**: Authentication method (`system_assigned_managed_identity` or `api_key`)
 - **AZURE_SEARCH_KEY**: API key (if using `api_key` authentication)
 
-#### Optional Settings:
+#### Optional Settings
 
 - **AZURE_SEARCH_PROJECT_RESOURCE_ID**: Project resource ID
 - **AZURE_SEARCH_SEMANTIC_CONFIGURATION**: Semantic configuration name
