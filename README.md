@@ -42,8 +42,8 @@ To install and configure functions in Open WebUI, follow these steps:
 
 1. **Ensure Admin Access**:
 
-   > [!NOTE]
-   > You must be an admin in Open WebUI to install functions.
+> [!NOTE]
+> You must be an admin in Open WebUI to install functions.
 
 2. **Access Admin Settings**:
    - Navigate to the **Admin Settings** section in Open WebUI.
@@ -58,8 +58,8 @@ To install and configure functions in Open WebUI, follow these steps:
 5. **Set Environment Variables (if required)**:
    - Some functions require API keys or specific configurations via environment variables.
 
-   > [!IMPORTANT]
-   > Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
+> [!IMPORTANT]
+> Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
 
 6. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
