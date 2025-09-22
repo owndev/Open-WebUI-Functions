@@ -95,6 +95,23 @@ GOOGLE_IMAGE_ENABLE_OPTIMIZATION=true
 # Default: 0.5
 GOOGLE_IMAGE_PNG_THRESHOLD_MB=0.5
 
+# Maximum number of images (history + current message) sent per request
+# Default: 5
+GOOGLE_IMAGE_HISTORY_MAX_REFERENCES=5
+
+# Add inline labels like [Bild 1] before each image to allow references in follow-up prompts
+# Default: true
+GOOGLE_IMAGE_ADD_LABELS=true
+
+# Deduplicate identical images from history (hash-based) to reduce payload size
+# Default: true
+GOOGLE_IMAGE_DEDUP_HISTORY=true
+
+# Boolean: When true (default) history images come before current message images.
+# When false, current message images are placed first.
+# Default: true
+GOOGLE_IMAGE_HISTORY_FIRST=true
+
 # Enable fallback to data URL when image upload fails
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
