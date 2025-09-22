@@ -2,11 +2,11 @@
 
 This integration enables **Open WebUI** to interact with **Google Gemini** models via the official Google Generative AI API (using API Keys) or through Google Cloud Vertex AI (leveraging Google Cloud's infrastructure and authentication). It provides a robust and customizable pipeline to access text and multimodal generation capabilities from Google’s latest AI models.
 
-🔗 [Learn More About Google AI](https://own.dev/ai-google-dev)
+🔗 [Learn More About Google AI](https://ai.google.dev/)
 
 ## Pipeline
 
-- 🧩 [Google Gemini Pipeline](https://own.dev/github-owndev-open-webui-functions-google-gemini)
+- 🧩 [Google Gemini Pipeline](../pipelines/google/google_gemini.py)
 
 ## Features
 
@@ -128,7 +128,7 @@ GOOGLE_API_KEY="your-google-api-key"
 ```
 
 > [!TIP]
-> You can obtain your API key from the [Google AI Studio](https://own.dev/aistudio-google-com) dashboard after signing up.
+> You can obtain your API key from the [Google AI Studio](https://aistudio.google.com/) dashboard after signing up.
 
 ### Connection Method: Google Cloud Vertex AI
 
