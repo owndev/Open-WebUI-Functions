@@ -99,7 +99,7 @@ GOOGLE_IMAGE_PNG_THRESHOLD_MB=0.5
 # Default: 5
 GOOGLE_IMAGE_HISTORY_MAX_REFERENCES=5
 
-# Add inline labels like [Bild 1] before each image to allow references in follow-up prompts
+# Add inline labels like [Image 1] before each image to allow references in follow-up prompts
 # Default: true
 GOOGLE_IMAGE_ADD_LABELS=true
 
