@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.4.1
+version: 2.5.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -135,6 +135,12 @@ async def cleanup_response(
 class Pipe:
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
+        # Custom prefix for pipeline display name
+        AZURE_AI_PIPELINE_PREFIX: str = Field(
+            default=os.getenv("AZURE_AI_PIPELINE_PREFIX", "Azure AI"),
+            description="Custom prefix for the pipeline display name (e.g., 'Azure AI', 'My Azure', 'Company AI'). The final display will be: '<prefix>: <model_name>'",
+        )
+
         # API key for Azure AI
         AZURE_AI_API_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
@@ -191,7 +197,7 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self.name: str = "Azure AI"
+        self.name: str = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}:"
         # Extract model name from Azure OpenAI URL if available
         self._extracted_model_name = self._extract_model_from_url()
 
@@ -517,7 +523,7 @@ class Pipe:
 
         # If custom models are provided, parse them and return as pipes
         if self.valves.AZURE_AI_MODEL:
-            self.name = "Azure AI: "
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
             models = self.parse_models(self.valves.AZURE_AI_MODEL)
             if models:
                 return [{"id": model, "name": model} for model in models]
@@ -532,19 +538,19 @@ class Pipe:
 
         # If custom model is not provided but predefined models are enabled, return those.
         if self.valves.USE_PREDEFINED_AZURE_AI_MODELS:
-            self.name = "Azure AI: "
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
             return self.get_azure_models()
 
         # Check if we can extract model name from Azure OpenAI URL
         if self._extracted_model_name:
-            self.name = "Azure AI: "
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
             return [
                 {"id": self._extracted_model_name, "name": self._extracted_model_name}
             ]
 
         # Otherwise, use a default name.
-        self.name = f"Azure AI: "
-        return [{"id": "azure_ai", "name": "Azure AI"}]
+        self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
+        return [{"id": "azure_ai", "name": self.valves.AZURE_AI_PIPELINE_PREFIX}]
 
     async def stream_processor_with_citations(
         self,

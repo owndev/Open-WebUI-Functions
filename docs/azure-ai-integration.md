@@ -24,6 +24,11 @@ The repository includes functions specifically designed for **Azure AI**, suppor
 Configure the following environment variables to enable Azure AI support:
 
 ```bash
+# Custom prefix for pipeline display name (default: "Azure AI")
+# The colon ":" will be added automatically between prefix and model name
+# Examples: "Azure AI" → "Azure AI: gpt-4o", "My Azure" → "My Azure: gpt-4o"
+AZURE_AI_PIPELINE_PREFIX="Azure AI"
+
 # API key or token for Azure AI
 AZURE_AI_API_KEY="your-api-key"
 
@@ -161,7 +166,7 @@ The pipeline automatically enhances Azure AI Search responses to make citations 
   "choices": [
     {
       "message": {
-        "content": "**Docker container actions** sind eine Art von GitHub Actions [doc1]...",
+        "content": "**Docker container actions** are a type of GitHub Actions [doc1]...",
         "context": {
           "citations": [
             {
