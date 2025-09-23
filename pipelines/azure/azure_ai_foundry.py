@@ -19,6 +19,7 @@ features:
 """
 
 from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
+from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
@@ -214,8 +215,10 @@ class Pipe:
 
         try:
             # Check if this is an Azure OpenAI URL
+            from urllib.parse import urlparse  # Local import to avoid scope issues
+            endpoint_host = urlparse(self.valves.AZURE_AI_ENDPOINT).hostname or ""
             if (
-                ".openai.azure.com" in self.valves.AZURE_AI_ENDPOINT
+                (endpoint_host == "openai.azure.com" or endpoint_host.endswith(".openai.azure.com"))
                 and "/deployments/" in self.valves.AZURE_AI_ENDPOINT
             ):
                 # Extract model name from URL pattern
