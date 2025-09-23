@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.5.1
+version: 1.6.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -30,6 +30,7 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
+  - Ability to forward User Headers and change gemini base url
 """
 
 import os
@@ -148,6 +149,14 @@ class Pipe:
 
     # Configuration valves for the pipeline
     class Valves(BaseModel):
+        BASE_URL: str = Field(
+            default=os.getenv("GOOGLE_GENAI_BASE_URL", "https://generativelanguage.googleapis.com/"),
+            description="Base URL for the Google Generative AI API.",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower() == "true",
+            description="Whether to forward user information headers.",
+        )
         GOOGLE_API_KEY: EncryptedStr = Field(
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
@@ -204,7 +213,7 @@ class Pipe:
         """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
         self.name: str = "Google Gemini: "
-
+        
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
@@ -230,7 +239,18 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
-            return genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+            headers = {}
+            if self.valves.ENABLE_FORWARD_USER_INFO_HEADERS and hasattr(self, 'user') and self.user:
+                headers = {
+                    "X-OpenWebUI-User-Name": self.user.name,
+                    "X-OpenWebUI-User-Id": self.user.id,
+                    "X-OpenWebUI-User-Email": self.user.email,
+                    "X-OpenWebUI-User-Role": self.user.role,
+                }
+            options = types.HttpOptions(api_version='v1alpha', base_url=self.valves.BASE_URL, headers=headers)
+            return genai.Client(
+                api_key=self.valves.GOOGLE_API_KEY.get_decrypted(), http_options=options
+            )
 
     def _validate_api_key(self) -> None:
         """
@@ -840,7 +860,7 @@ class Pipe:
                 }
             )
 
-            user = Users.get_user_by_id(__user__["id"])
+            self.user = user = Users.get_user_by_id(__user__["id"])
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -1329,9 +1349,18 @@ class Pipe:
                 duration_s = int(
                     max(0, time.time() - (thinking_started_at or time.time()))
                 )
+                # Format each line with > for blockquote while preserving formatting
+                thought_content = "".join(thought_chunks).strip()
+                quoted_lines = []
+                for line in thought_content.split("\n"):
+                    quoted_lines.append(f"> {line}")
+                quoted_content = "\n".join(quoted_lines)
+
                 details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_chunks)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
 
                 # Combine thoughts and answer (images not processed in streaming mode)
@@ -1459,6 +1488,8 @@ class Pipe:
         # Setup logging for this request
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
+        self.log.debug(f"User request body: {__user__}")
+        self.user = Users.get_user_by_id(__user__["id"])
 
         try:
             # Parse and validate model ID
@@ -1711,9 +1742,18 @@ class Pipe:
                     # If we have thoughts, wrap them using <details>
                     if thought_segments:
                         duration_s = int(max(0, time.time() - start_ts))
+                        # Format each line with > for blockquote while preserving formatting
+                        thought_content = "".join(thought_segments).strip()
+                        quoted_lines = []
+                        for line in thought_content.split("\n"):
+                            quoted_lines.append(f"> {line}")
+                        quoted_content = "\n".join(quoted_lines)
+
                         details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_segments)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
                         full_response += details_block
 
