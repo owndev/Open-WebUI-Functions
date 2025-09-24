@@ -85,6 +85,8 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
 - Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o;gpt-4o-mini`).
+- Customizable pipeline display with configurable prefix via `AZURE_AI_PIPELINE_PREFIX`.
+- Azure AI Search / RAG integration with enhanced collapsible citation display (Azure OpenAI only).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
