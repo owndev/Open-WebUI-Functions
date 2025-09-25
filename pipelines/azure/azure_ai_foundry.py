@@ -479,6 +479,7 @@ class Pipe:
             {"id": "gpt-4.1-nano", "name": "OpenAI GPT-4.1 Nano"},
             {"id": "gpt-4.5-preview", "name": "OpenAI GPT-4.5 Preview"},
             {"id": "gpt-5", "name": "OpenAI GPT-5"},
+            {"id": "gpt‑5‑codex", "name": "OpenAI GPT-5 Codex"},
             {"id": "gpt-5-mini", "name": "OpenAI GPT-5 Mini"},
             {"id": "gpt-5-nano", "name": "OpenAI GPT-5 Nano"},
             {"id": "gpt-5-chat", "name": "OpenAI GPT-5 Chat"},
