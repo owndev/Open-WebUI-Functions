@@ -2,11 +2,11 @@
 
 This integration enables **Open WebUI** to interact with **Google Gemini** models via the official Google Generative AI API (using API Keys) or through Google Cloud Vertex AI (leveraging Google Cloud's infrastructure and authentication). It provides a robust and customizable pipeline to access text and multimodal generation capabilities from Google’s latest AI models.
 
-🔗 [Learn More About Google AI](https://own.dev/ai-google-dev)
+🔗 [Learn More About Google AI](https://ai.google.dev/)
 
 ## Pipeline
 
-- 🧩 [Google Gemini Pipeline](https://own.dev/github-owndev-open-webui-functions-google-gemini)
+- 🧩 [Google Gemini Pipeline](../pipelines/google/google_gemini.py)
 
 ## Features
 
@@ -95,6 +95,23 @@ GOOGLE_IMAGE_ENABLE_OPTIMIZATION=true
 # Default: 0.5
 GOOGLE_IMAGE_PNG_THRESHOLD_MB=0.5
 
+# Maximum number of images (history + current message) sent per request
+# Default: 5
+GOOGLE_IMAGE_HISTORY_MAX_REFERENCES=5
+
+# Add inline labels like [Image 1] before each image to allow references in follow-up prompts
+# Default: true
+GOOGLE_IMAGE_ADD_LABELS=true
+
+# Deduplicate identical images from history (hash-based) to reduce payload size
+# Default: true
+GOOGLE_IMAGE_DEDUP_HISTORY=true
+
+# Boolean: When true (default) history images come before current message images.
+# When false, current message images are placed first.
+# Default: true
+GOOGLE_IMAGE_HISTORY_FIRST=true
+
 # Enable fallback to data URL when image upload fails
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
@@ -111,7 +128,7 @@ GOOGLE_API_KEY="your-google-api-key"
 ```
 
 > [!TIP]
-> You can obtain your API key from the [Google AI Studio](https://own.dev/aistudio-google-com) dashboard after signing up.
+> You can obtain your API key from the [Google AI Studio](https://aistudio.google.com/) dashboard after signing up.
 
 ### Connection Method: Google Cloud Vertex AI
 
