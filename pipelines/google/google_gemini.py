@@ -150,16 +150,19 @@ class Pipe:
     # Configuration valves for the pipeline
     class Valves(BaseModel):
         BASE_URL: str = Field(
-            default=os.getenv("GOOGLE_GENAI_BASE_URL", "https://generativelanguage.googleapis.com/"),
+            default=os.getenv(
+                "GOOGLE_GENAI_BASE_URL", "https://generativelanguage.googleapis.com/"
+            ),
             description="Base URL for the Google Generative AI API.",
-        )
-        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
-            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower() == "true",
-            description="Whether to forward user information headers.",
         )
         GOOGLE_API_KEY: EncryptedStr = Field(
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
+            == "true",
+            description="Whether to forward user information headers.",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -450,7 +453,7 @@ class Pipe:
         """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
         self.name: str = "Google Gemini: "
-        
+
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
@@ -477,14 +480,20 @@ class Pipe:
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
             headers = {}
-            if self.valves.ENABLE_FORWARD_USER_INFO_HEADERS and hasattr(self, 'user') and self.user:
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
                 headers = {
                     "X-OpenWebUI-User-Name": self.user.name,
                     "X-OpenWebUI-User-Id": self.user.id,
                     "X-OpenWebUI-User-Email": self.user.email,
                     "X-OpenWebUI-User-Role": self.user.role,
                 }
-            options = types.HttpOptions(api_version='v1alpha', base_url=self.valves.BASE_URL, headers=headers)
+            options = types.HttpOptions(
+                api_version="v1alpha", base_url=self.valves.BASE_URL, headers=headers
+            )
             return genai.Client(
                 api_key=self.valves.GOOGLE_API_KEY.get_decrypted(), http_options=options
             )

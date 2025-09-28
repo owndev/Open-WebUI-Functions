@@ -130,6 +130,7 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - **Advanced Image Processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
+- Ability to forward User Headers and change gemini base url
 - Native tool calling support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)

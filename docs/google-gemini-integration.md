@@ -52,7 +52,10 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Grounding with Google search**  
   Improve the accuracy and recency of Gemini responses with Google search grounding.
 
-- **Native tool calling support**
+- **Ability to forward User Headers and change gemini base url**  
+  Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
+
+- **Native tool calling support**  
   Leverage Google genai native function calling to orchestrate the use of tools
 
 ## Environment Variables
