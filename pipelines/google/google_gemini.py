@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.5.1
+version: 1.6.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -30,6 +30,7 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
+  - Ability to forward User Headers and change gemini base url
 """
 
 import os
@@ -148,9 +149,20 @@ class Pipe:
 
     # Configuration valves for the pipeline
     class Valves(BaseModel):
+        BASE_URL: str = Field(
+            default=os.getenv(
+                "GOOGLE_GENAI_BASE_URL", "https://generativelanguage.googleapis.com/"
+            ),
+            description="Base URL for the Google Generative AI API.",
+        )
         GOOGLE_API_KEY: EncryptedStr = Field(
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
+            == "true",
+            description="Whether to forward user information headers.",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -199,6 +211,243 @@ class Pipe:
             default=float(os.getenv("GOOGLE_IMAGE_PNG_THRESHOLD_MB", "0.5")),
             description="PNG files above this size (MB) will be converted to JPEG for better compression",
         )
+        IMAGE_HISTORY_MAX_REFERENCES: int = Field(
+            default=int(os.getenv("GOOGLE_IMAGE_HISTORY_MAX_REFERENCES", "5")),
+            description="Maximum total number of images (history + current message) to include in a generation call",
+        )
+        IMAGE_ADD_LABELS: bool = Field(
+            default=os.getenv("GOOGLE_IMAGE_ADD_LABELS", "true").lower() == "true",
+            description="If true, add small text labels like [Image 1] before each image part so the model can reference them.",
+        )
+        IMAGE_DEDUP_HISTORY: bool = Field(
+            default=os.getenv("GOOGLE_IMAGE_DEDUP_HISTORY", "true").lower() == "true",
+            description="If true, deduplicate identical images (by hash) when constructing history context",
+        )
+        IMAGE_HISTORY_FIRST: bool = Field(
+            default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
+            description="If true (default), history images precede current message images; if false, current images first.",
+        )
+
+    # ---------------- Internal Helpers ---------------- #
+    async def _gather_history_images(
+        self,
+        messages: List[Dict[str, Any]],
+        last_user_msg: Dict[str, Any],
+        optimization_stats: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        history_images: List[Dict[str, Any]] = []
+        for msg in messages:
+            if msg is last_user_msg:
+                continue
+            if msg.get("role") not in {"user", "assistant"}:
+                continue
+            _p, parts = await self._extract_images_from_message(
+                msg, stats_list=optimization_stats
+            )
+            if parts:
+                history_images.extend(parts)
+        return history_images
+
+    def _deduplicate_images(self, images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not self.valves.IMAGE_DEDUP_HISTORY:
+            return images
+        seen: set[str] = set()
+        result: List[Dict[str, Any]] = []
+        for part in images:
+            try:
+                data = part["inline_data"]["data"]
+                # Hash full base64 payload for stronger dedup reliability
+                h = hashlib.sha256(data.encode()).hexdigest()
+                if h in seen:
+                    continue
+                seen.add(h)
+            except Exception:
+                pass
+            result.append(part)
+        return result
+
+    def _apply_order_and_limit(
+        self,
+        history: List[Dict[str, Any]],
+        current: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[bool]]:
+        """Combine history & current image parts honoring order & global limit.
+
+        Returns:
+            (combined_parts, reused_flags) where reused_flags[i] == True indicates
+            the image originated from history, False if from current message.
+        """
+        history_first = self.valves.IMAGE_HISTORY_FIRST
+        limit = max(1, self.valves.IMAGE_HISTORY_MAX_REFERENCES)
+        combined: List[Dict[str, Any]] = []
+        reused_flags: List[bool] = []
+
+        def append(parts: List[Dict[str, Any]], reused: bool):
+            for p in parts:
+                if len(combined) >= limit:
+                    break
+                combined.append(p)
+                reused_flags.append(reused)
+
+        if history_first:
+            append(history, True)
+            append(current, False)
+        else:
+            append(current, False)
+            append(history, True)
+        return combined, reused_flags
+
+    async def _emit_image_stats(
+        self,
+        ordered_stats: List[Dict[str, Any]],
+        reused_flags: List[bool],
+        total_limit: int,
+        __event_emitter__: Callable,
+    ) -> None:
+        """Emit per-image optimization stats aligned with final combined order.
+
+        ordered_stats: stats list in the exact order images will be sent (same length as combined image list)
+        reused_flags: parallel list indicating whether image originated from history
+        """
+        if not ordered_stats:
+            return
+        for idx, stat in enumerate(ordered_stats, start=1):
+            reused = reused_flags[idx - 1] if idx - 1 < len(reused_flags) else False
+            stat_copy = dict(stat) if stat else {}
+            stat_copy.update({"index": idx, "reused": reused})
+            if stat and stat.get("original_size_mb") is not None:
+                desc = f"Image {idx}: {stat['original_size_mb']:.2f}MB -> {stat['final_size_mb']:.2f}MB"
+                if stat.get("quality") is not None:
+                    desc += f" (Q{stat['quality']})"
+            else:
+                desc = f"Image {idx}: (no metrics)"
+            reasons = stat.get("reasons") if stat else None
+            if reasons:
+                desc += " | " + ", ".join(reasons[:3])
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "image_optimization",
+                        "description": desc,
+                        "index": idx,
+                        "done": False,
+                        "details": stat_copy,
+                    },
+                }
+            )
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "action": "image_optimization",
+                    "description": f"{len(ordered_stats)} image(s) processed (limit {total_limit}).",
+                    "done": True,
+                },
+            }
+        )
+
+    async def _build_image_generation_contents(
+        self,
+        messages: List[Dict[str, Any]],
+        __event_emitter__: Callable,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Construct the contents payload for image-capable models.
+
+        Returns tuple (contents, system_instruction) where system_instruction is None for this path.
+        """
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if not last_user_msg:
+            raise ValueError("No user message found")
+
+        optimization_stats: List[Dict[str, Any]] = []
+        history_images = await self._gather_history_images(
+            messages, last_user_msg, optimization_stats
+        )
+        prompt, current_images = await self._extract_images_from_message(
+            last_user_msg, stats_list=optimization_stats
+        )
+
+        # Deduplicate
+        history_images = self._deduplicate_images(history_images)
+        current_images = self._deduplicate_images(current_images)
+
+        combined, reused_flags = self._apply_order_and_limit(
+            history_images, current_images
+        )
+
+        if not prompt and not combined:
+            raise ValueError("No prompt or images provided")
+        if not prompt and combined:
+            prompt = "Analyze and describe the provided images."
+
+        # Build ordered stats aligned with combined list
+        ordered_stats: List[Dict[str, Any]] = []
+        if optimization_stats:
+            # Build map from final_hash -> stat (first wins)
+            hash_map: Dict[str, Dict[str, Any]] = {}
+            for s in optimization_stats:
+                fh = s.get("final_hash")
+                if fh and fh not in hash_map:
+                    hash_map[fh] = s
+            for part in combined:
+                try:
+                    fh = hashlib.sha256(
+                        part["inline_data"]["data"].encode()
+                    ).hexdigest()
+                    ordered_stats.append(hash_map.get(fh) or {})
+                except Exception:
+                    ordered_stats.append({})
+        # Emit stats AFTER final ordering so labels match
+        await self._emit_image_stats(
+            ordered_stats,
+            reused_flags,
+            self.valves.IMAGE_HISTORY_MAX_REFERENCES,
+            __event_emitter__,
+        )
+
+        # Emit mapping
+        if combined:
+            mapping = [
+                {
+                    "index": i + 1,
+                    "label": (
+                        f"Image {i+1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
+                    ),
+                    "reused": reused_flags[i],
+                    "origin": "history" if reused_flags[i] else "current",
+                }
+                for i in range(len(combined))
+            ]
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "image_reference_map",
+                        "description": f"{len(combined)} image(s) included (limit {self.valves.IMAGE_HISTORY_MAX_REFERENCES}).",
+                        "images": mapping,
+                        "done": True,
+                    },
+                }
+            )
+
+        # Build parts
+        parts: List[Dict[str, Any]] = []
+        if prompt:
+            parts.append({"text": prompt})
+        if self.valves.IMAGE_ADD_LABELS:
+            for idx, part in enumerate(combined, start=1):
+                parts.append({"text": f"[Image {idx}]"})
+                parts.append(part)
+        else:
+            parts.extend(combined)
+
+        self.log.debug(
+            f"Image-capable payload: history={len(history_images)} current={len(current_images)} used={len(combined)} limit={self.valves.IMAGE_HISTORY_MAX_REFERENCES} history_first={self.valves.IMAGE_HISTORY_FIRST} prompt_len={len(prompt)}"
+        )
+        return [{"role": "user", "parts": parts}], None
 
     def __init__(self):
         """Initializes the Pipe instance and configures the genai library."""
@@ -230,7 +479,24 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
-            return genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
+            headers = {}
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
+                headers = {
+                    "X-OpenWebUI-User-Name": self.user.name,
+                    "X-OpenWebUI-User-Id": self.user.id,
+                    "X-OpenWebUI-User-Email": self.user.email,
+                    "X-OpenWebUI-User-Role": self.user.role,
+                }
+            options = types.HttpOptions(
+                api_version="v1alpha", base_url=self.valves.BASE_URL, headers=headers
+            )
+            return genai.Client(
+                api_key=self.valves.GOOGLE_API_KEY.get_decrypted(), http_options=options
+            )
 
     def _validate_api_key(self) -> None:
         """
@@ -569,68 +835,88 @@ class Pipe:
 
         return parts
 
-    async def _find_image(self, messages: List[Dict[str, Any]]) -> Optional[str]:
-        """
-        Find an image in the message history.
-        Searches through the last few messages for uploaded images.
+    # _find_image removed (was single-image oriented and is superseded by multi-image logic)
 
-        Args:
-            messages: List of message objects from the request
+    async def _extract_images_from_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        stats_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Extract prompt text and ALL images from a single user message.
+
+        This replaces the previous single-image _find_image logic for image-capable
+        models so that multi-image prompts are respected.
 
         Returns:
-            Base64 encoded image data or None if no image found
+            (prompt_text, image_parts)
+                prompt_text: concatenated text content (may be empty)
+                image_parts: list of {"inline_data": {mime_type, data}} dicts
         """
-        max_search = 5
-        search_count = 0
+        content = message.get("content", "")
+        text_segments: List[str] = []
+        image_parts: List[Dict[str, Any]] = []
 
-        for msg in reversed(messages):
-            if search_count >= max_search:
-                break
-            search_count += 1
+        # Helper to process a data URL or fetched file and append inline_data
+        def _add_image(data_url: str):
+            try:
+                optimized = self._optimize_image_for_api(data_url, stats_list)
+                header, b64 = optimized.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                image_parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            except Exception as e:  # pragma: no cover - defensive
+                self.log.warning(f"Skipping image (parse failure): {e}")
 
-            content = msg.get("content", [])
-            if isinstance(content, str):
-                # Search for image markdown syntax
-                match = re.search(
-                    r"!\[([^\]]*)\]\((data:image[^;]+;base64,[^)]+|/files/[^)]+|/api/v1/files/[^)]+)\)",
-                    content,
-                )
-                if match:
-                    url = match.group(2)
+        # Regex to extract markdown image references
+        md_pattern = re.compile(
+            r"!\[[^\]]*\]\((data:image[^)]+|/files/[^)]+|/api/v1/files/[^)]+)\)"
+        )
+
+        # Structured multimodal array
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text":
+                    txt = item.get("text", "")
+                    text_segments.append(txt)
+                    # Also parse any markdown images embedded in the text
+                    for match in md_pattern.finditer(txt):
+                        url = match.group(1)
+                        if url.startswith("data:"):
+                            _add_image(url)
+                        else:
+                            b64 = await self._fetch_file_as_base64(url)
+                            if b64:
+                                _add_image(b64)
+                elif item.get("type") == "image_url":
+                    url = item.get("image_url", {}).get("url", "")
                     if url.startswith("data:"):
-                        return self._optimize_image_for_api(url)
+                        _add_image(url)
                     elif "/files/" in url or "/api/v1/files/" in url:
                         b64 = await self._fetch_file_as_base64(url)
                         if b64:
-                            return self._optimize_image_for_api(b64)
+                            _add_image(b64)
+        # Plain string message (may include markdown images)
+        elif isinstance(content, str):
+            text_segments.append(content)
+            for match in md_pattern.finditer(content):
+                url = match.group(1)
+                if url.startswith("data:"):
+                    _add_image(url)
+                else:
+                    b64 = await self._fetch_file_as_base64(url)
+                    if b64:
+                        _add_image(b64)
+        else:
+            self.log.debug(
+                f"Unsupported content type for image extraction: {type(content)}"
+            )
 
-            elif isinstance(content, list):
-                for item in content:
-                    if item.get("type") == "image_url":
-                        url = item.get("image_url", {}).get("url", "")
-                        if url.startswith("data:"):
-                            return self._optimize_image_for_api(url)
-                        elif "/files/" in url or "/api/v1/files/" in url:
-                            b64 = await self._fetch_file_as_base64(url)
-                            if b64:
-                                return self._optimize_image_for_api(b64)
-                    elif item.get("type") == "text":
-                        text = item.get("text", "")
-                        match = re.search(
-                            r"!\[([^\]]*)\]\((data:image[^;]+;base64,[^)]+|/files/[^)]+|/api/v1/files/[^)]+)\)",
-                            text,
-                        )
-                        if match:
-                            url = match.group(2)
-                            if url.startswith("data:"):
-                                return self._optimize_image_for_api(url)
-                            elif "/files/" in url or "/api/v1/files/" in url:
-                                b64 = await self._fetch_file_as_base64(url)
-                                if b64:
-                                    return self._optimize_image_for_api(b64)
-        return None
+        prompt_text = " ".join(s.strip() for s in text_segments if s.strip())
+        return prompt_text, image_parts
 
-    def _optimize_image_for_api(self, image_data: str) -> str:
+    def _optimize_image_for_api(
+        self, image_data: str, stats_list: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
         """
         Optimize image data for Gemini API using configurable parameters.
 
@@ -669,7 +955,7 @@ class Pipe:
             )
 
             # Determine optimization strategy
-            reasons = []
+            reasons: List[str] = []
             if original_size_mb > max_size_mb:
                 reasons.append(f"size > {max_size_mb} MB")
             if base64_size_mb > max_size_mb * 1.4:
@@ -680,14 +966,32 @@ class Pipe:
             # Always check dimensions
             with Image.open(io.BytesIO(image_bytes)) as img:
                 width, height = img.size
+                resized_flag = False
                 if width > max_dimension or height > max_dimension:
                     reasons.append(f"dimensions > {max_dimension}px")
 
-                # Apply optimization logic
+                # Early exit: no optimization triggers -> keep original, record stats
                 if not reasons:
-                    reasons.append("ensuring API compatibility")
+                    if stats_list is not None:
+                        stats_list.append(
+                            {
+                                "original_size_mb": round(original_size_mb, 4),
+                                "final_size_mb": round(original_size_mb, 4),
+                                "quality": None,
+                                "format": mime_type.split("/")[-1].upper(),
+                                "resized": False,
+                                "reasons": ["no_optimization_needed"],
+                                "final_hash": hashlib.sha256(
+                                    encoded.encode()
+                                ).hexdigest(),
+                            }
+                        )
+                    self.log.debug(
+                        "Skipping optimization: image already within thresholds"
+                    )
+                    return image_data
 
-                self.log.debug(f"Optimization needed: {', '.join(reasons)}")
+                self.log.debug(f"Optimization triggers: {', '.join(reasons)}")
 
                 # Convert to RGB for JPEG compression
                 if img.mode in ("RGBA", "LA", "P"):
@@ -710,6 +1014,7 @@ class Pipe:
                         f"Resizing from {width}x{height} to {new_size[0]}x{new_size[1]}"
                     )
                     img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    resized_flag = True
 
                 # Determine quality levels based on original size and user configuration
                 if original_size_mb > 5.0:
@@ -764,6 +1069,20 @@ class Pipe:
                         self.log.debug(
                             f"Optimized: {original_size_mb:.2f} MB → {output_size_mb:.2f} MB (Q{quality})"
                         )
+                        if stats_list is not None:
+                            stats_list.append(
+                                {
+                                    "original_size_mb": round(original_size_mb, 4),
+                                    "final_size_mb": round(output_size_mb, 4),
+                                    "quality": quality,
+                                    "format": format_type,
+                                    "resized": resized_flag,
+                                    "reasons": reasons,
+                                    "final_hash": hashlib.sha256(
+                                        optimized_b64.encode()
+                                    ).hexdigest(),
+                                }
+                            )
                         return f"data:{output_mime};base64,{optimized_b64}"
 
                 # Fallback: minimum quality
@@ -776,12 +1095,42 @@ class Pipe:
                 self.log.warning(
                     f"Aggressive optimization: {output_size_mb:.2f} MB (Q15)"
                 )
+                if stats_list is not None:
+                    stats_list.append(
+                        {
+                            "original_size_mb": round(original_size_mb, 4),
+                            "final_size_mb": round(output_size_mb, 4),
+                            "quality": 15,
+                            "format": "JPEG",
+                            "resized": resized_flag,
+                            "reasons": reasons + ["fallback_min_quality"],
+                            "final_hash": hashlib.sha256(
+                                optimized_b64.encode()
+                            ).hexdigest(),
+                        }
+                    )
                 return f"data:image/jpeg;base64,{optimized_b64}"
 
         except Exception as e:
             self.log.error(f"Image optimization failed: {e}")
             # Return original or safe fallback
             if image_data.startswith("data:"):
+                if stats_list is not None:
+                    stats_list.append(
+                        {
+                            "original_size_mb": None,
+                            "final_size_mb": None,
+                            "quality": None,
+                            "format": None,
+                            "resized": False,
+                            "reasons": ["optimization_failed"],
+                            "final_hash": (
+                                hashlib.sha256(encoded.encode()).hexdigest()
+                                if "encoded" in locals()
+                                else None
+                            ),
+                        }
+                    )
                 return image_data
             return f"data:image/jpeg;base64,{encoded if 'encoded' in locals() else image_data}"
 
@@ -840,7 +1189,7 @@ class Pipe:
                 }
             )
 
-            user = Users.get_user_by_id(__user__["id"])
+            self.user = user = Users.get_user_by_id(__user__["id"])
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -1329,9 +1678,18 @@ class Pipe:
                 duration_s = int(
                     max(0, time.time() - (thinking_started_at or time.time()))
                 )
+                # Format each line with > for blockquote while preserving formatting
+                thought_content = "".join(thought_chunks).strip()
+                quoted_lines = []
+                for line in thought_content.split("\n"):
+                    quoted_lines.append(f"> {line}")
+                quoted_content = "\n".join(quoted_lines)
+
                 details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_chunks)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
 
                 # Combine thoughts and answer (images not processed in streaming mode)
@@ -1459,6 +1817,8 @@ class Pipe:
         # Setup logging for this request
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
+        self.log.debug(f"User request body: {__user__}")
+        self.user = Users.get_user_by_id(__user__["id"])
 
         try:
             # Parse and validate model ID
@@ -1476,65 +1836,16 @@ class Pipe:
             stream = body.get("stream", False)
             messages = body.get("messages", [])
 
-            # For image generation models, check if we need to include an existing image
-            image_base64 = None
+            # For image generation models, gather ALL images from the last user turn
             if supports_image_generation:
-                # Get the last user message to check if it's a generation request
-                last_user_msg = next(
-                    (msg for msg in reversed(messages) if msg.get("role") == "user"),
-                    None,
-                )
-
-                if not last_user_msg:
-                    return "Error: No user message found"
-
-                # Extract prompt from the last user message
-                content = last_user_msg.get("content", "")
-                if isinstance(content, list):
-                    text_parts = [
-                        item.get("text", "")
-                        for item in content
-                        if item.get("type") == "text"
-                    ]
-                    prompt = " ".join(text_parts)
-                else:
-                    prompt = content
-
-                if not prompt.strip():
-                    return "Error: No prompt provided"
-
-                # Look for images in the recent message history
-                image_base64 = await self._find_image(messages)
-
-                # Create optimized content structure for image generation models
-                parts = [{"text": prompt}]
-
-                if image_base64:
-                    # This is an image editing request
-                    self.log.debug("Image editing request detected")
-                    mime_type = re.search(r"data:([^;]+);base64,", image_base64).group(
-                        1
+                try:
+                    contents, system_instruction = (
+                        await self._build_image_generation_contents(
+                            messages, __event_emitter__
+                        )
                     )
-                    raw_base64 = image_base64.split(";base64,")[-1]
-
-                    # Add image to parts for editing workflow
-                    parts.append(
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": raw_base64,
-                            }
-                        }
-                    )
-                else:
-                    # This is a pure text-to-image generation request
-                    self.log.debug("Text-to-image generation request detected")
-
-                # Single optimized content structure for both text-to-image and image editing
-                contents = [{"role": "user", "parts": parts}]
-
-                # Override system instruction for image generation models
-                system_instruction = None
+                except ValueError as ve:
+                    return f"Error: {ve}"
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
@@ -1711,9 +2022,18 @@ class Pipe:
                     # If we have thoughts, wrap them using <details>
                     if thought_segments:
                         duration_s = int(max(0, time.time() - start_ts))
+                        # Format each line with > for blockquote while preserving formatting
+                        thought_content = "".join(thought_segments).strip()
+                        quoted_lines = []
+                        for line in thought_content.split("\n"):
+                            quoted_lines.append(f"> {line}")
+                        quoted_content = "\n".join(quoted_lines)
+
                         details_block = f"""<details>
-<summary>Thinking ({duration_s}s)</summary>
-{''.join(thought_segments)}
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
 </details>""".strip()
                         full_response += details_block
 
