@@ -207,4 +207,4 @@ This project is licensed under the [Apache License 2.0](./LICENSE) - see the [LI
 
 ---
 
-Created by [owndev](https://own.dev/github) - Let's make Open WebUI even more amazing together! 💪
+Created by [owndev](https://github.com/owndev) - Let's make Open WebUI even more amazing together! 💪
