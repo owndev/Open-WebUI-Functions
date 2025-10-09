@@ -214,13 +214,11 @@ class Pipe:
             return None
 
         try:
-            # Check if this is an Azure OpenAI URL
-            from urllib.parse import urlparse  # Local import to avoid scope issues
             endpoint_host = urlparse(self.valves.AZURE_AI_ENDPOINT).hostname or ""
             if (
-                (endpoint_host == "openai.azure.com" or endpoint_host.endswith(".openai.azure.com"))
-                and "/deployments/" in self.valves.AZURE_AI_ENDPOINT
-            ):
+                endpoint_host == "openai.azure.com"
+                or endpoint_host.endswith(".openai.azure.com")
+            ) and "/deployments/" in self.valves.AZURE_AI_ENDPOINT:
                 # Extract model name from URL pattern
                 # Pattern: .../deployments/{model}/chat/completions...
                 parts = self.valves.AZURE_AI_ENDPOINT.split("/deployments/")
