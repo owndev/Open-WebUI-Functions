@@ -4,9 +4,9 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.4.0
+version: 2.5.0
 license: Apache License 2.0
-description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations.
+description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
@@ -15,12 +15,13 @@ features:
   - Compatible with Azure OpenAI and other Azure AI models.
   - Predefined models for easy access.
   - Encrypted storage of sensitive API keys
+  - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
 """
 
 from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
+from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
-from starlette.background import BackgroundTask
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
@@ -135,6 +136,12 @@ async def cleanup_response(
 class Pipe:
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
+        # Custom prefix for pipeline display name
+        AZURE_AI_PIPELINE_PREFIX: str = Field(
+            default=os.getenv("AZURE_AI_PIPELINE_PREFIX", "Azure AI"),
+            description="Custom prefix for the pipeline display name (e.g., 'Azure AI', 'My Azure', 'Company AI'). The final display will be: '<prefix>: <model_name>'",
+        )
+
         # API key for Azure AI
         AZURE_AI_API_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
@@ -176,95 +183,64 @@ class Pipe:
             description="Set to True to use Authorization header with Bearer token instead of api-key header.",
         )
 
-        # Azure Search / RAG Configuration
-        AZURE_SEARCH_ENDPOINT: str = Field(
-            default=os.getenv("AZURE_SEARCH_ENDPOINT", ""),
-            description="Azure Search endpoint URL (e.g., https://xxx.search.windows.net)",
+        # Azure AI Data Sources Configuration (for Azure AI Search / RAG)
+        # Only works with Azure OpenAI endpoints: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview
+        AZURE_AI_DATA_SOURCES: str = Field(
+            default=os.getenv("AZURE_AI_DATA_SOURCES", ""),
+            description='JSON configuration for data_sources field (for Azure AI Search / RAG). Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key","key":"your-key"}}}]\'',
         )
 
-        AZURE_SEARCH_INDEX_NAME: str = Field(
-            default=os.getenv("AZURE_SEARCH_INDEX_NAME", ""),
-            description="Azure Search index name for RAG",
-        )
-
-        AZURE_SEARCH_FILTER: str = Field(
-            default=os.getenv("AZURE_SEARCH_FILTER", ""),
-            description="Azure Search filter expression (optional)",
-        )
-
-        AZURE_SEARCH_PROJECT_RESOURCE_ID: str = Field(
-            default=os.getenv("AZURE_SEARCH_PROJECT_RESOURCE_ID", ""),
-            description="Azure Search project resource ID",
-        )
-
-        AZURE_SEARCH_KEY: EncryptedStr = Field(
-            default=os.getenv("AZURE_SEARCH_KEY", ""),
-            description="Azure Search API key",
-        )
-
-        AZURE_SEARCH_AUTHENTICATION_TYPE: str = Field(
-            default=os.getenv(
-                "AZURE_SEARCH_AUTHENTICATION_TYPE", "system_assigned_managed_identity"
-            ),
-            description="Azure Search authentication type (system_assigned_managed_identity, api_key)",
-        )
-
-        AZURE_SEARCH_SEMANTIC_CONFIGURATION: str = Field(
-            default=os.getenv("AZURE_SEARCH_SEMANTIC_CONFIGURATION", "azureml-default"),
-            description="Azure Search semantic configuration name",
-        )
-
-        AZURE_SEARCH_EMBEDDING_ENDPOINT: str = Field(
-            default=os.getenv("AZURE_SEARCH_EMBEDDING_ENDPOINT", ""),
-            description="Azure Search embedding endpoint URL",
-        )
-
-        AZURE_SEARCH_EMBEDDING_KEY: EncryptedStr = Field(
-            default=os.getenv("AZURE_SEARCH_EMBEDDING_KEY", ""),
-            description="Azure Search embedding API key",
-        )
-
-        AZURE_SEARCH_EMBEDDING_DEPENDENCY: str = Field(
-            default=os.getenv("AZURE_SEARCH_EMBEDDING_DEPENDENCY", ""),
-            description="Azure Search embedding dependency configuration (optional)",
-        )
-
-        AZURE_SEARCH_QUERY_TYPE: str = Field(
-            default=os.getenv("AZURE_SEARCH_QUERY_TYPE", "vectorSimpleHybrid"),
-            description="Azure Search query type (vectorSimpleHybrid, vector, semantic)",
-        )
-
-        AZURE_SEARCH_IN_SCOPE: bool = Field(
-            default=bool(os.getenv("AZURE_SEARCH_IN_SCOPE", False)),
-            description="Whether to limit search to indexed documents only",
-        )
-
-        AZURE_SEARCH_ROLE_INFORMATION: str = Field(
-            default=os.getenv(
-                "AZURE_SEARCH_ROLE_INFORMATION", "You are an AI assistant."
-            ),
-            description="Role information for Azure Search responses",
-        )
-
-        AZURE_SEARCH_STRICTNESS: int = Field(
-            default=int(os.getenv("AZURE_SEARCH_STRICTNESS", 5)),
-            description="Azure Search strictness level (1-5)",
-        )
-
-        AZURE_SEARCH_TOP_N_DOCUMENTS: int = Field(
-            default=int(os.getenv("AZURE_SEARCH_TOP_N_DOCUMENTS", 20)),
-            description="Number of top documents to retrieve from Azure Search",
-        )
-
-        # Raw Azure Search data sources configuration (overrides individual settings if provided)
-        AZURE_SEARCH_RAW_DATA_SOURCES: str = Field(
-            default=os.getenv("AZURE_SEARCH_RAW_DATA_SOURCES", ""),
-            description="Raw JSON configuration for data_sources (overrides individual Azure Search settings if provided). Example: '[{\"type\":\"azure_search\",\"parameters\":{...}}]'",
+        # Enable enhanced citation display for Azure AI Search responses
+        AZURE_AI_ENHANCE_CITATIONS: bool = Field(
+            default=bool(os.getenv("AZURE_AI_ENHANCE_CITATIONS", True)),
+            description="If True, enhance Azure AI Search responses with better citation formatting and source content display.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        self.name: str = "Azure AI"
+        self.name: str = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}:"
+        # Extract model name from Azure OpenAI URL if available
+        self._extracted_model_name = self._extract_model_from_url()
+
+    def _extract_model_from_url(self) -> Optional[str]:
+        """
+        Extract model name from Azure OpenAI URL format.
+        Expected format: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions
+
+        Returns:
+            Model name if found in URL, None otherwise
+        """
+        if not self.valves.AZURE_AI_ENDPOINT:
+            return None
+
+        try:
+            endpoint_host = urlparse(self.valves.AZURE_AI_ENDPOINT).hostname or ""
+            if (
+                endpoint_host == "openai.azure.com"
+                or endpoint_host.endswith(".openai.azure.com")
+            ) and "/deployments/" in self.valves.AZURE_AI_ENDPOINT:
+                # Extract model name from URL pattern
+                # Pattern: .../deployments/{model}/chat/completions...
+                parts = self.valves.AZURE_AI_ENDPOINT.split("/deployments/")
+                if len(parts) > 1:
+                    model_part = parts[1].split("/")[
+                        0
+                    ]  # Get first segment after deployments/
+                    if model_part:
+                        # Log for debugging
+                        log = logging.getLogger("azure_ai._extract_model_from_url")
+                        log.debug(
+                            f"Extracted model name '{model_part}' from URL: {self.valves.AZURE_AI_ENDPOINT}"
+                        )
+                        return model_part
+        except Exception as e:
+            # Log parsing errors
+            log = logging.getLogger("azure_ai._extract_model_from_url")
+            log.warning(
+                f"Error extracting model from URL {self.valves.AZURE_AI_ENDPOINT}: {e}"
+            )
+
+        return None
 
     def validate_environment(self) -> None:
         """
@@ -328,73 +304,97 @@ class Pipe:
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
 
-    def get_azure_search_data_sources(self) -> Optional[List[Dict[str, Any]]]:
+    def get_azure_ai_data_sources(self) -> Optional[List[Dict[str, Any]]]:
         """
-        Builds Azure Search data sources configuration if Azure Search is configured.
-        If AZURE_SEARCH_RAW_DATA_SOURCES is provided, it takes precedence over individual settings.
+        Builds Azure AI data sources configuration from the AZURE_AI_DATA_SOURCES environment variable.
+        Only works with Azure OpenAI endpoints: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview
 
         Returns:
-            List containing Azure Search data source configuration, or None if not configured.
+            List containing Azure AI data source configuration, or None if not configured.
         """
-        # Check if raw data sources configuration is provided first
-        if self.valves.AZURE_SEARCH_RAW_DATA_SOURCES:
-            try:
-                import json
-                raw_data_sources = json.loads(self.valves.AZURE_SEARCH_RAW_DATA_SOURCES)
-                if isinstance(raw_data_sources, list):
-                    return raw_data_sources
-                else:
-                    # If it's a single object, wrap it in a list
-                    return [raw_data_sources]
-            except json.JSONDecodeError as e:
-                # Log error but continue with individual parameter approach
-                log = logging.getLogger("azure_ai.get_azure_search_data_sources")
-                log.error(f"Error parsing AZURE_SEARCH_RAW_DATA_SOURCES: {e}")
-
-        # Check if Azure Search is configured (at minimum endpoint and index are required)
-        if (
-            not self.valves.AZURE_SEARCH_ENDPOINT
-            or not self.valves.AZURE_SEARCH_INDEX_NAME
-        ):
+        if not self.valves.AZURE_AI_DATA_SOURCES:
             return None
 
-        # Build authentication configuration
-        auth_config = {
-            "type": self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE,
-            "key": None,
-        }
+        try:
+            data_sources = json.loads(self.valves.AZURE_AI_DATA_SOURCES)
+            if isinstance(data_sources, list):
+                return data_sources
+            else:
+                # If it's a single object, wrap it in a list
+                return [data_sources]
+        except json.JSONDecodeError as e:
+            # Log error and return None if JSON parsing fails
+            log = logging.getLogger("azure_ai.get_azure_ai_data_sources")
+            log.error(f"Error parsing AZURE_AI_DATA_SOURCES: {e}")
+            return None
 
-        # If using API key authentication, include the decrypted key
+    def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhances Azure AI Search responses by improving citation display and adding source content.
+
+        Args:
+            response: The original response from Azure AI
+
+        Returns:
+            Enhanced response with better citation formatting
+        """
+        if not isinstance(response, dict):
+            return response
+
+        # Check if this is an Azure AI Search response with citations
         if (
-            self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE == "api_key"
-            and self.valves.AZURE_SEARCH_KEY
+            "choices" not in response
+            or not response["choices"]
+            or "message" not in response["choices"][0]
+            or "context" not in response["choices"][0]["message"]
+            or "citations" not in response["choices"][0]["message"]["context"]
         ):
-            auth_config["key"] = self.valves.AZURE_SEARCH_KEY.get_decrypted()
+            return response
 
-        # Build minimal data source configuration matching exact JSON structure
-        data_source = {
-            "type": "azure_search",
-            "parameters": {
-                "filter": self.valves.AZURE_SEARCH_FILTER if self.valves.AZURE_SEARCH_FILTER else None,
-                "endpoint": self.valves.AZURE_SEARCH_ENDPOINT if self.valves.AZURE_SEARCH_ENDPOINT else None,
-                "index_name": self.valves.AZURE_SEARCH_INDEX_NAME if self.valves.AZURE_SEARCH_INDEX_NAME else None,
-                "project_resource_id": self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID if self.valves.AZURE_SEARCH_PROJECT_RESOURCE_ID else None,
-                "semantic_configuration": self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION if self.valves.AZURE_SEARCH_SEMANTIC_CONFIGURATION else "azureml-default",
-                "authentication": auth_config,
-                "embedding_dependency": self.valves.AZURE_SEARCH_EMBEDDING_DEPENDENCY if self.valves.AZURE_SEARCH_EMBEDDING_DEPENDENCY else None,
-                "embeddingEndpoint": self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT if self.valves.AZURE_SEARCH_EMBEDDING_ENDPOINT else None,
-                "embeddingKey": self.valves.AZURE_SEARCH_EMBEDDING_KEY.get_decrypted() if self.valves.AZURE_SEARCH_EMBEDDING_KEY else None,
-                "query_type": self.valves.AZURE_SEARCH_QUERY_TYPE if self.valves.AZURE_SEARCH_QUERY_TYPE else "vectorSimpleHybrid",
-                "in_scope": self.valves.AZURE_SEARCH_IN_SCOPE,
-                "role_information": self.valves.AZURE_SEARCH_ROLE_INFORMATION if self.valves.AZURE_SEARCH_ROLE_INFORMATION else "You are an AI assistant.",
-                "strictness": self.valves.AZURE_SEARCH_STRICTNESS if self.valves.AZURE_SEARCH_STRICTNESS else 5,
-                "top_n_documents": self.valves.AZURE_SEARCH_TOP_N_DOCUMENTS if self.valves.AZURE_SEARCH_TOP_N_DOCUMENTS else 20,
-                "key": self.valves.AZURE_SEARCH_KEY.get_decrypted() if (self.valves.AZURE_SEARCH_AUTHENTICATION_TYPE == "api_key" and self.valves.AZURE_SEARCH_KEY) else None,
-                "indexName": self.valves.AZURE_SEARCH_INDEX_NAME if self.valves.AZURE_SEARCH_INDEX_NAME else None,
-            },
-        }
+        try:
+            choice = response["choices"][0]
+            message = choice["message"]
+            context = message["context"]
+            citations = context["citations"]
+            content = message["content"]
 
-        return [data_source]
+            # Create citation mappings
+            citation_details = {}
+            for i, citation in enumerate(citations, 1):
+                if not isinstance(citation, dict):
+                    continue
+
+                doc_ref = f"[doc{i}]"
+                citation_details[doc_ref] = {
+                    "title": citation.get("title", "Unknown Document"),
+                    "content": citation.get("content", ""),
+                    "url": citation.get("url"),
+                    "filepath": citation.get("filepath"),
+                    "chunk_id": citation.get("chunk_id", "0"),
+                }
+
+            # Enhance the content with better citation display
+            enhanced_content = content
+
+            # Add citation section at the end
+            if citation_details:
+                citation_section = self._format_citation_section(
+                    citations, for_streaming=False
+                )
+                enhanced_content += citation_section
+
+            # Update the message content
+            message["content"] = enhanced_content
+
+            # Add enhanced citation info to context for API consumers
+            context["enhanced_citations"] = citation_details
+
+            return response
+
+        except Exception as e:
+            log = logging.getLogger("azure_ai.enhance_azure_search_response")
+            log.warning(f"Failed to enhance Azure Search response: {e}")
+            return response
 
     def parse_models(self, models_str: str) -> List[str]:
         """
@@ -470,6 +470,9 @@ class Pipe:
             {"id": "mistral-medium-2505", "name": "Mistral Medium 3 (25.05)"},
             {"id": "grok-3", "name": "Grok 3"},
             {"id": "grok-3-mini", "name": "Grok 3 Mini"},
+            {"id": "grok-4", "name": "Grok 4"},
+            {"id": "grok-4-fast-reasoning", "name": "Grok 4 Fast Reasoning"},
+            {"id": "grok-4-fast-non-reasoning", "name": "Grok 4 Fast Non-Reasoning"},
             {"id": "gpt-4o", "name": "OpenAI GPT-4o"},
             {"id": "gpt-4o-mini", "name": "OpenAI GPT-4o mini"},
             {"id": "gpt-4.1", "name": "OpenAI GPT-4.1"},
@@ -477,6 +480,7 @@ class Pipe:
             {"id": "gpt-4.1-nano", "name": "OpenAI GPT-4.1 Nano"},
             {"id": "gpt-4.5-preview", "name": "OpenAI GPT-4.5 Preview"},
             {"id": "gpt-5", "name": "OpenAI GPT-5"},
+            {"id": "gpt‑5‑codex", "name": "OpenAI GPT-5 Codex"},
             {"id": "gpt-5-mini", "name": "OpenAI GPT-5 Mini"},
             {"id": "gpt-5-nano", "name": "OpenAI GPT-5 Nano"},
             {"id": "gpt-5-chat", "name": "OpenAI GPT-5 Chat"},
@@ -519,9 +523,12 @@ class Pipe:
         """
         self.validate_environment()
 
+        # Re-extract model name in case valves were updated
+        self._extracted_model_name = self._extract_model_from_url()
+
         # If custom models are provided, parse them and return as pipes
         if self.valves.AZURE_AI_MODEL:
-            self.name = "Azure AI: "
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
             models = self.parse_models(self.valves.AZURE_AI_MODEL)
             if models:
                 return [{"id": model, "name": model} for model in models]
@@ -536,11 +543,285 @@ class Pipe:
 
         # If custom model is not provided but predefined models are enabled, return those.
         if self.valves.USE_PREDEFINED_AZURE_AI_MODELS:
-            self.name = "Azure AI: "
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
             return self.get_azure_models()
 
+        # Check if we can extract model name from Azure OpenAI URL
+        if self._extracted_model_name:
+            self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
+            return [
+                {"id": self._extracted_model_name, "name": self._extracted_model_name}
+            ]
+
         # Otherwise, use a default name.
-        return [{"id": "Azure AI", "name": "Azure AI"}]
+        self.name = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}: "
+        return [{"id": "azure_ai", "name": self.valves.AZURE_AI_PIPELINE_PREFIX}]
+
+    async def stream_processor_with_citations(
+        self,
+        content: aiohttp.StreamReader,
+        __event_emitter__=None,
+        response: Optional[aiohttp.ClientResponse] = None,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> AsyncIterator[bytes]:
+        """
+        Enhanced stream processor that can handle Azure AI Search citations in streaming responses.
+
+        Args:
+            content: The streaming content from the response
+            __event_emitter__: Optional event emitter for status updates
+
+        Yields:
+            Bytes from the streaming content with enhanced citations
+        """
+        log = logging.getLogger("azure_ai.stream_processor_with_citations")
+
+        try:
+            full_response_buffer = ""
+            citations_data = None
+            citations_added = False
+            all_chunks = []
+
+            async for chunk in content:
+                chunk_str = chunk.decode("utf-8", errors="ignore")
+                full_response_buffer += chunk_str
+                all_chunks.append(chunk)
+
+                # Log chunk for debugging (only first 200 chars to avoid spam)
+                log.debug(f"Processing chunk: {chunk_str[:200]}...")
+
+                # Look for citations in any part of the response
+                if "citations" in chunk_str.lower() and not citations_data:
+                    log.debug("Found 'citations' in chunk, attempting to parse...")
+
+                    # Try to extract citation data from the current buffer
+                    try:
+                        # Look for SSE data lines
+                        lines = full_response_buffer.split("\n")
+                        for line in lines:
+                            if (
+                                line.startswith("data: ")
+                                and line.strip() != "data: [DONE]"
+                            ):
+                                json_str = line[6:].strip()  # Remove 'data: ' prefix
+                                if json_str and json_str != "[DONE]":
+                                    try:
+                                        response_data = json.loads(json_str)
+
+                                        # Check multiple possible locations for citations
+                                        citations_found = None
+
+                                        if (
+                                            isinstance(response_data, dict)
+                                            and "choices" in response_data
+                                        ):
+                                            for choice in response_data["choices"]:
+                                                # Check in delta.context.citations
+                                                if (
+                                                    "delta" in choice
+                                                    and isinstance(
+                                                        choice["delta"], dict
+                                                    )
+                                                    and "context" in choice["delta"]
+                                                    and "citations"
+                                                    in choice["delta"]["context"]
+                                                ):
+                                                    citations_found = choice["delta"][
+                                                        "context"
+                                                    ]["citations"]
+                                                    log.debug(
+                                                        f"Found citations in delta.context: {len(citations_found)} citations"
+                                                    )
+                                                    break
+
+                                                # Check in message.context.citations
+                                                elif (
+                                                    "message" in choice
+                                                    and isinstance(
+                                                        choice["message"], dict
+                                                    )
+                                                    and "context" in choice["message"]
+                                                    and "citations"
+                                                    in choice["message"]["context"]
+                                                ):
+                                                    citations_found = choice["message"][
+                                                        "context"
+                                                    ]["citations"]
+                                                    log.debug(
+                                                        f"Found citations in message.context: {len(citations_found)} citations"
+                                                    )
+                                                    break
+
+                                        # Store the first valid citations we find
+                                        if citations_found and not citations_data:
+                                            citations_data = citations_found
+                                            log.info(
+                                                f"Successfully extracted {len(citations_data)} citations from stream"
+                                            )
+
+                                    except json.JSONDecodeError:
+                                        # Skip invalid JSON
+                                        continue
+
+                    except Exception as parse_error:
+                        log.debug(f"Error parsing citations from chunk: {parse_error}")
+
+                # Always yield the original chunk first
+                yield chunk
+
+                # Check if this is the end of the stream
+                if "data: [DONE]" in chunk_str:
+                    log.debug("End of stream detected")
+                    break
+
+            # After the stream ends, add citations if we found any
+            if citations_data and not citations_added:
+                log.info("Adding citation summary at end of stream...")
+
+                citation_section = self._format_citation_section(
+                    citations_data, for_streaming=True
+                )
+                if citation_section:
+                    # Convert escaped newlines to actual newlines for display
+                    display_section = citation_section.replace("\\n", "\n")
+
+                    # Send the citation section in smaller, safer chunks
+                    # Split by lines and send each as a separate SSE event
+                    lines = display_section.split("\n")
+
+                    for line in lines:
+                        # Escape quotes and backslashes for JSON
+                        safe_line = line.replace("\\", "\\\\").replace('"', '\\"')
+                        # Create a simple SSE event
+                        sse_event = f'data: {{"choices":[{{"delta":{{"content":"{safe_line}\\n"}}}}]}}\n\n'
+                        yield sse_event.encode("utf-8")
+
+                    citations_added = True
+                    log.info("Citation summary successfully added to stream")
+
+            # If we didn't find citations in the stream but detected citation references,
+            # try one more time with the full buffer
+            elif not citations_data and "[doc" in full_response_buffer:
+                log.warning(
+                    "Found [doc] references but no citation data - attempting final parse..."
+                )
+                # This is a fallback for cases where citation detection failed
+                fallback_message = "\\n\\n<details>\\n<summary>⚠️ Citations Processing Issue</summary>\\n\\nThe response contains citation references [doc1], [doc2], etc., but the citation details could not be extracted from the streaming response.\\n\\n</details>\\n"
+                fallback_sse = f'data: {{"choices":[{{"delta":{{"content":"{fallback_message}"}}}}]}}\n\n'
+                yield fallback_sse.encode("utf-8")
+
+            # Send completion status update when streaming is done
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": "Streaming completed", "done": True},
+                    }
+                )
+
+        except Exception as e:
+            log.error(f"Error processing stream: {e}")
+
+            # Send error status update
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"Error: {str(e)}", "done": True},
+                    }
+                )
+        finally:
+            # Always attempt to close response and session to avoid resource leaks
+            try:
+                if response:
+                    response.close()
+            except Exception:
+                pass
+            try:
+                if session:
+                    await session.close()
+            except Exception:
+                # Suppress close-time errors (e.g., SSL shutdown timeouts)
+                pass
+
+    def _format_citation_section(
+        self, citations: List[Dict[str, Any]], for_streaming: bool = False
+    ) -> str:
+        """
+        Creates a formatted citation section using collapsible details elements.
+
+        Args:
+            citations: List of citation objects
+            for_streaming: If True, format for streaming (with escaping), else for regular response
+
+        Returns:
+            Formatted citation section with HTML details elements
+        """
+        if not citations:
+            return ""
+
+        # Collect all citation details
+        citation_entries = []
+
+        for i, citation in enumerate(citations, 1):
+            if not isinstance(citation, dict):
+                continue
+
+            doc_ref = f"[doc{i}]"
+            title = citation.get("title", "Unknown Document")
+            content = citation.get("content", "")
+            filepath = citation.get("filepath")
+            url = citation.get("url")
+            chunk_id = citation.get("chunk_id", "0")
+
+            # Build individual citation details
+            citation_info = []
+
+            if filepath:
+                citation_info.append(f"📁 **File:** `{filepath}`")
+            elif url:
+                citation_info.append(f"🔗 **URL:** {url}")
+
+            citation_info.append(f"📄 **Chunk ID:** {chunk_id}")
+
+            # Add full content if available
+            if content:
+                try:
+                    # Clean content for display
+                    clean_content = str(content).strip()
+                    # Replace problematic characters for HTML display
+                    clean_content = clean_content.replace("\n", " ").replace("\r", " ")
+                    if for_streaming:
+                        # Additional escaping for streaming
+                        clean_content = clean_content.replace("\\", "\\\\").replace(
+                            '"', '\\"'
+                        )
+
+                    citation_info.append(f"**Content:**")
+                    citation_info.append(f"> {clean_content}")
+                except Exception:
+                    citation_info.append("**Content:** [Content unavailable]")
+
+            # Create collapsible details for individual citation
+            if for_streaming:
+                # For streaming, we need to escape newlines
+                citation_content = "\\n".join(citation_info)
+                citation_entry = f"<details>\\n<summary>{doc_ref} - {title}</summary>\\n\\n{citation_content}\\n\\n</details>"
+            else:
+                citation_content = "\n".join(citation_info)
+                citation_entry = f"<details>\n<summary>{doc_ref} - {title}</summary>\n\n{citation_content}\n\n</details>"
+
+            citation_entries.append(citation_entry)
+
+        # Combine all citations into main collapsible section
+        if for_streaming:
+            all_citations = "\\n\\n".join(citation_entries)
+            result = f"\\n\\n<details>\\n<summary>📚 Sources and References</summary>\\n\\n{all_citations}\\n\\n</details>\\n"
+        else:
+            all_citations = "\n\n".join(citation_entries)
+            result = f"\n\n<details>\n<summary>📚 Sources and References</summary>\n\n{all_citations}\n\n</details>\n"
+
+        return result
 
     async def stream_processor(
         self,
@@ -634,7 +915,7 @@ class Pipe:
         allowed_params = {
             "model",
             "messages",
-            "deployment", 
+            "deployment",
             "frequency_penalty",
             "max_tokens",
             "max_citations",
@@ -672,11 +953,11 @@ class Pipe:
                 else filtered_body["model"]
             )
 
-        # Add Azure Search data sources if configured and not already present in request
+        # Add Azure AI data sources if configured and not already present in request
         if "data_sources" not in filtered_body:
-            azure_search_data_sources = self.get_azure_search_data_sources()
-            if azure_search_data_sources:
-                filtered_body["data_sources"] = azure_search_data_sources
+            azure_ai_data_sources = self.get_azure_ai_data_sources()
+            if azure_ai_data_sources:
+                filtered_body["data_sources"] = azure_ai_data_sources
 
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
@@ -753,8 +1034,17 @@ class Pipe:
                 sse_headers["Content-Type"] = "text/event-stream"
                 sse_headers.pop("Content-Length", None)
 
+                # Use enhanced stream processor if Azure AI Search is configured and citations are enabled
+                if (
+                    self.valves.AZURE_AI_DATA_SOURCES
+                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
+                ):
+                    stream_processor = self.stream_processor_with_citations
+                else:
+                    stream_processor = self.stream_processor
+
                 return StreamingResponse(
-                    self.stream_processor(
+                    stream_processor(
                         request.content,
                         __event_emitter__=__event_emitter__,
                         response=request,
@@ -777,6 +1067,14 @@ class Pipe:
                     response = await request.text()
 
                 request.raise_for_status()
+
+                # Enhance Azure Search responses with better citation display
+                if (
+                    isinstance(response, dict)
+                    and self.valves.AZURE_AI_DATA_SOURCES
+                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
+                ):
+                    response = self.enhance_azure_search_response(response)
 
                 # Send completion status update
                 if __event_emitter__:
