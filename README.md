@@ -27,18 +27,17 @@
 
 ## Prerequisites 🔗
 
-> [!WARNING]
+> [!IMPORTANT]
 > To use these functions, ensure the following requirements are met:
-
-1. **An Active Open WebUI Instance**: You must have [Open WebUI](https://github.com/open-webui/open-webui) installed and running.
-
-2. **Required AI Services (if applicable)**: Some pipelines require external AI services, such as [Azure AI](https://ai.azure.com/).
-
-3. **Admin Access**: To install functions in Open WebUI, you must have administrator privileges.
+>
+> 1. **An Active Open WebUI Instance**: You must have [Open WebUI](https://github.com/open-webui/open-webui) installed and running.
+> 2. **Required AI Services (if applicable)**: Some pipelines require external AI services, such as [Azure AI](https://ai.azure.com/).
+> 3. **Admin Access**: To install functions in Open WebUI, you must have administrator privileges.
 
 ## Installation 🚀
 
-To install and configure functions in Open WebUI, follow these steps:
+> [!TIP]
+> Follow these steps to install and configure functions in Open WebUI:
 
 1. **Ensure Admin Access**:
 
@@ -66,6 +65,9 @@ To install and configure functions in Open WebUI, follow these steps:
 
 ## Security Features 🛡️
 
+> [!WARNING]
+> **API Key Security**: Always use encryption for sensitive information like API keys!
+
 ### API Key Encryption
 
 The functions include a built-in encryption mechanism for sensitive information:
@@ -75,21 +77,18 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Transparent Usage**: The encryption/decryption happens automatically when values are accessed.
 - **No Configuration Required**: Works out-of-the-box when [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) is set.
 
-**To enable encryption:**
-
-> [!CAUTION]
-> **WEBUI_SECRET_KEY is required for encryption to work!**
+> [!IMPORTANT]
+> **To enable encryption**, set the `WEBUI_SECRET_KEY` environment variable:
 >
 > ```bash
 > # Set this in your Open WebUI environment or .env file
 > WEBUI_SECRET_KEY="your-secure-random-string"
 > ```
->
-> Without this key, API keys and sensitive data will **not** be encrypted.
 
 ## Pipelines 🧩
 
-Pipelines are processing functions that extend Open WebUI with **custom AI models**, **external integrations**, and **data manipulation logic**.
+> [!NOTE]
+> Pipelines are processing functions that extend Open WebUI with **custom AI models**, **external integrations**, and **data manipulation logic**.
 
 ### **1. [Azure AI Foundry Pipeline](./pipelines/azure/azure_ai_foundry.py)**
 
@@ -101,6 +100,8 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
 - Supports Azure Search integration for enhanced document retrieval.
 - Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o;gpt-4o-mini`).
+- Customizable pipeline display with configurable prefix via `AZURE_AI_PIPELINE_PREFIX`.
+- Azure AI Search / RAG integration with enhanced collapsible citation display (Azure OpenAI only).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
@@ -148,14 +149,19 @@ Pipelines are processing functions that extend Open WebUI with **custom AI model
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
 - Native tool calling support
+- Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)
 
 🔗 [Learn More About Google Gemini](https://ai.google.dev/gemini-api/docs?hl=de)
 
+> [!NOTE]
+> **For LiteLLM Users**: To use Google Gemini models through LiteLLM, configure LiteLLM directly in Open WebUI's Admin Panel → Settings → Connections → OpenAI section instead of using this pipeline. For more information about LiteLLM, visit the [official LiteLLM GitHub repository](https://github.com/BerriAI/litellm).
+
 ## Filters 🔍
 
-Filters allow for **preprocessing and postprocessing** of data within Open WebUI.
+> [!NOTE]
+> Filters allow for **preprocessing and postprocessing** of data within Open WebUI.
 
 ### **1. [Time Token Tracker](./filters/time_token_tracker.py)**
 
@@ -194,8 +200,10 @@ Look here for [Google Gemini Integration](./docs/google-gemini-integration.md).
 
 ## Contribute 💪
 
-We accept different types of contributions, including some that don't require you to write a single line of code.
-For detailed instructions on how to get started with our project, see [about contributing to Open-WebUI-Functions](https://own.dev/github-owndev-open-webui-functions-contributing).
+> [!TIP]
+> We welcome contributions of all kinds! You don't need to write code to contribute.
+>
+> For detailed instructions on how to get started with our project, see [about contributing to Open-WebUI-Functions](./.github/CONTRIBUTING.md).
 
 ## License 📜
 
@@ -203,7 +211,8 @@ This project is licensed under the [Apache License 2.0](./LICENSE) - see the [LI
 
 ## Support 💬
 
-If you have any questions, suggestions, or need assistance, please open an [issue](../../issues/new/choose) to connect with us! 🤝
+> [!NOTE]
+> If you have any questions, suggestions, or need assistance, please open an [issue](../../issues/new/choose) to connect with us! 🤝
 
 ## Star History 💫
 
@@ -217,4 +226,4 @@ If you have any questions, suggestions, or need assistance, please open an [issu
 
 ---
 
-Created by [owndev](https://own.dev/github) - Let's make Open WebUI even more amazing together! 💪
+Created by [owndev](https://github.com/owndev) - Let's make Open WebUI even more amazing together! 💪
