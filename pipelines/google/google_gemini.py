@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.1
+version: 1.6.2
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -599,6 +599,7 @@ class Pipe:
         # Known image generation models
         image_generation_models = [
             "gemini-2.5-flash-image-preview",
+            "gemini-2.5-flash-image",
         ]
 
         # Check for exact matches or pattern matches
@@ -627,6 +628,7 @@ class Pipe:
         # Models that do NOT support thinking
         non_thinking_models = [
             "gemini-2.5-flash-image-preview",
+            "gemini-2.5-flash-image",
         ]
 
         # Check for exact matches
