@@ -137,12 +137,15 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Advanced Image Processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
-- Ability to forward User Headers and change gemini base url
 - Native tool calling support
+- Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)
 
 🔗 [Learn More About Google Gemini](https://ai.google.dev/gemini-api/docs?hl=de)
+
+> [!NOTE]
+> **For LiteLLM Users**: To use Google Gemini models through LiteLLM, configure LiteLLM directly in Open WebUI's Admin Panel → Settings → Connections → OpenAI section instead of using this pipeline. For more information about LiteLLM, visit the [official LiteLLM GitHub repository](https://github.com/BerriAI/litellm).
 
 ## Filters 🔍
 

@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.0
+version: 1.6.1
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -30,7 +30,6 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
-  - Ability to forward User Headers and change gemini base url
 """
 
 import os
@@ -159,10 +158,9 @@ class Pipe:
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
         )
-        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
-            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
-            == "true",
-            description="Whether to forward user information headers.",
+        API_VERSION: str = Field(
+            default=os.getenv("GOOGLE_API_VERSION", "v1alpha"),
+            description="API version to use for Google Generative AI (e.g., v1alpha, v1beta, v1).",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -479,20 +477,8 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
-            headers = {}
-            if (
-                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
-                and hasattr(self, "user")
-                and self.user
-            ):
-                headers = {
-                    "X-OpenWebUI-User-Name": self.user.name,
-                    "X-OpenWebUI-User-Id": self.user.id,
-                    "X-OpenWebUI-User-Email": self.user.email,
-                    "X-OpenWebUI-User-Role": self.user.role,
-                }
             options = types.HttpOptions(
-                api_version="v1alpha", base_url=self.valves.BASE_URL, headers=headers
+                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
             )
             return genai.Client(
                 api_key=self.valves.GOOGLE_API_KEY.get_decrypted(), http_options=options
