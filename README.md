@@ -40,7 +40,9 @@
 > Follow these steps to install and configure functions in Open WebUI:
 
 1. **Ensure Admin Access**:
-   - You must be an admin in Open WebUI to install functions.
+
+> [!NOTE]
+> You must be an admin in Open WebUI to install functions.
 
 2. **Access Admin Settings**:
    - Navigate to the **Admin Settings** section in Open WebUI.
@@ -54,7 +56,9 @@
 
 5. **Set Environment Variables (if required)**:
    - Some functions require API keys or specific configurations via environment variables.
-   - Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys.
+
+> [!IMPORTANT]
+> Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
 
 6. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
@@ -88,7 +92,13 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 ### **1. [Azure AI Foundry Pipeline](./pipelines/azure/azure_ai_foundry.py)**
 
+> [!TIP]
+> **Azure OpenAI Integration Made Easy**
+>
+> This pipeline provides seamless integration with Azure OpenAI and other Azure AI models with advanced features like Azure Search integration and multiple model support.
+
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
+- Supports Azure Search integration for enhanced document retrieval.
 - Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o;gpt-4o-mini`).
 - Customizable pipeline display with configurable prefix via `AZURE_AI_PIPELINE_PREFIX`.
 - Azure AI Search / RAG integration with enhanced collapsible citation display (Azure OpenAI only).
@@ -105,6 +115,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 ### **2. [N8N Pipeline](./pipelines/n8n/n8n.py)**
 
 - Integrates **Open WebUI** with **N8N**, an automation and workflow platform.
+- Streaming support for real-time data processing.
 - Sends messages from Open WebUI to an **N8N webhook**.
 - Supports real-time message processing with dynamic field handling.
 - Enables automation of AI-generated responses within an **N8N workflow**.
@@ -153,6 +164,11 @@ The functions include a built-in encryption mechanism for sensitive information:
 > Filters allow for **preprocessing and postprocessing** of data within Open WebUI.
 
 ### **1. [Time Token Tracker](./filters/time_token_tracker.py)**
+
+> [!NOTE]
+> **Performance Monitoring for AI Interactions**
+>
+> Track response times, token usage, and optionally send analytics to Azure Log Analytics for comprehensive monitoring.
 
 - Measures **response time** and **token usage** for AI interactions.
 - Supports tracking of **total token usage** and **per-message token counts**.
