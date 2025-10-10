@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
-version: 2.1.1
+version: 2.1.2
 license: Apache License 2.0
 description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats.
 features:
@@ -286,6 +286,10 @@ class Pipe:
             default="output",
             description="Field name for the response message in the N8N payload",
         )
+        SEND_CONVERSATION_HISTORY: bool = Field(
+            default=False,
+            description="Whether to include conversation history when sending requests to N8N",
+        )
         CF_ACCESS_CLIENT_ID: EncryptedStr = Field(
             default="",
             description="Only if behind Cloudflare: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/",
@@ -544,18 +548,24 @@ class Pipe:
                 if messages and messages[0].get("role") == "system":
                     system_prompt = self.dedupe_system_prompt(messages[0]["content"])
 
-                # Include full conversation history like in stream-example.py
+                # Optionally include full conversation history (controlled by valve)
                 conversation_history = []
-                for msg in messages:
-                    if msg.get("role") in ["user", "assistant"]:
-                        conversation_history.append(
-                            {"role": msg["role"], "content": msg["content"]}
-                        )
+                if self.valves.SEND_CONVERSATION_HISTORY:
+                    for msg in messages:
+                        if msg.get("role") in ["user", "assistant"]:
+                            conversation_history.append(
+                                {"role": msg["role"], "content": msg["content"]}
+                            )
 
                 # Prepare payload for N8N workflow (improved version)
                 payload = {
                     "systemPrompt": system_prompt,
-                    "messages": conversation_history,  # Full conversation context
+                    # Include messages only when enabled in valves for privacy/control
+                    "messages": (
+                        conversation_history
+                        if self.valves.SEND_CONVERSATION_HISTORY
+                        else []
+                    ),
                     "currentMessage": question,  # Current user message
                     "user_id": __user__.get("id") if __user__ else None,
                     "user_email": __user__.get("email") if __user__ else None,
