@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
-version: 2.0.0
+version: 2.0.1
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
 features:
@@ -108,10 +108,6 @@ class EncryptedStr(str):
             ),
         )
 
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
-
 
 # Helper functions
 async def cleanup_response(
@@ -167,7 +163,7 @@ class Pipe:
             ValueError: If required environment variables are not set.
         """
         # Access the decrypted API key
-        api_key = self.valves.INFOMANIAK_API_KEY.get_decrypted()
+        api_key = EncryptedStr.decrypt(self.valves.INFOMANIAK_API_KEY)
         if not api_key:
             raise ValueError("INFOMANIAK_API_KEY is not set!")
         if not self.valves.INFOMANIAK_PRODUCT_ID:
@@ -183,7 +179,7 @@ class Pipe:
             Dictionary containing the required headers for the API request.
         """
         # Access the decrypted API key
-        api_key = self.valves.INFOMANIAK_API_KEY.get_decrypted()
+        api_key = EncryptedStr.decrypt(self.valves.INFOMANIAK_API_KEY)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.0
+version: 2.5.1
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
 features:
@@ -116,10 +116,6 @@ class EncryptedStr(str):
             ),
         )
 
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
-
 
 # Helper functions
 async def cleanup_response(
@@ -197,7 +193,7 @@ class Filter:
         )
         bytes_to_hash = string_to_hash.encode("utf-8")
         decoded_key = base64.b64decode(
-            self.valves.LOG_ANALYTICS_SHARED_KEY.get_decrypted()
+            EncryptedStr.decrypt(self.valves.LOG_ANALYTICS_SHARED_KEY)
         )
         encoded_hash = base64.b64encode(
             hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()

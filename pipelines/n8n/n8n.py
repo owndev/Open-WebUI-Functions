@@ -4,8 +4,8 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/master/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
-version: 2.1.0
+n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
+version: 2.1.1
 license: Apache License 2.0
 description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats.
 features:
@@ -123,10 +123,6 @@ class EncryptedStr(str):
                 lambda instance: str(instance)
             ),
         )
-
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
 
 
 # Helper functions for resource cleanup
@@ -345,16 +341,16 @@ class Pipe:
         headers = {"Content-Type": "application/json"}
 
         # Add bearer token if available
-        bearer_token = self.valves.N8N_BEARER_TOKEN.get_decrypted()
+        bearer_token = EncryptedStr.decrypt(self.valves.N8N_BEARER_TOKEN)
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
 
         # Add Cloudflare Access headers if available
-        cf_client_id = self.valves.CF_ACCESS_CLIENT_ID.get_decrypted()
+        cf_client_id = EncryptedStr.decrypt(self.valves.CF_ACCESS_CLIENT_ID)
         if cf_client_id:
             headers["CF-Access-Client-Id"] = cf_client_id
 
-        cf_client_secret = self.valves.CF_ACCESS_CLIENT_SECRET.get_decrypted()
+        cf_client_secret = EncryptedStr.decrypt(self.valves.CF_ACCESS_CLIENT_SECRET)
         if cf_client_secret:
             headers["CF-Access-Client-Secret"] = cf_client_secret
 

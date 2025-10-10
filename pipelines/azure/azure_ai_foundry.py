@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.0
+version: 2.5.1
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -109,10 +109,6 @@ class EncryptedStr(str):
                 lambda instance: str(instance)
             ),
         )
-
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
 
 
 # Helper functions
@@ -250,7 +246,7 @@ class Pipe:
             ValueError: If required environment variables are not set.
         """
         # Access the decrypted API key
-        api_key = self.valves.AZURE_AI_API_KEY.get_decrypted()
+        api_key = EncryptedStr.decrypt(self.valves.AZURE_AI_API_KEY)
         if not api_key:
             raise ValueError("AZURE_AI_API_KEY is not set!")
         if not self.valves.AZURE_AI_ENDPOINT:
@@ -267,7 +263,7 @@ class Pipe:
             Dictionary containing the required headers for the API request.
         """
         # Access the decrypted API key
-        api_key = self.valves.AZURE_AI_API_KEY.get_decrypted()
+        api_key = EncryptedStr.decrypt(self.valves.AZURE_AI_API_KEY)
         if self.valves.USE_AUTHORIZATION_HEADER:
             headers = {
                 "Authorization": f"Bearer {api_key}",

@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.2
+version: 1.6.3
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -135,10 +135,6 @@ class EncryptedStr(str):
                 lambda instance: str(instance)
             ),
         )
-
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
 
 
 class Pipe:
@@ -481,7 +477,8 @@ class Pipe:
                 api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
             )
             return genai.Client(
-                api_key=self.valves.GOOGLE_API_KEY.get_decrypted(), http_options=options
+                api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
+                http_options=options,
             )
 
     def _validate_api_key(self) -> None:

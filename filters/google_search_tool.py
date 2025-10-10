@@ -1,5 +1,5 @@
 """
-title: Google Search Tool Filter for https://github.com/owndev/Open-WebUI-Functions/blob/master/pipelines/google/google_gemini.py
+title: Google Search Tool Filter for https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/google/google_gemini.py
 author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
@@ -7,7 +7,7 @@ funding_url: https://github.com/sponsors/owndev
 version: 1.0.0
 license: Apache License 2.0
 requirements:
-  - https://github.com/owndev/Open-WebUI-Functions/blob/master/pipelines/google/google_gemini.py
+  - https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/google/google_gemini.py
 description: Replacing web_search tool with google search grounding
 """
 
