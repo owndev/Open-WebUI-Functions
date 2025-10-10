@@ -12,8 +12,8 @@
       "name": "OpenAI Chat Model",
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "position": [
-        2288,
-        1248
+        2240,
+        1424
       ],
       "typeVersion": 1
     },
@@ -54,14 +54,14 @@
     },
     {
       "parameters": {
-        "respondWith": "text",
-        "responseBody": "={{ $json.output }}",
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
         "options": {}
       },
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        3008,
+        3136,
         848
       ],
       "id": "325974b4-e249-4eb3-81dc-26b392f0894e",
@@ -69,13 +69,13 @@
     },
     {
       "parameters": {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-mini",
         "options": {}
       },
       "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
       "typeVersion": 1,
       "position": [
-        2288,
+        2240,
         1072
       ],
       "id": "f2e088e0-aa71-4b42-8eaa-e0197150b9ca",
@@ -103,6 +103,7 @@
         "text": "={{ $json.body.chatInput }}",
         "options": {
           "systemMessage": "={{ $json.body.systemPrompt }}",
+          "returnIntermediateSteps": true,
           "enableStreaming": false
         }
       },
@@ -125,7 +126,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        3008,
+        3136,
         1008
       ],
       "id": "114d81bd-4573-43b4-bbfe-80b784cd467e",
@@ -148,6 +149,31 @@
       "id": "b5e9d507-92e1-45aa-8f48-3629f802bafc",
       "name": "Webhook",
       "webhookId": "d3b1cfa8-8f3c-48ca-b1c8-87c40e3dcf76"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolThink",
+      "typeVersion": 1.1,
+      "position": [
+        2928,
+        1072
+      ],
+      "id": "233faaf2-dc51-4dbd-9305-20e67a6ae589",
+      "name": "Think"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-pro",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        1248
+      ],
+      "id": "2e0360ac-d1db-45a4-91a5-f9e4a49e9d97",
+      "name": "Google Gemini Chat Model"
     }
   ],
   "pinData": {},
@@ -240,13 +266,24 @@
           }
         ]
       ]
+    },
+    "Think": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": true,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "72ba3fa2-7d33-475f-bf0d-9dcdc5a44bb7",
+  "versionId": "cf6cc59d-2f72-4cb3-91a9-aca8affa9094",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "6350a4271a2777a60d73e3a3c6a9549015b6bfe8b8f285cb566cd69ef87215da"

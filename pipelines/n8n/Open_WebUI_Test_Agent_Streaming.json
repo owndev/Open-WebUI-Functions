@@ -12,21 +12,22 @@
       "name": "OpenAI Chat Model",
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "position": [
-        32,
-        416
+        -16,
+        624
       ],
       "typeVersion": 1
     },
     {
       "parameters": {
-        "sessionKey": "={{ $('Webhook').item.json.body.user_id }}_{{ $('Webhook').item.json.body.chat_id }}"
+        "sessionKey": "={{ $('Webhook').item.json.body.user_id }}_{{ $('Webhook').item.json.body.chat_id }}",
+        "contextWindowLength": 2
       },
       "id": "5c11a401-5dbb-4edd-bd1e-7df6d0844083",
       "name": "Window Buffer Memory",
       "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
       "position": [
         160,
-        240
+        272
       ],
       "typeVersion": 1
     },
@@ -36,7 +37,7 @@
       "typeVersion": 1,
       "position": [
         288,
-        240
+        272
       ],
       "id": "01a2e9b2-0e01-48eb-91ac-628432c5d1a8",
       "name": "Wikipedia"
@@ -47,7 +48,7 @@
       "typeVersion": 1,
       "position": [
         416,
-        240
+        272
       ],
       "id": "6ec76a25-8339-4c61-88b1-aab1a861c9e3",
       "name": "Calculator"
@@ -60,8 +61,8 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
       "typeVersion": 1,
       "position": [
-        32,
-        240
+        -16,
+        272
       ],
       "id": "18b4d85b-a797-40d2-b3e3-22fe8985a872",
       "name": "Azure OpenAI Chat Model"
@@ -77,7 +78,7 @@
       "typeVersion": 2,
       "position": [
         544,
-        240
+        272
       ],
       "id": "5968806c-44bb-42bc-a2d5-f9532954e2e5",
       "name": "Date & Time"
@@ -88,6 +89,9 @@
         "text": "={{ $json.body.chatInput }}",
         "options": {
           "systemMessage": "={{ $json.body.systemPrompt }}",
+          "maxIterations": 10,
+          "returnIntermediateSteps": true,
+          "passthroughBinaryImages": true,
           "enableStreaming": true
         }
       },
@@ -113,8 +117,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        688,
-        32
+        656,
+        16
       ],
       "id": "184ac106-3444-43e7-a312-c359d6db33a0",
       "name": "Respond error to Webhook"
@@ -136,6 +140,31 @@
       "id": "e680d51f-ffb3-459b-b765-0d86881bcc80",
       "name": "Webhook",
       "webhookId": "852c394d-2b99-4688-9045-87aafbd721d1"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolThink",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        272
+      ],
+      "id": "d4956b3f-e35f-4752-9b96-e015a261136c",
+      "name": "Think"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-pro",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -16,
+        448
+      ],
+      "id": "745a19b5-a2ff-4472-a60d-3917e1d08cb6",
+      "name": "Google Gemini Chat Model"
     }
   ],
   "pinData": {},
@@ -222,13 +251,29 @@
       "main": [
         []
       ]
+    },
+    "Think": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        []
+      ]
     }
   },
   "active": true,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "753266e4-fd13-4b7c-be46-30bf91bd4517",
+  "versionId": "58d9fa88-0a07-4311-959a-e1d1eb5d4c37",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "6350a4271a2777a60d73e3a3c6a9549015b6bfe8b8f285cb566cd69ef87215da"

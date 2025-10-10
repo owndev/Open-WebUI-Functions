@@ -47,10 +47,10 @@ Shows tool names with short result previews:
 
 ```txt
 🛠️ Tool Calls (4 steps) ▶
-  Step 1: Date_Time → [{"currentDate":"2025-10-10T11:22:38.697+01:00"}]
-  Step 2: Crypto → [{"Property_Name":"uuid4","uuid4":"c28495ca-1eb8-419f-8941-7a38c753e809"}]
-  Step 3: Wikipedia → Page: List of tz database time zones...
-  Step 4: Calculator → 128675.5415958103
+  1. Date_Time → [{"currentDate":"2025-10-10T11:22:38.697+01:00"}]
+  2. Crypto → [{"Property_Name":"uuid4","uuid4":"c28495ca-1eb8-419f-8941-7a38c753e809"}]
+  3. Wikipedia → Page: List of tz database time zones...
+  4. Calculator → 128675.5415958103
 ```
 
 **Best for**: Balance between overview and detail
