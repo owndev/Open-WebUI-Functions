@@ -117,10 +117,10 @@ The functions include a built-in encryption mechanism for sensitive information:
 > [!TIP]
 > **N8N Workflow Automation Integration**
 >
-> Connect Open WebUI with N8N to leverage powerful workflow automation. Includes AI Agent tool usage display for complete transparency into your agent's actions.
+> Connect Open WebUI with N8N to leverage powerful workflow automation. Includes configurable AI Agent tool usage display for complete transparency into your agent's actions.
 
 - Integrates **Open WebUI** with **N8N**, an automation and workflow platform.
-- **AI Agent Tool Usage Display (v2.2.0)** 🛠️: Shows tool calls from N8N AI Agent workflows with collapsible details (non-streaming mode only).
+- **AI Agent Tool Usage Display (v2.2.0)** 🛠️: Shows tool calls from N8N AI Agent workflows with three verbosity levels (minimal, compact, detailed) and customizable length limits (non-streaming mode only).
 - Streaming and non-streaming support for real-time and batch data processing.
 - Sends messages from Open WebUI to an **N8N webhook**.
 - Supports real-time message processing with dynamic field handling.

@@ -22,9 +22,15 @@ This integration allows Open WebUI to communicate with workflows created in **n8
 ## Features
 
 > [!TIP]
-> **AI Agent Tool Usage Display (NEW in v2.2.0)** 🛠️
+> **AI Agent Tool Usage Display (v2.2.0)** 🛠️
 >
-> Automatically extracts and displays tool calls from N8N AI Agent workflows in **non-streaming mode**. Shows tool names, inputs, and results in collapsible `<details>` sections. Parses the `intermediateSteps` array to provide transparency into the AI agent's workflow execution.
+> Automatically extracts and displays tool calls from N8N AI Agent workflows in **non-streaming mode**.
+>
+> - 📊 **Three verbosity levels**: `minimal` (names only), `compact` (names + preview), `detailed` (full info)
+> - 📏 **Customizable length limits**: Control input/output text length
+> - 🎯 **Flexible configuration**: Adapt display to your needs
+>
+> Shows tool names, inputs, and results from the `intermediateSteps` array to provide transparency into the AI agent's workflow execution.
 >
 > 📖 [Learn more about Tool Usage Display](./n8n-tool-usage-display.md)
 
