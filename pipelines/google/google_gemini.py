@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.3
+version: 1.6.4
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -348,8 +348,14 @@ class Pipe:
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
-        Returns tuple (contents, system_instruction) where system_instruction is None for this path.
+        Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
+        # Extract system instruction first
+        system_instruction = next(
+            (msg["content"] for msg in messages if msg.get("role") == "system"),
+            None,
+        )
+
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -429,8 +435,27 @@ class Pipe:
 
         # Build parts
         parts: List[Dict[str, Any]] = []
-        if prompt:
-            parts.append({"text": prompt})
+
+        # For image generation models, prepend system instruction to the prompt
+        # since system_instruction parameter may not be supported
+        final_prompt = prompt
+        if system_instruction and prompt:
+            final_prompt = f"{system_instruction}\n\n{prompt}"
+            self.log.debug(
+                f"Prepended system instruction to prompt for image generation. "
+                f"System instruction length: {len(system_instruction)}, "
+                f"Original prompt length: {len(prompt)}, "
+                f"Final prompt length: {len(final_prompt)}"
+            )
+        elif system_instruction and not prompt:
+            final_prompt = system_instruction
+            self.log.debug(
+                f"Using system instruction as prompt for image generation "
+                f"(length: {len(system_instruction)})"
+            )
+
+        if final_prompt:
+            parts.append({"text": final_prompt})
         if self.valves.IMAGE_ADD_LABELS:
             for idx, part in enumerate(combined, start=1):
                 parts.append({"text": f"[Image {idx}]"})
@@ -439,8 +464,9 @@ class Pipe:
             parts.extend(combined)
 
         self.log.debug(
-            f"Image-capable payload: history={len(history_images)} current={len(current_images)} used={len(combined)} limit={self.valves.IMAGE_HISTORY_MAX_REFERENCES} history_first={self.valves.IMAGE_HISTORY_FIRST} prompt_len={len(prompt)}"
+            f"Image-capable payload: history={len(history_images)} current={len(current_images)} used={len(combined)} limit={self.valves.IMAGE_HISTORY_MAX_REFERENCES} history_first={self.valves.IMAGE_HISTORY_FIRST} prompt_len={len(final_prompt)}"
         )
+        # Return None for system_instruction since we've incorporated it into the prompt
         return [{"role": "user", "parts": parts}], None
 
     def __init__(self):
@@ -1829,6 +1855,11 @@ class Pipe:
                             messages, __event_emitter__
                         )
                     )
+                    # For image generation, system_instruction is integrated into the prompt
+                    # so it will be None here (this is expected and correct)
+                    self.log.debug(
+                        f"Image generation mode: system instruction integrated into prompt"
+                    )
                 except ValueError as ve:
                     return f"Error: {ve}"
             else:
@@ -1837,8 +1868,12 @@ class Pipe:
                 contents, system_instruction = self._prepare_content(messages)
                 if not contents:
                     return "Error: No valid message content found"
+                self.log.debug(
+                    f"Text generation mode: system instruction separate (value: {system_instruction})"
+                )
 
             # Configure generation parameters and safety settings
+            self.log.debug(f"Supports image generation: {supports_image_generation}")
             generation_config = self._configure_generation(
                 body,
                 system_instruction,
