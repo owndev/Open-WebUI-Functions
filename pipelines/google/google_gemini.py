@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.4
+version: 1.6.5
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -157,6 +157,14 @@ class Pipe:
         API_VERSION: str = Field(
             default=os.getenv("GOOGLE_API_VERSION", "v1alpha"),
             description="API version to use for Google Generative AI (e.g., v1alpha, v1beta, v1).",
+        )
+        THINKING_ENABLED: bool = Field(
+            default=os.getenv("GOOGLE_THINKING_ENABLED", "true").lower() == "true",
+            description="Enable Gemini thinking outputs (set false to disable).",
+        )
+        STREAMING_ENABLED: bool = Field(
+            default=os.getenv("GOOGLE_STREAMING_ENABLED", "true").lower() == "true",
+            description="Enable streaming responses (set false to force non-streaming mode).",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -1415,6 +1423,10 @@ class Pipe:
 
         # Enable Gemini "Thinking" when requested (default: on) and supported by the model
         include_thoughts = body.get("include_thoughts", True)
+        if not self.valves.THINKING_ENABLED:
+            include_thoughts = False
+            self.log.debug("Thinking disabled via GOOGLE_THINKING_ENABLED")
+
         if include_thoughts and self._check_thinking_support(model_id):
             try:
                 gen_config_params["thinking_config"] = types.ThinkingConfig(
@@ -1591,6 +1603,17 @@ class Pipe:
         Returns:
             Generator yielding text chunks
         """
+
+        async def emit_chat_event(event_type: str, data: Dict[str, Any]) -> None:
+            if not __event_emitter__:
+                return
+            try:
+                await __event_emitter__({"type": event_type, "data": data})
+            except Exception as emit_error:  # pragma: no cover - defensive
+                self.log.warning(f"Failed to emit {event_type} event: {emit_error}")
+
+        await emit_chat_event("chat:start", {"role": "assistant"})
+
         grounding_metadata_list = []
         # Accumulate content separately for answer and thoughts
         answer_chunks: list[str] = []
@@ -1606,9 +1629,32 @@ class Pipe:
                         response_iterator.prompt_feedback
                         and response_iterator.prompt_feedback.block_reason
                     ):
-                        yield f"[Blocked due to Prompt Safety: {response_iterator.prompt_feedback.block_reason.name}]"
+                        block_reason = (
+                            response_iterator.prompt_feedback.block_reason.name
+                        )
+                        message = f"[Blocked due to Prompt Safety: {block_reason}]"
+                        await emit_chat_event(
+                            "chat:finish",
+                            {
+                                "role": "assistant",
+                                "content": message,
+                                "done": True,
+                                "error": True,
+                            },
+                        )
+                        yield message
                     else:
-                        yield "[Blocked by safety settings]"
+                        message = "[Blocked by safety settings]"
+                        await emit_chat_event(
+                            "chat:finish",
+                            {
+                                "role": "assistant",
+                                "content": message,
+                                "done": True,
+                                "error": True,
+                            },
+                        )
+                        yield message
                     return  # Stop generation
 
                 if chunk.candidates[0].grounding_metadata:
@@ -1627,7 +1673,10 @@ class Pipe:
                         await __event_emitter__(
                             {
                                 "type": "chat:message:delta",
-                                "data": {"content": chunk.text},
+                                "data": {
+                                    "role": "assistant",
+                                    "content": chunk.text,
+                                },
                             }
                         )
                     continue
@@ -1664,7 +1713,10 @@ class Pipe:
                             await __event_emitter__(
                                 {
                                     "type": "chat:message:delta",
-                                    "data": {"content": part.text},
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": part.text,
+                                    },
                                 }
                             )
                     except Exception as part_error:
@@ -1684,7 +1736,9 @@ class Pipe:
                 )
                 final_answer_text = cited or final_answer_text
 
-            # If we captured thoughts, wrap them in a collapsible <details> section
+            final_content = final_answer_text
+            details_block: Optional[str] = None
+
             if thought_chunks:
                 duration_s = int(
                     max(0, time.time() - (thinking_started_at or time.time()))
@@ -1702,16 +1756,21 @@ class Pipe:
 {quoted_content}
 
 </details>""".strip()
+                final_content = f"{details_block}{final_answer_text}"
 
-                # Combine thoughts and answer (images not processed in streaming mode)
-                full_content = details_block + final_answer_text
+            if final_content is None:
+                final_content = ""
 
-                await __event_emitter__(
-                    {
-                        "type": "replace",
-                        "data": {"content": full_content},
-                    }
-                )
+            # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
+            await emit_chat_event(
+                "replace", {"role": "assistant", "content": final_content}
+            )
+            await emit_chat_event(
+                "chat:message",
+                {"role": "assistant", "content": final_content, "done": True},
+            )
+
+            if thought_chunks:
                 # Clear the thinking status without a summary in the status emitter
                 await __event_emitter__(
                     {
@@ -1719,22 +1778,32 @@ class Pipe:
                         "data": {"action": "thinking", "done": True, "hidden": True},
                     }
                 )
-            elif grounding_metadata_list:
-                # If no thoughts but we have grounding, ensure final answer (with citations) is reflected
-                await __event_emitter__(
-                    {"type": "replace", "data": {"content": final_answer_text}}
-                )
+
+            await emit_chat_event(
+                "chat:finish",
+                {"role": "assistant", "content": final_content, "done": True},
+            )
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
             # Check if it's a chunk size error and provide specific guidance
             error_msg = str(e).lower()
             if "chunk too big" in error_msg or "chunk size" in error_msg:
-                yield f"Error: Image too large for processing. Please try with a smaller image (max 15 MB recommended) or reduce image quality."
+                message = "Error: Image too large for processing. Please try with a smaller image (max 15 MB recommended) or reduce image quality."
             elif "quota" in error_msg or "rate limit" in error_msg:
-                yield f"Error: API quota exceeded. Please try again later."
+                message = "Error: API quota exceeded. Please try again later."
             else:
-                yield f"Error during streaming: {e}"
+                message = f"Error during streaming: {e}"
+            await emit_chat_event(
+                "chat:finish",
+                {
+                    "role": "assistant",
+                    "content": message,
+                    "done": True,
+                    "error": True,
+                },
+            )
+            yield message
 
     def _get_safety_block_message(self, response: Any) -> Optional[str]:
         """Check for safety blocks and return appropriate message."""
@@ -1845,6 +1914,10 @@ class Pipe:
 
             # Get stream flag
             stream = body.get("stream", False)
+            if not self.valves.STREAMING_ENABLED:
+                if stream:
+                    self.log.debug("Streaming disabled via GOOGLE_STREAMING_ENABLED")
+                stream = False
             messages = body.get("messages", [])
 
             # For image generation models, gather ALL images from the last user turn
