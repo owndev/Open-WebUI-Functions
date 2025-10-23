@@ -1758,7 +1758,7 @@ class Pipe:
 </details>""".strip()
                 final_content = f"{details_block}{final_answer_text}"
 
-            if final_content is None:
+            if not final_content:
                 final_content = ""
 
             # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
