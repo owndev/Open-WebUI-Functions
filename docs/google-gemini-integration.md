@@ -118,6 +118,14 @@ GOOGLE_IMAGE_HISTORY_FIRST=true
 # Enable fallback to data URL when image upload fails
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
+
+# Enable Gemini thinking outputs globally
+# Default: true
+GOOGLE_THINKING_ENABLED=true
+
+# Enable streaming responses globally
+# Default: true
+GOOGLE_STREAMING_ENABLED=true
 ```
 
 ### Connection Method: Google Generative AI API (Default)
