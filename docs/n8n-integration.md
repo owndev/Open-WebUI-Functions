@@ -3,7 +3,10 @@
 This integration allows Open WebUI to communicate with workflows created in **n8n**, a powerful workflow automation tool. Messages are sent and received via webhook endpoints, making it easy to plug Open WebUI into your existing automation pipelines.
 
 > [!NOTE]  
-> **Recent Improvements (v2.1.0)**: Enhanced streaming support with consistent response handling, automatic systemPrompt deduplication, simplified configuration, and improved error messaging.
+> **Recent Improvements (v2.2.0)**: Added AI Agent tool usage display with collapsible details sections. The pipeline now extracts and displays tool calls from `intermediateSteps` in **non-streaming mode**, showing tool names, inputs, and results in a user-friendly format.
+
+> [!IMPORTANT]  
+> **Tool Usage Display**: AI Agent tool calls are currently only visible in **non-streaming mode** due to N8N's streaming implementation. The code is future-proof and will automatically work if N8N adds `intermediateSteps` support to streaming responses.
 
 🔗 [Learn More About N8N](https://n8n.io/)
 
@@ -17,6 +20,19 @@ This integration allows Open WebUI to communicate with workflows created in **n8
 - 🧩 [N8N Open WebUI Test Agent (Non-Streaming)](../pipelines/n8n/Open_WebUI_Test_Agent.json)
 
 ## Features
+
+> [!TIP]
+> **AI Agent Tool Usage Display (v2.2.0)** 🛠️
+>
+> Automatically extracts and displays tool calls from N8N AI Agent workflows in **non-streaming mode**.
+>
+> - 📊 **Three verbosity levels**: `minimal` (names only), `compact` (names + preview), `detailed` (full info)
+> - 📏 **Customizable length limits**: Control input/output text length
+> - 🎯 **Flexible configuration**: Adapt display to your needs
+>
+> Shows tool names, inputs, and results from the `intermediateSteps` array to provide transparency into the AI agent's workflow execution.
+>
+> 📖 [Learn more about Tool Usage Display](./n8n-tool-usage-display.md)
 
 - **Streaming & Non-Streaming Support**  
   Automatic detection and handling of both streaming and non-streaming responses with consistent output formatting.

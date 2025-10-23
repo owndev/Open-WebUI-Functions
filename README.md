@@ -114,17 +114,28 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 ### **2. [N8N Pipeline](./pipelines/n8n/n8n.py)**
 
+> [!TIP]
+> **N8N Workflow Automation Integration**
+>
+> Connect Open WebUI with N8N to leverage powerful workflow automation. Includes configurable AI Agent tool usage display for complete transparency into your agent's actions.
+
 - Integrates **Open WebUI** with **N8N**, an automation and workflow platform.
-- Streaming support for real-time data processing.
+- **AI Agent Tool Usage Display (v2.2.0)** 🛠️: Shows tool calls from N8N AI Agent workflows with three verbosity levels (minimal, compact, detailed) and customizable length limits (non-streaming mode only).
+- Streaming and non-streaming support for real-time and batch data processing.
 - Sends messages from Open WebUI to an **N8N webhook**.
 - Supports real-time message processing with dynamic field handling.
 - Enables automation of AI-generated responses within an **N8N workflow**.
 - Supports encryption of sensitive information like API keys.
 - Here is an example [N8N workflow](./pipelines/n8n/Open_WebUI_Test_Agent.json) for [N8N Pipeline](./pipelines/n8n/n8n.py)
 
+> [!IMPORTANT]
+> **Tool Usage Display Limitation**: The AI Agent tool call display currently only works in **non-streaming mode** due to N8N's current streaming implementation. The code is future-proof and will automatically work when N8N adds `intermediateSteps` to streaming responses.
+
 🔗 [N8N Pipeline in Open WebUI](https://openwebui.com/f/owndev/n8n_pipeline)
 
 🔗 [Learn More About N8N](https://n8n.io/)
+
+📖 [N8N Tool Usage Display Documentation](./docs/n8n-tool-usage-display.md)
 
 ### **3. [Infomaniak](./pipelines/infomaniak/infomaniak.py)**
 
