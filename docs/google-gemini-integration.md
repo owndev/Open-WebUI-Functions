@@ -119,9 +119,9 @@ GOOGLE_IMAGE_HISTORY_FIRST=true
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 
-# Enable Gemini thinking outputs globally
+# Enable Gemini thoughts outputs globally
 # Default: true
-GOOGLE_THINKING_ENABLED=true
+GOOGLE_INCLUDE_THOUGHTS=true
 
 # Enable streaming responses globally
 # Default: true
