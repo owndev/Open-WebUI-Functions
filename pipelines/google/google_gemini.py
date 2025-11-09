@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.5
+version: 1.6.6
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -158,13 +158,13 @@ class Pipe:
             default=os.getenv("GOOGLE_API_VERSION", "v1alpha"),
             description="API version to use for Google Generative AI (e.g., v1alpha, v1beta, v1).",
         )
-        THINKING_ENABLED: bool = Field(
-            default=os.getenv("GOOGLE_THINKING_ENABLED", "true").lower() == "true",
-            description="Enable Gemini thinking outputs (set false to disable).",
-        )
         STREAMING_ENABLED: bool = Field(
             default=os.getenv("GOOGLE_STREAMING_ENABLED", "true").lower() == "true",
             description="Enable streaming responses (set false to force non-streaming mode).",
+        )
+        INCLUDE_THOUGHTS: bool = Field(
+            default=os.getenv("GOOGLE_INCLUDE_THOUGHTS", "true").lower() == "true",
+            description="Enable Gemini thoughts outputs (set false to disable).",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -1423,9 +1423,9 @@ class Pipe:
 
         # Enable Gemini "Thinking" when requested (default: on) and supported by the model
         include_thoughts = body.get("include_thoughts", True)
-        if not self.valves.THINKING_ENABLED:
+        if not self.valves.INCLUDE_THOUGHTS:
             include_thoughts = False
-            self.log.debug("Thinking disabled via GOOGLE_THINKING_ENABLED")
+            self.log.debug("Thoughts disabled via GOOGLE_INCLUDE_THOUGHTS")
 
         if include_thoughts and self._check_thinking_support(model_id):
             try:
