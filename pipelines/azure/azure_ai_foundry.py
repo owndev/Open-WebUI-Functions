@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.1
+version: 2.5.2
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -18,7 +18,17 @@ features:
   - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
 """
 
-from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
+from typing import (
+    List,
+    Union,
+    Generator,
+    Iterator,
+    Optional,
+    Dict,
+    Any,
+    AsyncIterator,
+    Set,
+)
 from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -30,6 +40,7 @@ import os
 import logging
 import base64
 import hashlib
+import re
 from pydantic_core import core_schema
 
 
@@ -375,7 +386,7 @@ class Pipe:
             # Add citation section at the end
             if citation_details:
                 citation_section = self._format_citation_section(
-                    citations, for_streaming=False
+                    citations, content, for_streaming=False
                 )
                 enhanced_content += citation_section
 
@@ -574,6 +585,7 @@ class Pipe:
 
         try:
             full_response_buffer = ""
+            response_content = ""  # Track the actual response content
             citations_data = None
             citations_added = False
             all_chunks = []
@@ -585,6 +597,33 @@ class Pipe:
 
                 # Log chunk for debugging (only first 200 chars to avoid spam)
                 log.debug(f"Processing chunk: {chunk_str[:200]}...")
+
+                # Extract content from delta messages to build the full response content
+                try:
+                    lines = chunk_str.split("\n")
+                    for line in lines:
+                        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                            json_str = line[6:].strip()
+                            if json_str and json_str != "[DONE]":
+                                try:
+                                    response_data = json.loads(json_str)
+                                    if (
+                                        isinstance(response_data, dict)
+                                        and "choices" in response_data
+                                    ):
+                                        for choice in response_data["choices"]:
+                                            if (
+                                                "delta" in choice
+                                                and "content" in choice["delta"]
+                                            ):
+                                                response_content += choice["delta"][
+                                                    "content"
+                                                ]
+                                except json.JSONDecodeError:
+                                    # Malformed or incomplete JSON is expected in streamed chunks; safely skip.
+                                    pass
+                except Exception as e:
+                    log.debug(f"Exception while processing chunk: {e}")
 
                 # Look for citations in any part of the response
                 if "citations" in chunk_str.lower() and not citations_data:
@@ -674,8 +713,9 @@ class Pipe:
             if citations_data and not citations_added:
                 log.info("Adding citation summary at end of stream...")
 
+                # Pass the accumulated response content to filter citations
                 citation_section = self._format_citation_section(
-                    citations_data, for_streaming=True
+                    citations_data, response_content, for_streaming=True
                 )
                 if citation_section:
                     # Convert escaped newlines to actual newlines for display
@@ -740,14 +780,36 @@ class Pipe:
                 # Suppress close-time errors (e.g., SSL shutdown timeouts)
                 pass
 
+    def _extract_referenced_citations(self, content: str) -> Set[int]:
+        """
+        Extract citation references (e.g., [doc1], [doc2]) from the content.
+
+        Args:
+            content: The response content containing citation references
+
+        Returns:
+            Set of citation indices that are referenced (e.g., {1, 2, 7, 8, 9})
+        """
+        # Find all [docN] references in the content
+        pattern = r"\[doc(\d+)\]"
+        matches = re.findall(pattern, content)
+
+        # Convert to integers and return as a set
+        return {int(match) for match in matches}
+
     def _format_citation_section(
-        self, citations: List[Dict[str, Any]], for_streaming: bool = False
+        self,
+        citations: List[Dict[str, Any]],
+        content: str = "",
+        for_streaming: bool = False,
     ) -> str:
         """
         Creates a formatted citation section using collapsible details elements.
+        Only includes citations that are actually referenced in the content.
 
         Args:
             citations: List of citation objects
+            content: The response content (used to filter only referenced citations)
             for_streaming: If True, format for streaming (with escaping), else for regular response
 
         Returns:
@@ -756,44 +818,74 @@ class Pipe:
         if not citations:
             return ""
 
-        # Collect all citation details
+        # Extract which citations are actually referenced in the content
+        referenced_indices = self._extract_referenced_citations(content)
+
+        # If we couldn't find any references, include all citations (backward compatibility)
+        if not referenced_indices:
+            referenced_indices = set(range(1, len(citations) + 1))
+
+        # Collect only referenced citation details
         citation_entries = []
 
         for i, citation in enumerate(citations, 1):
+            # Skip citations that are not referenced in the content
+            if i not in referenced_indices:
+                continue
+
             if not isinstance(citation, dict):
                 continue
 
             doc_ref = f"[doc{i}]"
-            title = citation.get("title", "Unknown Document")
-            content = citation.get("content", "")
-            filepath = citation.get("filepath")
-            url = citation.get("url")
-            chunk_id = citation.get("chunk_id", "0")
+
+            # Get title with fallback to filepath or url
+            title = citation.get("title", "")
+            # Check if title is empty (not just None) and use alternatives
+            if not title or not title.strip():
+                # Try filepath first
+                filepath = citation.get("filepath", "")
+                if filepath and filepath.strip():
+                    title = filepath
+                else:
+                    # Try url next
+                    url = citation.get("url", "")
+                    if url and url.strip():
+                        title = url
+                    else:
+                        # Final fallback
+                        title = "Unknown Document"
+
+            content_text = citation.get("content", "")
+            filepath = citation.get("filepath", "")
+            url = citation.get("url", "")
+            chunk_id = citation.get("chunk_id", "")
 
             # Build individual citation details
             citation_info = []
 
-            if filepath:
+            # Show filepath if available and not empty
+            if filepath and filepath.strip():
                 citation_info.append(f"📁 **File:** `{filepath}`")
-            elif url:
+            # Show URL if available, not empty, and no filepath was shown
+            elif url and url.strip():
                 citation_info.append(f"🔗 **URL:** {url}")
 
-            citation_info.append(f"📄 **Chunk ID:** {chunk_id}")
+            # Show chunk_id if available and not empty
+            if chunk_id is not None and str(chunk_id).strip():
+                citation_info.append(f"📄 **Chunk ID:** {chunk_id}")
 
             # Add full content if available
-            if content:
+            if content_text and str(content_text).strip():
                 try:
                     # Clean content for display
-                    clean_content = str(content).strip()
-                    # Replace problematic characters for HTML display
-                    clean_content = clean_content.replace("\n", " ").replace("\r", " ")
+                    clean_content = str(content_text).strip()
                     if for_streaming:
                         # Additional escaping for streaming
                         clean_content = clean_content.replace("\\", "\\\\").replace(
                             '"', '\\"'
                         )
 
-                    citation_info.append(f"**Content:**")
+                    citation_info.append("**Content:**")
                     citation_info.append(f"> {clean_content}")
                 except Exception:
                     citation_info.append("**Content:** [Content unavailable]")
@@ -808,6 +900,10 @@ class Pipe:
                 citation_entry = f"<details>\n<summary>{doc_ref} - {title}</summary>\n\n{citation_content}\n\n</details>"
 
             citation_entries.append(citation_entry)
+
+        # Only create the section if we have citations to show
+        if not citation_entries:
+            return ""
 
         # Combine all citations into main collapsible section
         if for_streaming:
