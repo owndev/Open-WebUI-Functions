@@ -18,7 +18,17 @@ features:
   - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
 """
 
-from typing import List, Union, Generator, Iterator, Optional, Dict, Any, AsyncIterator
+from typing import (
+    List,
+    Union,
+    Generator,
+    Iterator,
+    Optional,
+    Dict,
+    Any,
+    AsyncIterator,
+    Set,
+)
 from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -30,6 +40,7 @@ import os
 import logging
 import base64
 import hashlib
+import re
 from pydantic_core import core_schema
 
 
@@ -609,9 +620,10 @@ class Pipe:
                                                     "content"
                                                 ]
                                 except json.JSONDecodeError:
+                                    # Malformed or incomplete JSON is expected in streamed chunks; safely skip.
                                     pass
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(f"Exception while processing chunk: {e}")
 
                 # Look for citations in any part of the response
                 if "citations" in chunk_str.lower() and not citations_data:
@@ -768,7 +780,7 @@ class Pipe:
                 # Suppress close-time errors (e.g., SSL shutdown timeouts)
                 pass
 
-    def _extract_referenced_citations(self, content: str) -> set:
+    def _extract_referenced_citations(self, content: str) -> Set[int]:
         """
         Extract citation references (e.g., [doc1], [doc2]) from the content.
 
@@ -778,8 +790,6 @@ class Pipe:
         Returns:
             Set of citation indices that are referenced (e.g., {1, 2, 7, 8, 9})
         """
-        import re
-
         # Find all [docN] references in the content
         pattern = r"\[doc(\d+)\]"
         matches = re.findall(pattern, content)
@@ -861,7 +871,7 @@ class Pipe:
                 citation_info.append(f"🔗 **URL:** {url}")
 
             # Show chunk_id if available and not empty
-            if chunk_id and str(chunk_id).strip():
+            if chunk_id is not None and str(chunk_id).strip():
                 citation_info.append(f"📄 **Chunk ID:** {chunk_id}")
 
             # Add full content if available
