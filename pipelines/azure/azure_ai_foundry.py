@@ -869,8 +869,6 @@ class Pipe:
                 try:
                     # Clean content for display
                     clean_content = str(content_text).strip()
-                    # Replace problematic characters for HTML display
-                    clean_content = clean_content.replace("\n", " ").replace("\r", " ")
                     if for_streaming:
                         # Additional escaping for streaming
                         clean_content = clean_content.replace("\\", "\\\\").replace(
