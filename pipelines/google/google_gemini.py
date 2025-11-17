@@ -4,7 +4,8 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.6
+version: 1.6.7
+required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -33,8 +34,6 @@ features:
 """
 
 import os
-import inspect
-from functools import update_wrapper
 import re
 import time
 import asyncio
@@ -1340,53 +1339,6 @@ class Pipe:
             # Fallback to data URL if upload fails
             return f"data:{mime_type};base64,{image_data}"
 
-    @staticmethod
-    def _create_tool(tool_def):
-        """OpenwebUI tool is a functools.partial coroutine, which genai does not support directly.
-        See https://github.com/googleapis/python-genai/issues/907
-
-        This function wraps the tool into a callable that can be used with genai.
-        In particular, it sets the signature of the function properly,
-        removing any frozen keyword arguments (extra_params).
-        """
-        bound_callable = tool_def["callable"]
-
-        # Create a wrapper for bound_callable, which is always async
-        async def wrapper(*args, **kwargs):
-            return await bound_callable(*args, **kwargs)
-
-        # Remove 'frozen' keyword arguments (extra_params) from the signature
-        original_sig = inspect.signature(bound_callable)
-        frozen_kwargs = {
-            "__event_emitter__",
-            "__event_call__",
-            "__user__",
-            "__metadata__",
-            "__request__",
-            "__model__",
-        }
-        new_parameters = []
-
-        for name, parameter in original_sig.parameters.items():
-            # Exclude keyword arguments that are frozen
-            if name in frozen_kwargs and parameter.kind in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            ):
-                continue
-            # Keep remaining parameters
-            new_parameters.append(parameter)
-
-        new_sig = inspect.Signature(
-            parameters=new_parameters, return_annotation=original_sig.return_annotation
-        )
-
-        # Ensure name, docstring and signature are properly set
-        update_wrapper(wrapper, bound_callable)
-        wrapper.__signature__ = new_sig
-
-        return wrapper
-
     def _configure_generation(
         self,
         body: Dict[str, Any],
@@ -1462,8 +1414,7 @@ class Pipe:
             )
 
         if __tools__ is not None and __metadata__.get("function_calling") == "native":
-            for name, tool_def in __tools__.items():
-                tool = self._create_tool(tool_def)
+            for name, tool in __tools__.items():
                 self.log.debug(
                     f"Adding tool '{name}' with signature {tool.__signature__}"
                 )
@@ -1923,10 +1874,11 @@ class Pipe:
             # For image generation models, gather ALL images from the last user turn
             if supports_image_generation:
                 try:
-                    contents, system_instruction = (
-                        await self._build_image_generation_contents(
-                            messages, __event_emitter__
-                        )
+                    (
+                        contents,
+                        system_instruction,
+                    ) = await self._build_image_generation_contents(
+                        messages, __event_emitter__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
