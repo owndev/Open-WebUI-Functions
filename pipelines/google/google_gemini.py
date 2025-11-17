@@ -1461,7 +1461,8 @@ class Pipe:
                 types.Tool(google_search=types.GoogleSearch())
             )
 
-        if __tools__ is not None and __metadata__.get("function_calling") == "native":
+        params = __metadata__.get("params", {})
+        if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
                 tool = self._create_tool(tool_def)
                 self.log.debug(
@@ -1923,10 +1924,11 @@ class Pipe:
             # For image generation models, gather ALL images from the last user turn
             if supports_image_generation:
                 try:
-                    contents, system_instruction = (
-                        await self._build_image_generation_contents(
-                            messages, __event_emitter__
-                        )
+                    (
+                        contents,
+                        system_instruction,
+                    ) = await self._build_image_generation_contents(
+                        messages, __event_emitter__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
