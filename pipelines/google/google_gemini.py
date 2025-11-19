@@ -1416,12 +1416,12 @@ class Pipe:
         params = __metadata__.get("params", {})
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
-                tool = self._create_tool(tool_def)
-                self.log.debug(
-                    f"Adding tool '{name}' with signature {tool.__signature__}"
-                )
-
-                gen_config_params.setdefault("tools", []).append(tool)
+                if not name.startswith("_"):
+                    tool = tool_def["callable"]
+                    self.log.debug(
+                        f"Adding tool '{name}' with signature {tool.__signature__}"
+                    )
+                    gen_config_params.setdefault("tools", []).append(tool)
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
