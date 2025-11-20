@@ -1915,8 +1915,9 @@ class Pipe:
                 model_id,
             )
 
-            # Make the API call using async context manager for proper cleanup
-            async with self._get_client() as client:
+            # Make the API call
+            client = self._get_client()
+            try:
                 if stream:
                     # For image generation models, disable streaming to avoid chunk size issues
                     if supports_image_generation:
@@ -2120,6 +2121,14 @@ class Pipe:
                             f"Error in non-streaming request {request_id}: {e}"
                         )
                         return f"Error generating content: {e}"
+            finally:
+                # Close the async client to prevent "Unclosed connector" warnings
+                # Using client.aio.aclose() as per SDK documentation
+                try:
+                    await client.aio.aclose()
+                    self.log.debug("Async client closed successfully")
+                except Exception as close_error:
+                    self.log.warning(f"Error closing async client: {close_error}")
 
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
