@@ -42,7 +42,6 @@ import base64
 import hashlib
 import logging
 import io
-import json
 import uuid
 import aiofiles
 from PIL import Image
@@ -1447,13 +1446,18 @@ class Pipe:
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
         if __tools__ is not None and params.get("function_calling") == "native":
+            self.log.info(f"Tools provided: {list(__tools__.keys())}")
             for name, tool_def in __tools__.items():
                 if not name.startswith("_"):
                     tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
+                    self.log.info(
+                        f"Adding tool '{name}' with signature {tool.__signature__} to generation config"
                     )
                     gen_config_params.setdefault("tools", []).append(tool)
+        elif __tools__ is not None:
+            self.log.warning(
+                f"Tools provided but function_calling != 'native': {params.get('function_calling')}"
+            )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -1617,7 +1621,6 @@ class Pipe:
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
         thinking_started_at: Optional[float] = None
-        tool_calls_list: list[dict] = []
 
         try:
             async for chunk in response_iterator:
@@ -1682,22 +1685,21 @@ class Pipe:
 
                 for part in parts:
                     try:
+                        # Log all part attributes for debugging
+                        part_attrs = [
+                            attr for attr in dir(part) if not attr.startswith("_")
+                        ]
+                        self.log.debug(f"Part attributes: {part_attrs}")
+
                         # Function call parts (tool calls)
                         if getattr(part, "function_call", None):
                             function_call = part.function_call
-                            tool_call = {
-                                "id": f"call_{function_call.name}",
-                                "type": "function",
-                                "function": {
-                                    "name": function_call.name,
-                                    "arguments": json.dumps(dict(function_call.args)),
-                                },
-                            }
-                            # Only add if not already in list (avoid duplicates)
-                            if tool_call not in tool_calls_list:
-                                tool_calls_list.append(tool_call)
-                            self.log.debug(
-                                f"Collected tool call: {function_call.name} with args: {function_call.args}"
+                            self.log.info(
+                                f"TOOL CALL DETECTED in streaming: name={function_call.name}, args={dict(function_call.args)}"
+                            )
+                            # Log that we're skipping tool call handling for now
+                            self.log.warning(
+                                "Function call detected but not handled in streaming mode - this may cause issues"
                             )
 
                         # Thought parts (internal reasoning)
@@ -1778,16 +1780,13 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
-            # Prepare message data
-            message_data = {"role": "assistant", "content": final_content}
-            if tool_calls_list:
-                message_data["tool_calls"] = tool_calls_list
-
             # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
-            await emit_chat_event("replace", message_data)
+            await emit_chat_event(
+                "replace", {"role": "assistant", "content": final_content}
+            )
             await emit_chat_event(
                 "chat:message",
-                {**message_data, "done": True},
+                {"role": "assistant", "content": final_content, "done": True},
             )
 
             if thought_chunks:
@@ -1801,7 +1800,7 @@ class Pipe:
 
             await emit_chat_event(
                 "chat:finish",
-                {**message_data, "done": True},
+                {"role": "assistant", "content": final_content, "done": True},
             )
 
         except Exception as e:
@@ -2070,36 +2069,30 @@ class Pipe:
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
                     generated_images: list[str] = []
-                    tool_calls_list: list[dict] = []
 
                     for part in parts:
-                        # Handle function calls (tool calls)
+                        # Log all part attributes for debugging
+                        part_attrs = [
+                            attr for attr in dir(part) if not attr.startswith("_")
+                        ]
+                        self.log.debug(f"Non-streaming part attributes: {part_attrs}")
+
+                        # Check for function call
                         if getattr(part, "function_call", None):
                             function_call = part.function_call
-                            tool_call = {
-                                "id": f"call_{function_call.name}",
-                                "type": "function",
-                                "function": {
-                                    "name": function_call.name,
-                                    "arguments": json.dumps(dict(function_call.args)),
-                                },
-                            }
-                            tool_calls_list.append(tool_call)
-                            self.log.debug(
-                                f"Detected tool call: {function_call.name} with args: {function_call.args}"
+                            self.log.info(
+                                f"TOOL CALL DETECTED in non-streaming: name={function_call.name}, args={dict(function_call.args)}"
+                            )
+                            self.log.warning(
+                                "Function call detected but not handled - this may cause issues"
                             )
 
-                        # Handle thought parts
                         elif getattr(part, "thought", False) and getattr(
                             part, "text", None
                         ):
                             thought_segments.append(part.text)
-
-                        # Handle text parts
                         elif getattr(part, "text", None):
                             answer_segments.append(part.text)
-
-                        # Handle generated images with upload
                         elif (
                             getattr(part, "inline_data", None)
                             and __request__
@@ -2122,7 +2115,6 @@ class Pipe:
                             )
                             generated_images.append(f"![Generated Image]({image_url})")
 
-                        # Handle inline data without upload (fallback)
                         elif getattr(part, "inline_data", None):
                             # Fallback: return as base64 data URL if no request/user context
                             mime_type = part.inline_data.mime_type
@@ -2182,21 +2174,6 @@ class Pipe:
                         if full_response:
                             full_response += "\n\n"
                         full_response += "\n\n".join(generated_images)
-
-                    # Return in OpenAI-compatible format
-                    # If there are tool calls, include them in the response
-                    if tool_calls_list:
-                        return {
-                            "choices": [
-                                {
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": full_response or "",
-                                        "tool_calls": tool_calls_list,
-                                    }
-                                }
-                            ]
-                        }
 
                     return full_response if full_response else "[No content generated]"
 
