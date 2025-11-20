@@ -1419,6 +1419,13 @@ class Pipe:
             )
 
         params = __metadata__.get("params", {})
+        self.log.info(f"Metadata params: {params}")
+        self.log.info(
+            f"Tools parameter: __tools__ is {'provided' if __tools__ else 'None'}"
+        )
+        if __tools__:
+            self.log.info(f"Available tools: {list(__tools__.keys())}")
+
         if features.get("vertex_ai_search", False) or (
             self.valves.USE_VERTEX_AI
             and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
@@ -1445,19 +1452,25 @@ class Pipe:
                 self.log.warning(
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
-        if __tools__ is not None and params.get("function_calling") == "native":
-            self.log.info(f"Tools provided: {list(__tools__.keys())}")
-            for name, tool_def in __tools__.items():
-                if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.info(
-                        f"Adding tool '{name}' with signature {tool.__signature__} to generation config"
-                    )
-                    gen_config_params.setdefault("tools", []).append(tool)
-        elif __tools__ is not None:
-            self.log.warning(
-                f"Tools provided but function_calling != 'native': {params.get('function_calling')}"
-            )
+        # Add tools if provided - check for native mode or auto-enable
+        if __tools__ is not None:
+            function_calling_mode = params.get("function_calling", "auto")
+            self.log.info(f"function_calling mode: {function_calling_mode}")
+
+            # Enable tools for both "native" and "auto" modes
+            if function_calling_mode in ["native", "auto"]:
+                self.log.info(f"Enabling tools: {list(__tools__.keys())}")
+                for name, tool_def in __tools__.items():
+                    if not name.startswith("_"):
+                        tool = tool_def["callable"]
+                        self.log.info(
+                            f"Adding tool '{name}' with signature {tool.__signature__} to generation config"
+                        )
+                        gen_config_params.setdefault("tools", []).append(tool)
+            else:
+                self.log.warning(
+                    f"Tools provided but function_calling mode is '{function_calling_mode}' (not 'native' or 'auto')"
+                )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
