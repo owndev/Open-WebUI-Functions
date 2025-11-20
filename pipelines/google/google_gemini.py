@@ -1378,6 +1378,14 @@ class Pipe:
         if enable_image_generation:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
 
+        # Enable code execution (Gemini's native feature)
+        # This allows Gemini to execute Python code directly
+        try:
+            gen_config_params["tools"] = [types.Tool(code_execution={})]
+            self.log.info("Enabled Gemini native code execution")
+        except Exception as e:
+            self.log.warning(f"Could not enable code execution: {e}")
+
         # Enable Gemini "Thinking" when requested (default: on) and supported by the model
         include_thoughts = body.get("include_thoughts", True)
         if not self.valves.INCLUDE_THOUGHTS:
@@ -1704,8 +1712,52 @@ class Pipe:
                         ]
                         self.log.debug(f"Part attributes: {part_attrs}")
 
+                        # Code execution parts (Gemini's native code execution)
+                        if getattr(part, "executable_code", None):
+                            executable_code = part.executable_code
+                            code = getattr(executable_code, "code", None) or getattr(
+                                executable_code, "language", ""
+                            )
+                            language = getattr(executable_code, "language", "python")
+                            self.log.info(
+                                f"CODE EXECUTION: language={language}, code_length={len(str(code))}"
+                            )
+                            # Emit code block
+                            code_content = f"```{language}\n{code}\n```\n"
+                            answer_chunks.append(code_content)
+                            await __event_emitter__(
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": code_content,
+                                    },
+                                }
+                            )
+
+                        # Code execution result parts
+                        elif getattr(part, "code_execution_result", None):
+                            result = part.code_execution_result
+                            outcome = getattr(result, "outcome", "UNKNOWN")
+                            output = getattr(result, "output", "")
+                            self.log.info(
+                                f"CODE RESULT: outcome={outcome}, output_length={len(output)}"
+                            )
+                            # Emit result
+                            result_content = f"**Execution Result ({outcome}):**\n```\n{output}\n```\n"
+                            answer_chunks.append(result_content)
+                            await __event_emitter__(
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": result_content,
+                                    },
+                                }
+                            )
+
                         # Function call parts (tool calls)
-                        if getattr(part, "function_call", None):
+                        elif getattr(part, "function_call", None):
                             function_call = part.function_call
                             self.log.info(
                                 f"TOOL CALL DETECTED in streaming: name={function_call.name}, args={dict(function_call.args)}"
@@ -2090,8 +2142,34 @@ class Pipe:
                         ]
                         self.log.debug(f"Non-streaming part attributes: {part_attrs}")
 
+                        # Code execution parts (Gemini's native code execution)
+                        if getattr(part, "executable_code", None):
+                            executable_code = part.executable_code
+                            code = getattr(executable_code, "code", None) or getattr(
+                                executable_code, "language", ""
+                            )
+                            language = getattr(executable_code, "language", "python")
+                            self.log.info(
+                                f"CODE EXECUTION: language={language}, code_length={len(str(code))}"
+                            )
+                            # Add code block to answer
+                            answer_segments.append(f"```{language}\n{code}\n```\n")
+
+                        # Code execution result parts
+                        elif getattr(part, "code_execution_result", None):
+                            result = part.code_execution_result
+                            outcome = getattr(result, "outcome", "UNKNOWN")
+                            output = getattr(result, "output", "")
+                            self.log.info(
+                                f"CODE RESULT: outcome={outcome}, output_length={len(output)}"
+                            )
+                            # Add result to answer
+                            answer_segments.append(
+                                f"**Execution Result ({outcome}):**\n```\n{output}\n```\n"
+                            )
+
                         # Check for function call
-                        if getattr(part, "function_call", None):
+                        elif getattr(part, "function_call", None):
                             function_call = part.function_call
                             self.log.info(
                                 f"TOOL CALL DETECTED in non-streaming: name={function_call.name}, args={dict(function_call.args)}"
