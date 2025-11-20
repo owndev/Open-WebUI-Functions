@@ -42,6 +42,7 @@ import base64
 import hashlib
 import logging
 import io
+import json
 import uuid
 import aiofiles
 from PIL import Image
@@ -426,7 +427,7 @@ class Pipe:
                 {
                     "index": i + 1,
                     "label": (
-                        f"Image {i+1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
+                        f"Image {i + 1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
                     ),
                     "reused": reused_flags[i],
                     "origin": "history" if reused_flags[i] else "current",
@@ -1429,11 +1430,15 @@ class Pipe:
                 or os.getenv("VERTEX_AI_RAG_STORE")
             )
             if vertex_rag_store:
-                self.log.debug(f"Enabling Vertex AI Search grounding: {vertex_rag_store}")
+                self.log.debug(
+                    f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
+                )
                 gen_config_params.setdefault("tools", []).append(
                     types.Tool(
                         retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(datastore=vertex_rag_store)
+                            vertex_ai_search=types.VertexAISearch(
+                                datastore=vertex_rag_store
+                            )
                         )
                     )
                 )
@@ -1470,7 +1475,9 @@ class Pipe:
                             "uri": getattr(context, "uri", None),
                         },
                         "document": [getattr(context, "chunk_text", None) or ""],
-                        "metadata": [{"source": getattr(context, "title", None) or "Document"}],
+                        "metadata": [
+                            {"source": getattr(context, "title", None) or "Document"}
+                        ],
                     }
                 )
             elif hasattr(chunk, "web") and chunk.web:
@@ -1674,8 +1681,37 @@ class Pipe:
 
                 for part in parts:
                     try:
+                        # Function call parts (tool calls)
+                        if getattr(part, "function_call", None):
+                            function_call = part.function_call
+                            # Emit tool call event for Open WebUI
+                            await __event_emitter__(
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": f"call_{function_call.name}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": function_call.name,
+                                                    "arguments": json.dumps(
+                                                        dict(function_call.args)
+                                                    ),
+                                                },
+                                            }
+                                        ],
+                                    },
+                                }
+                            )
+                            self.log.debug(
+                                f"Emitted tool call: {function_call.name} with args: {function_call.args}"
+                            )
+
                         # Thought parts (internal reasoning)
-                        if getattr(part, "thought", False) and getattr(
+                        elif getattr(part, "thought", False) and getattr(
                             part, "text", None
                         ):
                             if thinking_started_at is None:
@@ -1923,7 +1959,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"
@@ -2041,14 +2077,36 @@ class Pipe:
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
                     generated_images: list[str] = []
+                    tool_calls_list: list[dict] = []
 
                     for part in parts:
-                        if getattr(part, "thought", False) and getattr(
+                        # Handle function calls (tool calls)
+                        if getattr(part, "function_call", None):
+                            function_call = part.function_call
+                            tool_call = {
+                                "id": f"call_{function_call.name}",
+                                "type": "function",
+                                "function": {
+                                    "name": function_call.name,
+                                    "arguments": json.dumps(dict(function_call.args)),
+                                },
+                            }
+                            tool_calls_list.append(tool_call)
+                            self.log.debug(
+                                f"Detected tool call: {function_call.name} with args: {function_call.args}"
+                            )
+
+                        # Handle thought parts
+                        elif getattr(part, "thought", False) and getattr(
                             part, "text", None
                         ):
                             thought_segments.append(part.text)
+
+                        # Handle text parts
                         elif getattr(part, "text", None):
                             answer_segments.append(part.text)
+
+                        # Handle generated images with upload
                         elif (
                             getattr(part, "inline_data", None)
                             and __request__
@@ -2071,6 +2129,7 @@ class Pipe:
                             )
                             generated_images.append(f"![Generated Image]({image_url})")
 
+                        # Handle inline data without upload (fallback)
                         elif getattr(part, "inline_data", None):
                             # Fallback: return as base64 data URL if no request/user context
                             mime_type = part.inline_data.mime_type
@@ -2130,6 +2189,32 @@ class Pipe:
                         if full_response:
                             full_response += "\n\n"
                         full_response += "\n\n".join(generated_images)
+
+                    # If there are tool calls, return them in the expected format
+                    if tool_calls_list:
+                        # Emit tool calls for Open WebUI
+                        await __event_emitter__(
+                            {
+                                "type": "chat:message",
+                                "data": {
+                                    "role": "assistant",
+                                    "content": full_response or "",
+                                    "tool_calls": tool_calls_list,
+                                },
+                            }
+                        )
+                        # Return in OpenAI-compatible format
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": full_response or "",
+                                        "tool_calls": tool_calls_list,
+                                    }
+                                }
+                            ]
+                        }
 
                     return full_response if full_response else "[No content generated]"
 
