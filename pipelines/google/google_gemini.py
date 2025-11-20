@@ -1621,7 +1621,7 @@ class Pipe:
         finally:
             # Ensure client is properly closed after streaming completes
             try:
-                await client.aclose()
+                await client.aio.aclose()
                 self.log.debug("Streaming client closed successfully")
             except Exception as close_error:
                 self.log.warning(f"Error closing streaming client: {close_error}")
@@ -2210,7 +2210,7 @@ class Pipe:
                 # Ensure client is properly closed for non-streaming responses
                 if not stream or supports_image_generation:
                     try:
-                        await client.aclose()
+                        await client.aio.aclose()
                         self.log.debug(
                             f"Request {request_id}: Client closed successfully"
                         )
