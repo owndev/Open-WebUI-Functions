@@ -426,7 +426,7 @@ class Pipe:
                 {
                     "index": i + 1,
                     "label": (
-                        f"Image {i+1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
+                        f"Image {i + 1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
                     ),
                     "reused": reused_flags[i],
                     "origin": "history" if reused_flags[i] else "current",
@@ -579,42 +579,50 @@ class Pipe:
 
         try:
             client = self._get_client()
-            self.log.debug("Fetching models from Google API")
-            models = client.models.list()
-            available_models = []
-            for model in models:
-                actions = model.supported_actions
-                if actions is None or "generateContent" in actions:
-                    model_id = self.strip_prefix(model.name)
-                    model_name = model.display_name or model_id
+            try:
+                self.log.debug("Fetching models from Google API")
+                models = client.models.list()
+                available_models = []
+                for model in models:
+                    actions = model.supported_actions
+                    if actions is None or "generateContent" in actions:
+                        model_id = self.strip_prefix(model.name)
+                        model_name = model.display_name or model_id
 
-                    # Check if model supports image generation
-                    supports_image_generation = self._check_image_generation_support(
-                        model_id
-                    )
-                    if supports_image_generation:
-                        model_name += " 🎨"  # Add image generation indicator
+                        # Check if model supports image generation
+                        supports_image_generation = (
+                            self._check_image_generation_support(model_id)
+                        )
+                        if supports_image_generation:
+                            model_name += " 🎨"  # Add image generation indicator
 
-                    available_models.append(
-                        {
-                            "id": model_id,
-                            "name": model_name,
-                            "image_generation": supports_image_generation,
-                        }
-                    )
+                        available_models.append(
+                            {
+                                "id": model_id,
+                                "name": model_name,
+                                "image_generation": supports_image_generation,
+                            }
+                        )
 
-            model_map = {model["id"]: model for model in available_models}
+                model_map = {model["id"]: model for model in available_models}
 
-            # Filter map to only include models starting with 'gemini-'
-            filtered_models = {
-                k: v for k, v in model_map.items() if k.startswith("gemini-")
-            }
+                # Filter map to only include models starting with 'gemini-'
+                filtered_models = {
+                    k: v for k, v in model_map.items() if k.startswith("gemini-")
+                }
 
-            # Update cache
-            self._model_cache = list(filtered_models.values())
-            self._model_cache_time = current_time
-            self.log.debug(f"Found {len(self._model_cache)} Gemini models")
-            return self._model_cache
+                # Update cache
+                self._model_cache = list(filtered_models.values())
+                self._model_cache_time = current_time
+                self.log.debug(f"Found {len(self._model_cache)} Gemini models")
+                return self._model_cache
+            finally:
+                # Ensure client is properly closed after fetching models
+                try:
+                    client.close()
+                    self.log.debug("Model list client closed successfully")
+                except Exception as close_error:
+                    self.log.warning(f"Error closing model list client: {close_error}")
 
         except Exception as e:
             self.log.exception(f"Could not fetch models from Google: {str(e)}")
@@ -1429,11 +1437,15 @@ class Pipe:
                 or os.getenv("VERTEX_AI_RAG_STORE")
             )
             if vertex_rag_store:
-                self.log.debug(f"Enabling Vertex AI Search grounding: {vertex_rag_store}")
+                self.log.debug(
+                    f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
+                )
                 gen_config_params.setdefault("tools", []).append(
                     types.Tool(
                         retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(datastore=vertex_rag_store)
+                            vertex_ai_search=types.VertexAISearch(
+                                datastore=vertex_rag_store
+                            )
                         )
                     )
                 )
@@ -1470,7 +1482,9 @@ class Pipe:
                             "uri": getattr(context, "uri", None),
                         },
                         "document": [getattr(context, "chunk_text", None) or ""],
-                        "metadata": [{"source": getattr(context, "title", None) or "Document"}],
+                        "metadata": [
+                            {"source": getattr(context, "title", None) or "Document"}
+                        ],
                     }
                 )
             elif hasattr(chunk, "web") and chunk.web:
@@ -1587,14 +1601,14 @@ class Pipe:
     ) -> AsyncIterator[str]:
         """
         Handle streaming response from Gemini API with proper client cleanup.
-        
+
         Args:
             client: The genai.Client instance to cleanup after streaming
             response_iterator: Iterator from generate_content_stream
             __event_emitter__: Event emitter for status updates
             __request__: FastAPI request object (for image upload)
             __user__: User information (for image upload)
-        
+
         Yields:
             Text chunks from the streaming response
         """
@@ -1958,7 +1972,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"
@@ -2007,10 +2021,16 @@ class Pipe:
                             response_iterator = await self._retry_with_backoff(
                                 get_streaming_response
                             )
-                            self.log.debug(f"Request {request_id}: Got streaming response")
+                            self.log.debug(
+                                f"Request {request_id}: Got streaming response"
+                            )
                             # For streaming, return a generator that properly closes the client
                             return self._handle_streaming_response_with_cleanup(
-                                client, response_iterator, __event_emitter__, __request__, __user__
+                                client,
+                                response_iterator,
+                                __event_emitter__,
+                                __request__,
+                                __user__,
                             )
 
                         except Exception as e:
@@ -2047,7 +2067,9 @@ class Pipe:
                             )
 
                         response = await self._retry_with_backoff(get_response)
-                        self.log.debug(f"Request {request_id}: Got non-streaming response")
+                        self.log.debug(
+                            f"Request {request_id}: Got non-streaming response"
+                        )
 
                         # Clear processing status for image generation
                         if supports_image_generation:
@@ -2072,7 +2094,9 @@ class Pipe:
                         candidate = response.candidates[0]
 
                         # Process content parts - use new streamlined approach
-                        parts = getattr(getattr(candidate, "content", None), "parts", [])
+                        parts = getattr(
+                            getattr(candidate, "content", None), "parts", []
+                        )
                         if not parts:
                             return "[No content generated or unexpected response structure]"
 
@@ -2107,7 +2131,9 @@ class Pipe:
                                     __user__,
                                     __event_emitter__,
                                 )
-                                generated_images.append(f"![Generated Image]({image_url})")
+                                generated_images.append(
+                                    f"![Generated Image]({image_url})"
+                                )
 
                             elif getattr(part, "inline_data", None):
                                 # Fallback: return as base64 data URL if no request/user context
@@ -2115,14 +2141,16 @@ class Pipe:
                                 image_data = part.inline_data.data
 
                                 if isinstance(image_data, bytes):
-                                    image_data_b64 = base64.b64encode(image_data).decode(
-                                        "utf-8"
-                                    )
+                                    image_data_b64 = base64.b64encode(
+                                        image_data
+                                    ).decode("utf-8")
                                 else:
                                     image_data_b64 = str(image_data)
 
                                 data_url = f"data:{mime_type};base64,{image_data_b64}"
-                                generated_images.append(f"![Generated Image]({data_url})")
+                                generated_images.append(
+                                    f"![Generated Image]({data_url})"
+                                )
 
                         final_answer = "".join(answer_segments)
 
@@ -2169,7 +2197,9 @@ class Pipe:
                                 full_response += "\n\n"
                             full_response += "\n\n".join(generated_images)
 
-                        return full_response if full_response else "[No content generated]"
+                        return (
+                            full_response if full_response else "[No content generated]"
+                        )
 
                     except Exception as e:
                         self.log.exception(
@@ -2181,7 +2211,9 @@ class Pipe:
                 if not stream or supports_image_generation:
                     try:
                         await client.aclose()
-                        self.log.debug(f"Request {request_id}: Client closed successfully")
+                        self.log.debug(
+                            f"Request {request_id}: Client closed successfully"
+                        )
                     except Exception as close_error:
                         self.log.warning(f"Error closing client: {close_error}")
 
