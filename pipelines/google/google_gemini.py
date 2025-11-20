@@ -1577,6 +1577,41 @@ class Pipe:
         if not emit_replace:
             return replaced_text if replaced_text is not None else text
 
+    async def _handle_streaming_response_with_cleanup(
+        self,
+        client: genai.Client,
+        response_iterator: Any,
+        __event_emitter__: Callable,
+        __request__: Optional[Request] = None,
+        __user__: Optional[dict] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Handle streaming response from Gemini API with proper client cleanup.
+        
+        Args:
+            client: The genai.Client instance to cleanup after streaming
+            response_iterator: Iterator from generate_content_stream
+            __event_emitter__: Event emitter for status updates
+            __request__: FastAPI request object (for image upload)
+            __user__: User information (for image upload)
+        
+        Yields:
+            Text chunks from the streaming response
+        """
+        try:
+            # Delegate to the existing streaming handler
+            async for chunk in self._handle_streaming_response(
+                response_iterator, __event_emitter__, __request__, __user__
+            ):
+                yield chunk
+        finally:
+            # Ensure client is properly closed after streaming completes
+            try:
+                await client.aclose()
+                self.log.debug("Streaming client closed successfully")
+            except Exception as close_error:
+                self.log.warning(f"Error closing streaming client: {close_error}")
+
     async def _handle_streaming_response(
         self,
         response_iterator: Any,
@@ -1949,195 +1984,206 @@ class Pipe:
             )
 
             # Make the API call
+            # Use async context manager to ensure proper client cleanup
             client = self._get_client()
-            if stream:
-                # For image generation models, disable streaming to avoid chunk size issues
-                if supports_image_generation:
-                    self.log.debug(
-                        "Disabling streaming for image generation model to avoid chunk size issues"
-                    )
-                    stream = False
-                else:
+            try:
+                if stream:
+                    # For image generation models, disable streaming to avoid chunk size issues
+                    if supports_image_generation:
+                        self.log.debug(
+                            "Disabling streaming for image generation model to avoid chunk size issues"
+                        )
+                        stream = False
+                    else:
+                        try:
+
+                            async def get_streaming_response():
+                                return await client.aio.models.generate_content_stream(
+                                    model=model_id,
+                                    contents=contents,
+                                    config=generation_config,
+                                )
+
+                            response_iterator = await self._retry_with_backoff(
+                                get_streaming_response
+                            )
+                            self.log.debug(f"Request {request_id}: Got streaming response")
+                            # For streaming, return a generator that properly closes the client
+                            return self._handle_streaming_response_with_cleanup(
+                                client, response_iterator, __event_emitter__, __request__, __user__
+                            )
+
+                        except Exception as e:
+                            self.log.exception(
+                                f"Error in streaming request {request_id}: {e}"
+                            )
+                            return f"Error during streaming: {e}"
+
+                # Non-streaming path (now also used for image generation)
+                if not stream or supports_image_generation:
                     try:
 
-                        async def get_streaming_response():
-                            return await client.aio.models.generate_content_stream(
+                        async def get_response():
+                            return await client.aio.models.generate_content(
                                 model=model_id,
                                 contents=contents,
                                 config=generation_config,
                             )
 
-                        response_iterator = await self._retry_with_backoff(
-                            get_streaming_response
-                        )
-                        self.log.debug(f"Request {request_id}: Got streaming response")
-                        return self._handle_streaming_response(
-                            response_iterator, __event_emitter__, __request__, __user__
-                        )
+                        # Measure duration for non-streaming path (no status to avoid false indicators)
+                        start_ts = time.time()
 
-                    except Exception as e:
-                        self.log.exception(
-                            f"Error in streaming request {request_id}: {e}"
-                        )
-                        return f"Error during streaming: {e}"
-
-            # Non-streaming path (now also used for image generation)
-            if not stream or supports_image_generation:
-                try:
-
-                    async def get_response():
-                        return await client.aio.models.generate_content(
-                            model=model_id,
-                            contents=contents,
-                            config=generation_config,
-                        )
-
-                    # Measure duration for non-streaming path (no status to avoid false indicators)
-                    start_ts = time.time()
-
-                    # Send processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing image request...",
-                                    "done": False,
-                                },
-                            }
-                        )
-
-                    response = await self._retry_with_backoff(get_response)
-                    self.log.debug(f"Request {request_id}: Got non-streaming response")
-
-                    # Clear processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing complete",
-                                    "done": True,
-                                },
-                            }
-                        )
-
-                    # Handle "Thinking" and produce final formatted content
-                    # Check for safety blocks first
-                    safety_message = self._get_safety_block_message(response)
-                    if safety_message:
-                        return safety_message
-
-                    # Get the first candidate (safety checks passed)
-                    candidate = response.candidates[0]
-
-                    # Process content parts - use new streamlined approach
-                    parts = getattr(getattr(candidate, "content", None), "parts", [])
-                    if not parts:
-                        return "[No content generated or unexpected response structure]"
-
-                    answer_segments: list[str] = []
-                    thought_segments: list[str] = []
-                    generated_images: list[str] = []
-
-                    for part in parts:
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
-                            thought_segments.append(part.text)
-                        elif getattr(part, "text", None):
-                            answer_segments.append(part.text)
-                        elif (
-                            getattr(part, "inline_data", None)
-                            and __request__
-                            and __user__
-                        ):
-                            # Handle generated images with unified upload method
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
-
-                            self.log.debug(
-                                f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
+                        # Send processing status for image generation
+                        if supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing image request...",
+                                        "done": False,
+                                    },
+                                }
                             )
 
-                            image_url = await self._upload_image_with_status(
-                                image_data,
-                                mime_type,
-                                __request__,
-                                __user__,
-                                __event_emitter__,
+                        response = await self._retry_with_backoff(get_response)
+                        self.log.debug(f"Request {request_id}: Got non-streaming response")
+
+                        # Clear processing status for image generation
+                        if supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing complete",
+                                        "done": True,
+                                    },
+                                }
                             )
-                            generated_images.append(f"![Generated Image]({image_url})")
 
-                        elif getattr(part, "inline_data", None):
-                            # Fallback: return as base64 data URL if no request/user context
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
+                        # Handle "Thinking" and produce final formatted content
+                        # Check for safety blocks first
+                        safety_message = self._get_safety_block_message(response)
+                        if safety_message:
+                            return safety_message
 
-                            if isinstance(image_data, bytes):
-                                image_data_b64 = base64.b64encode(image_data).decode(
-                                    "utf-8"
+                        # Get the first candidate (safety checks passed)
+                        candidate = response.candidates[0]
+
+                        # Process content parts - use new streamlined approach
+                        parts = getattr(getattr(candidate, "content", None), "parts", [])
+                        if not parts:
+                            return "[No content generated or unexpected response structure]"
+
+                        answer_segments: list[str] = []
+                        thought_segments: list[str] = []
+                        generated_images: list[str] = []
+
+                        for part in parts:
+                            if getattr(part, "thought", False) and getattr(
+                                part, "text", None
+                            ):
+                                thought_segments.append(part.text)
+                            elif getattr(part, "text", None):
+                                answer_segments.append(part.text)
+                            elif (
+                                getattr(part, "inline_data", None)
+                                and __request__
+                                and __user__
+                            ):
+                                # Handle generated images with unified upload method
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
+
+                                self.log.debug(
+                                    f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
                                 )
-                            else:
-                                image_data_b64 = str(image_data)
 
-                            data_url = f"data:{mime_type};base64,{image_data_b64}"
-                            generated_images.append(f"![Generated Image]({data_url})")
+                                image_url = await self._upload_image_with_status(
+                                    image_data,
+                                    mime_type,
+                                    __request__,
+                                    __user__,
+                                    __event_emitter__,
+                                )
+                                generated_images.append(f"![Generated Image]({image_url})")
 
-                    final_answer = "".join(answer_segments)
+                            elif getattr(part, "inline_data", None):
+                                # Fallback: return as base64 data URL if no request/user context
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
 
-                    # Apply grounding (if available) and send sources/status as needed
-                    grounding_metadata_list = []
-                    if getattr(candidate, "grounding_metadata", None):
-                        grounding_metadata_list.append(candidate.grounding_metadata)
-                    if grounding_metadata_list:
-                        cited = await self._process_grounding_metadata(
-                            grounding_metadata_list,
-                            final_answer,
-                            __event_emitter__,
-                            emit_replace=False,
-                        )
-                        final_answer = cited or final_answer
+                                if isinstance(image_data, bytes):
+                                    image_data_b64 = base64.b64encode(image_data).decode(
+                                        "utf-8"
+                                    )
+                                else:
+                                    image_data_b64 = str(image_data)
 
-                    # Combine all content
-                    full_response = ""
+                                data_url = f"data:{mime_type};base64,{image_data_b64}"
+                                generated_images.append(f"![Generated Image]({data_url})")
 
-                    # If we have thoughts, wrap them using <details>
-                    if thought_segments:
-                        duration_s = int(max(0, time.time() - start_ts))
-                        # Format each line with > for blockquote while preserving formatting
-                        thought_content = "".join(thought_segments).strip()
-                        quoted_lines = []
-                        for line in thought_content.split("\n"):
-                            quoted_lines.append(f"> {line}")
-                        quoted_content = "\n".join(quoted_lines)
+                        final_answer = "".join(answer_segments)
 
-                        details_block = f"""<details>
+                        # Apply grounding (if available) and send sources/status as needed
+                        grounding_metadata_list = []
+                        if getattr(candidate, "grounding_metadata", None):
+                            grounding_metadata_list.append(candidate.grounding_metadata)
+                        if grounding_metadata_list:
+                            cited = await self._process_grounding_metadata(
+                                grounding_metadata_list,
+                                final_answer,
+                                __event_emitter__,
+                                emit_replace=False,
+                            )
+                            final_answer = cited or final_answer
+
+                        # Combine all content
+                        full_response = ""
+
+                        # If we have thoughts, wrap them using <details>
+                        if thought_segments:
+                            duration_s = int(max(0, time.time() - start_ts))
+                            # Format each line with > for blockquote while preserving formatting
+                            thought_content = "".join(thought_segments).strip()
+                            quoted_lines = []
+                            for line in thought_content.split("\n"):
+                                quoted_lines.append(f"> {line}")
+                            quoted_content = "\n".join(quoted_lines)
+
+                            details_block = f"""<details>
 <summary>Thought ({duration_s}s)</summary>
 
 {quoted_content}
 
 </details>""".strip()
-                        full_response += details_block
+                            full_response += details_block
 
-                    # Add the main answer
-                    full_response += final_answer
+                        # Add the main answer
+                        full_response += final_answer
 
-                    # Add generated images
-                    if generated_images:
-                        if full_response:
-                            full_response += "\n\n"
-                        full_response += "\n\n".join(generated_images)
+                        # Add generated images
+                        if generated_images:
+                            if full_response:
+                                full_response += "\n\n"
+                            full_response += "\n\n".join(generated_images)
 
-                    return full_response if full_response else "[No content generated]"
+                        return full_response if full_response else "[No content generated]"
 
-                except Exception as e:
-                    self.log.exception(
-                        f"Error in non-streaming request {request_id}: {e}"
-                    )
-                    return f"Error generating content: {e}"
+                    except Exception as e:
+                        self.log.exception(
+                            f"Error in non-streaming request {request_id}: {e}"
+                        )
+                        return f"Error generating content: {e}"
+            finally:
+                # Ensure client is properly closed for non-streaming responses
+                if not stream or supports_image_generation:
+                    try:
+                        await client.aclose()
+                        self.log.debug(f"Request {request_id}: Client closed successfully")
+                    except Exception as close_error:
+                        self.log.warning(f"Error closing client: {close_error}")
 
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
