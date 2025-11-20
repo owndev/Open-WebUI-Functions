@@ -157,6 +157,11 @@ GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
 # The Google Cloud region for Vertex AI (e.g., "us-central1").
 # Defaults to "global" if not set.
 GOOGLE_CLOUD_LOCATION="your-gcp-location"
+
+# Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/global/collections/default_collection/dataStores/DATA_STORE_ID)
+# Optional: Can also be set via metadata params or filter
+# Auto-enabled when USE_VERTEX_AI is true and this is set
+VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_collection/dataStores/your-data-store-id"
 ```
 
 > [!IMPORTANT]
@@ -178,6 +183,46 @@ Grounding with Google search is enabled/disabled with the `google_search_tool` f
 For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with google search grounding.
 
 When enabled, sources and google queries used by Gemini will be displayed with the response.
+
+## Grounding with Vertex AI Search
+
+Improve the accuracy and recency of Gemini responses by grounding them with your own data in Vertex AI Search.
+
+### Configuration
+
+To enable Vertex AI Search grounding, you need to:
+
+1. **Set up a Vertex AI Search Data Store**: Follow the [Google Cloud documentation](https://cloud.google.com/vertex-ai/docs/search/overview) to create a Data Store in Discovery Engine and ingest your documents.
+2. **Provide the RAG Store Path**: The path should be in the format `projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID` or `projects/PROJECT/locations/global/collections/default_collection/dataStores/DATA_STORE_ID`.
+   - Set the `VERTEX_AI_RAG_STORE` environment variable, or
+   - Use the [Filter (vertex_ai_search_tool.py)](../filters/vertex_ai_search_tool.py) to enable the feature and optionally pass the store ID via chat metadata.
+3. **Enable Vertex AI**: Set `GOOGLE_GENAI_USE_VERTEXAI=true` to use Vertex AI (required for Vertex AI Search grounding).
+
+When `USE_VERTEX_AI` is `true` and `VERTEX_AI_RAG_STORE` is configured, Vertex AI Search grounding will be automatically enabled. You can also explicitly enable it via the `vertex_ai_search` feature flag.
+
+When enabled, Gemini will use the specified Vertex AI Search Data Store to retrieve relevant information and ground its responses, providing citations to the source documents.
+
+### Example Filter Usage
+
+The [vertex_ai_search_tool.py](../filters/vertex_ai_search_tool.py) filter enables Vertex AI Search grounding when the `vertex_ai_search` feature is requested:
+
+```python
+# filters/vertex_ai_search_tool.py
+# ... (filter code) ...
+```
+
+To use this filter, ensure it's enabled in your Open WebUI configuration. Then, in your chat settings or via metadata, you can enable the `vertex_ai_search` feature:
+
+```json
+{
+  "features": {
+    "vertex_ai_search": true
+  },
+  "params": {
+    "vertex_rag_store": "projects/your-project/locations/global/collections/default_collection/dataStores/your-data-store-id"
+  }
+}
+```
 
 ## Native tool calling support
 

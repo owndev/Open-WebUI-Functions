@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.6.8
+version: 1.7.0
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -26,6 +26,7 @@ features:
   - Configurable safety settings with environment variable support
   - Military-grade encrypted storage of sensitive API keys
   - Intelligent grounding with Google search integration
+  - Vertex AI Search grounding for RAG
   - Native tool calling support with automatic signature management
   - Unified image processing with consolidated helper methods
   - Optimized payload creation for image generation models
@@ -176,6 +177,10 @@ class Pipe:
         VERTEX_LOCATION: str = Field(
             default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             description="The Google Cloud region to use with Vertex AI.",
+        )
+        VERTEX_AI_RAG_STORE: str | None = Field(
+            default=os.getenv("VERTEX_AI_RAG_STORE"),
+            description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
@@ -1414,6 +1419,28 @@ class Pipe:
             )
 
         params = __metadata__.get("params", {})
+        if features.get("vertex_ai_search", False) or (
+            self.valves.USE_VERTEX_AI
+            and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
+        ):
+            vertex_rag_store = (
+                params.get("vertex_rag_store")
+                or self.valves.VERTEX_AI_RAG_STORE
+                or os.getenv("VERTEX_AI_RAG_STORE")
+            )
+            if vertex_rag_store:
+                self.log.debug(f"Enabling Vertex AI Search grounding: {vertex_rag_store}")
+                gen_config_params.setdefault("tools", []).append(
+                    types.Tool(
+                        retrieval=types.Retrieval(
+                            vertex_ai_search=types.VertexAISearch(datastore=vertex_rag_store)
+                        )
+                    )
+                )
+            else:
+                self.log.warning(
+                    "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
+                )
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
                 if not name.startswith("_"):
@@ -1433,24 +1460,35 @@ class Pipe:
     ):
         formatted_sources = []
         for chunk in grounding_chunks:
-            context = chunk.web or chunk.retrieved_context
-            if not context:
-                continue
+            if hasattr(chunk, "retrieved_context") and chunk.retrieved_context:
+                context = chunk.retrieved_context
+                formatted_sources.append(
+                    {
+                        "source": {
+                            "name": getattr(context, "title", None) or "Document",
+                            "type": "vertex_ai_search",
+                            "uri": getattr(context, "uri", None),
+                        },
+                        "document": [getattr(context, "chunk_text", None) or ""],
+                        "metadata": [{"source": getattr(context, "title", None) or "Document"}],
+                    }
+                )
+            elif hasattr(chunk, "web") and chunk.web:
+                context = chunk.web
+                uri = context.uri
+                title = context.title or "Source"
 
-            uri = context.uri
-            title = context.title or "Source"
-
-            formatted_sources.append(
-                {
-                    "source": {
-                        "name": title,
-                        "type": "web_search_results",
-                        "url": uri,
-                    },
-                    "document": ["Click the link to view the content."],
-                    "metadata": [{"source": title}],
-                }
-            )
+                formatted_sources.append(
+                    {
+                        "source": {
+                            "name": title,
+                            "type": "web_search_results",
+                            "url": uri,
+                        },
+                        "document": ["Click the link to view the content."],
+                        "metadata": [{"source": title}],
+                    }
+                )
         return formatted_sources
 
     async def _process_grounding_metadata(
