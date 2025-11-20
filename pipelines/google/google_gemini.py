@@ -1617,6 +1617,7 @@ class Pipe:
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
         thinking_started_at: Optional[float] = None
+        tool_calls_list: list[dict] = []
 
         try:
             async for chunk in response_iterator:
@@ -1684,30 +1685,19 @@ class Pipe:
                         # Function call parts (tool calls)
                         if getattr(part, "function_call", None):
                             function_call = part.function_call
-                            # Emit tool call event for Open WebUI
-                            await __event_emitter__(
-                                {
-                                    "type": "chat:message:delta",
-                                    "data": {
-                                        "role": "assistant",
-                                        "content": "",
-                                        "tool_calls": [
-                                            {
-                                                "id": f"call_{function_call.name}",
-                                                "type": "function",
-                                                "function": {
-                                                    "name": function_call.name,
-                                                    "arguments": json.dumps(
-                                                        dict(function_call.args)
-                                                    ),
-                                                },
-                                            }
-                                        ],
-                                    },
-                                }
-                            )
+                            tool_call = {
+                                "id": f"call_{function_call.name}",
+                                "type": "function",
+                                "function": {
+                                    "name": function_call.name,
+                                    "arguments": json.dumps(dict(function_call.args)),
+                                },
+                            }
+                            # Only add if not already in list (avoid duplicates)
+                            if tool_call not in tool_calls_list:
+                                tool_calls_list.append(tool_call)
                             self.log.debug(
-                                f"Emitted tool call: {function_call.name} with args: {function_call.args}"
+                                f"Collected tool call: {function_call.name} with args: {function_call.args}"
                             )
 
                         # Thought parts (internal reasoning)
@@ -1788,13 +1778,16 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
+            # Prepare message data
+            message_data = {"role": "assistant", "content": final_content}
+            if tool_calls_list:
+                message_data["tool_calls"] = tool_calls_list
+
             # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
-            await emit_chat_event(
-                "replace", {"role": "assistant", "content": final_content}
-            )
+            await emit_chat_event("replace", message_data)
             await emit_chat_event(
                 "chat:message",
-                {"role": "assistant", "content": final_content, "done": True},
+                {**message_data, "done": True},
             )
 
             if thought_chunks:
@@ -1808,7 +1801,7 @@ class Pipe:
 
             await emit_chat_event(
                 "chat:finish",
-                {"role": "assistant", "content": final_content, "done": True},
+                {**message_data, "done": True},
             )
 
         except Exception as e:
@@ -2190,20 +2183,9 @@ class Pipe:
                             full_response += "\n\n"
                         full_response += "\n\n".join(generated_images)
 
-                    # If there are tool calls, return them in the expected format
+                    # Return in OpenAI-compatible format
+                    # If there are tool calls, include them in the response
                     if tool_calls_list:
-                        # Emit tool calls for Open WebUI
-                        await __event_emitter__(
-                            {
-                                "type": "chat:message",
-                                "data": {
-                                    "role": "assistant",
-                                    "content": full_response or "",
-                                    "tool_calls": tool_calls_list,
-                                },
-                            }
-                        )
-                        # Return in OpenAI-compatible format
                         return {
                             "choices": [
                                 {
