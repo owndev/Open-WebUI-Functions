@@ -1622,19 +1622,42 @@ class Pipe:
             # Ensure client is properly closed after streaming completes
             self.log.debug("Attempting to close streaming client...")
             try:
-                # Use hasattr to support both old and new SDK versions
+                # Try multiple approaches to close the client, supporting various SDK versions
+                closed = False
+
+                # Approach 1: Try client.aio.aclose() (SDK 1.47.0+)
                 if hasattr(client.aio, "aclose"):
                     self.log.debug("Calling client.aio.aclose()")
                     await client.aio.aclose()
                     self.log.debug("Streaming client closed successfully (async)")
+                    closed = True
+
+                # Approach 2: Try client.close() (SDK 1.47.0+, sync)
                 elif hasattr(client, "close"):
-                    # Fallback to sync close if async not available
                     self.log.debug("Calling client.close()")
                     client.close()
                     self.log.debug("Streaming client closed successfully (sync)")
-                else:
+                    closed = True
+
+                # Approach 3: Try to access underlying _api_client directly (older SDK)
+                elif hasattr(client, "_api_client"):
+                    api_client = client._api_client
+                    if hasattr(api_client, "aclose"):
+                        self.log.debug("Calling client._api_client.aclose()")
+                        await api_client.aclose()
+                        self.log.debug(
+                            "Streaming client closed via _api_client (async)"
+                        )
+                        closed = True
+                    elif hasattr(api_client, "close"):
+                        self.log.debug("Calling client._api_client.close()")
+                        api_client.close()
+                        self.log.debug("Streaming client closed via _api_client (sync)")
+                        closed = True
+
+                if not closed:
                     self.log.warning(
-                        "No close method found on client - SDK may not support explicit cleanup"
+                        "No close method found - client will be cleaned up by garbage collector"
                     )
             except Exception as close_error:
                 self.log.warning(f"Error closing streaming client: {close_error}")
@@ -2226,7 +2249,10 @@ class Pipe:
                         f"Request {request_id}: Attempting to close non-streaming client..."
                     )
                     try:
-                        # Use hasattr to support both old and new SDK versions
+                        # Try multiple approaches to close the client, supporting various SDK versions
+                        closed = False
+
+                        # Approach 1: Try client.aio.aclose() (SDK 1.47.0+)
                         if hasattr(client.aio, "aclose"):
                             self.log.debug(
                                 f"Request {request_id}: Calling client.aio.aclose()"
@@ -2235,8 +2261,10 @@ class Pipe:
                             self.log.debug(
                                 f"Request {request_id}: Client closed successfully (async)"
                             )
+                            closed = True
+
+                        # Approach 2: Try client.close() (SDK 1.47.0+, sync)
                         elif hasattr(client, "close"):
-                            # Fallback to sync close if async not available
                             self.log.debug(
                                 f"Request {request_id}: Calling client.close()"
                             )
@@ -2244,9 +2272,33 @@ class Pipe:
                             self.log.debug(
                                 f"Request {request_id}: Client closed successfully (sync)"
                             )
-                        else:
+                            closed = True
+
+                        # Approach 3: Try to access underlying _api_client directly (older SDK)
+                        elif hasattr(client, "_api_client"):
+                            api_client = client._api_client
+                            if hasattr(api_client, "aclose"):
+                                self.log.debug(
+                                    f"Request {request_id}: Calling client._api_client.aclose()"
+                                )
+                                await api_client.aclose()
+                                self.log.debug(
+                                    f"Request {request_id}: Client closed via _api_client (async)"
+                                )
+                                closed = True
+                            elif hasattr(api_client, "close"):
+                                self.log.debug(
+                                    f"Request {request_id}: Calling client._api_client.close()"
+                                )
+                                api_client.close()
+                                self.log.debug(
+                                    f"Request {request_id}: Client closed via _api_client (sync)"
+                                )
+                                closed = True
+
+                        if not closed:
                             self.log.warning(
-                                f"Request {request_id}: No close method found on client"
+                                f"Request {request_id}: No close method found - client will be cleaned up by garbage collector"
                             )
                     except Exception as close_error:
                         self.log.warning(
