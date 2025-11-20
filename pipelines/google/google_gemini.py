@@ -1620,15 +1620,22 @@ class Pipe:
                 yield chunk
         finally:
             # Ensure client is properly closed after streaming completes
+            self.log.debug("Attempting to close streaming client...")
             try:
                 # Use hasattr to support both old and new SDK versions
                 if hasattr(client.aio, "aclose"):
+                    self.log.debug("Calling client.aio.aclose()")
                     await client.aio.aclose()
-                    self.log.debug("Streaming client closed successfully")
+                    self.log.debug("Streaming client closed successfully (async)")
                 elif hasattr(client, "close"):
                     # Fallback to sync close if async not available
+                    self.log.debug("Calling client.close()")
                     client.close()
                     self.log.debug("Streaming client closed successfully (sync)")
+                else:
+                    self.log.warning(
+                        "No close method found on client - SDK may not support explicit cleanup"
+                    )
             except Exception as close_error:
                 self.log.warning(f"Error closing streaming client: {close_error}")
 
@@ -2215,21 +2222,36 @@ class Pipe:
             finally:
                 # Ensure client is properly closed for non-streaming responses
                 if not stream or supports_image_generation:
+                    self.log.debug(
+                        f"Request {request_id}: Attempting to close non-streaming client..."
+                    )
                     try:
                         # Use hasattr to support both old and new SDK versions
                         if hasattr(client.aio, "aclose"):
+                            self.log.debug(
+                                f"Request {request_id}: Calling client.aio.aclose()"
+                            )
                             await client.aio.aclose()
                             self.log.debug(
-                                f"Request {request_id}: Client closed successfully"
+                                f"Request {request_id}: Client closed successfully (async)"
                             )
                         elif hasattr(client, "close"):
                             # Fallback to sync close if async not available
+                            self.log.debug(
+                                f"Request {request_id}: Calling client.close()"
+                            )
                             client.close()
                             self.log.debug(
                                 f"Request {request_id}: Client closed successfully (sync)"
                             )
+                        else:
+                            self.log.warning(
+                                f"Request {request_id}: No close method found on client"
+                            )
                     except Exception as close_error:
-                        self.log.warning(f"Error closing client: {close_error}")
+                        self.log.warning(
+                            f"Request {request_id}: Error closing client: {close_error}"
+                        )
 
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
