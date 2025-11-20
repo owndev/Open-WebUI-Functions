@@ -1915,9 +1915,8 @@ class Pipe:
                 model_id,
             )
 
-            # Make the API call
-            client = self._get_client()
-            try:
+            # Make the API call using async context manager for proper cleanup
+            async with self._get_client() as client:
                 if stream:
                     # For image generation models, disable streaming to avoid chunk size issues
                     if supports_image_generation:
@@ -2121,18 +2120,6 @@ class Pipe:
                             f"Error in non-streaming request {request_id}: {e}"
                         )
                         return f"Error generating content: {e}"
-            finally:
-                # Close the client to prevent "Unclosed connector" warnings
-                # The Google genai SDK uses aiohttp internally which needs explicit cleanup
-                try:
-                    if hasattr(client, "aclose"):
-                        await client.aclose()
-                        self.log.debug("Client closed via aclose()")
-                    elif hasattr(client, "close"):
-                        await client.close()
-                        self.log.debug("Client closed via close()")
-                except Exception as close_error:
-                    self.log.warning(f"Error closing client: {close_error}")
 
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
