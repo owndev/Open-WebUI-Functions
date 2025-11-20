@@ -1621,8 +1621,14 @@ class Pipe:
         finally:
             # Ensure client is properly closed after streaming completes
             try:
-                await client.aio.aclose()
-                self.log.debug("Streaming client closed successfully")
+                # Use hasattr to support both old and new SDK versions
+                if hasattr(client.aio, "aclose"):
+                    await client.aio.aclose()
+                    self.log.debug("Streaming client closed successfully")
+                elif hasattr(client, "close"):
+                    # Fallback to sync close if async not available
+                    client.close()
+                    self.log.debug("Streaming client closed successfully (sync)")
             except Exception as close_error:
                 self.log.warning(f"Error closing streaming client: {close_error}")
 
@@ -2210,10 +2216,18 @@ class Pipe:
                 # Ensure client is properly closed for non-streaming responses
                 if not stream or supports_image_generation:
                     try:
-                        await client.aio.aclose()
-                        self.log.debug(
-                            f"Request {request_id}: Client closed successfully"
-                        )
+                        # Use hasattr to support both old and new SDK versions
+                        if hasattr(client.aio, "aclose"):
+                            await client.aio.aclose()
+                            self.log.debug(
+                                f"Request {request_id}: Client closed successfully"
+                            )
+                        elif hasattr(client, "close"):
+                            # Fallback to sync close if async not available
+                            client.close()
+                            self.log.debug(
+                                f"Request {request_id}: Client closed successfully (sync)"
+                            )
                     except Exception as close_error:
                         self.log.warning(f"Error closing client: {close_error}")
 
