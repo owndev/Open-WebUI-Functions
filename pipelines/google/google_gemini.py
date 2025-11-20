@@ -1433,7 +1433,7 @@ class Pipe:
                 gen_config_params.setdefault("tools", []).append(
                     types.Tool(
                         retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(data_store=vertex_rag_store)
+                            vertex_ai_search=types.VertexAISearch(datastore=vertex_rag_store)
                         )
                     )
                 )
