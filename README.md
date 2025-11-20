@@ -159,6 +159,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Advanced Image Processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
+- Grounding with Vertex AI Search with [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
 - Native tool calling support
 - Configurable API version support
 
