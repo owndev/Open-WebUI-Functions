@@ -29,6 +29,7 @@ from typing import (
     Any,
     AsyncIterator,
     Set,
+    Callable,
 )
 from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
@@ -444,14 +445,14 @@ class Pipe:
     async def _emit_openwebui_citation_events(
         self,
         citations: List[Dict[str, Any]],
-        __event_emitter__: Optional[callable],
+        __event_emitter__: Optional[Callable[..., Any]],
     ) -> None:
         """
         Emit OpenWebUI citation events for each citation.
 
         Args:
             citations: List of Azure citation objects
-            __event_emitter__: Event emitter function
+            __event_emitter__: Event emitter callable for sending citation events
         """
         if not __event_emitter__ or not citations:
             return
@@ -481,13 +482,17 @@ class Pipe:
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
         Enhance Azure AI Search responses by improving citation display and adding source content.
-        Also attaches openwebui_citations field for native OpenWebUI citation support.
+        Modifies the response in-place and returns it.
+
+        The function performs the following enhancements:
+        1. If AZURE_AI_ENHANCE_CITATIONS is True: Appends a formatted markdown/HTML citation section
+        2. If AZURE_AI_OPENWEBUI_CITATIONS is True: Attaches an 'openwebui_citations' array at root level
 
         Args:
-            response: The original response from Azure AI
+            response: The original response from Azure AI (modified in-place)
 
         Returns:
-            Enhanced response with better citation formatting and optional openwebui_citations field
+            The enhanced response with better citation formatting and optional openwebui_citations field
         """
         if not isinstance(response, dict):
             return response
@@ -540,8 +545,8 @@ class Pipe:
             # Add enhanced citation info to context for API consumers
             context["enhanced_citations"] = citation_details
 
-            # Add native OpenWebUI citations field (if enabled)
-            if self.valves.AZURE_AI_OPENWEBUI_CITATIONS:
+            # Add native OpenWebUI citations field (if enabled and citations exist)
+            if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and citations:
                 openwebui_citations = []
                 for i, citation in enumerate(citations, 1):
                     if not isinstance(citation, dict):
