@@ -99,6 +99,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
 - Supports Azure Search integration for enhanced document retrieval.
+- **Native OpenWebUI Citations Support** 🎯: Rich citation cards, source previews, and inline citation correlations for Azure AI Search responses (Azure OpenAI only).
 - Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o;gpt-4o-mini`).
 - Customizable pipeline display with configurable prefix via `AZURE_AI_PIPELINE_PREFIX`.
 - Azure AI Search / RAG integration with enhanced collapsible citation display (Azure OpenAI only).
@@ -111,6 +112,8 @@ The functions include a built-in encryption mechanism for sensitive information:
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai)
 
 🔗 [Learn More About Azure AI](https://azure.microsoft.com/en-us/solutions/ai)
+
+📖 [Azure AI Citations Documentation](./docs/azure-ai-citations.md)
 
 ### **2. [N8N Pipeline](./pipelines/n8n/n8n.py)**
 

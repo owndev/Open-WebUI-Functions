@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.2
+version: 2.6.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -16,6 +16,7 @@ features:
   - Predefined models for easy access.
   - Encrypted storage of sensitive API keys
   - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
+  - Native OpenWebUI citations support with structured events and citation cards (Azure OpenAI only)
 """
 
 from typing import (
