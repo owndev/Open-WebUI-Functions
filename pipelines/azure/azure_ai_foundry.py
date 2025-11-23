@@ -125,6 +125,20 @@ class EncryptedStr(str):
 
 
 # Helper functions
+def get_bool_env(env_var: str, default: str = "true") -> bool:
+    """
+    Parse a boolean environment variable.
+
+    Args:
+        env_var: The environment variable name
+        default: The default value as a string ("true" or "false")
+
+    Returns:
+        Boolean value parsed from the environment variable
+    """
+    return os.getenv(env_var, default).lower() == "true"
+
+
 async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
     session: Optional[aiohttp.ClientSession],
@@ -201,13 +215,13 @@ class Pipe:
 
         # Enable enhanced citation display for Azure AI Search responses
         AZURE_AI_ENHANCE_CITATIONS: bool = Field(
-            default=os.getenv("AZURE_AI_ENHANCE_CITATIONS", "true").lower() == "true",
+            default=get_bool_env("AZURE_AI_ENHANCE_CITATIONS"),
             description="If True, enhance Azure AI Search responses with better citation formatting and source content display.",
         )
 
         # Enable native OpenWebUI citations (structured events and fields)
         AZURE_AI_OPENWEBUI_CITATIONS: bool = Field(
-            default=os.getenv("AZURE_AI_OPENWEBUI_CITATIONS", "true").lower() == "true",
+            default=get_bool_env("AZURE_AI_OPENWEBUI_CITATIONS"),
             description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
@@ -396,18 +410,13 @@ class Pipe:
         Returns:
             Normalized citation in OpenWebUI format
         """
-        # Get title with fallback to filepath or url
-        title = citation.get("title", "")
-        if not title or not title.strip():
-            filepath = citation.get("filepath", "")
-            if filepath and filepath.strip():
-                title = filepath
-            else:
-                url = citation.get("url", "")
-                if url and url.strip():
-                    title = url
-                else:
-                    title = "Unknown Document"
+        # Get title with fallback chain: title → filepath → url → "Unknown Document"
+        title = (
+            citation.get("title", "").strip()
+            or citation.get("filepath", "").strip()
+            or citation.get("url", "").strip()
+            or "Unknown Document"
+        )
 
         doc_id = f"doc{index}"
 
