@@ -200,13 +200,13 @@ class Pipe:
 
         # Enable enhanced citation display for Azure AI Search responses
         AZURE_AI_ENHANCE_CITATIONS: bool = Field(
-            default=bool(os.getenv("AZURE_AI_ENHANCE_CITATIONS", True)),
+            default=os.getenv("AZURE_AI_ENHANCE_CITATIONS", "true").lower() == "true",
             description="If True, enhance Azure AI Search responses with better citation formatting and source content display.",
         )
 
         # Enable native OpenWebUI citations (structured events and fields)
         AZURE_AI_OPENWEBUI_CITATIONS: bool = Field(
-            default=bool(os.getenv("AZURE_AI_OPENWEBUI_CITATIONS", True)),
+            default=os.getenv("AZURE_AI_OPENWEBUI_CITATIONS", "true").lower() == "true",
             description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
@@ -444,7 +444,7 @@ class Pipe:
     async def _emit_openwebui_citation_events(
         self,
         citations: List[Dict[str, Any]],
-        __event_emitter__,
+        __event_emitter__: Optional[callable],
     ) -> None:
         """
         Emit OpenWebUI citation events for each citation.
@@ -480,7 +480,7 @@ class Pipe:
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enhances Azure AI Search responses by improving citation display and adding source content.
+        Enhance Azure AI Search responses by improving citation display and adding source content.
         Also attaches openwebui_citations field for native OpenWebUI citation support.
 
         Args:
