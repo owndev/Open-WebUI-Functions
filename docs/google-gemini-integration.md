@@ -317,18 +317,34 @@ from google.genai import types
 
 client = genai.Client()
 
+# Example with a specific thinking budget
 response = client.models.generate_content(
     model="gemini-2.5-pro",
     contents="Provide a list of 3 famous physicists and their key contributions",
     config=types.GenerateContentConfig(
         thinking_config=types.ThinkingConfig(thinking_budget=1024)
-        # Turn off thinking:
-        # thinking_config=types.ThinkingConfig(thinking_budget=0)
-        # Turn on dynamic thinking:
-        # thinking_config=types.ThinkingConfig(thinking_budget=-1)
     ),
 )
+print(response.text)
 
+# Turn off thinking entirely
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="What is 2+2?",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    ),
+)
+print(response.text)
+
+# Use dynamic thinking (model decides based on query complexity)
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Explain quantum computing",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=-1)
+    ),
+)
 print(response.text)
 ```
 

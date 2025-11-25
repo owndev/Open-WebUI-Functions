@@ -742,7 +742,7 @@ class Pipe:
         )
         return None
 
-    def _validate_thinking_budget(self, budget: int) -> Optional[int]:
+    def _validate_thinking_budget(self, budget: int) -> int:
         """
         Validate and normalize the thinking budget value.
 
@@ -750,7 +750,7 @@ class Pipe:
             budget: The thinking budget integer to validate
 
         Returns:
-            Validated budget (0-24576 or -1 for dynamic) or None if disabled
+            Validated budget: -1 for dynamic, 0 to disable, or 1-24576 for fixed limit
         """
         # -1 means dynamic thinking (let the model decide)
         if budget == -1:
@@ -1499,19 +1499,18 @@ class Pipe:
                     validated_budget = self._validate_thinking_budget(
                         self.valves.THINKING_BUDGET
                     )
-                    if validated_budget is not None:
-                        if validated_budget == 0:
-                            # Disable thinking if budget is 0
-                            thinking_config_params = {"thinking_budget": 0}
-                            self.log.debug(
-                                f"Thinking disabled via thinking_budget=0 for model {model_id}"
-                            )
-                        elif validated_budget > 0:
-                            thinking_config_params["thinking_budget"] = validated_budget
-                            self.log.debug(
-                                f"Using thinking_budget={validated_budget} for model {model_id}"
-                            )
-                        # -1 means dynamic, so we don't set thinking_budget explicitly
+                    if validated_budget == 0:
+                        # Disable thinking if budget is 0
+                        thinking_config_params["thinking_budget"] = 0
+                        self.log.debug(
+                            f"Thinking disabled via thinking_budget=0 for model {model_id}"
+                        )
+                    elif validated_budget > 0:
+                        thinking_config_params["thinking_budget"] = validated_budget
+                        self.log.debug(
+                            f"Using thinking_budget={validated_budget} for model {model_id}"
+                        )
+                    # -1 means dynamic, so we don't set thinking_budget explicitly
 
                 gen_config_params["thinking_config"] = types.ThinkingConfig(
                     **thinking_config_params
