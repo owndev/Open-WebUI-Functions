@@ -170,8 +170,8 @@ class Pipe:
         )
         THINKING_BUDGET: int = Field(
             default=int(os.getenv("GOOGLE_THINKING_BUDGET", "-1")),
-            description="Thinking budget for Gemini models (0=disabled, -1=dynamic, 1-24576=fixed token limit). "
-            "Only applicable to models that support thinking (e.g., gemini-2.5-*, gemini-3-*).",
+            description="Thinking budget for Gemini 2.5 models (0=disabled, -1=dynamic, 1-32768=fixed token limit). "
+            "Not used for Gemini 3 models which use THINKING_LEVEL instead.",
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
@@ -696,8 +696,8 @@ class Pipe:
         """
         Check if a model supports the thinking_level parameter.
 
-        Currently, only Gemini 3 Pro models support thinking_level.
-        Other models use thinking_budget instead.
+        Gemini 3 models support thinking_level and should NOT use thinking_budget.
+        Other models (like Gemini 2.5) use thinking_budget instead.
 
         Args:
             model_id: The model ID to check
@@ -705,13 +705,13 @@ class Pipe:
         Returns:
             True if the model supports thinking_level, False otherwise
         """
-        # Gemini 3 Pro models support thinking_level
-        gemini_3_pro_patterns = [
-            "gemini-3-pro",
+        # Gemini 3 models support thinking_level (not thinking_budget)
+        gemini_3_patterns = [
+            "gemini-3-",
         ]
 
         model_lower = model_id.lower()
-        for pattern in gemini_3_pro_patterns:
+        for pattern in gemini_3_patterns:
             if pattern in model_lower:
                 return True
 
@@ -750,7 +750,7 @@ class Pipe:
             budget: The thinking budget integer to validate
 
         Returns:
-            Validated budget: -1 for dynamic, 0 to disable, or 1-24576 for fixed limit
+            Validated budget: -1 for dynamic, 0 to disable, or 1-32768 for fixed limit
         """
         # -1 means dynamic thinking (let the model decide)
         if budget == -1:
@@ -760,18 +760,18 @@ class Pipe:
         if budget == 0:
             return 0
 
-        # Validate positive range (1-24576)
+        # Validate positive range (1-32768)
         if budget > 0:
-            if budget > 24576:
+            if budget > 32768:
                 self.log.warning(
-                    f"Thinking budget {budget} exceeds maximum of 24576. Clamping to 24576."
+                    f"Thinking budget {budget} exceeds maximum of 32768. Clamping to 32768."
                 )
-                return 24576
+                return 32768
             return budget
 
         # Negative values (except -1) are invalid, treat as -1 (dynamic)
         self.log.warning(
-            f"Invalid thinking budget {budget}. Only -1 (dynamic), 0 (disabled), or 1-24576 are valid. "
+            f"Invalid thinking budget {budget}. Only -1 (dynamic), 0 (disabled), or 1-32768 are valid. "
             "Falling back to dynamic thinking."
         )
         return -1
@@ -1474,18 +1474,25 @@ class Pipe:
         if enable_image_generation:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
 
-        # Enable Gemini "Thinking" when requested (default: on) and supported by the model
-        include_thoughts = body.get("include_thoughts", True)
-        if not self.valves.INCLUDE_THOUGHTS:
-            include_thoughts = False
-            self.log.debug("Thoughts disabled via GOOGLE_INCLUDE_THOUGHTS")
-
-        if include_thoughts and self._check_thinking_support(model_id):
+        # Configure Gemini thinking/reasoning for models that support it
+        # This is independent of include_thoughts - thinking config controls HOW the model reasons,
+        # while include_thoughts controls whether the reasoning is shown in the output
+        if self._check_thinking_support(model_id):
             try:
-                thinking_config_params: Dict[str, Any] = {"include_thoughts": True}
+                thinking_config_params: Dict[str, Any] = {}
 
-                # Check if model supports thinking_level (Gemini 3 Pro only)
+                # Determine include_thoughts setting
+                include_thoughts = body.get("include_thoughts", True)
+                if not self.valves.INCLUDE_THOUGHTS:
+                    include_thoughts = False
+                    self.log.debug(
+                        "Thoughts output disabled via GOOGLE_INCLUDE_THOUGHTS"
+                    )
+                thinking_config_params["include_thoughts"] = include_thoughts
+
+                # Check if model supports thinking_level (Gemini 3 models)
                 if self._check_thinking_level_support(model_id):
+                    # For Gemini 3 models, use thinking_level (not thinking_budget)
                     validated_level = self._validate_thinking_level(
                         self.valves.THINKING_LEVEL
                     )
@@ -1494,8 +1501,12 @@ class Pipe:
                         self.log.debug(
                             f"Using thinking_level='{validated_level}' for model {model_id}"
                         )
+                    else:
+                        self.log.debug(
+                            f"Using default thinking level for model {model_id}"
+                        )
                 else:
-                    # For non-Gemini 3 Pro models, use thinking_budget
+                    # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
                     validated_budget = self._validate_thinking_budget(
                         self.valves.THINKING_BUDGET
                     )

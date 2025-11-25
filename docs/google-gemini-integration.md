@@ -126,18 +126,18 @@ GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 # Default: true
 GOOGLE_INCLUDE_THOUGHTS=true
 
-# Thinking budget for Gemini models (Gemini 2.5 and other thinking-capable models)
-# -1 = dynamic (model decides), 0 = disabled, 1-24576 = fixed token limit
+# Thinking budget for Gemini 2.5 models (not used for Gemini 3 models)
+# -1 = dynamic (model decides), 0 = disabled, 1-32768 = fixed token limit
 # Default: -1 (dynamic)
-# Note: This setting is ignored for Gemini 3 Pro models which use GOOGLE_THINKING_LEVEL instead
+# Note: Gemini 3 models use GOOGLE_THINKING_LEVEL instead
 GOOGLE_THINKING_BUDGET=-1
 
-# Thinking level for Gemini 3 Pro models only
+# Thinking level for Gemini 3 models only
 # Valid values: "low", "high", or empty string for model default
 # - "low": Minimizes latency and cost, suitable for simple tasks
 # - "high": Maximizes reasoning depth, ideal for complex problem-solving
 # Default: "" (empty, uses model default)
-# Note: This setting is ignored for non-Gemini 3 Pro models
+# Note: This setting is ignored for non-Gemini 3 models
 GOOGLE_THINKING_LEVEL=""
 
 # Enable streaming responses globally
@@ -252,12 +252,15 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 > [!Note]
 > For detailed information about thinking capabilities, see the [Google Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking).
 
-### Thinking Levels (Gemini 3 Pro only)
+### Thinking Levels (Gemini 3 models)
 
-Gemini 3 Pro models support the `thinking_level` parameter, which controls the depth of reasoning:
+Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
 - **`"low"`**: Minimizes latency and cost, suitable for simple tasks, chat, or high-throughput APIs.
 - **`"high"`**: Maximizes reasoning depth, ideal for complex problem-solving, code analysis, and agentic workflows.
+
+> [!Note]
+> Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
 
 Set via environment variable:
 
@@ -288,13 +291,16 @@ response = client.models.generate_content(
 print(response.text)
 ```
 
-### Thinking Budget (Gemini 2.5 and other models)
+### Thinking Budget (Gemini 2.5 models)
 
-For models that support thinking budgets (like Gemini 2.5), you can control the maximum number of tokens used during internal reasoning:
+For Gemini 2.5 models, you can control the maximum number of tokens used during internal reasoning using `thinking_budget`:
 
 - **`0`**: Disables thinking entirely for fastest responses
 - **`-1`**: Dynamic thinking (model decides based on query complexity) - default
-- **`1-24576`**: Fixed token limit for reasoning
+- **`1-32768`**: Fixed token limit for reasoning
+
+> [!Note]
+> Gemini 3 models do **not** use `thinking_budget`. Use `GOOGLE_THINKING_LEVEL` for Gemini 3 models instead.
 
 Set via environment variable:
 
@@ -352,7 +358,7 @@ print(response.text)
 
 | Model | thinking_level | thinking_budget |
 |-------|---------------|-----------------|
-| gemini-3-pro-* | ✅ Supported ("low", "high") | ❌ Not used |
-| gemini-2.5-* | ❌ Not used | ✅ Supported (0-24576) |
+| gemini-3-* | ✅ Supported ("low", "high") | ❌ Not used |
+| gemini-2.5-* | ❌ Not used | ✅ Supported (0-32768) |
 | gemini-2.5-flash-image-* | ❌ Not supported | ❌ Not supported |
 | Other models | ❌ Not used | ✅ May be supported |
