@@ -1510,15 +1510,21 @@ class Pipe:
                         self.log.debug(
                             f"Using thinking_budget={validated_budget} for model {model_id}"
                         )
-                    # -1 means dynamic, so we don't set thinking_budget explicitly
+                    else:
+                        # -1 means dynamic thinking
+                        self.log.debug(
+                            f"Using dynamic thinking (model decides) for model {model_id}"
+                        )
 
                 gen_config_params["thinking_config"] = types.ThinkingConfig(
                     **thinking_config_params
                 )
-            except Exception as e:
-                # Fall back silently if SDK/model does not support ThinkingConfig
+            except (AttributeError, TypeError) as e:
+                # Fall back if SDK/model does not support ThinkingConfig
                 self.log.debug(f"ThinkingConfig not supported: {e}")
-                pass
+            except Exception as e:
+                # Log unexpected errors but continue without thinking config
+                self.log.warning(f"Unexpected error configuring ThinkingConfig: {e}")
 
         # Configure safety settings
         if self.valves.USE_PERMISSIVE_SAFETY:
