@@ -426,7 +426,7 @@ class Pipe:
                 {
                     "index": i + 1,
                     "label": (
-                        f"Image {i+1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
+                        f"Image {i + 1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
                     ),
                     "reused": reused_flags[i],
                     "origin": "history" if reused_flags[i] else "current",
@@ -1429,11 +1429,15 @@ class Pipe:
                 or os.getenv("VERTEX_AI_RAG_STORE")
             )
             if vertex_rag_store:
-                self.log.debug(f"Enabling Vertex AI Search grounding: {vertex_rag_store}")
+                self.log.debug(
+                    f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
+                )
                 gen_config_params.setdefault("tools", []).append(
                     types.Tool(
                         retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(datastore=vertex_rag_store)
+                            vertex_ai_search=types.VertexAISearch(
+                                datastore=vertex_rag_store
+                            )
                         )
                     )
                 )
@@ -1470,7 +1474,9 @@ class Pipe:
                             "uri": getattr(context, "uri", None),
                         },
                         "document": [getattr(context, "chunk_text", None) or ""],
-                        "metadata": [{"source": getattr(context, "title", None) or "Document"}],
+                        "metadata": [
+                            {"source": getattr(context, "title", None) or "Document"}
+                        ],
                     }
                 )
             elif hasattr(chunk, "web") and chunk.web:
