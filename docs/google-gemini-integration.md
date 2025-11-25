@@ -80,6 +80,12 @@ GOOGLE_MODEL_CACHE_TTL=600
 # Default: 2
 GOOGLE_RETRY_COUNT=2
 
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+# Leave empty to disable
+# Default: "" (empty, disabled)
+GOOGLE_DEFAULT_SYSTEM_PROMPT=""
+
 # Image processing optimization settings
 # Maximum image size in MB before compression is applied
 # Default: 15.0
@@ -244,6 +250,47 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 ## Native tool calling support
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
+
+## Default System Prompt
+
+The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
+
+### How It Works
+
+- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
+- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
+- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
+
+### Configuration
+
+Set via environment variable:
+
+```bash
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Example
+
+If your default system prompt is:
+```
+You are a helpful AI assistant.
+```
+
+And your model-specific system prompt is:
+```
+Always respond in formal English.
+```
+
+The combined system prompt sent to Gemini will be:
+```
+You are a helpful AI assistant.
+
+Always respond in formal English.
+```
 
 ## Thinking Configuration
 

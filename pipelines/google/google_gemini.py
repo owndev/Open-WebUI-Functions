@@ -206,6 +206,11 @@ class Pipe:
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
         )
+        DEFAULT_SYSTEM_PROMPT: str = Field(
+            default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
+            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
+            "this is prepended to it. Leave empty to disable.",
+        )
 
         # Image Processing Configuration
         IMAGE_MAX_SIZE_MB: float = Field(
@@ -283,6 +288,39 @@ class Pipe:
                 pass
             result.append(part)
         return result
+
+    def _combine_system_prompts(
+        self, user_system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Combine default system prompt with user-defined system prompt.
+
+        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
+        the default is prepended to the user's prompt.
+        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
+        If only user_system_prompt is set, it is used as-is.
+
+        Args:
+            user_system_prompt: The user-defined system prompt from messages (may be None)
+
+        Returns:
+            Combined system prompt or None if neither is set
+        """
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
+        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
+
+        if default_prompt and user_prompt:
+            combined = f"{default_prompt}\n\n{user_prompt}"
+            self.log.debug(
+                f"Combined system prompts: default ({len(default_prompt)} chars) + "
+                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
+            )
+            return combined
+        elif default_prompt:
+            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
+            return default_prompt
+        elif user_prompt:
+            return user_prompt
+        return None
 
     def _apply_order_and_limit(
         self,
@@ -374,11 +412,14 @@ class Pipe:
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
-        # Extract system instruction first
-        system_instruction = next(
+        # Extract user-defined system instruction first
+        user_system_instruction = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_instruction = self._combine_system_prompts(user_system_instruction)
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -848,11 +889,14 @@ class Pipe:
         Returns:
             Tuple of (prepared content list, system message string or None)
         """
-        # Extract system message
-        system_message = next(
+        # Extract user-defined system message
+        user_system_message = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_message = self._combine_system_prompts(user_system_message)
 
         # Prepare contents for the API
         contents = []
@@ -2074,7 +2118,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"
