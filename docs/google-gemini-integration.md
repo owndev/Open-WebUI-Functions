@@ -26,7 +26,7 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 > Streaming is automatically disabled for image generation models to prevent chunk size issues.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-24576 tokens) for other thinking-capable models.
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models.
 
   > [!Note]
   > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.

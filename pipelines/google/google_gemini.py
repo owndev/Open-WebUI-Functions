@@ -32,8 +32,8 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
-  - Configurable thinking levels (low/high) for Gemini 3 Pro models
-  - Configurable thinking budgets (0-24576 tokens) for Gemini 2.5 models
+  - Configurable thinking levels (low/high) for Gemini 3 models
+  - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
 """
 
 import os
@@ -175,7 +175,7 @@ class Pipe:
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
-            description="Thinking level for Gemini 3 Pro models only ('low' or 'high'). "
+            description="Thinking level for Gemini 3 models ('low' or 'high'). "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -1523,6 +1523,7 @@ class Pipe:
                         )
                     else:
                         # -1 means dynamic thinking
+                        thinking_config_params["thinking_budget"] = -1
                         self.log.debug(
                             f"Using dynamic thinking (model decides) for model {model_id}"
                         )
