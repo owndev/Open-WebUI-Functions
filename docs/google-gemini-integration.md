@@ -26,7 +26,10 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 > Streaming is automatically disabled for image generation models to prevent chunk size issues.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks.
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-24576 tokens) for other thinking-capable models.
+
+  > [!Note]
+  > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
 
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions with configurable image optimization.
@@ -122,6 +125,20 @@ GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 # Enable Gemini thoughts outputs globally
 # Default: true
 GOOGLE_INCLUDE_THOUGHTS=true
+
+# Thinking budget for Gemini models (Gemini 2.5 and other thinking-capable models)
+# -1 = dynamic (model decides), 0 = disabled, 1-24576 = fixed token limit
+# Default: -1 (dynamic)
+# Note: This setting is ignored for Gemini 3 Pro models which use GOOGLE_THINKING_LEVEL instead
+GOOGLE_THINKING_BUDGET=-1
+
+# Thinking level for Gemini 3 Pro models only
+# Valid values: "low", "high", or empty string for model default
+# - "low": Minimizes latency and cost, suitable for simple tasks
+# - "high": Maximizes reasoning depth, ideal for complex problem-solving
+# Default: "" (empty, uses model default)
+# Note: This setting is ignored for non-Gemini 3 Pro models
+GOOGLE_THINKING_LEVEL=""
 
 # Enable streaming responses globally
 # Default: true
@@ -227,3 +244,99 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 ## Native tool calling support
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
+
+## Thinking Configuration
+
+The Google Gemini pipeline supports advanced thinking configuration to control how much reasoning and computation is applied by the model.
+
+> [!Note]
+> For detailed information about thinking capabilities, see the [Google Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking).
+
+### Thinking Levels (Gemini 3 Pro only)
+
+Gemini 3 Pro models support the `thinking_level` parameter, which controls the depth of reasoning:
+
+- **`"low"`**: Minimizes latency and cost, suitable for simple tasks, chat, or high-throughput APIs.
+- **`"high"`**: Maximizes reasoning depth, ideal for complex problem-solving, code analysis, and agentic workflows.
+
+Set via environment variable:
+
+```bash
+# Use low thinking level for faster responses
+GOOGLE_THINKING_LEVEL="low"
+
+# Use high thinking level for complex reasoning
+GOOGLE_THINKING_LEVEL="high"
+```
+
+**Example API Usage:**
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+response = client.models.generate_content(
+    model="gemini-3-pro-preview",
+    contents="Provide a list of 3 famous physicists and their key contributions",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="low")
+    ),
+)
+
+print(response.text)
+```
+
+### Thinking Budget (Gemini 2.5 and other models)
+
+For models that support thinking budgets (like Gemini 2.5), you can control the maximum number of tokens used during internal reasoning:
+
+- **`0`**: Disables thinking entirely for fastest responses
+- **`-1`**: Dynamic thinking (model decides based on query complexity) - default
+- **`1-24576`**: Fixed token limit for reasoning
+
+Set via environment variable:
+
+```bash
+# Disable thinking for fastest responses
+GOOGLE_THINKING_BUDGET=0
+
+# Use dynamic thinking (model decides)
+GOOGLE_THINKING_BUDGET=-1
+
+# Set a specific token budget for reasoning
+GOOGLE_THINKING_BUDGET=1024
+```
+
+**Example API Usage:**
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Provide a list of 3 famous physicists and their key contributions",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=1024)
+        # Turn off thinking:
+        # thinking_config=types.ThinkingConfig(thinking_budget=0)
+        # Turn on dynamic thinking:
+        # thinking_config=types.ThinkingConfig(thinking_budget=-1)
+    ),
+)
+
+print(response.text)
+```
+
+### Model Compatibility
+
+| Model | thinking_level | thinking_budget |
+|-------|---------------|-----------------|
+| gemini-3-pro-* | ✅ Supported ("low", "high") | ❌ Not used |
+| gemini-2.5-* | ❌ Not used | ✅ Supported (0-24576) |
+| gemini-2.5-flash-image-* | ❌ Not supported | ❌ Not supported |
+| Other models | ❌ Not used | ✅ May be supported |
