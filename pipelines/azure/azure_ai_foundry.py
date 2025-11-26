@@ -447,7 +447,9 @@ class Pipe:
         source_url = url_raw or filepath_raw
 
         # Build metadata with source information
-        metadata_entry = {"source": source_url}
+        # Use title with [docX] prefix as metadata source for OpenWebUI display
+        # The UI may extract display name from metadata.source rather than source.name
+        metadata_entry = {"source": title, "url": source_url}
         if citation.get("metadata"):
             metadata_entry.update(citation.get("metadata", {}))
 
