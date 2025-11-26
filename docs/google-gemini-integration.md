@@ -319,6 +319,10 @@ GOOGLE_THINKING_LEVEL="low"
 GOOGLE_THINKING_LEVEL="high"
 ```
 
+#### Per-Chat Override (Reasoning Effort)
+
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (e.g., "low" or "high"), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
+
 **Example API Usage:**
 
 ```python

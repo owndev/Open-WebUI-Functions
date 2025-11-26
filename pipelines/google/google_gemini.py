@@ -1537,13 +1537,34 @@ class Pipe:
                 # Check if model supports thinking_level (Gemini 3 models)
                 if self._check_thinking_level_support(model_id):
                     # For Gemini 3 models, use thinking_level (not thinking_budget)
-                    validated_level = self._validate_thinking_level(
-                        self.valves.THINKING_LEVEL
-                    )
+                    # Per-chat reasoning_effort overrides environment-level THINKING_LEVEL
+                    reasoning_effort = body.get("reasoning_effort")
+                    validated_level = None
+                    source = None
+
+                    if reasoning_effort:
+                        validated_level = self._validate_thinking_level(
+                            reasoning_effort
+                        )
+                        if validated_level:
+                            source = "per-chat reasoning_effort"
+                        else:
+                            self.log.debug(
+                                f"Invalid reasoning_effort '{reasoning_effort}', falling back to THINKING_LEVEL"
+                            )
+
+                    # Fall back to environment-level THINKING_LEVEL if no valid reasoning_effort
+                    if not validated_level:
+                        validated_level = self._validate_thinking_level(
+                            self.valves.THINKING_LEVEL
+                        )
+                        if validated_level:
+                            source = "THINKING_LEVEL"
+
                     if validated_level:
                         thinking_config_params["thinking_level"] = validated_level
                         self.log.debug(
-                            f"Using thinking_level='{validated_level}' for model {model_id}"
+                            f"Using thinking_level='{validated_level}' from {source} for model {model_id}"
                         )
                     else:
                         self.log.debug(
