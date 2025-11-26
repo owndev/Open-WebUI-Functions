@@ -595,11 +595,6 @@ class Pipe:
             # Enhance the content with better citation display (if enabled)
             enhanced_content = content
 
-            # Convert [docX] references to markdown links
-            enhanced_content = self._convert_doc_refs_to_markdown_links(
-                enhanced_content, citations
-            )
-
             # Add citation section at the end (if markdown/HTML citations are enabled)
             if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
                 citation_section = self._format_citation_section(
@@ -1026,41 +1021,6 @@ class Pipe:
 
         # Convert to integers and return as a set
         return {int(match) for match in matches}
-
-    def _convert_doc_refs_to_markdown_links(
-        self, content: str, citations: List[Dict[str, Any]]
-    ) -> str:
-        """
-        Convert [docX] references in content to markdown links if the document has a URL.
-
-        Args:
-            content: The response content containing [docX] references
-            citations: List of citation objects with URLs
-
-        Returns:
-            Content with [docX] references converted to markdown links
-        """
-        if not citations:
-            return content
-
-        # Build a mapping of doc index to URL
-        doc_urls = {}
-        for i, citation in enumerate(citations, 1):
-            if isinstance(citation, dict):
-                url = citation.get("url") or citation.get("filepath") or ""
-                if url:
-                    doc_urls[i] = url
-
-        # Replace [docX] with markdown links where URL is available
-        def replace_doc_ref(match: re.Match) -> str:
-            doc_num = int(match.group(1))
-            if doc_num in doc_urls:
-                # Use standard markdown link format: [text](url)
-                return f"[doc{doc_num}]({doc_urls[doc_num]})"
-            return match.group(0)  # Keep original if no URL
-
-        pattern = r"\[doc(\d+)\]"
-        return re.sub(pattern, replace_doc_ref, content)
 
     def _format_citation_section(
         self,
