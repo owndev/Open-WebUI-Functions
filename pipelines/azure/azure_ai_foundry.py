@@ -441,25 +441,30 @@ class Pipe:
         log = logging.getLogger("azure_ai._normalize_citation_for_openwebui")
 
         # Get title with fallback chain: title → filepath → url → "Unknown Document"
+        # Handle None values explicitly since dict.get() returns None if key exists but value is None
+        title_raw = citation.get("title") or ""
+        filepath_raw = citation.get("filepath") or ""
+        url_raw = citation.get("url") or ""
+
         base_title = (
-            citation.get("title", "").strip()
-            or citation.get("filepath", "").strip()
-            or citation.get("url", "").strip()
+            title_raw.strip()
+            or filepath_raw.strip()
+            or url_raw.strip()
             or "Unknown Document"
         )
         # Always prefix title with doc index to ensure uniqueness and prevent grouping
         title = f"[doc{index}] {base_title}"
 
         # Build source URL for metadata
-        source_url = citation.get("url") or citation.get("filepath") or ""
+        source_url = url_raw or filepath_raw
 
         # Build metadata with source information
         metadata_entry = {"source": source_url}
         if citation.get("metadata"):
             metadata_entry.update(citation.get("metadata", {}))
 
-        # Get document content
-        content = citation.get("content", "")
+        # Get document content (handle None values)
+        content = citation.get("content") or ""
 
         # Build normalized citation data structure matching OpenWebUI format exactly
         citation_data = {
