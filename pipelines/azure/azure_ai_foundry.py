@@ -498,6 +498,7 @@ class Pipe:
         self,
         citations: List[Dict[str, Any]],
         __event_emitter__: Optional[Callable[..., Any]],
+        content: str = "",
     ) -> None:
         """
         Emit OpenWebUI citation events for citations.
@@ -506,9 +507,12 @@ class Pipe:
         citation event format. Each citation is emitted separately to ensure
         all sources appear in the UI.
 
+        Only emits citations that are actually referenced in the content (e.g., [doc1], [doc2]).
+
         Args:
             citations: List of Azure citation objects
             __event_emitter__: Event emitter callable for sending citation events
+            content: The response content (used to filter only referenced citations)
         """
         log = logging.getLogger("azure_ai._emit_openwebui_citation_events")
 
@@ -520,10 +524,25 @@ class Pipe:
             log.info("No citations to emit")
             return
 
-        log.info(f"Emitting {len(citations)} citation events via __event_emitter__")
+        # Extract which citations are actually referenced in the content
+        referenced_indices = self._extract_referenced_citations(content)
+
+        # If we couldn't find any references, include all citations (backward compatibility)
+        if not referenced_indices:
+            referenced_indices = set(range(1, len(citations) + 1))
+            log.debug(f"No [docX] references found in content, including all {len(citations)} citations")
+        else:
+            log.info(f"Found {len(referenced_indices)} referenced citations: {sorted(referenced_indices)}")
+
+        log.info(f"Emitting citation events for {len(referenced_indices)} referenced citations via __event_emitter__")
 
         emitted_count = 0
         for i, citation in enumerate(citations, 1):
+            # Skip citations that are not referenced in the content
+            if i not in referenced_indices:
+                log.debug(f"Skipping citation {i} - not referenced in content")
+                continue
+
             if not isinstance(citation, dict):
                 log.warning(f"Citation {i} is not a dict, skipping: {type(citation)}")
                 continue
@@ -549,7 +568,7 @@ class Pipe:
             except Exception as e:
                 log.exception(f"Failed to emit citation event for citation {i}: {e}")
 
-        log.info(f"Finished emitting {emitted_count}/{len(citations)} citation events")
+        log.info(f"Finished emitting {emitted_count}/{len(referenced_indices)} citation events")
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -913,15 +932,8 @@ class Pipe:
                                             log.info(
                                                 f"Successfully extracted {len(citations_data)} citations from stream"
                                             )
-
-                                            # Emit native OpenWebUI citation events immediately if enabled
-                                            if (
-                                                self.valves.AZURE_AI_OPENWEBUI_CITATIONS
-                                                and __event_emitter__
-                                            ):
-                                                await self._emit_openwebui_citation_events(
-                                                    citations_data, __event_emitter__
-                                                )
+                                            # Note: OpenWebUI citation events are emitted after the stream ends
+                                            # to filter only citations referenced in the response content
 
                                     except json.JSONDecodeError:
                                         # Skip invalid JSON
@@ -937,6 +949,18 @@ class Pipe:
                 if "data: [DONE]" in chunk_str:
                     log.debug("End of stream detected")
                     break
+
+            # After the stream ends, emit OpenWebUI citation events if enabled
+            if (
+                citations_data
+                and self.valves.AZURE_AI_OPENWEBUI_CITATIONS
+                and __event_emitter__
+            ):
+                log.info("Emitting OpenWebUI citation events at end of stream...")
+                # Filter to only citations referenced in the response content
+                await self._emit_openwebui_citation_events(
+                    citations_data, __event_emitter__, response_content
+                )
 
             # After the stream ends, add markdown/HTML citations if we found any and it's enabled
             if (
@@ -1406,8 +1430,17 @@ class Pipe:
                     if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and __event_emitter__:
                         citations = self._extract_citations_from_response(response)
                         if citations:
+                            # Get response content for filtering
+                            response_content = ""
+                            if (
+                                isinstance(response, dict)
+                                and "choices" in response
+                                and response["choices"]
+                            ):
+                                message = response["choices"][0].get("message", {})
+                                response_content = message.get("content", "")
                             await self._emit_openwebui_citation_events(
-                                citations, __event_emitter__
+                                citations, __event_emitter__, response_content
                             )
 
                 # Send completion status update
