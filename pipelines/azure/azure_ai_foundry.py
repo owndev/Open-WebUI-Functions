@@ -529,9 +529,15 @@ class Pipe:
             try:
                 normalized = self._normalize_citation_for_openwebui(citation, i)
 
+                # Log the full citation JSON for debugging
+                log.debug(
+                    f"Full citation event JSON for doc{i}: {json.dumps(normalized, default=str)}"
+                )
+
                 # Emit citation event for this individual source
+                source_name = normalized.get("data", {}).get("source", {}).get("name", "unknown")
                 log.info(
-                    f"Emitting citation event {i}/{len(citations)}: {normalized.get('data', {}).get('source', {}).get('name', 'unknown')}"
+                    f"Emitting citation event {i}/{len(citations)} with source.name='{source_name}'"
                 )
                 await __event_emitter__(normalized)
                 emitted_count += 1
