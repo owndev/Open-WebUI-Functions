@@ -6,9 +6,9 @@ This document describes the native OpenWebUI citation support in the Azure AI Fo
 
 The Azure AI Foundry Pipeline now supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature enables the OpenWebUI frontend to display:
 
-- **Citation cards** with source information
+- **Citation cards** with source information and relevance scores
 - **Source previews** with content snippets
-- **Inline citation correlations** linking `[doc1]`, `[doc2]` markers to their sources
+- **Relevance percentage** displayed on citation cards
 - **Interactive citation UI** with clickable sources
 
 ## Features
@@ -17,7 +17,7 @@ The Azure AI Foundry Pipeline now supports **native OpenWebUI citations** for Az
 
 The pipeline supports two modes for displaying citations:
 
-1. **Native OpenWebUI Citations** (new): Structured citation events and fields for frontend consumption
+1. **Native OpenWebUI Citations** (new): Structured citation events emitted via `__event_emitter__` for frontend consumption
 2. **Markdown/HTML Citations** (existing): Collapsible HTML details with formatted citation information
 
 Both modes can be enabled simultaneously or independently via configuration.
@@ -26,7 +26,7 @@ Both modes can be enabled simultaneously or independently via configuration.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `AZURE_AI_OPENWEBUI_CITATIONS` | `true` | Enable native OpenWebUI citation events and fields |
+| `AZURE_AI_OPENWEBUI_CITATIONS` | `true` | Enable native OpenWebUI citation events |
 | `AZURE_AI_ENHANCE_CITATIONS` | `true` | Enable markdown/HTML citation display (collapsible sections) |
 
 ### How It Works
@@ -44,36 +44,28 @@ When Azure AI Search returns citations in a streaming response:
 When Azure AI Search returns citations in a non-streaming response:
 
 1. The pipeline extracts citations from the response
-2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: An `openwebui_citations` field is attached to the response root
+2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: Citation events are emitted via `__event_emitter__`
 3. **If `AZURE_AI_ENHANCE_CITATIONS` is enabled**: The response content is enhanced with a formatted citation section
 
 ## Citation Format
 
 ### OpenWebUI Citation Event Structure
 
-Citation events follow the OpenWebUI specification:
+Citation events follow the official OpenWebUI specification (see [OpenWebUI Events Documentation](https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution)):
 
 ```python
 {
     "type": "citation",
     "data": {
-        "id": "doc1",           # Unique identifier (matches inline tokens)
-        "token": "doc1",        # Token for correlation (e.g., [doc1])
-        "title": "Document Title",  # Source name/title
-        "document": ["..."],    # Content array
-        "metadata": [{}],       # Metadata array
-        "source": {
-            "name": "Document Title",
-            "url": "https://..."  # Optional
-        },
-        "url": "https://...",   # Optional: document URL
-        "filepath": "/path/to/file",  # Optional: file path
-        "preview": "Content snippet...",  # Optional: content preview
-        "chunk_id": "chunk-123",  # Optional: chunk identifier
-        "score": 0.95           # Optional: relevance score
+        "document": ["Document content 1", "Document content 2", ...],  # Content from each citation
+        "metadata": [{"source": "https://..."}, ...],  # Metadata with source URLs
+        "source": {"name": "Source Name"},  # Display name for the source
+        "distances": [0.95, 0.87, ...]  # Relevance scores (displayed as percentage)
     }
 }
 ```
+
+The `distances` array contains relevance scores from Azure AI Search, which OpenWebUI displays as a percentage on the citation cards.
 
 ### Azure Citation Format (Input)
 

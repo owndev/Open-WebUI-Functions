@@ -403,6 +403,9 @@ class Pipe:
         """
         Normalize an Azure citation object to OpenWebUI citation format.
 
+        The format follows OpenWebUI's official citation event structure:
+        https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution
+
         Args:
             citation: Azure citation object
             index: Citation index (1-based)
@@ -418,36 +421,25 @@ class Pipe:
             or "Unknown Document"
         )
 
-        doc_id = f"doc{index}"
+        # Build source URL for metadata
+        source_url = citation.get("url") or citation.get("filepath") or ""
 
-        # Build normalized citation structure
+        # Build metadata with source information
+        metadata_entry = {"source": source_url}
+        if citation.get("metadata"):
+            metadata_entry.update(citation.get("metadata", {}))
+
+        # Build normalized citation structure matching OpenWebUI format exactly
         normalized = {
-            "id": doc_id,
-            "token": doc_id,
-            "title": title,
             "document": [citation.get("content", "")],
-            "metadata": [citation.get("metadata", {})],
-            "source": {
-                "name": title,
-            },
+            "metadata": [metadata_entry],
+            "source": {"name": title},
         }
 
-        # Add optional fields if available
-        if citation.get("url"):
-            normalized["url"] = citation["url"]
-            normalized["source"]["url"] = citation["url"]
-
-        if citation.get("filepath"):
-            normalized["filepath"] = citation["filepath"]
-
-        if citation.get("content"):
-            normalized["preview"] = citation["content"]
-
-        if citation.get("chunk_id") is not None:
-            normalized["chunk_id"] = citation["chunk_id"]
-
+        # Add distances array for relevance score (OpenWebUI uses this for percentage display)
         if citation.get("score") is not None:
-            normalized["score"] = citation["score"]
+            # Azure AI Search returns relevance scores - convert to distance format
+            normalized["distances"] = [citation["score"]]
 
         return normalized
 
@@ -457,7 +449,10 @@ class Pipe:
         __event_emitter__: Optional[Callable[..., Any]],
     ) -> None:
         """
-        Emit OpenWebUI citation events for each citation.
+        Emit OpenWebUI citation events for citations.
+
+        Emits a single citation event with all citations as arrays in the data fields,
+        following the OpenWebUI citation event format.
 
         Args:
             citations: List of Azure citation objects
@@ -468,40 +463,65 @@ class Pipe:
 
         log = logging.getLogger("azure_ai._emit_openwebui_citation_events")
 
-        for i, citation in enumerate(citations, 1):
-            if not isinstance(citation, dict):
-                continue
+        try:
+            # Build combined citation data with all citations
+            all_documents = []
+            all_metadata = []
+            all_distances = []
+            source_name = None
 
-            try:
+            for i, citation in enumerate(citations, 1):
+                if not isinstance(citation, dict):
+                    continue
+
                 normalized = self._normalize_citation_for_openwebui(citation, i)
 
-                # Emit citation event
-                await __event_emitter__(
-                    {
-                        "type": "citation",
-                        "data": normalized,
-                    }
-                )
+                # Collect documents, metadata, and distances from each citation
+                all_documents.extend(normalized.get("document", []))
+                all_metadata.extend(normalized.get("metadata", []))
 
-                log.debug(f"Emitted citation event for {normalized['id']}")
+                if "distances" in normalized:
+                    all_distances.extend(normalized.get("distances", []))
 
-            except Exception as e:
-                log.warning(f"Failed to emit citation event for citation {i}: {e}")
+                # Use the first citation's source name, or aggregate if needed
+                if source_name is None and "source" in normalized:
+                    source_name = normalized["source"].get("name", "Source")
+
+            # Build the combined citation event
+            citation_event = {
+                "type": "citation",
+                "data": {
+                    "document": all_documents,
+                    "metadata": all_metadata,
+                    "source": {"name": source_name or "Azure AI Search"},
+                },
+            }
+
+            # Add distances if we have any scores
+            if all_distances:
+                citation_event["data"]["distances"] = all_distances
+
+            # Emit the citation event
+            await __event_emitter__(citation_event)
+
+            log.debug(f"Emitted citation event with {len(all_documents)} documents")
+
+        except Exception as e:
+            log.warning(f"Failed to emit citation events: {e}")
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
         Enhance Azure AI Search responses by improving citation display and adding source content.
         Modifies the response in-place and returns it.
 
-        The function performs the following enhancements:
-        1. If AZURE_AI_ENHANCE_CITATIONS is True: Appends a formatted markdown/HTML citation section
-        2. If AZURE_AI_OPENWEBUI_CITATIONS is True: Attaches an 'openwebui_citations' array at root level
+        If AZURE_AI_ENHANCE_CITATIONS is True, appends a formatted markdown/HTML citation section
+        to the response content.
 
         Args:
             response: The original response from Azure AI (modified in-place)
 
         Returns:
-            The enhanced response with better citation formatting and optional openwebui_citations field
+            The enhanced response with better citation formatting
         """
         if not isinstance(response, dict):
             return response
@@ -553,19 +573,6 @@ class Pipe:
 
             # Add enhanced citation info to context for API consumers
             context["enhanced_citations"] = citation_details
-
-            # Add native OpenWebUI citations field (if enabled and citations exist)
-            if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and citations:
-                openwebui_citations = []
-                for i, citation in enumerate(citations, 1):
-                    if not isinstance(citation, dict):
-                        continue
-                    normalized = self._normalize_citation_for_openwebui(citation, i)
-                    openwebui_citations.append(normalized)
-
-                # Attach to response root level for OpenWebUI frontend
-                if openwebui_citations:
-                    response["openwebui_citations"] = openwebui_citations
 
             return response
 
@@ -1345,12 +1352,21 @@ class Pipe:
                 request.raise_for_status()
 
                 # Enhance Azure Search responses with better citation display
-                if (
-                    isinstance(response, dict)
-                    and self.valves.AZURE_AI_DATA_SOURCES
-                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
-                ):
-                    response = self.enhance_azure_search_response(response)
+                # Call this when either citation mode is enabled
+                if isinstance(response, dict) and self.valves.AZURE_AI_DATA_SOURCES:
+                    if (
+                        self.valves.AZURE_AI_ENHANCE_CITATIONS
+                        or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
+                    ):
+                        response = self.enhance_azure_search_response(response)
+
+                    # Emit native OpenWebUI citation events for non-streaming responses
+                    if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and __event_emitter__:
+                        citations = self._extract_citations_from_response(response)
+                        if citations:
+                            await self._emit_openwebui_citation_events(
+                                citations, __event_emitter__
+                            )
 
                 # Send completion status update
                 if __event_emitter__:
