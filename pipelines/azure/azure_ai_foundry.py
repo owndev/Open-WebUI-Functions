@@ -369,7 +369,10 @@ class Pipe:
         Returns:
             List of citation objects, or None if no citations found
         """
+        log = logging.getLogger("azure_ai._extract_citations_from_response")
+
         if not isinstance(response_data, dict):
+            log.debug(f"Response data is not a dict: {type(response_data)}")
             return None
 
         # Try multiple possible locations for citations
@@ -385,6 +388,9 @@ class Pipe:
                 and "citations" in choice["delta"]["context"]
             ):
                 citations = choice["delta"]["context"]["citations"]
+                log.info(
+                    f"Found {len(citations) if citations else 0} citations in delta.context.citations"
+                )
 
             # Check in choices[0].message.context.citations (non-streaming)
             elif (
@@ -394,8 +400,27 @@ class Pipe:
                 and "citations" in choice["message"]["context"]
             ):
                 citations = choice["message"]["context"]["citations"]
+                log.info(
+                    f"Found {len(citations) if citations else 0} citations in message.context.citations"
+                )
+            else:
+                log.debug(
+                    f"No citations found in response. Choice keys: {choice.keys() if isinstance(choice, dict) else 'not a dict'}"
+                )
+        else:
+            log.debug(f"No choices in response. Response keys: {response_data.keys()}")
 
-        return citations if citations and isinstance(citations, list) else None
+        if citations and isinstance(citations, list):
+            log.info(f"Extracted {len(citations)} citations from response")
+            # Log first citation structure for debugging
+            if citations:
+                log.info(
+                    f"First citation structure: {json.dumps(citations[0], default=str)[:500]}"
+                )
+            return citations
+
+        log.debug("No valid citations found in response")
+        return None
 
     def _normalize_citation_for_openwebui(
         self, citation: Dict[str, Any], index: int
@@ -413,6 +438,8 @@ class Pipe:
         Returns:
             Complete citation event object with type and data fields
         """
+        log = logging.getLogger("azure_ai._normalize_citation_for_openwebui")
+
         # Get title with fallback chain: title → filepath → url → "Unknown Document"
         base_title = (
             citation.get("title", "").strip()
@@ -431,9 +458,12 @@ class Pipe:
         if citation.get("metadata"):
             metadata_entry.update(citation.get("metadata", {}))
 
+        # Get document content
+        content = citation.get("content", "")
+
         # Build normalized citation data structure matching OpenWebUI format exactly
         citation_data = {
-            "document": [citation.get("content", "")],
+            "document": [content],
             "metadata": [metadata_entry],
             "source": {"name": title},
         }
@@ -443,15 +473,30 @@ class Pipe:
             citation_data["source"]["url"] = source_url
 
         # Add distances array for relevance score (OpenWebUI uses this for percentage display)
-        if citation.get("score") is not None:
-            # Wrap score in distances array as required by OpenWebUI format
-            citation_data["distances"] = [citation["score"]]
+        # Always include distances to ensure relevance is shown (use 0 if score not available)
+        score = citation.get("score")
+        if score is not None:
+            citation_data["distances"] = [float(score)]
+        else:
+            # Default to 0 if no score to ensure the distances field is present
+            citation_data["distances"] = [0.0]
 
-        # Return complete citation event structure
-        return {
+        # Build complete citation event structure
+        citation_event = {
             "type": "citation",
             "data": citation_data,
         }
+
+        # Log the normalized citation for debugging
+        log.info(
+            f"Normalized citation {index}: title='{title}', "
+            f"content_length={len(content)}, "
+            f"url='{source_url}', "
+            f"score={score}, "
+            f"event={json.dumps(citation_event, default=str)[:500]}"
+        )
+
+        return citation_event
 
     async def _emit_openwebui_citation_events(
         self,
@@ -469,25 +514,40 @@ class Pipe:
             citations: List of Azure citation objects
             __event_emitter__: Event emitter callable for sending citation events
         """
-        if not __event_emitter__ or not citations:
-            return
-
         log = logging.getLogger("azure_ai._emit_openwebui_citation_events")
 
+        if not __event_emitter__:
+            log.warning("No __event_emitter__ provided, cannot emit citation events")
+            return
+
+        if not citations:
+            log.info("No citations to emit")
+            return
+
+        log.info(f"Emitting {len(citations)} citation events via __event_emitter__")
+
+        emitted_count = 0
         for i, citation in enumerate(citations, 1):
             if not isinstance(citation, dict):
+                log.warning(f"Citation {i} is not a dict, skipping: {type(citation)}")
                 continue
 
             try:
                 normalized = self._normalize_citation_for_openwebui(citation, i)
 
                 # Emit citation event for this individual source
+                log.info(
+                    f"Emitting citation event {i}/{len(citations)}: {normalized.get('data', {}).get('source', {}).get('name', 'unknown')}"
+                )
                 await __event_emitter__(normalized)
+                emitted_count += 1
 
-                log.debug(f"Emitted citation event for doc{i}")
+                log.info(f"Successfully emitted citation event for doc{i}")
 
             except Exception as e:
-                log.warning(f"Failed to emit citation event for citation {i}: {e}")
+                log.exception(f"Failed to emit citation event for citation {i}: {e}")
+
+        log.info(f"Finished emitting {emitted_count}/{len(citations)} citation events")
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
