@@ -438,7 +438,7 @@ class Pipe:
 
         # Add distances array for relevance score (OpenWebUI uses this for percentage display)
         if citation.get("score") is not None:
-            # Azure AI Search returns relevance scores - convert to distance format
+            # Wrap score in distances array as required by OpenWebUI format
             normalized["distances"] = [citation["score"]]
 
         return normalized
@@ -483,7 +483,7 @@ class Pipe:
                 if "distances" in normalized:
                     all_distances.extend(normalized.get("distances", []))
 
-                # Use the first citation's source name, or aggregate if needed
+                # Use the first citation's source name for the combined event
                 if source_name is None and "source" in normalized:
                     source_name = normalized["source"].get("name", "Source")
 
