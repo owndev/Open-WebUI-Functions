@@ -401,7 +401,7 @@ class Pipe:
         self, citation: Dict[str, Any], index: int
     ) -> Dict[str, Any]:
         """
-        Normalize an Azure citation object to OpenWebUI citation format.
+        Normalize an Azure citation object to OpenWebUI citation event format.
 
         The format follows OpenWebUI's official citation event structure:
         https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution
@@ -411,15 +411,18 @@ class Pipe:
             index: Citation index (1-based)
 
         Returns:
-            Normalized citation in OpenWebUI format
+            Complete citation event object with type and data fields
         """
         # Get title with fallback chain: title → filepath → url → "Unknown Document"
-        title = (
+        # Add index to make each source unique and prevent grouping
+        base_title = (
             citation.get("title", "").strip()
             or citation.get("filepath", "").strip()
             or citation.get("url", "").strip()
             or "Unknown Document"
         )
+        # Make title unique by appending doc index if there could be duplicates
+        title = f"[doc{index}] {base_title}"
 
         # Build source URL for metadata
         source_url = citation.get("url") or citation.get("filepath") or ""
@@ -429,19 +432,27 @@ class Pipe:
         if citation.get("metadata"):
             metadata_entry.update(citation.get("metadata", {}))
 
-        # Build normalized citation structure matching OpenWebUI format exactly
-        normalized = {
+        # Build normalized citation data structure matching OpenWebUI format exactly
+        citation_data = {
             "document": [citation.get("content", "")],
             "metadata": [metadata_entry],
             "source": {"name": title},
         }
 
+        # Add URL to source if available
+        if source_url:
+            citation_data["source"]["url"] = source_url
+
         # Add distances array for relevance score (OpenWebUI uses this for percentage display)
         if citation.get("score") is not None:
             # Wrap score in distances array as required by OpenWebUI format
-            normalized["distances"] = [citation["score"]]
+            citation_data["distances"] = [citation["score"]]
 
-        return normalized
+        # Return complete citation event structure
+        return {
+            "type": "citation",
+            "data": citation_data,
+        }
 
     async def _emit_openwebui_citation_events(
         self,
@@ -451,8 +462,9 @@ class Pipe:
         """
         Emit OpenWebUI citation events for citations.
 
-        Emits a single citation event with all citations as arrays in the data fields,
-        following the OpenWebUI citation event format.
+        Emits one citation event per source document, following the OpenWebUI
+        citation event format. Each citation is emitted separately to ensure
+        all sources appear in the UI.
 
         Args:
             citations: List of Azure citation objects
@@ -463,51 +475,20 @@ class Pipe:
 
         log = logging.getLogger("azure_ai._emit_openwebui_citation_events")
 
-        try:
-            # Build combined citation data with all citations
-            all_documents = []
-            all_metadata = []
-            all_distances = []
-            source_name = None
+        for i, citation in enumerate(citations, 1):
+            if not isinstance(citation, dict):
+                continue
 
-            for i, citation in enumerate(citations, 1):
-                if not isinstance(citation, dict):
-                    continue
-
+            try:
                 normalized = self._normalize_citation_for_openwebui(citation, i)
 
-                # Collect documents, metadata, and distances from each citation
-                all_documents.extend(normalized.get("document", []))
-                all_metadata.extend(normalized.get("metadata", []))
+                # Emit citation event for this individual source
+                await __event_emitter__(normalized)
 
-                if "distances" in normalized:
-                    all_distances.extend(normalized.get("distances", []))
+                log.debug(f"Emitted citation event for doc{i}")
 
-                # Use the first citation's source name for the combined event
-                if source_name is None and "source" in normalized:
-                    source_name = normalized["source"].get("name", "Source")
-
-            # Build the combined citation event
-            citation_event = {
-                "type": "citation",
-                "data": {
-                    "document": all_documents,
-                    "metadata": all_metadata,
-                    "source": {"name": source_name or "Azure AI Search"},
-                },
-            }
-
-            # Add distances if we have any scores
-            if all_distances:
-                citation_event["data"]["distances"] = all_distances
-
-            # Emit the citation event
-            await __event_emitter__(citation_event)
-
-            log.debug(f"Emitted citation event with {len(all_documents)} documents")
-
-        except Exception as e:
-            log.warning(f"Failed to emit citation events: {e}")
+            except Exception as e:
+                log.warning(f"Failed to emit citation event for citation {i}: {e}")
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """

@@ -44,28 +44,34 @@ When Azure AI Search returns citations in a streaming response:
 When Azure AI Search returns citations in a non-streaming response:
 
 1. The pipeline extracts citations from the response
-2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: Citation events are emitted via `__event_emitter__`
+2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: Individual citation events are emitted via `__event_emitter__` for each source
 3. **If `AZURE_AI_ENHANCE_CITATIONS` is enabled**: The response content is enhanced with a formatted citation section
 
 ## Citation Format
 
 ### OpenWebUI Citation Event Structure
 
-Citation events follow the official OpenWebUI specification (see [OpenWebUI Events Documentation](https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution)):
+Each citation is emitted as a separate event to ensure all sources appear in the UI. Citation events follow the official OpenWebUI specification (see [OpenWebUI Events Documentation](https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution)):
 
 ```python
 {
     "type": "citation",
     "data": {
-        "document": ["Document content 1", "Document content 2", ...],  # Content from each citation
-        "metadata": [{"source": "https://..."}, ...],  # Metadata with source URLs
-        "source": {"name": "Source Name"},  # Display name for the source
-        "distances": [0.95, 0.87, ...]  # Relevance scores (displayed as percentage)
+        "document": ["Document content..."],  # Content from this citation
+        "metadata": [{"source": "https://..."}],  # Metadata with source URL
+        "source": {
+            "name": "[doc1] Document Title",  # Unique name with index
+            "url": "https://..."  # Source URL if available
+        },
+        "distances": [0.95]  # Relevance score (displayed as percentage)
     }
 }
 ```
 
-The `distances` array contains relevance scores from Azure AI Search, which OpenWebUI displays as a percentage on the citation cards.
+Key points:
+- Each source document gets its own citation event
+- The `source.name` includes the doc index (`[doc1]`, `[doc2]`, etc.) to prevent grouping
+- The `distances` array contains relevance scores from Azure AI Search, which OpenWebUI displays as a percentage on the citation cards
 
 ### Azure Citation Format (Input)
 
