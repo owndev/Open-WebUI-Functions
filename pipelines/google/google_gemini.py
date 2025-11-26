@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.1
+version: 1.8.2
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -34,6 +34,7 @@ features:
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
+  - Hierarchical system prompts (default, per-user personalization, per-chat)
 """
 
 import os
@@ -289,38 +290,67 @@ class Pipe:
             result.append(part)
         return result
 
-    def _combine_system_prompts(
-        self, user_system_prompt: Optional[str]
-    ) -> Optional[str]:
-        """Combine default system prompt with user-defined system prompt.
+    def _get_user_personalization_prompt(self) -> Optional[str]:
+        """Get the per-user system prompt from user settings (Personalization).
 
-        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
-        the default is prepended to the user's prompt.
-        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
-        If only user_system_prompt is set, it is used as-is.
-
-        Args:
-            user_system_prompt: The user-defined system prompt from messages (may be None)
+        In Open WebUI, users can configure a personalized system prompt
+        in Settings > Personalization. This is stored in user.info.system.
 
         Returns:
-            Combined system prompt or None if neither is set
+            The user's personalized system prompt or None if not set
+        """
+        if not hasattr(self, "user") or self.user is None:
+            return None
+
+        try:
+            user_info = self.user.info
+            if user_info and isinstance(user_info, dict):
+                system_prompt = user_info.get("system")
+                if system_prompt and isinstance(system_prompt, str):
+                    return system_prompt.strip() or None
+        except Exception as e:
+            self.log.debug(f"Could not retrieve user personalization prompt: {e}")
+
+        return None
+
+    def _combine_system_prompts(
+        self, chat_system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Combine default, per-user, and chat-level system prompts.
+
+        Prompt hierarchy (all prompts are combined if set):
+        1. DEFAULT_SYSTEM_PROMPT (environment/valve setting)
+        2. Per-user system prompt (from user.info.system - Personalization settings)
+        3. Chat-level system prompt (from messages in this request)
+
+        Args:
+            chat_system_prompt: The chat-level system prompt from messages (may be None)
+
+        Returns:
+            Combined system prompt or None if none are set
         """
         default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
-        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
+        user_personalization = self._get_user_personalization_prompt() or ""
+        chat_prompt = chat_system_prompt.strip() if chat_system_prompt else ""
 
-        if default_prompt and user_prompt:
-            combined = f"{default_prompt}\n\n{user_prompt}"
-            self.log.debug(
-                f"Combined system prompts: default ({len(default_prompt)} chars) + "
-                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
-            )
-            return combined
-        elif default_prompt:
-            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
-            return default_prompt
-        elif user_prompt:
-            return user_prompt
-        return None
+        prompts = [p for p in [default_prompt, user_personalization, chat_prompt] if p]
+
+        if not prompts:
+            return None
+
+        if len(prompts) == 1:
+            self.log.debug(f"Using single system prompt ({len(prompts[0])} chars)")
+            return prompts[0]
+
+        combined = "\n\n".join(prompts)
+        self.log.debug(
+            f"Combined system prompts: "
+            f"default={len(default_prompt) if default_prompt else 0}, "
+            f"user_personalization={len(user_personalization) if user_personalization else 0}, "
+            f"chat={len(chat_prompt) if chat_prompt else 0} -> "
+            f"total={len(combined)} chars"
+        )
+        return combined
 
     def _apply_order_and_limit(
         self,

@@ -251,36 +251,68 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
 
-## Default System Prompt
+## System Prompt Hierarchy
 
-The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
+The Google Gemini pipeline supports a hierarchical system prompt configuration that combines multiple sources. This allows for flexible customization at different levels: global defaults, per-user personalization, and per-chat customization.
+
+### Prompt Sources (in order of combination)
+
+1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
+
+2. **Per-User System Prompt** (User Personalization): Each user can set their own system prompt in Open WebUI's Settings > Personalization. This is stored in `user.info.system` and is automatically included.
+
+3. **Chat-Level System Prompt**: The system message defined in the model settings or passed with individual chat messages.
 
 ### How It Works
 
-- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
-- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
-- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
+All available prompts are combined in order, separated by blank lines:
+
+```
+{Default System Prompt}
+
+{Per-User Personalization Prompt}
+
+{Chat-Level System Prompt}
+```
+
+If only one prompt source is set, it is used as-is without any additional formatting.
 
 ### Configuration
 
-Set via environment variable:
+**Environment Variable:**
 
 ```bash
 # Default system prompt applied to all chats
-# If a user-defined system prompt exists, this is prepended to it
+# Combined with per-user and chat-level prompts if they exist
 GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
 ```
 
 Or configure through the pipeline valves in Open WebUI's Admin panel.
 
+**Per-User Personalization:**
+
+Users can set their personalized system prompt in Open WebUI:
+1. Go to Settings > Personalization
+2. Enter your preferred system prompt in the "System Prompt" field
+3. Save settings
+
+This prompt will be automatically applied to all your Gemini chats, combined with any default and chat-level prompts.
+
 ### Example
 
-If your default system prompt is:
+If your configuration is:
+
+**Default system prompt (`GOOGLE_DEFAULT_SYSTEM_PROMPT`):**
 ```
 You are a helpful AI assistant.
 ```
 
-And your model-specific system prompt is:
+**Per-user personalization prompt (Settings > Personalization):**
+```
+My name is John. I prefer detailed explanations.
+```
+
+**Chat-level system prompt (model settings):**
 ```
 Always respond in formal English.
 ```
@@ -288,6 +320,8 @@ Always respond in formal English.
 The combined system prompt sent to Gemini will be:
 ```
 You are a helpful AI assistant.
+
+My name is John. I prefer detailed explanations.
 
 Always respond in formal English.
 ```
