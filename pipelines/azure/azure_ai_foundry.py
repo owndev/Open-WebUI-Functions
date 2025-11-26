@@ -441,7 +441,7 @@ class Pipe:
             or "Unknown Document"
         )
         # Include [docX] prefix in OpenWebUI citation card titles for document identification
-        title = f"[doc{index}] {base_title}"
+        title = f"[doc{index}] - {base_title}"
 
         # Build source URL for metadata
         source_url = url_raw or filepath_raw
@@ -530,11 +530,17 @@ class Pipe:
         # If we couldn't find any references, include all citations (backward compatibility)
         if not referenced_indices:
             referenced_indices = set(range(1, len(citations) + 1))
-            log.debug(f"No [docX] references found in content, including all {len(citations)} citations")
+            log.debug(
+                f"No [docX] references found in content, including all {len(citations)} citations"
+            )
         else:
-            log.info(f"Found {len(referenced_indices)} referenced citations: {sorted(referenced_indices)}")
+            log.info(
+                f"Found {len(referenced_indices)} referenced citations: {sorted(referenced_indices)}"
+            )
 
-        log.info(f"Emitting citation events for {len(referenced_indices)} referenced citations via __event_emitter__")
+        log.info(
+            f"Emitting citation events for {len(referenced_indices)} referenced citations via __event_emitter__"
+        )
 
         emitted_count = 0
         for i, citation in enumerate(citations, 1):
@@ -556,7 +562,9 @@ class Pipe:
                 )
 
                 # Emit citation event for this individual source
-                source_name = normalized.get("data", {}).get("source", {}).get("name", "unknown")
+                source_name = (
+                    normalized.get("data", {}).get("source", {}).get("name", "unknown")
+                )
                 log.info(
                     f"Emitting citation event {i}/{len(citations)} with source.name='{source_name}'"
                 )
@@ -568,7 +576,9 @@ class Pipe:
             except Exception as e:
                 log.exception(f"Failed to emit citation event for citation {i}: {e}")
 
-        log.info(f"Finished emitting {emitted_count}/{len(referenced_indices)} citation events")
+        log.info(
+            f"Finished emitting {emitted_count}/{len(referenced_indices)} citation events"
+        )
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
