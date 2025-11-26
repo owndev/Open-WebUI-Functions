@@ -412,8 +412,8 @@ class Pipe:
 
         if citations and isinstance(citations, list):
             log.info(f"Extracted {len(citations)} citations from response")
-            # Log first citation structure for debugging
-            if citations:
+            # Log first citation structure for debugging (only if INFO logging is enabled)
+            if citations and log.isEnabledFor(logging.INFO):
                 log.info(
                     f"First citation structure: {json.dumps(citations[0], default=str)[:500]}"
                 )
@@ -487,14 +487,15 @@ class Pipe:
             "data": citation_data,
         }
 
-        # Log the normalized citation for debugging
-        log.info(
-            f"Normalized citation {index}: title='{title}', "
-            f"content_length={len(content)}, "
-            f"url='{source_url}', "
-            f"score={score}, "
-            f"event={json.dumps(citation_event, default=str)[:500]}"
-        )
+        # Log the normalized citation for debugging (only if INFO logging is enabled)
+        if log.isEnabledFor(logging.INFO):
+            log.info(
+                f"Normalized citation {index}: title='{title}', "
+                f"content_length={len(content)}, "
+                f"url='{source_url}', "
+                f"score={score}, "
+                f"event={json.dumps(citation_event, default=str)[:500]}"
+            )
 
         return citation_event
 
