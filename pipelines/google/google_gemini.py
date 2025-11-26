@@ -290,47 +290,55 @@ class Pipe:
             result.append(part)
         return result
 
-    def _get_user_personalization_prompt(self) -> Optional[str]:
+    def _get_user_personalization_prompt(
+        self, __user__: Optional[dict] = None
+    ) -> Optional[str]:
         """Get the per-user system prompt from user settings (Personalization).
 
         In Open WebUI, users can configure a personalized system prompt
-        in Settings > Personalization. This is stored in user.info.system.
+        in Settings > Personalization. This is stored in __user__["settings"]["ui"]["system"].
+
+        Args:
+            __user__: The user dict passed to the pipe method
 
         Returns:
             The user's personalized system prompt or None if not set
         """
-        if not hasattr(self, "user") or self.user is None:
+        if __user__ is None:
             return None
 
         try:
-            user_info = self.user.info
-            if user_info and isinstance(user_info, dict):
-                system_prompt = user_info.get("system")
-                if system_prompt and isinstance(system_prompt, str):
-                    return system_prompt.strip() or None
+            settings = __user__.get("settings")
+            if settings and isinstance(settings, dict):
+                ui_settings = settings.get("ui")
+                if ui_settings and isinstance(ui_settings, dict):
+                    system_prompt = ui_settings.get("system")
+                    if system_prompt and isinstance(system_prompt, str):
+                        return system_prompt.strip() or None
         except Exception as e:
             self.log.debug(f"Could not retrieve user personalization prompt: {e}")
 
         return None
 
     def _combine_system_prompts(
-        self, chat_system_prompt: Optional[str]
+        self, chat_system_prompt: Optional[str], __user__: Optional[dict] = None
     ) -> Optional[str]:
         """Combine default, per-user, and chat-level system prompts.
 
         Prompt hierarchy (all prompts are combined if set):
         1. DEFAULT_SYSTEM_PROMPT (environment/valve setting)
-        2. Per-user system prompt (from user.info.system - Personalization settings)
+        2. Per-user system prompt (from __user__["settings"]["ui"]["system"] - Personalization settings)
         3. Chat-level system prompt (from messages in this request)
 
         Args:
             chat_system_prompt: The chat-level system prompt from messages (may be None)
+            __user__: The user dict passed to the pipe method
 
         Returns:
             Combined system prompt or None if none are set
         """
         default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip() or None
-        user_personalization = self._get_user_personalization_prompt()
+        user_personalization = self._get_user_personalization_prompt(__user__)
         chat_prompt = chat_system_prompt.strip() if chat_system_prompt else None
 
         prompts = [p for p in [default_prompt, user_personalization, chat_prompt] if p]
@@ -437,6 +445,7 @@ class Pipe:
         self,
         messages: List[Dict[str, Any]],
         __event_emitter__: Callable,
+        __user__: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
@@ -449,7 +458,9 @@ class Pipe:
         )
 
         # Combine with default system prompt if configured
-        system_instruction = self._combine_system_prompts(user_system_instruction)
+        system_instruction = self._combine_system_prompts(
+            user_system_instruction, __user__
+        )
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -908,13 +919,14 @@ class Pipe:
         return model_id
 
     def _prepare_content(
-        self, messages: List[Dict[str, Any]]
+        self, messages: List[Dict[str, Any]], __user__: Optional[dict] = None
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
 
         Args:
             messages: List of message objects from the request
+            __user__: The user dict passed to the pipe method
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -926,7 +938,7 @@ class Pipe:
         )
 
         # Combine with default system prompt if configured
-        system_message = self._combine_system_prompts(user_system_message)
+        system_message = self._combine_system_prompts(user_system_message, __user__)
 
         # Prepare contents for the API
         contents = []
@@ -1602,22 +1614,43 @@ class Pipe:
                         )
                 else:
                     # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
-                    validated_budget = self._validate_thinking_budget(
-                        self.valves.THINKING_BUDGET
-                    )
+                    # Body-level thinking_budget overrides environment-level THINKING_BUDGET
+                    body_thinking_budget = body.get("thinking_budget")
+                    validated_budget = None
+                    source = None
+
+                    if body_thinking_budget is not None:
+                        validated_budget = self._validate_thinking_budget(
+                            body_thinking_budget
+                        )
+                        if validated_budget is not None:
+                            source = "body thinking_budget"
+                        else:
+                            self.log.debug(
+                                f"Invalid body thinking_budget '{body_thinking_budget}', falling back to THINKING_BUDGET"
+                            )
+
+                    # Fall back to environment-level THINKING_BUDGET
+                    if validated_budget is None:
+                        validated_budget = self._validate_thinking_budget(
+                            self.valves.THINKING_BUDGET
+                        )
+                        if validated_budget is not None:
+                            source = "THINKING_BUDGET"
+
                     if validated_budget == 0:
                         # Disable thinking if budget is 0
                         thinking_config_params["thinking_budget"] = 0
                         self.log.debug(
-                            f"Thinking disabled via thinking_budget=0 for model {model_id}"
+                            f"Thinking disabled via thinking_budget=0 from {source} for model {model_id}"
                         )
-                    elif validated_budget > 0:
+                    elif validated_budget is not None and validated_budget > 0:
                         thinking_config_params["thinking_budget"] = validated_budget
                         self.log.debug(
-                            f"Using thinking_budget={validated_budget} for model {model_id}"
+                            f"Using thinking_budget={validated_budget} from {source} for model {model_id}"
                         )
                     else:
-                        # -1 means dynamic thinking
+                        # -1 or None means dynamic thinking
                         thinking_config_params["thinking_budget"] = -1
                         self.log.debug(
                             f"Using dynamic thinking (model decides) for model {model_id}"
@@ -2164,7 +2197,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__
+                        messages, __event_emitter__, __user__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
@@ -2176,7 +2209,7 @@ class Pipe:
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
-                contents, system_instruction = self._prepare_content(messages)
+                contents, system_instruction = self._prepare_content(messages, __user__)
                 if not contents:
                     return "Error: No valid message content found"
                 self.log.debug(

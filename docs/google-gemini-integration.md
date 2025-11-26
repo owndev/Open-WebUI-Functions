@@ -259,7 +259,7 @@ The Google Gemini pipeline supports a hierarchical system prompt configuration t
 
 1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
 
-2. **Per-User System Prompt** (User Personalization): Each user can set their own system prompt in Open WebUI's Settings > Personalization. This is stored in `user.info.system` and is automatically included.
+2. **Per-User System Prompt** (User Personalization): Each user can set their own system prompt in Open WebUI's Settings > Personalization. This is stored in `settings.ui.system` and is automatically included.
 
 3. **Chat-Level System Prompt**: The system message defined in the model settings or passed with individual chat messages.
 
@@ -399,6 +399,10 @@ GOOGLE_THINKING_BUDGET=-1
 # Set a specific token budget for reasoning
 GOOGLE_THINKING_BUDGET=1024
 ```
+
+#### Per-Chat Override (thinking_budget)
+
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
 
 **Example API Usage:**
 
