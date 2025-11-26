@@ -440,8 +440,8 @@ class Pipe:
             or url_raw.strip()
             or "Unknown Document"
         )
-        # Use base title directly without prefix for OpenWebUI citation cards
-        title = base_title
+        # Include [docX] prefix in OpenWebUI citation card titles for document identification
+        title = f"[doc{index}] {base_title}"
 
         # Build source URL for metadata
         source_url = url_raw or filepath_raw
@@ -1392,9 +1392,9 @@ class Pipe:
                 sse_headers.pop("Content-Length", None)
 
                 # Use enhanced stream processor if Azure AI Search is configured and citations are enabled
-                if (
-                    self.valves.AZURE_AI_DATA_SOURCES
-                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
+                if self.valves.AZURE_AI_DATA_SOURCES and (
+                    self.valves.AZURE_AI_ENHANCE_CITATIONS
+                    or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
                 ):
                     stream_processor = self.stream_processor_with_citations
                 else:
