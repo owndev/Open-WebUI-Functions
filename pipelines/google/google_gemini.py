@@ -209,8 +209,8 @@ class Pipe:
         )
         DEFAULT_SYSTEM_PROMPT: str = Field(
             default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
-            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
-            "this is prepended to it. Leave empty to disable.",
+            description="Default system prompt applied to all chats. Combined with per-user personalization "
+            "and chat-level prompts in a hierarchy: default → per-user → per-chat. Leave empty to disable.",
         )
 
         # Image Processing Configuration
@@ -329,9 +329,9 @@ class Pipe:
         Returns:
             Combined system prompt or None if none are set
         """
-        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
-        user_personalization = self._get_user_personalization_prompt() or ""
-        chat_prompt = chat_system_prompt.strip() if chat_system_prompt else ""
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip() or None
+        user_personalization = self._get_user_personalization_prompt()
+        chat_prompt = chat_system_prompt.strip() if chat_system_prompt else None
 
         prompts = [p for p in [default_prompt, user_personalization, chat_prompt] if p]
 
