@@ -125,18 +125,6 @@ class EncryptedStr(str):
 
 
 # Helper functions
-def get_bool_env(env_var: str, default: str = "true") -> bool:
-    """
-    Parse a boolean environment variable.
-
-    Args:
-        env_var: The environment variable name
-        default: The default value as a string ("true" or "false")
-
-    Returns:
-        Boolean value parsed from the environment variable
-    """
-    return os.getenv(env_var, default).lower() == "true"
 
 
 async def cleanup_response(
@@ -215,13 +203,13 @@ class Pipe:
 
         # Enable enhanced citation display for Azure AI Search responses
         AZURE_AI_ENHANCE_CITATIONS: bool = Field(
-            default=get_bool_env("AZURE_AI_ENHANCE_CITATIONS"),
-            description="If True, enhance Azure AI Search responses with better citation formatting and source content display.",
+            default=False,
+            description="If True, enhance Azure AI Search responses with better citation formatting and source content display (markdown/HTML).",
         )
 
         # Enable native OpenWebUI citations (structured events and fields)
         AZURE_AI_OPENWEBUI_CITATIONS: bool = Field(
-            default=get_bool_env("AZURE_AI_OPENWEBUI_CITATIONS"),
+            default=True,
             description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
@@ -452,8 +440,8 @@ class Pipe:
             or url_raw.strip()
             or "Unknown Document"
         )
-        # Always prefix title with doc index to ensure uniqueness and prevent grouping
-        title = f"[doc{index}] {base_title}"
+        # Use base title directly without prefix for OpenWebUI citation cards
+        title = base_title
 
         # Build source URL for metadata
         source_url = url_raw or filepath_raw
@@ -606,6 +594,11 @@ class Pipe:
 
             # Enhance the content with better citation display (if enabled)
             enhanced_content = content
+
+            # Convert [docX] references to markdown links
+            enhanced_content = self._convert_doc_refs_to_markdown_links(
+                enhanced_content, citations
+            )
 
             # Add citation section at the end (if markdown/HTML citations are enabled)
             if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
@@ -820,7 +813,7 @@ class Pipe:
                 all_chunks.append(chunk)
 
                 # Log chunk for debugging (only first 200 chars to avoid spam)
-                log.debug(f"Processing chunk: {chunk_str[:200]}...")
+                # log.debug(f"Processing chunk: {chunk_str[:200]}...")
 
                 # Extract content from delta messages to build the full response content
                 try:
@@ -1033,6 +1026,41 @@ class Pipe:
 
         # Convert to integers and return as a set
         return {int(match) for match in matches}
+
+    def _convert_doc_refs_to_markdown_links(
+        self, content: str, citations: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Convert [docX] references in content to markdown links if the document has a URL.
+
+        Args:
+            content: The response content containing [docX] references
+            citations: List of citation objects with URLs
+
+        Returns:
+            Content with [docX] references converted to markdown links
+        """
+        if not citations:
+            return content
+
+        # Build a mapping of doc index to URL
+        doc_urls = {}
+        for i, citation in enumerate(citations, 1):
+            if isinstance(citation, dict):
+                url = citation.get("url") or citation.get("filepath") or ""
+                if url:
+                    doc_urls[i] = url
+
+        # Replace [docX] with markdown links where URL is available
+        def replace_doc_ref(match: re.Match) -> str:
+            doc_num = int(match.group(1))
+            if doc_num in doc_urls:
+                # Use standard markdown link format: [text](url)
+                return f"[doc{doc_num}]({doc_urls[doc_num]})"
+            return match.group(0)  # Keep original if no URL
+
+        pattern = r"\[doc(\d+)\]"
+        return re.sub(pattern, replace_doc_ref, content)
 
     def _format_citation_section(
         self,
