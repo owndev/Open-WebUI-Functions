@@ -414,14 +414,13 @@ class Pipe:
             Complete citation event object with type and data fields
         """
         # Get title with fallback chain: title → filepath → url → "Unknown Document"
-        # Add index to make each source unique and prevent grouping
         base_title = (
             citation.get("title", "").strip()
             or citation.get("filepath", "").strip()
             or citation.get("url", "").strip()
             or "Unknown Document"
         )
-        # Make title unique by appending doc index if there could be duplicates
+        # Always prefix title with doc index to ensure uniqueness and prevent grouping
         title = f"[doc{index}] {base_title}"
 
         # Build source URL for metadata
