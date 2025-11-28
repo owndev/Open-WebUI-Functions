@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.3
+version: 1.8.1
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -34,7 +34,7 @@ features:
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
-  - Hierarchical system prompts (default, model, user)
+  - Hierarchical system prompts (default, user)
 """
 
 import os
@@ -320,89 +320,34 @@ class Pipe:
 
         return None
 
-    def _get_model_system_prompt(
-        self,
-        __metadata__: Optional[dict] = None,
-    ) -> Optional[str]:
-        """Get the model's system prompt from model settings.
-
-        In Open WebUI, each model can have its own system prompt configured
-        in Admin > Models > Select Model > System Prompt. This is accessed
-        via __metadata__["model"]["info"]["params"]["system"].
-
-        Args:
-            __metadata__: The metadata dict passed to the pipe method
-
-        Returns:
-            The model's system prompt or None if not set
-        """
-        if __metadata__ is None:
-            self.log.debug("__metadata__ is None - model system prompt not available")
-            return None
-
-        try:
-            model = __metadata__.get("model")
-            if model and isinstance(model, dict):
-                self.log.debug(f"__metadata__['model'] keys: {list(model.keys())}")
-                info = model.get("info")
-                if info and isinstance(info, dict):
-                    self.log.debug(f"__metadata__['model']['info'] keys: {list(info.keys())}")
-                    params = info.get("params")
-                    if params and isinstance(params, dict):
-                        self.log.debug(
-                            f"__metadata__['model']['info']['params'] keys: {list(params.keys())}"
-                        )
-                        system_prompt = params.get("system")
-                        if system_prompt and isinstance(system_prompt, str):
-                            self.log.debug(
-                                f"Found model system prompt ({len(system_prompt)} chars)"
-                            )
-                            return system_prompt.strip() or None
-                        else:
-                            self.log.debug(
-                                "No system prompt in __metadata__['model']['info']['params']['system']"
-                            )
-                    else:
-                        self.log.debug("No params in __metadata__['model']['info']")
-                else:
-                    self.log.debug("No info in __metadata__['model']")
-            else:
-                self.log.debug("No model in __metadata__")
-        except Exception as e:
-            self.log.debug(f"Could not retrieve model system prompt: {e}")
-
-        return None
-
     def _combine_system_prompts(
         self,
         chat_system_prompt: Optional[str],
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> Optional[str]:
-        """Combine default, model, and user system prompts.
+        """Combine default and user system prompts.
 
         Prompt hierarchy (all prompts are combined if set):
         1. DEFAULT_SYSTEM_PROMPT (environment/valve setting)
-        2. Model system prompt (from __metadata__["model"]["info"]["params"]["system"])
-        3. User system prompt (from chat controls OR user settings - chat controls take precedence)
+        2. User system prompt (from chat controls OR user settings - chat controls take precedence)
 
         Args:
             chat_system_prompt: The chat-level system prompt from messages (may be None)
             __user__: The user dict passed to the pipe method
-            __metadata__: The metadata dict passed to the pipe method
+            __metadata__: The metadata dict passed to the pipe method (unused, kept for API compatibility)
 
         Returns:
             Combined system prompt or None if none are set
         """
         default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip() or None
-        model_prompt = self._get_model_system_prompt(__metadata__)
         user_personalization = self._get_user_personalization_prompt(__user__)
         chat_prompt = chat_system_prompt.strip() if chat_system_prompt else None
 
         # User prompt = chat controls OR user settings (chat controls take precedence if both are set)
         user_prompt = chat_prompt or user_personalization
 
-        prompts = [p for p in [default_prompt, model_prompt, user_prompt] if p]
+        prompts = [p for p in [default_prompt, user_prompt] if p]
 
         if not prompts:
             return None
@@ -415,7 +360,6 @@ class Pipe:
         self.log.debug(
             f"Combined system prompts: "
             f"default={len(default_prompt) if default_prompt else 0}, "
-            f"model={len(model_prompt) if model_prompt else 0}, "
             f"user={len(user_prompt) if user_prompt else 0} -> "
             f"total={len(combined)} chars"
         )
