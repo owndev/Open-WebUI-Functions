@@ -253,15 +253,19 @@ Native tool calling is enabled/disabled via the standard 'Function calling' Open
 
 ## System Prompt Hierarchy
 
-The Google Gemini pipeline supports a hierarchical system prompt configuration that combines multiple sources. This allows for flexible customization at different levels: global defaults, per-user personalization, and per-chat customization.
+The Google Gemini pipeline supports a hierarchical system prompt configuration that combines multiple sources. This allows for flexible customization at different levels: global defaults, model-specific settings, and user preferences.
 
 ### Prompt Sources (in order of combination)
 
 1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
 
-2. **Per-User System Prompt** (User Personalization): Each user can set their own system prompt in Open WebUI's Settings > Personalization. This is stored in `settings.ui.system` and is automatically included.
+2. **Model System Prompt**: The system prompt configured in the model settings (Admin > Models > Select Model > System Prompt). This is passed via `__metadata__["chat"]["params"]["system"]`.
 
-3. **Chat-Level System Prompt**: The system message defined in the model settings or passed with individual chat messages.
+3. **User System Prompt**: The user's personalized system prompt from either:
+   - **User Settings** (Settings > Personalization): Stored in `settings.ui.system`
+   - **Chat Controls**: The system message passed with individual chat messages
+   
+   Note: User settings take precedence over chat controls if both are set.
 
 ### How It Works
 
@@ -270,9 +274,9 @@ All available prompts are combined in order, separated by blank lines:
 ```
 {Default System Prompt}
 
-{Per-User Personalization Prompt}
+{Model System Prompt}
 
-{Chat-Level System Prompt}
+{User System Prompt}
 ```
 
 If only one prompt source is set, it is used as-is without any additional formatting.
@@ -283,20 +287,30 @@ If only one prompt source is set, it is used as-is without any additional format
 
 ```bash
 # Default system prompt applied to all chats
-# Combined with per-user and chat-level prompts if they exist
+# Combined with model and user prompts if they exist
 GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
 ```
 
 Or configure through the pipeline valves in Open WebUI's Admin panel.
 
-**Per-User Personalization:**
+**Model System Prompt:**
+
+Configure the model's system prompt in Open WebUI:
+1. Go to Admin > Models
+2. Select the model you want to configure
+3. Enter the system prompt in the "System Prompt" field
+4. Save settings
+
+This prompt will be applied to all chats using this model.
+
+**User System Prompt:**
 
 Users can set their personalized system prompt in Open WebUI:
 1. Go to Settings > Personalization
 2. Enter your preferred system prompt in the "System Prompt" field
 3. Save settings
 
-This prompt will be automatically applied to all your Gemini chats, combined with any default and chat-level prompts.
+This prompt will be automatically applied to all your Gemini chats, combined with any default and model prompts.
 
 ### Example
 
@@ -307,23 +321,23 @@ If your configuration is:
 You are a helpful AI assistant.
 ```
 
-**Per-user personalization prompt (Settings > Personalization):**
+**Model system prompt (Admin > Models > System Prompt):**
 ```
-My name is John. I prefer detailed explanations.
+You specialize in Python programming.
 ```
 
-**Chat-level system prompt (model settings):**
+**User system prompt (Settings > Personalization OR chat controls):**
 ```
-Always respond in formal English.
+My name is John. I prefer detailed explanations.
 ```
 
 The combined system prompt sent to Gemini will be:
 ```
 You are a helpful AI assistant.
 
-My name is John. I prefer detailed explanations.
+You specialize in Python programming.
 
-Always respond in formal English.
+My name is John. I prefer detailed explanations.
 ```
 
 ## Thinking Configuration
