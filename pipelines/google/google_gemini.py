@@ -327,7 +327,7 @@ class Pipe:
 
         In Open WebUI, each model can have its own system prompt configured
         in Admin > Models > Select Model > System Prompt. This is accessed
-        via __model__["info"]["system"].
+        via __model__["info"]["params"]["system"].
 
         Args:
             __model__: The model dict passed to the pipe method
@@ -336,14 +336,28 @@ class Pipe:
             The model's system prompt or None if not set
         """
         if __model__ is None:
+            self.log.debug("__model__ is None - model system prompt not available")
             return None
+
+        self.log.debug(f"__model__ received: {type(__model__)}, keys: {list(__model__.keys()) if isinstance(__model__, dict) else 'not a dict'}")
 
         try:
             info = __model__.get("info")
             if info and isinstance(info, dict):
-                system_prompt = info.get("system")
-                if system_prompt and isinstance(system_prompt, str):
-                    return system_prompt.strip() or None
+                self.log.debug(f"__model__['info'] keys: {list(info.keys())}")
+                params = info.get("params")
+                if params and isinstance(params, dict):
+                    self.log.debug(f"__model__['info']['params'] keys: {list(params.keys())}")
+                    system_prompt = params.get("system")
+                    if system_prompt and isinstance(system_prompt, str):
+                        self.log.debug(f"Found model system prompt ({len(system_prompt)} chars)")
+                        return system_prompt.strip() or None
+                    else:
+                        self.log.debug("No system prompt in __model__['info']['params']['system']")
+                else:
+                    self.log.debug("No params in __model__['info']")
+            else:
+                self.log.debug("No info in __model__")
         except Exception as e:
             self.log.debug(f"Could not retrieve model system prompt: {e}")
 
@@ -2214,6 +2228,9 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
+        self.log.debug(f"__model__ parameter: {__model__ is not None}, type: {type(__model__)}")
+        if __model__ is not None:
+            self.log.debug(f"__model__ keys: {list(__model__.keys()) if isinstance(__model__, dict) else 'not a dict'}")
         self.user = Users.get_user_by_id(__user__["id"])
 
         try:
