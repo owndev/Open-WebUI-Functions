@@ -259,13 +259,13 @@ The Google Gemini pipeline supports a hierarchical system prompt configuration t
 
 1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
 
-2. **Model System Prompt**: The system prompt configured in the model settings (Admin > Models > Select Model > System Prompt). This is passed via `__metadata__["chat"]["params"]["system"]`.
+2. **Model System Prompt**: The system prompt configured in the model settings (Admin > Models > Select Model > System Prompt). This is accessed via `__model__["info"]["system"]`.
 
 3. **User System Prompt**: The user's personalized system prompt from either:
-   - **User Settings** (Settings > Personalization): Stored in `settings.ui.system`
    - **Chat Controls**: The system message passed with individual chat messages
+   - **User Settings** (Settings > Personalization): Stored in `settings.ui.system`
    
-   Note: User settings take precedence over chat controls if both are set.
+   Note: Chat controls take precedence over user settings if both are set.
 
 ### How It Works
 
@@ -310,7 +310,7 @@ Users can set their personalized system prompt in Open WebUI:
 2. Enter your preferred system prompt in the "System Prompt" field
 3. Save settings
 
-This prompt will be automatically applied to all your Gemini chats, combined with any default and model prompts.
+Alternatively, users can override the system prompt per-chat using chat controls. If both are set, the chat controls value takes precedence.
 
 ### Example
 
@@ -326,7 +326,7 @@ You are a helpful AI assistant.
 You specialize in Python programming.
 ```
 
-**User system prompt (Settings > Personalization OR chat controls):**
+**User system prompt (chat controls OR Settings > Personalization):**
 ```
 My name is John. I prefer detailed explanations.
 ```
