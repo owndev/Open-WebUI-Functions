@@ -209,8 +209,8 @@ class Pipe:
         )
         DEFAULT_SYSTEM_PROMPT: str = Field(
             default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
-            description="Default system prompt applied to all chats. Combined with model and user prompts "
-            "in a hierarchy: default → model → user. Leave empty to disable.",
+            description="Default system prompt applied to all chats. Combined with user prompt "
+            "in a hierarchy: default → user. Leave empty to disable.",
         )
 
         # Image Processing Configuration
@@ -324,7 +324,6 @@ class Pipe:
         self,
         chat_system_prompt: Optional[str],
         __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
     ) -> Optional[str]:
         """Combine default and user system prompts.
 
@@ -335,7 +334,6 @@ class Pipe:
         Args:
             chat_system_prompt: The chat-level system prompt from messages (may be None)
             __user__: The user dict passed to the pipe method
-            __metadata__: The metadata dict passed to the pipe method (unused, kept for API compatibility)
 
         Returns:
             Combined system prompt or None if none are set
@@ -451,7 +449,6 @@ class Pipe:
         messages: List[Dict[str, Any]],
         __event_emitter__: Callable,
         __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
@@ -465,7 +462,7 @@ class Pipe:
 
         # Combine with default system prompt if configured
         system_instruction = self._combine_system_prompts(
-            user_system_instruction, __user__, __metadata__
+            user_system_instruction, __user__
         )
 
         last_user_msg = next(
@@ -928,7 +925,6 @@ class Pipe:
         self,
         messages: List[Dict[str, Any]],
         __user__: Optional[dict] = None,
-        __metadata__: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
@@ -936,7 +932,6 @@ class Pipe:
         Args:
             messages: List of message objects from the request
             __user__: The user dict passed to the pipe method
-            __metadata__: The metadata dict passed to the pipe method
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -948,9 +943,7 @@ class Pipe:
         )
 
         # Combine with default system prompt if configured
-        system_message = self._combine_system_prompts(
-            user_system_message, __user__, __metadata__
-        )
+        system_message = self._combine_system_prompts(user_system_message, __user__)
 
         # Prepare contents for the API
         contents = []
@@ -2209,7 +2202,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__, __user__, __metadata__
+                        messages, __event_emitter__, __user__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
@@ -2221,9 +2214,7 @@ class Pipe:
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
-                contents, system_instruction = self._prepare_content(
-                    messages, __user__, __metadata__
-                )
+                contents, system_instruction = self._prepare_content(messages, __user__)
                 if not contents:
                     return "Error: No valid message content found"
                 self.log.debug(
