@@ -322,137 +322,80 @@ class Pipe:
 
     def _get_model_system_prompt(
         self,
-        __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
-        body: Optional[dict] = None,
     ) -> Optional[str]:
         """Get the model's system prompt from model settings.
 
         In Open WebUI, each model can have its own system prompt configured
         in Admin > Models > Select Model > System Prompt. This is accessed
-        via __model__["info"]["params"]["system"] or alternative paths.
+        via __metadata__["model"]["info"]["params"]["system"].
 
         Args:
-            __model__: The model dict passed to the pipe method
-            __metadata__: The metadata dict passed to the pipe method (fallback)
-            body: The request body (fallback)
+            __metadata__: The metadata dict passed to the pipe method
 
         Returns:
             The model's system prompt or None if not set
         """
-        # Try __model__ first (the official reserved argument)
-        if __model__ is not None:
-            self.log.debug(
-                f"__model__ received: {type(__model__)}, "
-                f"keys: {list(__model__.keys()) if isinstance(__model__, dict) else 'not a dict'}"
-            )
+        if __metadata__ is None:
+            self.log.debug("__metadata__ is None - model system prompt not available")
+            return None
 
-            try:
-                # Try path: __model__["info"]["params"]["system"]
-                info = __model__.get("info")
+        try:
+            model = __metadata__.get("model")
+            if model and isinstance(model, dict):
+                self.log.debug(f"__metadata__['model'] keys: {list(model.keys())}")
+                info = model.get("info")
                 if info and isinstance(info, dict):
-                    self.log.debug(f"__model__['info'] keys: {list(info.keys())}")
+                    self.log.debug(f"__metadata__['model']['info'] keys: {list(info.keys())}")
                     params = info.get("params")
                     if params and isinstance(params, dict):
                         self.log.debug(
-                            f"__model__['info']['params'] keys: {list(params.keys())}"
+                            f"__metadata__['model']['info']['params'] keys: {list(params.keys())}"
                         )
                         system_prompt = params.get("system")
                         if system_prompt and isinstance(system_prompt, str):
                             self.log.debug(
-                                f"Found model system prompt via __model__['info']['params']['system'] ({len(system_prompt)} chars)"
+                                f"Found model system prompt ({len(system_prompt)} chars)"
                             )
                             return system_prompt.strip() or None
-
-                # Try alternative path: __model__["params"]["system"] (directly)
-                params = __model__.get("params")
-                if params and isinstance(params, dict):
-                    self.log.debug(f"__model__['params'] keys: {list(params.keys())}")
-                    system_prompt = params.get("system")
-                    if system_prompt and isinstance(system_prompt, str):
-                        self.log.debug(
-                            f"Found model system prompt via __model__['params']['system'] ({len(system_prompt)} chars)"
-                        )
-                        return system_prompt.strip() or None
-            except Exception as e:
-                self.log.debug(f"Could not retrieve model system prompt from __model__: {e}")
-        else:
-            self.log.debug("__model__ is None - trying fallback paths")
-
-        # Fallback: Try __metadata__["chat"]["params"]["system"]
-        if __metadata__ is not None:
-            self.log.debug(
-                f"__metadata__ keys: {list(__metadata__.keys()) if isinstance(__metadata__, dict) else 'not a dict'}"
-            )
-            try:
-                chat = __metadata__.get("chat")
-                if chat and isinstance(chat, dict):
-                    self.log.debug(f"__metadata__['chat'] keys: {list(chat.keys())}")
-                    params = chat.get("params")
-                    if params and isinstance(params, dict):
-                        self.log.debug(
-                            f"__metadata__['chat']['params'] keys: {list(params.keys())}"
-                        )
-                        system_prompt = params.get("system")
-                        if system_prompt and isinstance(system_prompt, str):
+                        else:
                             self.log.debug(
-                                f"Found model system prompt via __metadata__['chat']['params']['system'] ({len(system_prompt)} chars)"
+                                "No system prompt in __metadata__['model']['info']['params']['system']"
                             )
-                            return system_prompt.strip() or None
-            except Exception as e:
-                self.log.debug(f"Could not retrieve model system prompt from __metadata__: {e}")
+                    else:
+                        self.log.debug("No params in __metadata__['model']['info']")
+                else:
+                    self.log.debug("No info in __metadata__['model']")
+            else:
+                self.log.debug("No model in __metadata__")
+        except Exception as e:
+            self.log.debug(f"Could not retrieve model system prompt: {e}")
 
-        # Fallback: Try body["model_info"]["params"]["system"] or similar
-        if body is not None:
-            self.log.debug(f"body keys: {list(body.keys()) if isinstance(body, dict) else 'not a dict'}")
-            try:
-                # Check if model info is embedded in body
-                model_info = body.get("model_info") or body.get("model")
-                if model_info and isinstance(model_info, dict):
-                    self.log.debug(f"body model_info keys: {list(model_info.keys())}")
-                    info = model_info.get("info")
-                    if info and isinstance(info, dict):
-                        params = info.get("params")
-                        if params and isinstance(params, dict):
-                            system_prompt = params.get("system")
-                            if system_prompt and isinstance(system_prompt, str):
-                                self.log.debug(
-                                    f"Found model system prompt via body['model_info']['info']['params']['system'] ({len(system_prompt)} chars)"
-                                )
-                                return system_prompt.strip() or None
-            except Exception as e:
-                self.log.debug(f"Could not retrieve model system prompt from body: {e}")
-
-        self.log.debug("No model system prompt found in any source")
         return None
 
     def _combine_system_prompts(
         self,
         chat_system_prompt: Optional[str],
         __user__: Optional[dict] = None,
-        __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
-        body: Optional[dict] = None,
     ) -> Optional[str]:
         """Combine default, model, and user system prompts.
 
         Prompt hierarchy (all prompts are combined if set):
         1. DEFAULT_SYSTEM_PROMPT (environment/valve setting)
-        2. Model system prompt (from model settings)
+        2. Model system prompt (from __metadata__["model"]["info"]["params"]["system"])
         3. User system prompt (from chat controls OR user settings - chat controls take precedence)
 
         Args:
             chat_system_prompt: The chat-level system prompt from messages (may be None)
             __user__: The user dict passed to the pipe method
-            __model__: The model dict passed to the pipe method
             __metadata__: The metadata dict passed to the pipe method
-            body: The request body
 
         Returns:
             Combined system prompt or None if none are set
         """
         default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip() or None
-        model_prompt = self._get_model_system_prompt(__model__, __metadata__, body)
+        model_prompt = self._get_model_system_prompt(__metadata__)
         user_personalization = self._get_user_personalization_prompt(__user__)
         chat_prompt = chat_system_prompt.strip() if chat_system_prompt else None
 
@@ -564,9 +507,7 @@ class Pipe:
         messages: List[Dict[str, Any]],
         __event_emitter__: Callable,
         __user__: Optional[dict] = None,
-        __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
-        body: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
@@ -580,7 +521,7 @@ class Pipe:
 
         # Combine with default system prompt if configured
         system_instruction = self._combine_system_prompts(
-            user_system_instruction, __user__, __model__, __metadata__, body
+            user_system_instruction, __user__, __metadata__
         )
 
         last_user_msg = next(
@@ -1043,9 +984,7 @@ class Pipe:
         self,
         messages: List[Dict[str, Any]],
         __user__: Optional[dict] = None,
-        __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
-        body: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
@@ -1053,9 +992,7 @@ class Pipe:
         Args:
             messages: List of message objects from the request
             __user__: The user dict passed to the pipe method
-            __model__: The model dict passed to the pipe method
             __metadata__: The metadata dict passed to the pipe method
-            body: The request body
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -1068,7 +1005,7 @@ class Pipe:
 
         # Combine with default system prompt if configured
         system_message = self._combine_system_prompts(
-            user_system_message, __user__, __model__, __metadata__, body
+            user_system_message, __user__, __metadata__
         )
 
         # Prepare contents for the API
@@ -2280,19 +2217,17 @@ class Pipe:
         __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-        __model__: Optional[dict] = None,
     ) -> Union[str, AsyncIterator[str]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
         Args:
             body: The request body containing messages and other parameters.
-            __metadata__: Request metadata
+            __metadata__: Request metadata (contains model info in __metadata__["model"])
             __event_emitter__: Event emitter for status updates
             __tools__: Available tools
             __request__: FastAPI request object (for image upload)
             __user__: User information (for image upload)
-            __model__: Model information (for model-specific system prompt)
 
         Returns:
             Response from Google Gemini API, which could be a string or an iterator for streaming.
@@ -2301,9 +2236,7 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        self.log.debug(f"__model__ parameter: {__model__ is not None}, type: {type(__model__)}")
-        if __model__ is not None:
-            self.log.debug(f"__model__ keys: {list(__model__.keys()) if isinstance(__model__, dict) else 'not a dict'}")
+        self.log.debug(f"__metadata__ keys: {list(__metadata__.keys()) if isinstance(__metadata__, dict) else 'not a dict'}")
         self.user = Users.get_user_by_id(__user__["id"])
 
         try:
@@ -2333,7 +2266,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__, __user__, __model__, __metadata__, body
+                        messages, __event_emitter__, __user__, __metadata__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
@@ -2346,7 +2279,7 @@ class Pipe:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
                 contents, system_instruction = self._prepare_content(
-                    messages, __user__, __model__, __metadata__, body
+                    messages, __user__, __metadata__
                 )
                 if not contents:
                     return "Error: No valid message content found"
