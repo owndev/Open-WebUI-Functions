@@ -285,8 +285,9 @@ class Pipe:
                 if h in seen:
                     continue
                 seen.add(h)
-            except Exception:
-                pass
+            except Exception as e:
+                # Skip images with malformed or missing data, but log for debugging.
+                self.log.debug(f"Skipping image in deduplication due to error: {e}")
             result.append(part)
         return result
 
