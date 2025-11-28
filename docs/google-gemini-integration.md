@@ -259,7 +259,10 @@ The Google Gemini pipeline supports a hierarchical system prompt configuration t
 
 1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
 
-2. **Model System Prompt**: The system prompt configured in the model settings (Admin > Models > Select Model > System Prompt). This is accessed via `__model__["info"]["params"]["system"]`.
+2. **Model System Prompt**: The system prompt configured in the model settings (Admin > Models > Select Model > System Prompt). The pipeline attempts to retrieve this from multiple sources in order:
+   - `__model__["info"]["params"]["system"]` (primary)
+   - `__model__["params"]["system"]` (alternative)
+   - `__metadata__["chat"]["params"]["system"]` (fallback)
 
 3. **User System Prompt**: The user's personalized system prompt from either:
    - **Chat Controls**: The system message passed with individual chat messages
