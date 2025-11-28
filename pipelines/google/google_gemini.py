@@ -2167,7 +2167,7 @@ class Pipe:
 
         Args:
             body: The request body containing messages and other parameters.
-            __metadata__: Request metadata (contains model info in __metadata__["model"])
+            __metadata__: Request metadata
             __event_emitter__: Event emitter for status updates
             __tools__: Available tools
             __request__: FastAPI request object (for image upload)
@@ -2180,7 +2180,6 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        self.log.debug(f"__metadata__ keys: {list(__metadata__.keys()) if isinstance(__metadata__, dict) else 'not a dict'}")
         self.user = Users.get_user_by_id(__user__["id"])
 
         try:
