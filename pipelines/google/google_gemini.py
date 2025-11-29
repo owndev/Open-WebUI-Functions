@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.0
+version: 1.8.1
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -206,6 +206,11 @@ class Pipe:
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
         )
+        DEFAULT_SYSTEM_PROMPT: str = Field(
+            default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
+            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
+            "this is prepended to it. Leave empty to disable.",
+        )
 
         # Image Processing Configuration
         IMAGE_MAX_SIZE_MB: float = Field(
@@ -279,10 +284,44 @@ class Pipe:
                 if h in seen:
                     continue
                 seen.add(h)
-            except Exception:
-                pass
+            except Exception as e:
+                # Skip images with malformed or missing data, but log for debugging.
+                self.log.debug(f"Skipping image in deduplication due to error: {e}")
             result.append(part)
         return result
+
+    def _combine_system_prompts(
+        self, user_system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Combine default system prompt with user-defined system prompt.
+
+        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
+        the default is prepended to the user's prompt.
+        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
+        If only user_system_prompt is set, it is used as-is.
+
+        Args:
+            user_system_prompt: The user-defined system prompt from messages (may be None)
+
+        Returns:
+            Combined system prompt or None if neither is set
+        """
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
+        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
+
+        if default_prompt and user_prompt:
+            combined = f"{default_prompt}\n\n{user_prompt}"
+            self.log.debug(
+                f"Combined system prompts: default ({len(default_prompt)} chars) + "
+                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
+            )
+            return combined
+        elif default_prompt:
+            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
+            return default_prompt
+        elif user_prompt:
+            return user_prompt
+        return None
 
     def _apply_order_and_limit(
         self,
@@ -374,11 +413,14 @@ class Pipe:
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
-        # Extract system instruction first
-        system_instruction = next(
+        # Extract user-defined system instruction first
+        user_system_instruction = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_instruction = self._combine_system_prompts(user_system_instruction)
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -848,11 +890,14 @@ class Pipe:
         Returns:
             Tuple of (prepared content list, system message string or None)
         """
-        # Extract system message
-        system_message = next(
+        # Extract user-defined system message
+        user_system_message = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_message = self._combine_system_prompts(user_system_message)
 
         # Prepare contents for the API
         contents = []
@@ -1493,13 +1538,34 @@ class Pipe:
                 # Check if model supports thinking_level (Gemini 3 models)
                 if self._check_thinking_level_support(model_id):
                     # For Gemini 3 models, use thinking_level (not thinking_budget)
-                    validated_level = self._validate_thinking_level(
-                        self.valves.THINKING_LEVEL
-                    )
+                    # Per-chat reasoning_effort overrides environment-level THINKING_LEVEL
+                    reasoning_effort = body.get("reasoning_effort")
+                    validated_level = None
+                    source = None
+
+                    if reasoning_effort:
+                        validated_level = self._validate_thinking_level(
+                            reasoning_effort
+                        )
+                        if validated_level:
+                            source = "per-chat reasoning_effort"
+                        else:
+                            self.log.debug(
+                                f"Invalid reasoning_effort '{reasoning_effort}', falling back to THINKING_LEVEL"
+                            )
+
+                    # Fall back to environment-level THINKING_LEVEL if no valid reasoning_effort
+                    if not validated_level:
+                        validated_level = self._validate_thinking_level(
+                            self.valves.THINKING_LEVEL
+                        )
+                        if validated_level:
+                            source = "THINKING_LEVEL"
+
                     if validated_level:
                         thinking_config_params["thinking_level"] = validated_level
                         self.log.debug(
-                            f"Using thinking_level='{validated_level}' for model {model_id}"
+                            f"Using thinking_level='{validated_level}' from {source} for model {model_id}"
                         )
                     else:
                         self.log.debug(
@@ -1507,22 +1573,43 @@ class Pipe:
                         )
                 else:
                     # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
-                    validated_budget = self._validate_thinking_budget(
-                        self.valves.THINKING_BUDGET
-                    )
+                    # Body-level thinking_budget overrides environment-level THINKING_BUDGET
+                    body_thinking_budget = body.get("thinking_budget")
+                    validated_budget = None
+                    source = None
+
+                    if body_thinking_budget is not None:
+                        validated_budget = self._validate_thinking_budget(
+                            body_thinking_budget
+                        )
+                        if validated_budget is not None:
+                            source = "body thinking_budget"
+                        else:
+                            self.log.debug(
+                                f"Invalid body thinking_budget '{body_thinking_budget}', falling back to THINKING_BUDGET"
+                            )
+
+                    # Fall back to environment-level THINKING_BUDGET
+                    if validated_budget is None:
+                        validated_budget = self._validate_thinking_budget(
+                            self.valves.THINKING_BUDGET
+                        )
+                        if validated_budget is not None:
+                            source = "THINKING_BUDGET"
+
                     if validated_budget == 0:
                         # Disable thinking if budget is 0
                         thinking_config_params["thinking_budget"] = 0
                         self.log.debug(
-                            f"Thinking disabled via thinking_budget=0 for model {model_id}"
+                            f"Thinking disabled via thinking_budget=0 from {source} for model {model_id}"
                         )
-                    elif validated_budget > 0:
+                    elif validated_budget is not None and validated_budget > 0:
                         thinking_config_params["thinking_budget"] = validated_budget
                         self.log.debug(
-                            f"Using thinking_budget={validated_budget} for model {model_id}"
+                            f"Using thinking_budget={validated_budget} from {source} for model {model_id}"
                         )
                     else:
-                        # -1 means dynamic thinking
+                        # -1 or None means dynamic thinking
                         thinking_config_params["thinking_budget"] = -1
                         self.log.debug(
                             f"Using dynamic thinking (model decides) for model {model_id}"
@@ -2074,7 +2161,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"

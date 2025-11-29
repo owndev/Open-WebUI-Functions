@@ -80,6 +80,12 @@ GOOGLE_MODEL_CACHE_TTL=600
 # Default: 2
 GOOGLE_RETRY_COUNT=2
 
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+# Leave empty to disable
+# Default: "" (empty, disabled)
+GOOGLE_DEFAULT_SYSTEM_PROMPT=""
+
 # Image processing optimization settings
 # Maximum image size in MB before compression is applied
 # Default: 15.0
@@ -245,6 +251,50 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
 
+## Default System Prompt
+
+The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
+
+### How It Works
+
+- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
+- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
+- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
+
+### Configuration
+
+Set via environment variable:
+
+```bash
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Example
+
+If your default system prompt is:
+
+```
+You are a helpful AI assistant.
+```
+
+And your model-specific system prompt is:
+
+```
+Always respond in formal English.
+```
+
+The combined system prompt sent to Gemini will be:
+
+```
+You are a helpful AI assistant.
+
+Always respond in formal English.
+```
+
 ## Thinking Configuration
 
 The Google Gemini pipeline supports advanced thinking configuration to control how much reasoning and computation is applied by the model.
@@ -271,6 +321,10 @@ GOOGLE_THINKING_LEVEL="low"
 # Use high thinking level for complex reasoning
 GOOGLE_THINKING_LEVEL="high"
 ```
+
+#### Per-Chat Override (Reasoning Effort)
+
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (e.g., "low" or "high"), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
 
 **Example API Usage:**
 
@@ -315,6 +369,10 @@ GOOGLE_THINKING_BUDGET=-1
 GOOGLE_THINKING_BUDGET=1024
 ```
 
+#### Per-Chat Override (thinking_budget)
+
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
+
 **Example API Usage:**
 
 ```python
@@ -356,9 +414,9 @@ print(response.text)
 
 ### Model Compatibility
 
-| Model | thinking_level | thinking_budget |
-|-------|---------------|-----------------|
-| gemini-3-* | ✅ Supported ("low", "high") | ❌ Not used |
-| gemini-2.5-* | ❌ Not used | ✅ Supported (0-32768) |
-| gemini-2.5-flash-image-* | ❌ Not supported | ❌ Not supported |
-| Other models | ❌ Not used | ✅ May be supported |
+| Model                     | thinking_level               | thinking_budget        |
+| ------------------------- | ---------------------------- | ---------------------- |
+| gemini-3-\*               | ✅ Supported ("low", "high") | ❌ Not used            |
+| gemini-2.5-\*             | ❌ Not used                  | ✅ Supported (0-32768) |
+| gemini-2.5-flash-image-\* | ❌ Not supported             | ❌ Not supported       |
+| Other models              | ❌ Not used                  | ✅ May be supported    |
