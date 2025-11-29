@@ -251,72 +251,48 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
 
-## System Prompt Hierarchy
+## Default System Prompt
 
-The Google Gemini pipeline supports a hierarchical system prompt configuration that combines multiple sources. This allows for flexible customization at different levels: global defaults and user preferences.
-
-### Prompt Sources (in order of combination)
-
-1. **Default System Prompt** (`GOOGLE_DEFAULT_SYSTEM_PROMPT`): Global default applied to all chats, configurable via environment variable or Admin UI valves.
-
-2. **User System Prompt**: The user's personalized system prompt from either:
-   - **Chat Controls**: The system message passed with individual chat messages
-   - **User Settings** (Settings > Personalization): Stored in `settings.ui.system`
-   
-   Note: Chat controls take precedence over user settings if both are set.
+The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
 
 ### How It Works
 
-All available prompts are combined in order, separated by blank lines:
-
-```
-{Default System Prompt}
-
-{User System Prompt}
-```
-
-If only one prompt source is set, it is used as-is without any additional formatting.
+- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
+- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
+- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
 
 ### Configuration
 
-**Environment Variable:**
+Set via environment variable:
 
 ```bash
 # Default system prompt applied to all chats
-# Combined with user prompts if they exist
+# If a user-defined system prompt exists, this is prepended to it
 GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
 ```
 
 Or configure through the pipeline valves in Open WebUI's Admin panel.
 
-**User System Prompt:**
-
-Users can set their personalized system prompt in Open WebUI:
-1. Go to Settings > Personalization
-2. Enter your preferred system prompt in the "System Prompt" field
-3. Save settings
-
-Alternatively, users can override the system prompt per-chat using chat controls. If both are set, the chat controls value takes precedence.
-
 ### Example
 
-If your configuration is:
+If your default system prompt is:
 
-**Default system prompt (`GOOGLE_DEFAULT_SYSTEM_PROMPT`):**
 ```
 You are a helpful AI assistant.
 ```
 
-**User system prompt (chat controls OR Settings > Personalization):**
+And your model-specific system prompt is:
+
 ```
-My name is John. I prefer detailed explanations.
+Always respond in formal English.
 ```
 
 The combined system prompt sent to Gemini will be:
+
 ```
 You are a helpful AI assistant.
 
-My name is John. I prefer detailed explanations.
+Always respond in formal English.
 ```
 
 ## Thinking Configuration
@@ -438,9 +414,9 @@ print(response.text)
 
 ### Model Compatibility
 
-| Model | thinking_level | thinking_budget |
-|-------|---------------|-----------------|
-| gemini-3-* | ✅ Supported ("low", "high") | ❌ Not used |
-| gemini-2.5-* | ❌ Not used | ✅ Supported (0-32768) |
-| gemini-2.5-flash-image-* | ❌ Not supported | ❌ Not supported |
-| Other models | ❌ Not used | ✅ May be supported |
+| Model                     | thinking_level               | thinking_budget        |
+| ------------------------- | ---------------------------- | ---------------------- |
+| gemini-3-\*               | ✅ Supported ("low", "high") | ❌ Not used            |
+| gemini-2.5-\*             | ❌ Not used                  | ✅ Supported (0-32768) |
+| gemini-2.5-flash-image-\* | ❌ Not supported             | ❌ Not supported       |
+| Other models              | ❌ Not used                  | ✅ May be supported    |

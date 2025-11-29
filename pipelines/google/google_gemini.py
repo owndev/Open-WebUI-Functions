@@ -34,7 +34,6 @@ features:
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
-  - Hierarchical system prompts (default, user)
 """
 
 import os
@@ -209,8 +208,8 @@ class Pipe:
         )
         DEFAULT_SYSTEM_PROMPT: str = Field(
             default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
-            description="Default system prompt applied to all chats. Combined with user prompt "
-            "in a hierarchy: default → user. Leave empty to disable.",
+            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
+            "this is prepended to it. Leave empty to disable.",
         )
 
         # Image Processing Configuration
@@ -291,78 +290,38 @@ class Pipe:
             result.append(part)
         return result
 
-    def _get_user_personalization_prompt(
-        self, __user__: Optional[dict] = None
-    ) -> Optional[str]:
-        """Get the per-user system prompt from user settings (Personalization).
-
-        In Open WebUI, users can configure a personalized system prompt
-        in Settings > Personalization. This is stored in __user__["settings"]["ui"]["system"].
-
-        Args:
-            __user__: The user dict passed to the pipe method
-
-        Returns:
-            The user's personalized system prompt or None if not set
-        """
-        if __user__ is None:
-            return None
-
-        try:
-            settings = __user__.get("settings")
-            if settings and isinstance(settings, dict):
-                ui_settings = settings.get("ui")
-                if ui_settings and isinstance(ui_settings, dict):
-                    system_prompt = ui_settings.get("system")
-                    if system_prompt and isinstance(system_prompt, str):
-                        return system_prompt.strip() or None
-        except Exception as e:
-            self.log.debug(f"Could not retrieve user personalization prompt: {e}")
-
-        return None
-
     def _combine_system_prompts(
-        self,
-        chat_system_prompt: Optional[str],
-        __user__: Optional[dict] = None,
+        self, user_system_prompt: Optional[str]
     ) -> Optional[str]:
-        """Combine default and user system prompts.
+        """Combine default system prompt with user-defined system prompt.
 
-        Prompt hierarchy (all prompts are combined if set):
-        1. DEFAULT_SYSTEM_PROMPT (environment/valve setting)
-        2. User system prompt (from chat controls OR user settings - chat controls take precedence)
+        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
+        the default is prepended to the user's prompt.
+        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
+        If only user_system_prompt is set, it is used as-is.
 
         Args:
-            chat_system_prompt: The chat-level system prompt from messages (may be None)
-            __user__: The user dict passed to the pipe method
+            user_system_prompt: The user-defined system prompt from messages (may be None)
 
         Returns:
-            Combined system prompt or None if none are set
+            Combined system prompt or None if neither is set
         """
-        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip() or None
-        user_personalization = self._get_user_personalization_prompt(__user__)
-        chat_prompt = chat_system_prompt.strip() if chat_system_prompt else None
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
+        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
 
-        # User prompt = chat controls OR user settings (chat controls take precedence if both are set)
-        user_prompt = chat_prompt or user_personalization
-
-        prompts = [p for p in [default_prompt, user_prompt] if p]
-
-        if not prompts:
-            return None
-
-        if len(prompts) == 1:
-            self.log.debug(f"Using single system prompt ({len(prompts[0])} chars)")
-            return prompts[0]
-
-        combined = "\n\n".join(prompts)
-        self.log.debug(
-            f"Combined system prompts: "
-            f"default={len(default_prompt) if default_prompt else 0}, "
-            f"user={len(user_prompt) if user_prompt else 0} -> "
-            f"total={len(combined)} chars"
-        )
-        return combined
+        if default_prompt and user_prompt:
+            combined = f"{default_prompt}\n\n{user_prompt}"
+            self.log.debug(
+                f"Combined system prompts: default ({len(default_prompt)} chars) + "
+                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
+            )
+            return combined
+        elif default_prompt:
+            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
+            return default_prompt
+        elif user_prompt:
+            return user_prompt
+        return None
 
     def _apply_order_and_limit(
         self,
@@ -449,7 +408,6 @@ class Pipe:
         self,
         messages: List[Dict[str, Any]],
         __event_emitter__: Callable,
-        __user__: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
@@ -462,9 +420,7 @@ class Pipe:
         )
 
         # Combine with default system prompt if configured
-        system_instruction = self._combine_system_prompts(
-            user_system_instruction, __user__
-        )
+        system_instruction = self._combine_system_prompts(user_system_instruction)
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -923,16 +879,13 @@ class Pipe:
         return model_id
 
     def _prepare_content(
-        self,
-        messages: List[Dict[str, Any]],
-        __user__: Optional[dict] = None,
+        self, messages: List[Dict[str, Any]]
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
 
         Args:
             messages: List of message objects from the request
-            __user__: The user dict passed to the pipe method
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -944,7 +897,7 @@ class Pipe:
         )
 
         # Combine with default system prompt if configured
-        system_message = self._combine_system_prompts(user_system_message, __user__)
+        system_message = self._combine_system_prompts(user_system_message)
 
         # Prepare contents for the API
         contents = []
@@ -2203,7 +2156,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__, __user__
+                        messages, __event_emitter__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
@@ -2215,7 +2168,7 @@ class Pipe:
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
-                contents, system_instruction = self._prepare_content(messages, __user__)
+                contents, system_instruction = self._prepare_content(messages)
                 if not contents:
                     return "Error: No valid message content found"
                 self.log.debug(
