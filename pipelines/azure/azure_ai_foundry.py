@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.2
+version: 2.6.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -16,6 +16,7 @@ features:
   - Predefined models for easy access.
   - Encrypted storage of sensitive API keys
   - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
+  - Native OpenWebUI citations support with structured events and citation cards (Azure OpenAI only)
 """
 
 from typing import (
@@ -28,6 +29,7 @@ from typing import (
     Any,
     AsyncIterator,
     Set,
+    Callable,
 )
 from urllib.parse import urlparse
 from fastapi.responses import StreamingResponse
@@ -123,6 +125,8 @@ class EncryptedStr(str):
 
 
 # Helper functions
+
+
 async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
     session: Optional[aiohttp.ClientSession],
@@ -199,8 +203,14 @@ class Pipe:
 
         # Enable enhanced citation display for Azure AI Search responses
         AZURE_AI_ENHANCE_CITATIONS: bool = Field(
-            default=bool(os.getenv("AZURE_AI_ENHANCE_CITATIONS", True)),
-            description="If True, enhance Azure AI Search responses with better citation formatting and source content display.",
+            default=False,
+            description="If True, enhance Azure AI Search responses with better citation formatting and source content display (markdown/HTML).",
+        )
+
+        # Enable native OpenWebUI citations (structured events and fields)
+        AZURE_AI_OPENWEBUI_CITATIONS: bool = Field(
+            default=True,
+            description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
     def __init__(self):
@@ -335,15 +345,254 @@ class Pipe:
             log.error(f"Error parsing AZURE_AI_DATA_SOURCES: {e}")
             return None
 
-    def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_citations_from_response(
+        self, response_data: Dict[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
         """
-        Enhances Azure AI Search responses by improving citation display and adding source content.
+        Extract citations from an Azure AI response (streaming or non-streaming).
 
         Args:
-            response: The original response from Azure AI
+            response_data: Response data from Azure AI (can be a delta or full message)
 
         Returns:
-            Enhanced response with better citation formatting
+            List of citation objects, or None if no citations found
+        """
+        log = logging.getLogger("azure_ai._extract_citations_from_response")
+
+        if not isinstance(response_data, dict):
+            log.debug(f"Response data is not a dict: {type(response_data)}")
+            return None
+
+        # Try multiple possible locations for citations
+        citations = None
+
+        # Check in choices[0].delta.context.citations (streaming)
+        if "choices" in response_data and response_data["choices"]:
+            choice = response_data["choices"][0]
+            if (
+                "delta" in choice
+                and isinstance(choice["delta"], dict)
+                and "context" in choice["delta"]
+                and "citations" in choice["delta"]["context"]
+            ):
+                citations = choice["delta"]["context"]["citations"]
+                log.info(
+                    f"Found {len(citations) if citations else 0} citations in delta.context.citations"
+                )
+
+            # Check in choices[0].message.context.citations (non-streaming)
+            elif (
+                "message" in choice
+                and isinstance(choice["message"], dict)
+                and "context" in choice["message"]
+                and "citations" in choice["message"]["context"]
+            ):
+                citations = choice["message"]["context"]["citations"]
+                log.info(
+                    f"Found {len(citations) if citations else 0} citations in message.context.citations"
+                )
+            else:
+                log.debug(
+                    f"No citations found in response. Choice keys: {choice.keys() if isinstance(choice, dict) else 'not a dict'}"
+                )
+        else:
+            log.debug(f"No choices in response. Response keys: {response_data.keys()}")
+
+        if citations and isinstance(citations, list):
+            log.info(f"Extracted {len(citations)} citations from response")
+            # Log first citation structure for debugging (only if INFO logging is enabled)
+            if citations and log.isEnabledFor(logging.INFO):
+                log.info(
+                    f"First citation structure: {json.dumps(citations[0], default=str)[:500]}"
+                )
+            return citations
+
+        log.debug("No valid citations found in response")
+        return None
+
+    def _normalize_citation_for_openwebui(
+        self, citation: Dict[str, Any], index: int
+    ) -> Dict[str, Any]:
+        """
+        Normalize an Azure citation object to OpenWebUI citation event format.
+
+        The format follows OpenWebUI's official citation event structure:
+        https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution
+
+        Args:
+            citation: Azure citation object
+            index: Citation index (1-based)
+
+        Returns:
+            Complete citation event object with type and data fields
+        """
+        log = logging.getLogger("azure_ai._normalize_citation_for_openwebui")
+
+        # Get title with fallback chain: title → filepath → url → "Unknown Document"
+        # Handle None values explicitly since dict.get() returns None if key exists but value is None
+        title_raw = citation.get("title") or ""
+        filepath_raw = citation.get("filepath") or ""
+        url_raw = citation.get("url") or ""
+
+        base_title = (
+            title_raw.strip()
+            or filepath_raw.strip()
+            or url_raw.strip()
+            or "Unknown Document"
+        )
+        # Include [docX] prefix in OpenWebUI citation card titles for document identification
+        title = f"[doc{index}] - {base_title}"
+
+        # Build source URL for metadata
+        source_url = url_raw or filepath_raw
+
+        # Build metadata with source information
+        # Use title with [docX] prefix as metadata source for OpenWebUI display
+        # The UI may extract display name from metadata.source rather than source.name
+        metadata_entry = {"source": title, "url": source_url}
+        if citation.get("metadata"):
+            metadata_entry.update(citation.get("metadata", {}))
+
+        # Get document content (handle None values)
+        content = citation.get("content") or ""
+
+        # Build normalized citation data structure matching OpenWebUI format exactly
+        citation_data = {
+            "document": [content],
+            "metadata": [metadata_entry],
+            "source": {"name": title},
+        }
+
+        # Add URL to source if available
+        if source_url:
+            citation_data["source"]["url"] = source_url
+
+        # Add distances array for relevance score (OpenWebUI uses this for percentage display)
+        # Always include distances to ensure relevance is shown (use 0 if score not available)
+        score = citation.get("score")
+        if score is not None:
+            citation_data["distances"] = [float(score)]
+        else:
+            # Default to 0 if no score to ensure the distances field is present
+            citation_data["distances"] = [0.0]
+
+        # Build complete citation event structure
+        citation_event = {
+            "type": "citation",
+            "data": citation_data,
+        }
+
+        # Log the normalized citation for debugging (only if INFO logging is enabled)
+        if log.isEnabledFor(logging.INFO):
+            log.info(
+                f"Normalized citation {index}: title='{title}', "
+                f"content_length={len(content)}, "
+                f"url='{source_url}', "
+                f"score={score}, "
+                f"event={json.dumps(citation_event, default=str)[:500]}"
+            )
+
+        return citation_event
+
+    async def _emit_openwebui_citation_events(
+        self,
+        citations: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable[..., Any]],
+        content: str = "",
+    ) -> None:
+        """
+        Emit OpenWebUI citation events for citations.
+
+        Emits one citation event per source document, following the OpenWebUI
+        citation event format. Each citation is emitted separately to ensure
+        all sources appear in the UI.
+
+        Only emits citations that are actually referenced in the content (e.g., [doc1], [doc2]).
+
+        Args:
+            citations: List of Azure citation objects
+            __event_emitter__: Event emitter callable for sending citation events
+            content: The response content (used to filter only referenced citations)
+        """
+        log = logging.getLogger("azure_ai._emit_openwebui_citation_events")
+
+        if not __event_emitter__:
+            log.warning("No __event_emitter__ provided, cannot emit citation events")
+            return
+
+        if not citations:
+            log.info("No citations to emit")
+            return
+
+        # Extract which citations are actually referenced in the content
+        referenced_indices = self._extract_referenced_citations(content)
+
+        # If we couldn't find any references, include all citations (backward compatibility)
+        if not referenced_indices:
+            referenced_indices = set(range(1, len(citations) + 1))
+            log.debug(
+                f"No [docX] references found in content, including all {len(citations)} citations"
+            )
+        else:
+            log.info(
+                f"Found {len(referenced_indices)} referenced citations: {sorted(referenced_indices)}"
+            )
+
+        log.info(
+            f"Emitting citation events for {len(referenced_indices)} referenced citations via __event_emitter__"
+        )
+
+        emitted_count = 0
+        for i, citation in enumerate(citations, 1):
+            # Skip citations that are not referenced in the content
+            if i not in referenced_indices:
+                log.debug(f"Skipping citation {i} - not referenced in content")
+                continue
+
+            if not isinstance(citation, dict):
+                log.warning(f"Citation {i} is not a dict, skipping: {type(citation)}")
+                continue
+
+            try:
+                normalized = self._normalize_citation_for_openwebui(citation, i)
+
+                # Log the full citation JSON for debugging
+                log.debug(
+                    f"Full citation event JSON for doc{i}: {json.dumps(normalized, default=str)}"
+                )
+
+                # Emit citation event for this individual source
+                source_name = (
+                    normalized.get("data", {}).get("source", {}).get("name", "unknown")
+                )
+                log.info(
+                    f"Emitting citation event {i}/{len(citations)} with source.name='{source_name}'"
+                )
+                await __event_emitter__(normalized)
+                emitted_count += 1
+
+                log.info(f"Successfully emitted citation event for doc{i}")
+
+            except Exception as e:
+                log.exception(f"Failed to emit citation event for citation {i}: {e}")
+
+        log.info(
+            f"Finished emitting {emitted_count}/{len(referenced_indices)} citation events"
+        )
+
+    def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhance Azure AI Search responses by improving citation display and adding source content.
+        Modifies the response in-place and returns it.
+
+        If AZURE_AI_ENHANCE_CITATIONS is True, appends a formatted markdown/HTML citation section
+        to the response content.
+
+        Args:
+            response: The original response from Azure AI (modified in-place)
+
+        Returns:
+            The enhanced response with better citation formatting
         """
         if not isinstance(response, dict):
             return response
@@ -380,11 +629,11 @@ class Pipe:
                     "chunk_id": citation.get("chunk_id", "0"),
                 }
 
-            # Enhance the content with better citation display
+            # Enhance the content with better citation display (if enabled)
             enhanced_content = content
 
-            # Add citation section at the end
-            if citation_details:
+            # Add citation section at the end (if markdown/HTML citations are enabled)
+            if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
                 citation_section = self._format_citation_section(
                     citations, content, for_streaming=False
                 )
@@ -596,7 +845,7 @@ class Pipe:
                 all_chunks.append(chunk)
 
                 # Log chunk for debugging (only first 200 chars to avoid spam)
-                log.debug(f"Processing chunk: {chunk_str[:200]}...")
+                # log.debug(f"Processing chunk: {chunk_str[:200]}...")
 
                 # Extract content from delta messages to build the full response content
                 try:
@@ -693,6 +942,8 @@ class Pipe:
                                             log.info(
                                                 f"Successfully extracted {len(citations_data)} citations from stream"
                                             )
+                                            # Note: OpenWebUI citation events are emitted after the stream ends
+                                            # to filter only citations referenced in the response content
 
                                     except json.JSONDecodeError:
                                         # Skip invalid JSON
@@ -709,8 +960,24 @@ class Pipe:
                     log.debug("End of stream detected")
                     break
 
-            # After the stream ends, add citations if we found any
-            if citations_data and not citations_added:
+            # After the stream ends, emit OpenWebUI citation events if enabled
+            if (
+                citations_data
+                and self.valves.AZURE_AI_OPENWEBUI_CITATIONS
+                and __event_emitter__
+            ):
+                log.info("Emitting OpenWebUI citation events at end of stream...")
+                # Filter to only citations referenced in the response content
+                await self._emit_openwebui_citation_events(
+                    citations_data, __event_emitter__, response_content
+                )
+
+            # After the stream ends, add markdown/HTML citations if we found any and it's enabled
+            if (
+                citations_data
+                and not citations_added
+                and self.valves.AZURE_AI_ENHANCE_CITATIONS
+            ):
                 log.info("Adding citation summary at end of stream...")
 
                 # Pass the accumulated response content to filter citations
@@ -1127,9 +1394,9 @@ class Pipe:
                 sse_headers.pop("Content-Length", None)
 
                 # Use enhanced stream processor if Azure AI Search is configured and citations are enabled
-                if (
-                    self.valves.AZURE_AI_DATA_SOURCES
-                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
+                if self.valves.AZURE_AI_DATA_SOURCES and (
+                    self.valves.AZURE_AI_ENHANCE_CITATIONS
+                    or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
                 ):
                     stream_processor = self.stream_processor_with_citations
                 else:
@@ -1161,12 +1428,30 @@ class Pipe:
                 request.raise_for_status()
 
                 # Enhance Azure Search responses with better citation display
-                if (
-                    isinstance(response, dict)
-                    and self.valves.AZURE_AI_DATA_SOURCES
-                    and self.valves.AZURE_AI_ENHANCE_CITATIONS
-                ):
-                    response = self.enhance_azure_search_response(response)
+                # Call this when either citation mode is enabled
+                if isinstance(response, dict) and self.valves.AZURE_AI_DATA_SOURCES:
+                    if (
+                        self.valves.AZURE_AI_ENHANCE_CITATIONS
+                        or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
+                    ):
+                        response = self.enhance_azure_search_response(response)
+
+                    # Emit native OpenWebUI citation events for non-streaming responses
+                    if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and __event_emitter__:
+                        citations = self._extract_citations_from_response(response)
+                        if citations:
+                            # Get response content for filtering
+                            response_content = ""
+                            if (
+                                isinstance(response, dict)
+                                and "choices" in response
+                                and response["choices"]
+                            ):
+                                message = response["choices"][0].get("message", {})
+                                response_content = message.get("content", "")
+                            await self._emit_openwebui_citation_events(
+                                citations, __event_emitter__, response_content
+                            )
 
                 # Send completion status update
                 if __event_emitter__:
