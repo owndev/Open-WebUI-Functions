@@ -1854,13 +1854,8 @@ class Pipe:
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
                     # Check prompt feedback
-                    if (
-                        response_iterator.prompt_feedback
-                        and response_iterator.prompt_feedback.block_reason
-                    ):
-                        block_reason = (
-                            response_iterator.prompt_feedback.block_reason.name
-                        )
+                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                        block_reason = chunk.prompt_feedback.block_reason.name
                         message = f"[Blocked due to Prompt Safety: {block_reason}]"
                         await emit_chat_event(
                             "chat:finish",
