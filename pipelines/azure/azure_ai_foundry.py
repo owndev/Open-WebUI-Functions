@@ -213,6 +213,12 @@ class Pipe:
             description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
+        # Enable relevance scores from Azure AI Search
+        AZURE_AI_INCLUDE_SEARCH_SCORES: bool = Field(
+            default=True,
+            description="If True, automatically add 'include_contexts' with 'all_retrieved_documents' to Azure AI Search requests to get relevance scores (original_search_score and rerank_score). This enables relevance percentage display in citation cards.",
+        )
+
     def __init__(self):
         self.valves = self.Valves()
         self.name: str = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}:"
@@ -326,22 +332,51 @@ class Pipe:
         Builds Azure AI data sources configuration from the AZURE_AI_DATA_SOURCES environment variable.
         Only works with Azure OpenAI endpoints: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview
 
+        If AZURE_AI_INCLUDE_SEARCH_SCORES is enabled, automatically adds 'include_contexts'
+        with 'all_retrieved_documents' to get relevance scores from Azure AI Search.
+
         Returns:
             List containing Azure AI data source configuration, or None if not configured.
         """
         if not self.valves.AZURE_AI_DATA_SOURCES:
             return None
 
+        log = logging.getLogger("azure_ai.get_azure_ai_data_sources")
+
         try:
             data_sources = json.loads(self.valves.AZURE_AI_DATA_SOURCES)
-            if isinstance(data_sources, list):
-                return data_sources
-            else:
+            if not isinstance(data_sources, list):
                 # If it's a single object, wrap it in a list
-                return [data_sources]
+                data_sources = [data_sources]
+
+            # If AZURE_AI_INCLUDE_SEARCH_SCORES is enabled, add include_contexts
+            if self.valves.AZURE_AI_INCLUDE_SEARCH_SCORES:
+                for source in data_sources:
+                    if (
+                        isinstance(source, dict)
+                        and source.get("type") == "azure_search"
+                        and "parameters" in source
+                    ):
+                        params = source["parameters"]
+                        # Get or create include_contexts list
+                        include_contexts = params.get("include_contexts", [])
+                        if not isinstance(include_contexts, list):
+                            include_contexts = [include_contexts]
+
+                        # Add 'citations' and 'all_retrieved_documents' if not present
+                        if "citations" not in include_contexts:
+                            include_contexts.append("citations")
+                        if "all_retrieved_documents" not in include_contexts:
+                            include_contexts.append("all_retrieved_documents")
+
+                        params["include_contexts"] = include_contexts
+                        log.debug(
+                            f"Added include_contexts to Azure Search: {include_contexts}"
+                        )
+
+            return data_sources
         except json.JSONDecodeError as e:
             # Log error and return None if JSON parsing fails
-            log = logging.getLogger("azure_ai.get_azure_ai_data_sources")
             log.error(f"Error parsing AZURE_AI_DATA_SOURCES: {e}")
             return None
 
@@ -350,6 +385,10 @@ class Pipe:
     ) -> Optional[List[Dict[str, Any]]]:
         """
         Extract citations from an Azure AI response (streaming or non-streaming).
+
+        Supports both 'citations' and 'all_retrieved_documents' response structures.
+        When include_contexts includes 'all_retrieved_documents', the response contains
+        additional score fields like 'original_search_score' and 'rerank_score'.
 
         Args:
             response_data: Response data from Azure AI (can be a delta or full message)
@@ -366,34 +405,45 @@ class Pipe:
         # Try multiple possible locations for citations
         citations = None
 
-        # Check in choices[0].delta.context.citations (streaming)
+        # Check in choices[0].delta.context or choices[0].message.context
         if "choices" in response_data and response_data["choices"]:
             choice = response_data["choices"][0]
-            if (
-                "delta" in choice
-                and isinstance(choice["delta"], dict)
-                and "context" in choice["delta"]
-                and "citations" in choice["delta"]["context"]
-            ):
-                citations = choice["delta"]["context"]["citations"]
-                log.info(
-                    f"Found {len(citations) if citations else 0} citations in delta.context.citations"
-                )
+            context = None
 
-            # Check in choices[0].message.context.citations (non-streaming)
-            elif (
-                "message" in choice
-                and isinstance(choice["message"], dict)
-                and "context" in choice["message"]
-                and "citations" in choice["message"]["context"]
-            ):
-                citations = choice["message"]["context"]["citations"]
-                log.info(
-                    f"Found {len(citations) if citations else 0} citations in message.context.citations"
-                )
+            # Get context from delta (streaming) or message (non-streaming)
+            if "delta" in choice and isinstance(choice["delta"], dict):
+                context = choice["delta"].get("context")
+            elif "message" in choice and isinstance(choice["message"], dict):
+                context = choice["message"].get("context")
+
+            if context and isinstance(context, dict):
+                # Try citations first
+                if "citations" in context:
+                    citations = context["citations"]
+                    log.info(
+                        f"Found {len(citations) if citations else 0} citations in context.citations"
+                    )
+
+                # If all_retrieved_documents is present, merge score data into citations
+                if "all_retrieved_documents" in context:
+                    all_docs = context["all_retrieved_documents"]
+                    log.debug(
+                        f"Found {len(all_docs) if all_docs else 0} all_retrieved_documents"
+                    )
+
+                    # If we have both citations and all_retrieved_documents,
+                    # try to merge score data from all_retrieved_documents into citations
+                    if citations and all_docs:
+                        self._merge_score_data(citations, all_docs, log)
+                    elif all_docs and not citations:
+                        # Use all_retrieved_documents as citations if no citations found
+                        citations = all_docs
+                        log.info(
+                            f"Using {len(citations)} all_retrieved_documents as citations"
+                        )
             else:
                 log.debug(
-                    f"No citations found in response. Choice keys: {choice.keys() if isinstance(choice, dict) else 'not a dict'}"
+                    f"No context found in response. Choice keys: {choice.keys() if isinstance(choice, dict) else 'not a dict'}"
                 )
         else:
             log.debug(f"No choices in response. Response keys: {response_data.keys()}")
@@ -409,6 +459,64 @@ class Pipe:
 
         log.debug("No valid citations found in response")
         return None
+
+    def _merge_score_data(
+        self,
+        citations: List[Dict[str, Any]],
+        all_docs: List[Dict[str, Any]],
+        log: logging.Logger,
+    ) -> None:
+        """
+        Merge score data from all_retrieved_documents into citations.
+
+        When include_contexts includes 'all_retrieved_documents', Azure returns
+        additional documents with score fields. This method attempts to match
+        them with citations and copy over the score data.
+
+        Args:
+            citations: List of citation objects to update (modified in place)
+            all_docs: List of all_retrieved_documents with score data
+            log: Logger instance
+        """
+        # Build a lookup map by content or filepath to match documents
+        doc_scores = {}
+        for doc in all_docs:
+            # Try to match by chunk_id, filepath, or content hash
+            key = None
+            if doc.get("chunk_id"):
+                key = doc["chunk_id"]
+            elif doc.get("filepath"):
+                key = doc["filepath"]
+            elif doc.get("content"):
+                # Use first 100 chars of content as a key
+                key = doc["content"][:100] if len(doc.get("content", "")) > 100 else doc.get("content")
+
+            if key:
+                doc_scores[key] = {
+                    "original_search_score": doc.get("original_search_score"),
+                    "rerank_score": doc.get("rerank_score"),
+                }
+
+        # Match citations with score data
+        matched = 0
+        for citation in citations:
+            key = None
+            if citation.get("chunk_id"):
+                key = citation["chunk_id"]
+            elif citation.get("filepath"):
+                key = citation["filepath"]
+            elif citation.get("content"):
+                key = citation["content"][:100] if len(citation.get("content", "")) > 100 else citation.get("content")
+
+            if key and key in doc_scores:
+                scores = doc_scores[key]
+                if scores.get("original_search_score") is not None:
+                    citation["original_search_score"] = scores["original_search_score"]
+                if scores.get("rerank_score") is not None:
+                    citation["rerank_score"] = scores["rerank_score"]
+                matched += 1
+
+        log.debug(f"Merged score data for {matched}/{len(citations)} citations")
 
     def _normalize_citation_for_openwebui(
         self, citation: Dict[str, Any], index: int
@@ -468,10 +576,38 @@ class Pipe:
             citation_data["source"]["url"] = source_url
 
         # Add distances array for relevance score (OpenWebUI uses this for percentage display)
-        # Always include distances to ensure relevance is shown (use 0 if score not available)
-        score = citation.get("score")
-        if score is not None:
-            citation_data["distances"] = [float(score)]
+        # Priority: rerank_score > original_search_score > score
+        # rerank_score is the semantic reranker score (if enabled in Azure AI Search)
+        # original_search_score is the BM25/keyword search score
+        # score is a legacy field for backward compatibility
+        rerank_score = citation.get("rerank_score")
+        original_search_score = citation.get("original_search_score")
+        legacy_score = citation.get("score")
+
+        # Prefer rerank_score (semantic ranker), then original_search_score, then legacy score
+        if rerank_score is not None:
+            # Reranker scores are typically 0-4 range, normalize to 0-1 for display
+            # Azure AI Search semantic reranker returns scores in 0-4 range
+            normalized_score = min(float(rerank_score) / 4.0, 1.0)
+            citation_data["distances"] = [normalized_score]
+            log.debug(
+                f"Using rerank_score {rerank_score} -> normalized {normalized_score}"
+            )
+        elif original_search_score is not None:
+            # Original search scores can vary widely, use as-is if <= 1, otherwise normalize
+            score_val = float(original_search_score)
+            if score_val > 1.0:
+                # Normalize high scores (BM25 scores can be > 1)
+                normalized_score = min(score_val / 100.0, 1.0)
+            else:
+                normalized_score = score_val
+            citation_data["distances"] = [normalized_score]
+            log.debug(
+                f"Using original_search_score {original_search_score} -> {normalized_score}"
+            )
+        elif legacy_score is not None:
+            citation_data["distances"] = [float(legacy_score)]
+            log.debug(f"Using legacy score {legacy_score}")
         else:
             # Default to 0 if no score to ensure the distances field is present
             citation_data["distances"] = [0.0]
@@ -488,7 +624,8 @@ class Pipe:
                 f"Normalized citation {index}: title='{title}', "
                 f"content_length={len(content)}, "
                 f"url='{source_url}', "
-                f"score={score}, "
+                f"rerank_score={rerank_score}, original_search_score={original_search_score}, "
+                f"distances={citation_data['distances']}, "
                 f"event={json.dumps(citation_event, default=str)[:500]}"
             )
 
@@ -874,9 +1011,9 @@ class Pipe:
                 except Exception as e:
                     log.debug(f"Exception while processing chunk: {e}")
 
-                # Look for citations in any part of the response
-                if "citations" in chunk_str.lower() and not citations_data:
-                    log.debug("Found 'citations' in chunk, attempting to parse...")
+                # Look for citations or all_retrieved_documents in any part of the response
+                if ("citations" in chunk_str.lower() or "all_retrieved_documents" in chunk_str.lower()) and not citations_data:
+                    log.debug("Found 'citations' or 'all_retrieved_documents' in chunk, attempting to parse...")
 
                     # Try to extract citation data from the current buffer
                     try:
@@ -894,53 +1031,49 @@ class Pipe:
 
                                         # Check multiple possible locations for citations
                                         citations_found = None
+                                        all_docs_found = None
 
                                         if (
                                             isinstance(response_data, dict)
                                             and "choices" in response_data
                                         ):
                                             for choice in response_data["choices"]:
-                                                # Check in delta.context.citations
-                                                if (
-                                                    "delta" in choice
-                                                    and isinstance(
-                                                        choice["delta"], dict
-                                                    )
-                                                    and "context" in choice["delta"]
-                                                    and "citations"
-                                                    in choice["delta"]["context"]
-                                                ):
-                                                    citations_found = choice["delta"][
-                                                        "context"
-                                                    ]["citations"]
-                                                    log.debug(
-                                                        f"Found citations in delta.context: {len(citations_found)} citations"
-                                                    )
+                                                context = None
+                                                # Get context from delta or message
+                                                if "delta" in choice and isinstance(choice["delta"], dict):
+                                                    context = choice["delta"].get("context")
+                                                elif "message" in choice and isinstance(choice["message"], dict):
+                                                    context = choice["message"].get("context")
+
+                                                if context and isinstance(context, dict):
+                                                    # Check for citations
+                                                    if "citations" in context:
+                                                        citations_found = context["citations"]
+                                                        log.debug(
+                                                            f"Found citations in context: {len(citations_found)} citations"
+                                                        )
+                                                    # Check for all_retrieved_documents
+                                                    if "all_retrieved_documents" in context:
+                                                        all_docs_found = context["all_retrieved_documents"]
+                                                        log.debug(
+                                                            f"Found all_retrieved_documents in context: {len(all_docs_found)} docs"
+                                                        )
                                                     break
 
-                                                # Check in message.context.citations
-                                                elif (
-                                                    "message" in choice
-                                                    and isinstance(
-                                                        choice["message"], dict
-                                                    )
-                                                    and "context" in choice["message"]
-                                                    and "citations"
-                                                    in choice["message"]["context"]
-                                                ):
-                                                    citations_found = choice["message"][
-                                                        "context"
-                                                    ]["citations"]
-                                                    log.debug(
-                                                        f"Found citations in message.context: {len(citations_found)} citations"
-                                                    )
-                                                    break
+                                        # Merge score data if we have both
+                                        if citations_found and all_docs_found:
+                                            self._merge_score_data(citations_found, all_docs_found, log)
 
-                                        # Store the first valid citations we find
+                                        # Use citations if found, otherwise use all_retrieved_documents
                                         if citations_found and not citations_data:
                                             citations_data = citations_found
                                             log.info(
                                                 f"Successfully extracted {len(citations_data)} citations from stream"
+                                            )
+                                        elif all_docs_found and not citations_data:
+                                            citations_data = all_docs_found
+                                            log.info(
+                                                f"Using {len(citations_data)} all_retrieved_documents as citations"
                                             )
                                             # Note: OpenWebUI citation events are emitted after the stream ends
                                             # to filter only citations referenced in the response content
