@@ -492,7 +492,10 @@ class Pipe:
             }
 
             # Only store if we have at least one score
-            if scores["original_search_score"] is None and scores["rerank_score"] is None:
+            if (
+                scores["original_search_score"] is None
+                and scores["rerank_score"] is None
+            ):
                 continue
 
             # Index by title
@@ -514,7 +517,11 @@ class Pipe:
 
             # Index by content prefix (first 100 chars)
             if doc.get("content"):
-                content_key = doc["content"][:100] if len(doc.get("content", "")) > 100 else doc.get("content")
+                content_key = (
+                    doc["content"][:100]
+                    if len(doc.get("content", "")) > 100
+                    else doc.get("content")
+                )
                 doc_scores_by_content[content_key] = scores
 
         log.debug(
@@ -554,7 +561,11 @@ class Pipe:
 
             # Try matching by content prefix
             if not scores and citation.get("content"):
-                content_key = citation["content"][:100] if len(citation.get("content", "")) > 100 else citation.get("content")
+                content_key = (
+                    citation["content"][:100]
+                    if len(citation.get("content", "")) > 100
+                    else citation.get("content")
+                )
                 scores = doc_scores_by_content.get(content_key)
                 if scores:
                     log.debug(f"Matched citation by content prefix")
@@ -748,9 +759,9 @@ class Pipe:
                 normalized = self._normalize_citation_for_openwebui(citation, i)
 
                 # Log the full citation JSON for debugging
-                log.debug(
-                    f"Full citation event JSON for doc{i}: {json.dumps(normalized, default=str)}"
-                )
+                # log.debug(
+                #     f"Full citation event JSON for doc{i}: {json.dumps(normalized, default=str)}"
+                # )
 
                 # Emit citation event for this individual source
                 source_name = (
@@ -1066,8 +1077,13 @@ class Pipe:
                     log.debug(f"Exception while processing chunk: {e}")
 
                 # Look for citations or all_retrieved_documents in any part of the response
-                if ("citations" in chunk_str.lower() or "all_retrieved_documents" in chunk_str.lower()) and not citations_data:
-                    log.debug("Found 'citations' or 'all_retrieved_documents' in chunk, attempting to parse...")
+                if (
+                    "citations" in chunk_str.lower()
+                    or "all_retrieved_documents" in chunk_str.lower()
+                ) and not citations_data:
+                    log.debug(
+                        "Found 'citations' or 'all_retrieved_documents' in chunk, attempting to parse..."
+                    )
 
                     # Try to extract citation data from the current buffer
                     try:
@@ -1094,21 +1110,38 @@ class Pipe:
                                             for choice in response_data["choices"]:
                                                 context = None
                                                 # Get context from delta or message
-                                                if "delta" in choice and isinstance(choice["delta"], dict):
-                                                    context = choice["delta"].get("context")
-                                                elif "message" in choice and isinstance(choice["message"], dict):
-                                                    context = choice["message"].get("context")
+                                                if "delta" in choice and isinstance(
+                                                    choice["delta"], dict
+                                                ):
+                                                    context = choice["delta"].get(
+                                                        "context"
+                                                    )
+                                                elif "message" in choice and isinstance(
+                                                    choice["message"], dict
+                                                ):
+                                                    context = choice["message"].get(
+                                                        "context"
+                                                    )
 
-                                                if context and isinstance(context, dict):
+                                                if context and isinstance(
+                                                    context, dict
+                                                ):
                                                     # Check for citations
                                                     if "citations" in context:
-                                                        citations_found = context["citations"]
+                                                        citations_found = context[
+                                                            "citations"
+                                                        ]
                                                         log.debug(
                                                             f"Found citations in context: {len(citations_found)} citations"
                                                         )
                                                     # Check for all_retrieved_documents
-                                                    if "all_retrieved_documents" in context:
-                                                        all_docs_found = context["all_retrieved_documents"]
+                                                    if (
+                                                        "all_retrieved_documents"
+                                                        in context
+                                                    ):
+                                                        all_docs_found = context[
+                                                            "all_retrieved_documents"
+                                                        ]
                                                         log.debug(
                                                             f"Found all_retrieved_documents in context: {len(all_docs_found)} docs"
                                                         )
@@ -1116,7 +1149,9 @@ class Pipe:
 
                                         # Merge score data if we have both
                                         if citations_found and all_docs_found:
-                                            self._merge_score_data(citations_found, all_docs_found, log)
+                                            self._merge_score_data(
+                                                citations_found, all_docs_found, log
+                                            )
 
                                         # Use citations if found, otherwise use all_retrieved_documents
                                         if citations_found and not citations_data:
