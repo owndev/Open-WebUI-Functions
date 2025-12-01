@@ -478,45 +478,99 @@ class Pipe:
             all_docs: List of all_retrieved_documents with score data
             log: Logger instance
         """
-        # Build a lookup map by content or filepath to match documents
-        doc_scores = {}
+        # Build multiple lookup maps to maximize matching chances
+        # all_retrieved_documents may have different keys than citations
+        doc_scores_by_title = {}
+        doc_scores_by_filepath = {}
+        doc_scores_by_content = {}
+        doc_scores_by_chunk_id = {}
+
         for doc in all_docs:
-            # Try to match by chunk_id, filepath, or content hash
-            key = None
-            if doc.get("chunk_id"):
-                key = doc["chunk_id"]
-            elif doc.get("filepath"):
-                key = doc["filepath"]
-            elif doc.get("content"):
-                # Use first 100 chars of content as a key
-                key = doc["content"][:100] if len(doc.get("content", "")) > 100 else doc.get("content")
+            scores = {
+                "original_search_score": doc.get("original_search_score"),
+                "rerank_score": doc.get("rerank_score"),
+            }
 
-            if key:
-                doc_scores[key] = {
-                    "original_search_score": doc.get("original_search_score"),
-                    "rerank_score": doc.get("rerank_score"),
-                }
+            # Only store if we have at least one score
+            if scores["original_search_score"] is None and scores["rerank_score"] is None:
+                continue
 
-        # Match citations with score data
+            # Index by title
+            if doc.get("title"):
+                doc_scores_by_title[doc["title"]] = scores
+
+            # Index by filepath
+            if doc.get("filepath"):
+                doc_scores_by_filepath[doc["filepath"]] = scores
+
+            # Index by chunk_id (may include title as prefix for uniqueness)
+            if doc.get("chunk_id") is not None:
+                chunk_key = doc.get("chunk_id")
+                # Also try with title prefix for uniqueness
+                if doc.get("title"):
+                    chunk_key = f"{doc['title']}_{doc['chunk_id']}"
+                doc_scores_by_chunk_id[str(doc["chunk_id"])] = scores
+                doc_scores_by_chunk_id[chunk_key] = scores
+
+            # Index by content prefix (first 100 chars)
+            if doc.get("content"):
+                content_key = doc["content"][:100] if len(doc.get("content", "")) > 100 else doc.get("content")
+                doc_scores_by_content[content_key] = scores
+
+        log.debug(
+            f"Built score lookup: by_title={len(doc_scores_by_title)}, "
+            f"by_filepath={len(doc_scores_by_filepath)}, "
+            f"by_chunk_id={len(doc_scores_by_chunk_id)}, "
+            f"by_content={len(doc_scores_by_content)}"
+        )
+
+        # Match citations with score data using multiple strategies
         matched = 0
         for citation in citations:
-            key = None
-            if citation.get("chunk_id"):
-                key = citation["chunk_id"]
-            elif citation.get("filepath"):
-                key = citation["filepath"]
-            elif citation.get("content"):
-                key = citation["content"][:100] if len(citation.get("content", "")) > 100 else citation.get("content")
+            scores = None
 
-            if key and key in doc_scores:
-                scores = doc_scores[key]
+            # Try matching by title first (most reliable)
+            if not scores and citation.get("title"):
+                scores = doc_scores_by_title.get(citation["title"])
+                if scores:
+                    log.debug(f"Matched citation by title: {citation['title']}")
+
+            # Try matching by filepath
+            if not scores and citation.get("filepath"):
+                scores = doc_scores_by_filepath.get(citation["filepath"])
+                if scores:
+                    log.debug(f"Matched citation by filepath: {citation['filepath']}")
+
+            # Try matching by chunk_id with title prefix
+            if not scores and citation.get("chunk_id") is not None:
+                chunk_key = str(citation["chunk_id"])
+                if citation.get("title"):
+                    chunk_key_with_title = f"{citation['title']}_{citation['chunk_id']}"
+                    scores = doc_scores_by_chunk_id.get(chunk_key_with_title)
+                if not scores:
+                    scores = doc_scores_by_chunk_id.get(chunk_key)
+                if scores:
+                    log.debug(f"Matched citation by chunk_id: {citation['chunk_id']}")
+
+            # Try matching by content prefix
+            if not scores and citation.get("content"):
+                content_key = citation["content"][:100] if len(citation.get("content", "")) > 100 else citation.get("content")
+                scores = doc_scores_by_content.get(content_key)
+                if scores:
+                    log.debug(f"Matched citation by content prefix")
+
+            if scores:
                 if scores.get("original_search_score") is not None:
                     citation["original_search_score"] = scores["original_search_score"]
                 if scores.get("rerank_score") is not None:
                     citation["rerank_score"] = scores["rerank_score"]
                 matched += 1
+                log.debug(
+                    f"Citation scores: original={scores.get('original_search_score')}, "
+                    f"rerank={scores.get('rerank_score')}"
+                )
 
-        log.debug(f"Merged score data for {matched}/{len(citations)} citations")
+        log.info(f"Merged score data for {matched}/{len(citations)} citations")
 
     def _normalize_citation_for_openwebui(
         self, citation: Dict[str, Any], index: int
