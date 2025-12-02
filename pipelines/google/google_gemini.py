@@ -195,7 +195,8 @@ class Pipe:
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower() == "true",
+            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
+            == "true",
             description="Use permissive safety settings for content generation.",
         )
         MODEL_CACHE_TTL: int = Field(
@@ -212,7 +213,9 @@ class Pipe:
             "this is prepended to it. Leave empty to disable.",
         )
         ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
-            default=os.getenv("GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
+            default=os.getenv(
+                "GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false"
+            ).lower()
             == "true",
             description="Whether to forward user information headers.",
         )
@@ -576,14 +579,38 @@ class Pipe:
                 and hasattr(self, "user")
                 and self.user
             ):
-                headers = {
-                    "X-OpenWebUI-User-Name": self.user.name,
-                    "X-OpenWebUI-User-Id": self.user.id,
-                    "x-openwebui-user-email": self.user.email,
-                    "X-OpenWebUI-User-Role": self.user.role,
+
+                def sanitize_header_value(value: Any, max_length: int = 255) -> str:
+                    if value is None:
+                        return ""
+                    # Convert to string and remove all control characters
+                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    sanitized = sanitized.strip()
+                    return (
+                        sanitized[:max_length]
+                        if len(sanitized) > max_length
+                        else sanitized
+                    )
+
+                user_attrs = {
+                    "X-OpenWebUI-User-Name": sanitize_header_value(
+                        getattr(self.user, "name", None)
+                    ),
+                    "X-OpenWebUI-User-Id": sanitize_header_value(
+                        getattr(self.user, "id", None)
+                    ),
+                    "X-OpenWebUI-User-Email": sanitize_header_value(
+                        getattr(self.user, "email", None)
+                    ),
+                    "X-OpenWebUI-User-Role": sanitize_header_value(
+                        getattr(self.user, "role", None)
+                    ),
                 }
+                headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
             options = types.HttpOptions(
-                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL, headers=headers
+                api_version=self.valves.API_VERSION,
+                base_url=self.valves.BASE_URL,
+                headers=headers,
             )
             return genai.Client(
                 api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
