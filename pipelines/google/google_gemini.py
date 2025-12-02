@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.2
+version: 1.8.3
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -191,11 +191,11 @@ class Pipe:
             description="The Google Cloud region to use with Vertex AI.",
         )
         VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("VERTEX_AI_RAG_STORE"),
+            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
+            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower() == "true",
             description="Use permissive safety settings for content generation.",
         )
         MODEL_CACHE_TTL: int = Field(
@@ -210,6 +210,11 @@ class Pipe:
             default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
             description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
             "this is prepended to it. Leave empty to disable.",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv("GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
+            == "true",
+            description="Whether to forward user information headers.",
         )
 
         # Image Processing Configuration
@@ -249,12 +254,6 @@ class Pipe:
         IMAGE_HISTORY_FIRST: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
-        )
-        
-        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
-            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
-            == "true",
-            description="Whether to forward user information headers.",
         )
 
     # ---------------- Internal Helpers ---------------- #
