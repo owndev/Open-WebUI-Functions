@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.3
+version: 1.8.4
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -2051,6 +2051,10 @@ class Pipe:
                 "chat:finish",
                 {"role": "assistant", "content": final_content, "done": True},
             )
+
+            # Yield final content to ensure the async iterator completes properly.
+            # This ensures the response is persisted even if the user navigates away.
+            yield final_content
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
