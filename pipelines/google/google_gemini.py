@@ -2052,6 +2052,10 @@ class Pipe:
                 {"role": "assistant", "content": final_content, "done": True},
             )
 
+            # Yield final content to ensure the async iterator completes properly.
+            # This ensures the response is persisted even if the user navigates away.
+            yield final_content
+
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
             # Check if it's a chunk size error and provide specific guidance
