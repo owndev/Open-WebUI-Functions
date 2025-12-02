@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.2
+version: 1.8.3
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -191,11 +191,12 @@ class Pipe:
             description="The Google Cloud region to use with Vertex AI.",
         )
         VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("VERTEX_AI_RAG_STORE"),
+            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
+            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
+            == "true",
             description="Use permissive safety settings for content generation.",
         )
         MODEL_CACHE_TTL: int = Field(
@@ -210,6 +211,13 @@ class Pipe:
             default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
             description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
             "this is prepended to it. Leave empty to disable.",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv(
+                "GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false"
+            ).lower()
+            == "true",
+            description="Whether to forward user information headers.",
         )
 
         # Image Processing Configuration
@@ -565,8 +573,44 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
+            headers = {}
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
+
+                def sanitize_header_value(value: Any, max_length: int = 255) -> str:
+                    if value is None:
+                        return ""
+                    # Convert to string and remove all control characters
+                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    sanitized = sanitized.strip()
+                    return (
+                        sanitized[:max_length]
+                        if len(sanitized) > max_length
+                        else sanitized
+                    )
+
+                user_attrs = {
+                    "X-OpenWebUI-User-Name": sanitize_header_value(
+                        getattr(self.user, "name", None)
+                    ),
+                    "X-OpenWebUI-User-Id": sanitize_header_value(
+                        getattr(self.user, "id", None)
+                    ),
+                    "X-OpenWebUI-User-Email": sanitize_header_value(
+                        getattr(self.user, "email", None)
+                    ),
+                    "X-OpenWebUI-User-Role": sanitize_header_value(
+                        getattr(self.user, "role", None)
+                    ),
+                }
+                headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
             options = types.HttpOptions(
-                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
+                api_version=self.valves.API_VERSION,
+                base_url=self.valves.BASE_URL,
+                headers=headers,
             )
             return genai.Client(
                 api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
