@@ -250,6 +250,12 @@ class Pipe:
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
         )
+        
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv("ENABLE_FORWARD_USER_INFO_HEADERS", "false").lower()
+            == "true",
+            description="Whether to forward user information headers.",
+        )
 
     # ---------------- Internal Helpers ---------------- #
     async def _gather_history_images(
@@ -565,8 +571,20 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
+            headers = {}
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
+                headers = {
+                    "X-OpenWebUI-User-Name": self.user.name,
+                    "X-OpenWebUI-User-Id": self.user.id,
+                    "x-openwebui-user-email": self.user.email,
+                    "X-OpenWebUI-User-Role": self.user.role,
+                }
             options = types.HttpOptions(
-                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
+                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL, headers=headers
             )
             return genai.Client(
                 api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
