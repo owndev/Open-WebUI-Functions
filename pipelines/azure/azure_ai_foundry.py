@@ -526,12 +526,12 @@ class Pipe:
 
             # Index by chunk_id (may include title as prefix for uniqueness)
             if doc.get("chunk_id") is not None:
-                chunk_key = doc.get("chunk_id")
-                # Also try with title prefix for uniqueness
-                if doc.get("title"):
-                    chunk_key = f"{doc['title']}_{doc['chunk_id']}"
+                # Store by plain chunk_id
                 doc_data_by_chunk_id[str(doc["chunk_id"])] = doc_data
-                doc_data_by_chunk_id[chunk_key] = doc_data
+                # Also store by title-prefixed chunk_id for uniqueness
+                if doc.get("title"):
+                    chunk_key_with_title = f"{doc['title']}_{doc['chunk_id']}"
+                    doc_data_by_chunk_id[chunk_key_with_title] = doc_data
 
             # Index by content prefix (first 100 chars)
             if doc.get("content"):
@@ -673,7 +673,9 @@ class Pipe:
 
         normalized_score = 0.0
 
-        # Select score based on filter_reason as per Azure documentation
+        # Select score based on filter_reason as per Azure documentation:
+        # - filter_reason="rerank": Document filtered by rerank score threshold, use rerank_score
+        # - filter_reason="score" or not present: Document filtered by/passed original search score, use original_search_score
         if filter_reason == "rerank" and rerank_score is not None:
             # Document filtered by rerank score - use rerank_score
             # Azure AI Search semantic rerankers typically return scores in 0-1 range.
@@ -686,8 +688,10 @@ class Pipe:
             log.debug(
                 f"Using rerank_score (filter_reason=rerank): {rerank_score} -> {normalized_score}"
             )
-        elif original_search_score is not None:
-            # filter_reason not present, "score", or rerank_score unavailable - use original_search_score
+        elif (
+            filter_reason is None or filter_reason == "score"
+        ) and original_search_score is not None:
+            # filter_reason is "score" or not present - use original_search_score
             # BM25/keyword search scores vary based on term frequency and document collection.
             # Typical BM25 scores in Azure AI Search range from ~0 to ~50 but can go higher.
             score_val = float(original_search_score)
@@ -698,8 +702,18 @@ class Pipe:
             log.debug(
                 f"Using original_search_score (filter_reason={filter_reason}): {original_search_score} -> {normalized_score}"
             )
+        elif original_search_score is not None:
+            # Fallback for unknown filter_reason values - use original_search_score
+            score_val = float(original_search_score)
+            if score_val > 1.0:
+                normalized_score = min(score_val / 100.0, 1.0)
+            else:
+                normalized_score = score_val
+            log.debug(
+                f"Using original_search_score (fallback, filter_reason={filter_reason}): {original_search_score} -> {normalized_score}"
+            )
         elif rerank_score is not None:
-            # Fallback to rerank_score if available but filter_reason doesn't indicate it
+            # Fallback to rerank_score if available but filter_reason doesn't match
             score_val = float(rerank_score)
             if score_val > 1.0:
                 normalized_score = min(score_val / 4.0, 1.0)
