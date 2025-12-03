@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.7.0
+version: 2.6.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -1148,7 +1148,6 @@ class Pipe:
             async for chunk in content:
                 chunk_str = chunk.decode("utf-8", errors="ignore")
                 full_response_buffer += chunk_str
-                all_chunks.append(chunk)
 
                 # Log chunk for debugging (only first 200 chars to avoid spam)
                 # log.debug(f"Processing chunk: {chunk_str[:200]}...")
