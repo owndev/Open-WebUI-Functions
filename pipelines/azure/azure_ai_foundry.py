@@ -145,6 +145,9 @@ async def cleanup_response(
 
 
 class Pipe:
+    # Regex pattern for matching [docX] citation references
+    DOC_REF_PATTERN = r"\[doc(\d+)\]"
+
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
         # Custom prefix for pipeline display name
@@ -1299,9 +1302,8 @@ class Pipe:
         Returns:
             Set of citation indices that are referenced (e.g., {1, 2, 7, 8, 9})
         """
-        # Find all [docN] references in the content
-        pattern = r"\[doc(\d+)\]"
-        matches = re.findall(pattern, content)
+        # Find all [docN] references in the content using class constant
+        matches = re.findall(self.DOC_REF_PATTERN, content)
 
         # Convert to integers and return as a set
         return {int(match) for match in matches}
@@ -1341,23 +1343,24 @@ class Pipe:
             log.debug("No URLs found in citations, skipping link conversion")
             return content
 
+        # Track conversion count during replacement
+        conversion_count = 0
+
         # Replace [docX] references with markdown links
         def replace_doc_ref(match):
+            nonlocal conversion_count
             doc_num = int(match.group(1))
             if doc_num in doc_urls:
+                conversion_count += 1
                 # Convert [doc1] to [[doc1]](url)
                 return f"[[doc{doc_num}]]({doc_urls[doc_num]})"
             return match.group(0)  # Return unchanged if no URL
 
-        pattern = r"\[doc(\d+)\]"
-        converted_content = re.sub(pattern, replace_doc_ref, content)
+        converted_content = re.sub(self.DOC_REF_PATTERN, replace_doc_ref, content)
 
         # Log how many conversions were made
-        converted_count = len(
-            re.findall(r"\[\[doc\d+\]\]\(", converted_content)
-        )
-        if converted_count > 0:
-            log.info(f"Converted {converted_count} [docX] references to markdown links")
+        if conversion_count > 0:
+            log.info(f"Converted {conversion_count} [docX] references to markdown links")
 
         return converted_content
 
