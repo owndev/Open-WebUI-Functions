@@ -60,8 +60,9 @@ AZURE_AI_ENDPOINT="https://<deployment>.openai.azure.com/openai/deployments/<mod
 # Complete JSON configuration for Azure Search - copy exactly and replace placeholder values
 AZURE_AI_DATA_SOURCES='[{"type":"azure_search","parameters":{"endpoint":"https://<your-search-service>.search.windows.net","index_name":"<your-index-name>","authentication":{"type":"api_key","key":"<your-search-api-key>"}}}]'
 
-# Enable enhanced citation display for better readability (default: true)
-AZURE_AI_ENHANCE_CITATIONS=true
+# Enable relevance score extraction from Azure Search (default: true)
+# When enabled, automatically adds include_contexts to get original_search_score and rerank_score
+AZURE_AI_INCLUDE_SEARCH_SCORES=true
 ```
 
 ### Azure AI Search / RAG Integration
@@ -155,73 +156,40 @@ For advanced use cases, you can include additional parameters:
 - **Missing API key**: Ensure your Azure Search API key has proper permissions
 - **Index not found**: Verify your index name matches exactly (case-sensitive)
 
-#### Enhanced Citation Display
+#### Native OpenWebUI Citation Support
 
-The pipeline automatically enhances Azure AI Search responses to make citations and source documents more accessible and readable. When Azure AI Search is configured, the pipeline transforms the raw citation data into a user-friendly format.
+The pipeline automatically provides native OpenWebUI citation support for Azure AI Search responses. When Azure AI Search is configured, the pipeline:
 
-**Original Azure AI Response:**
+1. **Emits citation events** via `__event_emitter__` for the OpenWebUI frontend to display interactive citation cards
+2. **Converts `[docX]` references** to clickable markdown links that link directly to document URLs
+3. **Extracts relevance scores** when `AZURE_AI_INCLUDE_SEARCH_SCORES=true`
+4. **Filters citations** to only show documents actually referenced in the response
 
-```json
-{
-  "choices": [
-    {
-      "message": {
-        "content": "**Docker container actions** are a type of GitHub Actions [doc1]...",
-        "context": {
-          "citations": [
-            {
-              "content": "environment variable. The token can be used to authenticate...",
-              "title": "README.md",
-              "chunk_id": "0"
-            }
-          ]
-        }
-      }
-    }
-  ]
-}
-```
+**Example: Clickable Document Links**
 
-**Enhanced Response with Collapsible Citations:**
-
-```html
+```markdown
+# Original Azure AI response
 **Docker container actions** are a type of GitHub Actions [doc1]...
 
-<details>
-<summary>📚 Sources and References</summary>
-
-<details>
-<summary>[doc1] - README.md</summary>
-
-📁 **File:** `README.md`
-📄 **Chunk ID:** 0
-**Content:**
-> environment variable. The token can be used to authenticate the workflow when accessing GitHub resources...
-
-</details>
-
-<details>
-<summary>[doc2] - Documentation.md</summary>
-
-📁 **File:** `Documentation.md`
-📄 **Chunk ID:** 1
-**Content:**
-> Docker container actions contain all their dependencies in the container and are therefore very consistent...
-
-</details>
-
-</details>
+# Enhanced response (with clickable links)
+**Docker container actions** are a type of GitHub Actions [[doc1]](https://example.com/README.md)...
 ```
 
-**Enhanced Citation Features:**
+**Citation Card Features:**
 
-- **Collapsible interface** with expandable sections for clean presentation
-- **Two-level organization** - main sources section and individual document details
-- **Complete content display** - full document content, not just previews
-- **Document references** with clear [doc1], [doc2] labels for easy cross-referencing
-- **Source metadata** including file paths, URLs, and chunk IDs for precise tracking
-- **Streaming support** with citations properly formatted for both streaming and non-streaming responses
-- **Space efficient** - collapsed by default to avoid overwhelming the main response
+- **Source information** with `[docX]` prefix for easy identification
+- **Relevance percentage** displayed on citation cards (requires `AZURE_AI_INCLUDE_SEARCH_SCORES=true`)
+- **Document preview** with content snippets
+- **Clickable links** to source documents when URLs are available
+- **Streaming support** with links converted inline as content streams
+
+**Relevance Score Selection:**
+
+The pipeline uses the `filter_reason` field from Azure Search to select the appropriate score:
+- `filter_reason="rerank"` → uses `rerank_score`
+- `filter_reason="score"` or not present → uses `original_search_score`
+
+For more details, see the [Azure AI Citations Documentation](azure-ai-citations.md).
 
 > [!TIP]  
 > To use **Azure OpenAI** and other **Azure AI** models **simultaneously**, you can use the following URL: `https://<your project>.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview`
