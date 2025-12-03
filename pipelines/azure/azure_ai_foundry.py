@@ -662,11 +662,11 @@ class Pipe:
 
         # Prefer rerank_score (semantic ranker), then original_search_score, then legacy score
         if rerank_score is not None:
-            # Azure AI Search reranker scores are typically already 0-1
-            # Use as-is if <= 1, normalize if > 1 (some models may return 0-4 range)
+            # Azure AI Search semantic rerankers typically return scores in 0-1 range.
+            # However, some Cohere rerankers (via Azure AI) may use 0-4 range.
+            # We normalize to 0-1: use as-is if <= 1, divide by 4 if > 1.
             score_val = float(rerank_score)
             if score_val > 1.0:
-                # Normalize scores > 1 (some semantic rerankers use 0-4 range)
                 normalized_score = min(score_val / 4.0, 1.0)
             else:
                 normalized_score = score_val
@@ -675,11 +675,11 @@ class Pipe:
                 f"Using rerank_score {rerank_score} -> normalized {normalized_score}"
             )
         elif original_search_score is not None:
-            # Original search scores can vary widely (BM25 scores can be > 1)
-            # Use as-is if <= 1, otherwise normalize
+            # BM25/keyword search scores vary based on term frequency and document collection.
+            # Typical BM25 scores in Azure AI Search range from ~0 to ~50 but can go higher.
+            # We normalize to 0-1: use as-is if <= 1, otherwise apply heuristic /100 cap.
             score_val = float(original_search_score)
             if score_val > 1.0:
-                # Normalize high scores (BM25 scores can be much greater than 1)
                 normalized_score = min(score_val / 100.0, 1.0)
             else:
                 normalized_score = score_val
