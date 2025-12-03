@@ -750,6 +750,34 @@ class Pipe:
 
         return citation_event
 
+    def _build_citation_names_map(
+        self, citations: Optional[List[Dict[str, Any]]]
+    ) -> Dict[int, Optional[str]]:
+        """
+        Build a mapping of citation indices to source names.
+
+        Args:
+            citations: List of citation objects with title, filepath, url, etc.
+
+        Returns:
+            Dict mapping 1-based citation index to source name (or None if no name available)
+        """
+        citation_names: Dict[int, Optional[str]] = {}
+        if not citations:
+            return citation_names
+
+        for i, citation in enumerate(citations, 1):
+            if isinstance(citation, dict):
+                # Get title with fallback chain
+                title = citation.get("title") or ""
+                filepath = citation.get("filepath") or ""
+                url = citation.get("url") or ""
+
+                source_name = title.strip() or filepath.strip() or url.strip() or None
+                citation_names[i] = source_name
+
+        return citation_names
+
     def _format_source_tag(
         self, doc_num: int, source_name: Optional[str] = None
     ) -> str:
@@ -802,18 +830,7 @@ class Pipe:
         log = logging.getLogger("azure_ai._convert_doc_refs_to_source_tags")
 
         # Build a mapping of citation index to source name
-        citation_names = {}
-        for i, citation in enumerate(citations, 1):
-            if isinstance(citation, dict):
-                # Get title with fallback chain
-                title = citation.get("title") or ""
-                filepath = citation.get("filepath") or ""
-                url = citation.get("url") or ""
-
-                source_name = (
-                    title.strip() or filepath.strip() or url.strip() or f"Document {i}"
-                )
-                citation_names[i] = source_name
+        citation_names = self._build_citation_names_map(citations)
 
         def replace_doc_ref(match):
             """Replace [docX] with <source id="X" name="title">[docX]</source>"""
@@ -1322,20 +1339,14 @@ class Pipe:
                 chunk_modified = False
                 if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and "[doc" in chunk_str:
                     try:
-                        # Build citation names map if we have citations data
-                        citation_names = {}
-                        if citations_data:
-                            for i, cit in enumerate(citations_data, 1):
-                                if isinstance(cit, dict):
-                                    title = cit.get("title") or ""
-                                    filepath = cit.get("filepath") or ""
-                                    url = cit.get("url") or ""
-                                    citation_names[i] = (
-                                        title.strip()
-                                        or filepath.strip()
-                                        or url.strip()
-                                        or None
-                                    )
+                        # Build citation names map using shared helper
+                        citation_names = self._build_citation_names_map(citations_data)
+
+                        # Define replacement function once, outside inner loops
+                        def replace_ref(m):
+                            doc_num = int(m.group(1))
+                            source_name = citation_names.get(doc_num)
+                            return self._format_source_tag(doc_num, source_name)
 
                         # Parse and modify each SSE data line
                         modified_lines = []
@@ -1361,17 +1372,6 @@ class Pipe:
                                                     content_val = choice["delta"]["content"]
                                                     if "[doc" in content_val:
                                                         # Convert [docX] to <source> tag
-                                                        # Use _format_source_tag with name if available
-
-                                                        def replace_ref(m):
-                                                            doc_num = int(m.group(1))
-                                                            source_name = citation_names.get(
-                                                                doc_num
-                                                            )
-                                                            return self._format_source_tag(
-                                                                doc_num, source_name
-                                                            )
-
                                                         choice["delta"]["content"] = re.sub(
                                                             self.DOC_REF_PATTERN,
                                                             replace_ref,
