@@ -476,6 +476,11 @@ class Pipe:
         additional documents with score fields. This method attempts to match
         them with citations and copy over the score data.
 
+        Copies:
+        - original_search_score: BM25/keyword search score
+        - rerank_score: Semantic reranker score (if enabled)
+        - filter_reason: Indicates which score is relevant ("score" or "rerank")
+
         Args:
             citations: List of citation objects to update (modified in place)
             all_docs: List of all_retrieved_documents with score data
@@ -483,39 +488,41 @@ class Pipe:
         """
         # Build multiple lookup maps to maximize matching chances
         # all_retrieved_documents may have different keys than citations
-        doc_scores_by_title = {}
-        doc_scores_by_filepath = {}
-        doc_scores_by_content = {}
-        doc_scores_by_chunk_id = {}
+        doc_data_by_title = {}
+        doc_data_by_filepath = {}
+        doc_data_by_content = {}
+        doc_data_by_chunk_id = {}
 
         for doc in all_docs:
-            scores = {
+            doc_data = {
                 "original_search_score": doc.get("original_search_score"),
                 "rerank_score": doc.get("rerank_score"),
+                "filter_reason": doc.get("filter_reason"),
             }
 
             log.debug(
                 f"Processing all_retrieved_document: title='{doc.get('title')}', "
                 f"chunk_id='{doc.get('chunk_id')}', "
-                f"original_search_score={scores['original_search_score']}, "
-                f"rerank_score={scores['rerank_score']}"
+                f"original_search_score={doc_data['original_search_score']}, "
+                f"rerank_score={doc_data['rerank_score']}, "
+                f"filter_reason={doc_data['filter_reason']}"
             )
 
             # Only store if we have at least one score
             if (
-                scores["original_search_score"] is None
-                and scores["rerank_score"] is None
+                doc_data["original_search_score"] is None
+                and doc_data["rerank_score"] is None
             ):
                 log.debug(f"Skipping doc with no scores: {doc.get('title')}")
                 continue
 
             # Index by title
             if doc.get("title"):
-                doc_scores_by_title[doc["title"]] = scores
+                doc_data_by_title[doc["title"]] = doc_data
 
             # Index by filepath
             if doc.get("filepath"):
-                doc_scores_by_filepath[doc["filepath"]] = scores
+                doc_data_by_filepath[doc["filepath"]] = doc_data
 
             # Index by chunk_id (may include title as prefix for uniqueness)
             if doc.get("chunk_id") is not None:
@@ -523,8 +530,8 @@ class Pipe:
                 # Also try with title prefix for uniqueness
                 if doc.get("title"):
                     chunk_key = f"{doc['title']}_{doc['chunk_id']}"
-                doc_scores_by_chunk_id[str(doc["chunk_id"])] = scores
-                doc_scores_by_chunk_id[chunk_key] = scores
+                doc_data_by_chunk_id[str(doc["chunk_id"])] = doc_data
+                doc_data_by_chunk_id[chunk_key] = doc_data
 
             # Index by content prefix (first 100 chars)
             if doc.get("content"):
@@ -533,63 +540,66 @@ class Pipe:
                     if len(doc.get("content", "")) > 100
                     else doc.get("content")
                 )
-                doc_scores_by_content[content_key] = scores
+                doc_data_by_content[content_key] = doc_data
 
         log.debug(
-            f"Built score lookup: by_title={len(doc_scores_by_title)}, "
-            f"by_filepath={len(doc_scores_by_filepath)}, "
-            f"by_chunk_id={len(doc_scores_by_chunk_id)}, "
-            f"by_content={len(doc_scores_by_content)}"
+            f"Built score lookup: by_title={len(doc_data_by_title)}, "
+            f"by_filepath={len(doc_data_by_filepath)}, "
+            f"by_chunk_id={len(doc_data_by_chunk_id)}, "
+            f"by_content={len(doc_data_by_content)}"
         )
 
         # Match citations with score data using multiple strategies
         matched = 0
         for citation in citations:
-            scores = None
+            doc_data = None
 
             # Try matching by title first (most reliable)
-            if not scores and citation.get("title"):
-                scores = doc_scores_by_title.get(citation["title"])
-                if scores:
+            if not doc_data and citation.get("title"):
+                doc_data = doc_data_by_title.get(citation["title"])
+                if doc_data:
                     log.debug(f"Matched citation by title: {citation['title']}")
 
             # Try matching by filepath
-            if not scores and citation.get("filepath"):
-                scores = doc_scores_by_filepath.get(citation["filepath"])
-                if scores:
+            if not doc_data and citation.get("filepath"):
+                doc_data = doc_data_by_filepath.get(citation["filepath"])
+                if doc_data:
                     log.debug(f"Matched citation by filepath: {citation['filepath']}")
 
             # Try matching by chunk_id with title prefix
-            if not scores and citation.get("chunk_id") is not None:
+            if not doc_data and citation.get("chunk_id") is not None:
                 chunk_key = str(citation["chunk_id"])
                 if citation.get("title"):
                     chunk_key_with_title = f"{citation['title']}_{citation['chunk_id']}"
-                    scores = doc_scores_by_chunk_id.get(chunk_key_with_title)
-                if not scores:
-                    scores = doc_scores_by_chunk_id.get(chunk_key)
-                if scores:
+                    doc_data = doc_data_by_chunk_id.get(chunk_key_with_title)
+                if not doc_data:
+                    doc_data = doc_data_by_chunk_id.get(chunk_key)
+                if doc_data:
                     log.debug(f"Matched citation by chunk_id: {citation['chunk_id']}")
 
             # Try matching by content prefix
-            if not scores and citation.get("content"):
+            if not doc_data and citation.get("content"):
                 content_key = (
                     citation["content"][:100]
                     if len(citation.get("content", "")) > 100
                     else citation.get("content")
                 )
-                scores = doc_scores_by_content.get(content_key)
-                if scores:
-                    log.debug(f"Matched citation by content prefix")
+                doc_data = doc_data_by_content.get(content_key)
+                if doc_data:
+                    log.debug("Matched citation by content prefix")
 
-            if scores:
-                if scores.get("original_search_score") is not None:
-                    citation["original_search_score"] = scores["original_search_score"]
-                if scores.get("rerank_score") is not None:
-                    citation["rerank_score"] = scores["rerank_score"]
+            if doc_data:
+                if doc_data.get("original_search_score") is not None:
+                    citation["original_search_score"] = doc_data["original_search_score"]
+                if doc_data.get("rerank_score") is not None:
+                    citation["rerank_score"] = doc_data["rerank_score"]
+                if doc_data.get("filter_reason") is not None:
+                    citation["filter_reason"] = doc_data["filter_reason"]
                 matched += 1
                 log.debug(
-                    f"Citation scores: original={scores.get('original_search_score')}, "
-                    f"rerank={scores.get('rerank_score')}"
+                    f"Citation scores: original={doc_data.get('original_search_score')}, "
+                    f"rerank={doc_data.get('rerank_score')}, "
+                    f"filter_reason={doc_data.get('filter_reason')}"
                 )
 
         log.info(f"Merged score data for {matched}/{len(citations)} citations")
@@ -652,47 +662,59 @@ class Pipe:
             citation_data["source"]["url"] = source_url
 
         # Add distances array for relevance score (OpenWebUI uses this for percentage display)
-        # Priority: rerank_score > original_search_score > score
-        # rerank_score is the semantic reranker score (if enabled in Azure AI Search)
-        # original_search_score is the BM25/keyword search score
-        # score is a legacy field for backward compatibility
+        # Azure AI Search returns filter_reason to indicate which score type is relevant:
+        # - filter_reason not present or "score": use original_search_score (BM25/keyword)
+        # - filter_reason "rerank": use rerank_score (semantic reranker)
+        # Reference: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data
+        filter_reason = citation.get("filter_reason")
         rerank_score = citation.get("rerank_score")
         original_search_score = citation.get("original_search_score")
         legacy_score = citation.get("score")
 
-        # Prefer rerank_score (semantic ranker), then original_search_score, then legacy score
-        if rerank_score is not None:
+        normalized_score = 0.0
+
+        # Select score based on filter_reason as per Azure documentation
+        if filter_reason == "rerank" and rerank_score is not None:
+            # Document filtered by rerank score - use rerank_score
             # Azure AI Search semantic rerankers typically return scores in 0-1 range.
             # However, some Cohere rerankers (via Azure AI) may use 0-4 range.
-            # We normalize to 0-1: use as-is if <= 1, divide by 4 if > 1.
             score_val = float(rerank_score)
             if score_val > 1.0:
                 normalized_score = min(score_val / 4.0, 1.0)
             else:
                 normalized_score = score_val
-            citation_data["distances"] = [normalized_score]
             log.debug(
-                f"Using rerank_score {rerank_score} -> normalized {normalized_score}"
+                f"Using rerank_score (filter_reason=rerank): {rerank_score} -> {normalized_score}"
             )
         elif original_search_score is not None:
+            # filter_reason not present, "score", or rerank_score unavailable - use original_search_score
             # BM25/keyword search scores vary based on term frequency and document collection.
             # Typical BM25 scores in Azure AI Search range from ~0 to ~50 but can go higher.
-            # We normalize to 0-1: use as-is if <= 1, otherwise apply heuristic /100 cap.
             score_val = float(original_search_score)
             if score_val > 1.0:
                 normalized_score = min(score_val / 100.0, 1.0)
             else:
                 normalized_score = score_val
-            citation_data["distances"] = [normalized_score]
             log.debug(
-                f"Using original_search_score {original_search_score} -> {normalized_score}"
+                f"Using original_search_score (filter_reason={filter_reason}): {original_search_score} -> {normalized_score}"
+            )
+        elif rerank_score is not None:
+            # Fallback to rerank_score if available but filter_reason doesn't indicate it
+            score_val = float(rerank_score)
+            if score_val > 1.0:
+                normalized_score = min(score_val / 4.0, 1.0)
+            else:
+                normalized_score = score_val
+            log.debug(
+                f"Using rerank_score (fallback): {rerank_score} -> {normalized_score}"
             )
         elif legacy_score is not None:
-            citation_data["distances"] = [float(legacy_score)]
-            log.debug(f"Using legacy score {legacy_score}")
+            normalized_score = float(legacy_score)
+            log.debug(f"Using legacy score: {legacy_score}")
         else:
-            # Default to 0 if no score to ensure the distances field is present
-            citation_data["distances"] = [0.0]
+            log.debug("No score available, using default 0.0")
+
+        citation_data["distances"] = [normalized_score]
 
         # Build complete citation event structure
         citation_event = {
@@ -706,6 +728,7 @@ class Pipe:
                 f"Normalized citation {index}: title='{title}', "
                 f"content_length={len(content)}, "
                 f"url='{source_url}', "
+                f"filter_reason={filter_reason}, "
                 f"rerank_score={rerank_score}, original_search_score={original_search_score}, "
                 f"distances={citation_data['distances']}, "
                 f"event={json.dumps(citation_event, default=str)[:500]}"
