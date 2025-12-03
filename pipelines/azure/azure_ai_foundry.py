@@ -42,6 +42,7 @@ import os
 import logging
 import base64
 import hashlib
+import html
 import re
 from pydantic_core import core_schema
 
@@ -794,13 +795,8 @@ class Pipe:
             Formatted <source> tag string
         """
         if source_name:
-            # Escape special characters in source_name for HTML attribute
-            escaped_name = (
-                source_name.replace("&", "&amp;")
-                .replace('"', "&quot;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
+            # Use html.escape for proper HTML entity encoding (handles all special chars)
+            escaped_name = html.escape(source_name, quote=True)
             return f'<source id="{doc_num}" name="{escaped_name}">[doc{doc_num}]</source>'
         else:
             return f'<source id="{doc_num}">[doc{doc_num}]</source>'
