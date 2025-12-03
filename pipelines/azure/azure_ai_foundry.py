@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.0
+version: 2.7.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -15,8 +15,9 @@ features:
   - Compatible with Azure OpenAI and other Azure AI models.
   - Predefined models for easy access.
   - Encrypted storage of sensitive API keys
-  - Azure AI Search / RAG integration with enhanced citation display (Azure OpenAI only)
-  - Native OpenWebUI citations support with structured events and citation cards (Azure OpenAI only)
+  - Azure AI Search / RAG integration with native OpenWebUI citations (Azure OpenAI only)
+  - Automatic [docX] to markdown link conversion for clickable citations
+  - Relevance scores from Azure AI Search displayed in citation cards
 """
 
 from typing import (
@@ -202,18 +203,6 @@ class Pipe:
         AZURE_AI_DATA_SOURCES: str = Field(
             default=os.getenv("AZURE_AI_DATA_SOURCES", ""),
             description='JSON configuration for data_sources field (for Azure AI Search / RAG). Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key","key":"your-key"}}}]\'',
-        )
-
-        # Enable enhanced citation display for Azure AI Search responses
-        AZURE_AI_ENHANCE_CITATIONS: bool = Field(
-            default=False,
-            description="If True, enhance Azure AI Search responses with better citation formatting and source content display (markdown/HTML).",
-        )
-
-        # Enable native OpenWebUI citations (structured events and fields)
-        AZURE_AI_OPENWEBUI_CITATIONS: bool = Field(
-            default=True,
-            description="If True, emit native OpenWebUI citation events for streaming responses and attach openwebui_citations field for non-streaming responses. Enables citation cards and UI in OpenWebUI frontend.",
         )
 
         # Enable relevance scores from Azure AI Search
@@ -929,17 +918,14 @@ class Pipe:
 
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enhance Azure AI Search responses by improving citation display and adding source content.
+        Enhance Azure AI Search responses by converting [docX] references to markdown links.
         Modifies the response in-place and returns it.
-
-        If AZURE_AI_ENHANCE_CITATIONS is True, appends a formatted markdown/HTML citation section
-        to the response content.
 
         Args:
             response: The original response from Azure AI (modified in-place)
 
         Returns:
-            The enhanced response with better citation formatting
+            The enhanced response with markdown links for citations
         """
         if not isinstance(response, dict):
             return response
@@ -961,42 +947,11 @@ class Pipe:
             citations = context["citations"]
             content = message["content"]
 
-            # Create citation mappings
-            citation_details = {}
-            for i, citation in enumerate(citations, 1):
-                if not isinstance(citation, dict):
-                    continue
-
-                doc_ref = f"[doc{i}]"
-                citation_details[doc_ref] = {
-                    "title": citation.get("title", "Unknown Document"),
-                    "content": citation.get("content", ""),
-                    "url": citation.get("url"),
-                    "filepath": citation.get("filepath"),
-                    "chunk_id": citation.get("chunk_id", "0"),
-                }
-
-            # Enhance the content with better citation display (if enabled)
-            enhanced_content = content
-
-            # Convert [docX] references to markdown links for citation linking
-            if self.valves.AZURE_AI_OPENWEBUI_CITATIONS:
-                enhanced_content = self._convert_doc_refs_to_links(
-                    enhanced_content, citations
-                )
-
-            # Add citation section at the end (if markdown/HTML citations are enabled)
-            if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
-                citation_section = self._format_citation_section(
-                    citations, content, for_streaming=False
-                )
-                enhanced_content += citation_section
+            # Convert [docX] references to markdown links
+            enhanced_content = self._convert_doc_refs_to_links(content, citations)
 
             # Update the message content
             message["content"] = enhanced_content
-
-            # Add enhanced citation info to context for API consumers
-            context["enhanced_citations"] = citation_details
 
             return response
 
@@ -1189,8 +1144,6 @@ class Pipe:
             full_response_buffer = ""
             response_content = ""  # Track the actual response content
             citations_data = None
-            citations_added = False
-            all_chunks = []
 
             async for chunk in content:
                 chunk_str = chunk.decode("utf-8", errors="ignore")
@@ -1328,7 +1281,7 @@ class Pipe:
                 # Convert [docX] references to markdown links in the chunk content
                 # This creates clickable links to source documents in streaming responses
                 chunk_modified = False
-                if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and "[doc" in chunk_str:
+                if "[doc" in chunk_str:
                     try:
                         # Build citation URLs map using shared helper
                         citation_urls = self._build_citation_urls_map(citations_data)
@@ -1404,58 +1357,13 @@ class Pipe:
                     log.debug("End of stream detected")
                     break
 
-            # After the stream ends, emit OpenWebUI citation events if enabled
-            if (
-                citations_data
-                and self.valves.AZURE_AI_OPENWEBUI_CITATIONS
-                and __event_emitter__
-            ):
+            # After the stream ends, emit OpenWebUI citation events
+            if citations_data and __event_emitter__:
                 log.info("Emitting OpenWebUI citation events at end of stream...")
                 # Filter to only citations referenced in the response content
                 await self._emit_openwebui_citation_events(
                     citations_data, __event_emitter__, response_content
                 )
-
-            # After the stream ends, add markdown/HTML citations if we found any and it's enabled
-            if (
-                citations_data
-                and not citations_added
-                and self.valves.AZURE_AI_ENHANCE_CITATIONS
-            ):
-                log.info("Adding citation summary at end of stream...")
-
-                # Pass the accumulated response content to filter citations
-                citation_section = self._format_citation_section(
-                    citations_data, response_content, for_streaming=True
-                )
-                if citation_section:
-                    # Convert escaped newlines to actual newlines for display
-                    display_section = citation_section.replace("\\n", "\n")
-
-                    # Send the citation section in smaller, safer chunks
-                    # Split by lines and send each as a separate SSE event
-                    lines = display_section.split("\n")
-
-                    for line in lines:
-                        # Escape quotes and backslashes for JSON
-                        safe_line = line.replace("\\", "\\\\").replace('"', '\\"')
-                        # Create a simple SSE event
-                        sse_event = f'data: {{"choices":[{{"delta":{{"content":"{safe_line}\\n"}}}}]}}\n\n'
-                        yield sse_event.encode("utf-8")
-
-                    citations_added = True
-                    log.info("Citation summary successfully added to stream")
-
-            # If we didn't find citations in the stream but detected citation references,
-            # try one more time with the full buffer
-            elif not citations_data and "[doc" in full_response_buffer:
-                log.warning(
-                    "Found [doc] references but no citation data - attempting final parse..."
-                )
-                # This is a fallback for cases where citation detection failed
-                fallback_message = "\\n\\n<details>\\n<summary>⚠️ Citations Processing Issue</summary>\\n\\nThe response contains citation references [doc1], [doc2], etc., but the citation details could not be extracted from the streaming response.\\n\\n</details>\\n"
-                fallback_sse = f'data: {{"choices":[{{"delta":{{"content":"{fallback_message}"}}}}]}}\n\n'
-                yield fallback_sse.encode("utf-8")
 
             # Send completion status update when streaming is done
             if __event_emitter__:
@@ -1506,124 +1414,6 @@ class Pipe:
 
         # Convert to integers and return as a set
         return {int(match) for match in matches}
-
-    def _format_citation_section(
-        self,
-        citations: List[Dict[str, Any]],
-        content: str = "",
-        for_streaming: bool = False,
-    ) -> str:
-        """
-        Creates a formatted citation section using collapsible details elements.
-        Only includes citations that are actually referenced in the content.
-
-        Args:
-            citations: List of citation objects
-            content: The response content (used to filter only referenced citations)
-            for_streaming: If True, format for streaming (with escaping), else for regular response
-
-        Returns:
-            Formatted citation section with HTML details elements
-        """
-        if not citations:
-            return ""
-
-        # Extract which citations are actually referenced in the content
-        referenced_indices = self._extract_referenced_citations(content)
-
-        # If we couldn't find any references, include all citations (backward compatibility)
-        if not referenced_indices:
-            referenced_indices = set(range(1, len(citations) + 1))
-
-        # Collect only referenced citation details
-        citation_entries = []
-
-        for i, citation in enumerate(citations, 1):
-            # Skip citations that are not referenced in the content
-            if i not in referenced_indices:
-                continue
-
-            if not isinstance(citation, dict):
-                continue
-
-            doc_ref = f"[doc{i}]"
-
-            # Get title with fallback to filepath or url
-            title = citation.get("title", "")
-            # Check if title is empty (not just None) and use alternatives
-            if not title or not title.strip():
-                # Try filepath first
-                filepath = citation.get("filepath", "")
-                if filepath and filepath.strip():
-                    title = filepath
-                else:
-                    # Try url next
-                    url = citation.get("url", "")
-                    if url and url.strip():
-                        title = url
-                    else:
-                        # Final fallback
-                        title = "Unknown Document"
-
-            content_text = citation.get("content", "")
-            filepath = citation.get("filepath", "")
-            url = citation.get("url", "")
-            chunk_id = citation.get("chunk_id", "")
-
-            # Build individual citation details
-            citation_info = []
-
-            # Show filepath if available and not empty
-            if filepath and filepath.strip():
-                citation_info.append(f"📁 **File:** `{filepath}`")
-            # Show URL if available, not empty, and no filepath was shown
-            elif url and url.strip():
-                citation_info.append(f"🔗 **URL:** {url}")
-
-            # Show chunk_id if available and not empty
-            if chunk_id is not None and str(chunk_id).strip():
-                citation_info.append(f"📄 **Chunk ID:** {chunk_id}")
-
-            # Add full content if available
-            if content_text and str(content_text).strip():
-                try:
-                    # Clean content for display
-                    clean_content = str(content_text).strip()
-                    if for_streaming:
-                        # Additional escaping for streaming
-                        clean_content = clean_content.replace("\\", "\\\\").replace(
-                            '"', '\\"'
-                        )
-
-                    citation_info.append("**Content:**")
-                    citation_info.append(f"> {clean_content}")
-                except Exception:
-                    citation_info.append("**Content:** [Content unavailable]")
-
-            # Create collapsible details for individual citation
-            if for_streaming:
-                # For streaming, we need to escape newlines
-                citation_content = "\\n".join(citation_info)
-                citation_entry = f"<details>\\n<summary>{doc_ref} - {title}</summary>\\n\\n{citation_content}\\n\\n</details>"
-            else:
-                citation_content = "\n".join(citation_info)
-                citation_entry = f"<details>\n<summary>{doc_ref} - {title}</summary>\n\n{citation_content}\n\n</details>"
-
-            citation_entries.append(citation_entry)
-
-        # Only create the section if we have citations to show
-        if not citation_entries:
-            return ""
-
-        # Combine all citations into main collapsible section
-        if for_streaming:
-            all_citations = "\\n\\n".join(citation_entries)
-            result = f"\\n\\n<details>\\n<summary>📚 Sources and References</summary>\\n\\n{all_citations}\\n\\n</details>\\n"
-        else:
-            all_citations = "\n\n".join(citation_entries)
-            result = f"\n\n<details>\n<summary>📚 Sources and References</summary>\n\n{all_citations}\n\n</details>\n"
-
-        return result
 
     async def stream_processor(
         self,
@@ -1836,11 +1626,8 @@ class Pipe:
                 sse_headers["Content-Type"] = "text/event-stream"
                 sse_headers.pop("Content-Length", None)
 
-                # Use enhanced stream processor if Azure AI Search is configured and citations are enabled
-                if self.valves.AZURE_AI_DATA_SOURCES and (
-                    self.valves.AZURE_AI_ENHANCE_CITATIONS
-                    or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
-                ):
+                # Use enhanced stream processor if Azure AI Search is configured
+                if self.valves.AZURE_AI_DATA_SOURCES:
                     stream_processor = self.stream_processor_with_citations
                 else:
                     stream_processor = self.stream_processor
@@ -1870,17 +1657,12 @@ class Pipe:
 
                 request.raise_for_status()
 
-                # Enhance Azure Search responses with better citation display
-                # Call this when either citation mode is enabled
+                # Enhance Azure Search responses with citation linking and emit citation events
                 if isinstance(response, dict) and self.valves.AZURE_AI_DATA_SOURCES:
-                    if (
-                        self.valves.AZURE_AI_ENHANCE_CITATIONS
-                        or self.valves.AZURE_AI_OPENWEBUI_CITATIONS
-                    ):
-                        response = self.enhance_azure_search_response(response)
+                    response = self.enhance_azure_search_response(response)
 
-                    # Emit native OpenWebUI citation events for non-streaming responses
-                    if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and __event_emitter__:
+                    # Emit OpenWebUI citation events for non-streaming responses
+                    if __event_emitter__:
                         citations = self._extract_citations_from_response(response)
                         if citations:
                             # Get response content for filtering
