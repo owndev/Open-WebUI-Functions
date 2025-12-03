@@ -42,7 +42,6 @@ import os
 import logging
 import base64
 import hashlib
-import html
 import re
 from pydantic_core import core_schema
 
@@ -751,96 +750,94 @@ class Pipe:
 
         return citation_event
 
-    def _build_citation_names_map(
+    def _build_citation_urls_map(
         self, citations: Optional[List[Dict[str, Any]]]
     ) -> Dict[int, Optional[str]]:
         """
-        Build a mapping of citation indices to source names.
+        Build a mapping of citation indices to document URLs.
 
         Args:
             citations: List of citation objects with title, filepath, url, etc.
 
         Returns:
-            Dict mapping 1-based citation index to source name (or None if no name available)
+            Dict mapping 1-based citation index to URL (or None if no URL available)
         """
-        citation_names: Dict[int, Optional[str]] = {}
+        citation_urls: Dict[int, Optional[str]] = {}
         if not citations:
-            return citation_names
+            return citation_urls
 
         for i, citation in enumerate(citations, 1):
             if isinstance(citation, dict):
-                # Get title with fallback chain
-                title = citation.get("title") or ""
-                filepath = citation.get("filepath") or ""
+                # Get URL with fallback to filepath
                 url = citation.get("url") or ""
+                filepath = citation.get("filepath") or ""
 
-                source_name = title.strip() or filepath.strip() or url.strip() or None
-                citation_names[i] = source_name
+                citation_url = url.strip() or filepath.strip() or None
+                citation_urls[i] = citation_url
 
-        return citation_names
+        return citation_urls
 
-    def _format_source_tag(
-        self, doc_num: int, source_name: Optional[str] = None
+    def _format_citation_link(
+        self, doc_num: int, url: Optional[str] = None
     ) -> str:
         """
-        Format a <source> tag for a [docX] reference.
+        Format a markdown link for a [docX] reference.
 
-        Creates an OpenWebUI-compatible source tag that enables citation linking.
+        If a URL is available, creates a clickable markdown link.
+        Otherwise, returns the original [docX] reference.
 
         Args:
             doc_num: The document number (1-based)
-            source_name: Optional source name/title for the document
+            url: Optional URL for the document
 
         Returns:
-            Formatted <source> tag string
+            Formatted markdown link string or original [docX] reference
         """
-        if source_name:
-            # Use html.escape for proper HTML entity encoding (handles all special chars)
-            escaped_name = html.escape(source_name, quote=True)
-            return f'<source id="{doc_num}" name="{escaped_name}">[doc{doc_num}]</source>'
+        if url:
+            # Create markdown link: [[doc1]](url)
+            return f"[[doc{doc_num}]]({url})"
         else:
-            return f'<source id="{doc_num}">[doc{doc_num}]</source>'
+            # No URL available, keep original reference
+            return f"[doc{doc_num}]"
 
-    def _convert_doc_refs_to_source_tags(
+    def _convert_doc_refs_to_links(
         self, content: str, citations: List[Dict[str, Any]]
     ) -> str:
         """
-        Convert [docX] references in content to OpenWebUI <source> tags for citation linking.
+        Convert [docX] references in content to markdown links with document URLs.
 
-        OpenWebUI uses <source id="X" name="title">text</source> tags to create clickable
-        citation links in the response. This method converts Azure's [doc1], [doc2], etc.
-        references to this format.
-
-        Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+        If a citation has a URL, [doc1] becomes [[doc1]](url). This creates clickable
+        links to the source documents in the response.
 
         Args:
             content: The response content containing [docX] references
             citations: List of citation objects with title, url, etc.
 
         Returns:
-            Content with [docX] references converted to <source> tags
+            Content with [docX] references converted to markdown links
         """
         if not content or not citations:
             return content
 
-        log = logging.getLogger("azure_ai._convert_doc_refs_to_source_tags")
+        log = logging.getLogger("azure_ai._convert_doc_refs_to_links")
 
-        # Build a mapping of citation index to source name
-        citation_names = self._build_citation_names_map(citations)
+        # Build a mapping of citation index to URL
+        citation_urls = self._build_citation_urls_map(citations)
 
         def replace_doc_ref(match):
-            """Replace [docX] with <source id="X" name="title">[docX]</source>"""
+            """Replace [docX] with [[docX]](url) if URL available"""
             doc_num = int(match.group(1))
-            source_name = citation_names.get(doc_num)
-            return self._format_source_tag(doc_num, source_name)
+            url = citation_urls.get(doc_num)
+            return self._format_citation_link(doc_num, url)
 
         # Replace all [docX] references
         converted = re.sub(self.DOC_REF_PATTERN, replace_doc_ref, content)
 
         # Count conversions for logging
         original_count = len(re.findall(self.DOC_REF_PATTERN, content))
+        linked_count = sum(1 for i in range(1, len(citations) + 1) if citation_urls.get(i))
         if original_count > 0:
-            log.info(f"Converted {original_count} [docX] references to <source> tags")
+            log.info(f"Converted {original_count} [docX] references to markdown links ({linked_count} with URLs)")
 
         return converted
 
@@ -982,10 +979,9 @@ class Pipe:
             # Enhance the content with better citation display (if enabled)
             enhanced_content = content
 
-            # Convert [docX] references to <source> tags for OpenWebUI citation linking
-            # Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+            # Convert [docX] references to markdown links for citation linking
             if self.valves.AZURE_AI_OPENWEBUI_CITATIONS:
-                enhanced_content = self._convert_doc_refs_to_source_tags(
+                enhanced_content = self._convert_doc_refs_to_links(
                     enhanced_content, citations
                 )
 
@@ -1329,20 +1325,19 @@ class Pipe:
                     except Exception as parse_error:
                         log.debug(f"Error parsing citations from chunk: {parse_error}")
 
-                # Convert [docX] references to <source> tags in the chunk content
-                # This enables OpenWebUI to link citations in streaming responses
-                # Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+                # Convert [docX] references to markdown links in the chunk content
+                # This creates clickable links to source documents in streaming responses
                 chunk_modified = False
                 if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and "[doc" in chunk_str:
                     try:
-                        # Build citation names map using shared helper
-                        citation_names = self._build_citation_names_map(citations_data)
+                        # Build citation URLs map using shared helper
+                        citation_urls = self._build_citation_urls_map(citations_data)
 
                         # Define replacement function once, outside inner loops
                         def replace_ref(m):
                             doc_num = int(m.group(1))
-                            source_name = citation_names.get(doc_num)
-                            return self._format_source_tag(doc_num, source_name)
+                            url = citation_urls.get(doc_num)
+                            return self._format_citation_link(doc_num, url)
 
                         # Parse and modify each SSE data line
                         modified_lines = []
@@ -1367,7 +1362,7 @@ class Pipe:
                                                 ):
                                                     content_val = choice["delta"]["content"]
                                                     if "[doc" in content_val:
-                                                        # Convert [docX] to <source> tag
+                                                        # Convert [docX] to markdown link
                                                         choice["delta"]["content"] = re.sub(
                                                             self.DOC_REF_PATTERN,
                                                             replace_ref,
@@ -1393,12 +1388,12 @@ class Pipe:
                         if chunk_modified:
                             modified_chunk_str = "\n".join(modified_lines)
                             log.debug(
-                                "Converted [docX] references to <source> tags in streaming chunk"
+                                "Converted [docX] references to markdown links in streaming chunk"
                             )
                             chunk = modified_chunk_str.encode("utf-8")
 
                     except Exception as convert_err:
-                        log.debug(f"Error converting [docX] to source tags: {convert_err}")
+                        log.debug(f"Error converting [docX] to markdown links: {convert_err}")
                         # Fall through to yield original chunk
 
                 # Yield the (possibly modified) chunk
