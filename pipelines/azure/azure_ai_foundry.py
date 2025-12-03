@@ -750,6 +750,33 @@ class Pipe:
 
         return citation_event
 
+    def _format_source_tag(
+        self, doc_num: int, source_name: Optional[str] = None
+    ) -> str:
+        """
+        Format a <source> tag for a [docX] reference.
+
+        Creates an OpenWebUI-compatible source tag that enables citation linking.
+
+        Args:
+            doc_num: The document number (1-based)
+            source_name: Optional source name/title for the document
+
+        Returns:
+            Formatted <source> tag string
+        """
+        if source_name:
+            # Escape special characters in source_name for HTML attribute
+            escaped_name = (
+                source_name.replace("&", "&amp;")
+                .replace('"', "&quot;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            return f'<source id="{doc_num}" name="{escaped_name}">[doc{doc_num}]</source>'
+        else:
+            return f'<source id="{doc_num}">[doc{doc_num}]</source>'
+
     def _convert_doc_refs_to_source_tags(
         self, content: str, citations: List[Dict[str, Any]]
     ) -> str:
@@ -791,15 +818,8 @@ class Pipe:
         def replace_doc_ref(match):
             """Replace [docX] with <source id="X" name="title">[docX]</source>"""
             doc_num = int(match.group(1))
-            source_name = citation_names.get(doc_num, f"Document {doc_num}")
-            # Escape special characters in source_name for HTML attribute
-            escaped_name = (
-                source_name.replace("&", "&amp;")
-                .replace('"', "&quot;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-            return f'<source id="{doc_num}" name="{escaped_name}">[doc{doc_num}]</source>'
+            source_name = citation_names.get(doc_num)
+            return self._format_source_tag(doc_num, source_name)
 
         # Replace all [docX] references
         converted = re.sub(self.DOC_REF_PATTERN, replace_doc_ref, content)
@@ -1299,8 +1319,24 @@ class Pipe:
                 # Convert [docX] references to <source> tags in the chunk content
                 # This enables OpenWebUI to link citations in streaming responses
                 # Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+                chunk_modified = False
                 if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and "[doc" in chunk_str:
                     try:
+                        # Build citation names map if we have citations data
+                        citation_names = {}
+                        if citations_data:
+                            for i, cit in enumerate(citations_data, 1):
+                                if isinstance(cit, dict):
+                                    title = cit.get("title") or ""
+                                    filepath = cit.get("filepath") or ""
+                                    url = cit.get("url") or ""
+                                    citation_names[i] = (
+                                        title.strip()
+                                        or filepath.strip()
+                                        or url.strip()
+                                        or None
+                                    )
+
                         # Parse and modify each SSE data line
                         modified_lines = []
                         chunk_lines = chunk_str.split("\n")
@@ -1316,7 +1352,7 @@ class Pipe:
                                             and "choices" in data
                                             and data["choices"]
                                         ):
-                                            modified = False
+                                            line_modified = False
                                             for choice in data["choices"]:
                                                 if (
                                                     "delta" in choice
@@ -1324,21 +1360,28 @@ class Pipe:
                                                 ):
                                                     content_val = choice["delta"]["content"]
                                                     if "[doc" in content_val:
-                                                        # Convert [docX] to <source> tag inline
-                                                        # Format: <source id="X">[docX]</source>
+                                                        # Convert [docX] to <source> tag
+                                                        # Use _format_source_tag with name if available
+
                                                         def replace_ref(m):
-                                                            doc_num = m.group(1)
-                                                            return f'<source id="{doc_num}">[doc{doc_num}]</source>'
+                                                            doc_num = int(m.group(1))
+                                                            source_name = citation_names.get(
+                                                                doc_num
+                                                            )
+                                                            return self._format_source_tag(
+                                                                doc_num, source_name
+                                                            )
 
                                                         choice["delta"]["content"] = re.sub(
                                                             self.DOC_REF_PATTERN,
                                                             replace_ref,
                                                             content_val,
                                                         )
-                                                        modified = True
+                                                        line_modified = True
 
-                                            if modified:
+                                            if line_modified:
                                                 modified_lines.append(f"data: {json.dumps(data)}")
+                                                chunk_modified = True
                                             else:
                                                 modified_lines.append(line)
                                         else:
@@ -1350,10 +1393,12 @@ class Pipe:
                             else:
                                 modified_lines.append(line)
 
-                        # Reconstruct the chunk with modified content
-                        modified_chunk_str = "\n".join(modified_lines)
-                        if modified_chunk_str != chunk_str:
-                            log.debug("Converted [docX] references to <source> tags in streaming chunk")
+                        # Reconstruct the chunk only if something was modified
+                        if chunk_modified:
+                            modified_chunk_str = "\n".join(modified_lines)
+                            log.debug(
+                                "Converted [docX] references to <source> tags in streaming chunk"
+                            )
                             chunk = modified_chunk_str.encode("utf-8")
 
                     except Exception as convert_err:
