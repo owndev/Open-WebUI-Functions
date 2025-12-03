@@ -4,30 +4,31 @@ This document describes the native OpenWebUI citation support in the Azure AI Fo
 
 ## Overview
 
-The Azure AI Foundry Pipeline now supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature enables the OpenWebUI frontend to display:
+The Azure AI Foundry Pipeline supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature is **automatically enabled** when you configure Azure AI Search data sources (`AZURE_AI_DATA_SOURCES`). The OpenWebUI frontend will display:
 
 - **Citation cards** with source information and relevance scores
 - **Source previews** with content snippets
-- **Relevance percentage** displayed on citation cards
-- **Interactive citation UI** with clickable sources
+- **Relevance percentage** displayed on citation cards (requires `AZURE_AI_INCLUDE_SEARCH_SCORES=true`)
+- **Clickable `[docX]` references** that link directly to document URLs
+- **Interactive citation UI** with expandable source details
 
 ## Features
 
-### Dual Citation Modes
+### Automatic Citation Support
 
-The pipeline supports two modes for displaying citations:
+When Azure AI Search is configured, the pipeline automatically:
 
-1. **Native OpenWebUI Citations** (new): Structured citation events emitted via `__event_emitter__` for frontend consumption
-2. **Markdown/HTML Citations** (existing): Collapsible HTML details with formatted citation information
-
-Both modes can be enabled simultaneously or independently via configuration.
+1. Emits citation events via `__event_emitter__` for the OpenWebUI frontend
+2. Converts `[docX]` references in the response to clickable markdown links
+3. Filters citations to only show documents actually referenced in the response
+4. Extracts relevance scores from Azure Search when available
 
 ### Configuration Options
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `AZURE_AI_OPENWEBUI_CITATIONS` | `true` | Enable native OpenWebUI citation events |
-| `AZURE_AI_ENHANCE_CITATIONS` | `true` | Enable markdown/HTML citation display (collapsible sections) |
+| `AZURE_AI_DATA_SOURCES` | `""` | JSON configuration for Azure AI Search (required for citations) |
+| `AZURE_AI_INCLUDE_SEARCH_SCORES` | `true` | Enable relevance score extraction from Azure Search |
 
 ### How It Works
 
@@ -36,16 +37,17 @@ Both modes can be enabled simultaneously or independently via configuration.
 When Azure AI Search returns citations in a streaming response:
 
 1. The pipeline detects citations in the SSE (Server-Sent Events) stream
-2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: Citation events are emitted immediately via `__event_emitter__`
-3. **If `AZURE_AI_ENHANCE_CITATIONS` is enabled**: A formatted markdown/HTML citation section is appended at the end of the stream
+2. `[docX]` references in each chunk are converted to markdown links with document URLs
+3. After the stream ends, citation events are emitted via `__event_emitter__`
+4. Citations are filtered to only include documents referenced in the response
 
 #### Non-Streaming Responses
 
 When Azure AI Search returns citations in a non-streaming response:
 
-1. The pipeline extracts citations from the response
-2. **If `AZURE_AI_OPENWEBUI_CITATIONS` is enabled**: Individual citation events are emitted via `__event_emitter__` for each source
-3. **If `AZURE_AI_ENHANCE_CITATIONS` is enabled**: The response content is enhanced with a formatted citation section
+1. The pipeline extracts citations from the response context
+2. `[docX]` references in the content are converted to markdown links
+3. Individual citation events are emitted via `__event_emitter__` for each referenced source
 
 ## Citation Format
 
@@ -91,74 +93,71 @@ Azure AI Search returns citations in this format:
 
 The pipeline automatically converts Azure citations to OpenWebUI format.
 
-## Usage Examples
+## Usage
 
-### Basic Setup with Native Citations
+### Basic Setup
 
-```python
-# Enable native OpenWebUI citations (default)
-AZURE_AI_OPENWEBUI_CITATIONS=true
+Configure Azure AI Search to enable citation support:
 
-# Optionally disable markdown/HTML citations if you only want native citations
-AZURE_AI_ENHANCE_CITATIONS=false
+```bash
+# Azure AI Search configuration (required for citations)
+AZURE_AI_DATA_SOURCES='[{"type":"azure_search","parameters":{"endpoint":"https://YOUR-SEARCH-SERVICE.search.windows.net","index_name":"YOUR-INDEX-NAME","authentication":{"type":"api_key","key":"YOUR-SEARCH-API-KEY"}}}]'
+
+# Enable relevance scores (default: true)
+AZURE_AI_INCLUDE_SEARCH_SCORES=true
 ```
 
-### Both Citation Modes Enabled (Default)
+### Clickable Document Links
 
-```python
-# Enable both native and markdown/HTML citations (default)
-AZURE_AI_OPENWEBUI_CITATIONS=true
-AZURE_AI_ENHANCE_CITATIONS=true
+The pipeline automatically converts `[docX]` references to clickable markdown links:
+
+```markdown
+# Input from Azure AI
+The answer can be found in [doc1] and [doc2].
+
+# Output (converted by pipeline)
+The answer can be found in [[doc1]](https://example.com/doc1.pdf) and [[doc2]](https://example.com/doc2.pdf).
 ```
 
-This configuration provides:
-- Native citation cards in the OpenWebUI frontend
-- Markdown/HTML citation section as fallback for non-supported clients
+This works for both streaming and non-streaming responses.
 
-### Only Markdown/HTML Citations (Legacy)
+### Relevance Scores
 
-```python
-# Disable native citations, use only markdown/HTML
-AZURE_AI_OPENWEBUI_CITATIONS=false
-AZURE_AI_ENHANCE_CITATIONS=true
-```
+When `AZURE_AI_INCLUDE_SEARCH_SCORES=true` (default), the pipeline:
+
+1. Automatically adds `include_contexts: ["citations", "all_retrieved_documents"]` to Azure Search requests
+2. Extracts scores based on the `filter_reason` field:
+   - `filter_reason="rerank"` → uses `rerank_score`
+   - `filter_reason="score"` or not present → uses `original_search_score`
+3. Displays the score as a percentage on citation cards
 
 ## Implementation Details
 
 ### Helper Functions
 
-The pipeline includes three new helper functions:
+The pipeline includes these helper functions for citation processing:
 
 1. **`_extract_citations_from_response()`**: Extracts citations from Azure responses
 2. **`_normalize_citation_for_openwebui()`**: Converts Azure citations to OpenWebUI format
 3. **`_emit_openwebui_citation_events()`**: Emits citation events via `__event_emitter__`
+4. **`_merge_score_data()`**: Matches citations with score data from `all_retrieved_documents`
+5. **`_build_citation_urls_map()`**: Builds mapping of citation indices to URLs
+6. **`_format_citation_link()`**: Creates markdown links for `[docX]` references
+7. **`_convert_doc_refs_to_links()`**: Converts all `[docX]` references in content to markdown links
 
 ### Title Fallback Logic
 
 The pipeline uses intelligent title fallback:
 
 1. Use `title` field if available
-2. Fallback to `filepath` if title is empty
-3. Fallback to `url` if both title and filepath are empty
-4. Fallback to `"Unknown Document"` if all are empty
+2. Fallback to filename extracted from `filepath` or `url`
+3. Fallback to `"Unknown Document"` if all are empty
 
 This ensures every citation has a meaningful display name.
 
-### Streaming Citation Emission
+### Citation Filtering
 
-Citations are emitted **as soon as they are detected** in the stream, ensuring:
-- Low latency for citation display
-- Frontend can start rendering citations while content is still streaming
-- No waiting for the complete response
-
-### Backward Compatibility
-
-The implementation maintains full backward compatibility:
-
-- Existing markdown/HTML citation display continues to work
-- No breaking changes to the API
-- Both citation modes can be enabled simultaneously
-- Default configuration enables both modes
+Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI.
 
 ## Troubleshooting
 
@@ -167,34 +166,37 @@ The implementation maintains full backward compatibility:
 **Problem**: Citations don't appear in the OpenWebUI frontend
 
 **Solutions**:
-1. Verify `AZURE_AI_OPENWEBUI_CITATIONS=true` is set
-2. Check that Azure AI Search is properly configured (`AZURE_AI_DATA_SOURCES`)
-3. Ensure you're using an Azure OpenAI endpoint (not a generic Azure AI endpoint)
-4. Check browser console for errors
+1. Check that Azure AI Search is properly configured (`AZURE_AI_DATA_SOURCES`)
+2. Ensure you're using an Azure OpenAI endpoint (not a generic Azure AI endpoint)
+3. Verify the response contains `[docX]` references
+4. Check browser console and server logs for errors
 
-### Citation Cards vs. Markdown Section
+### Relevance Scores Showing 0%
 
-**Problem**: Seeing both citation cards and markdown section
+**Problem**: All citation cards show 0% relevance
 
-**Solution**: This is the default behavior. To show only citation cards:
-```bash
-AZURE_AI_OPENWEBUI_CITATIONS=true
-AZURE_AI_ENHANCE_CITATIONS=false
-```
+**Solutions**:
+1. Verify `AZURE_AI_INCLUDE_SEARCH_SCORES=true` is set
+2. Check that your Azure Search index supports scoring
+3. Enable DEBUG logging to see the raw score values from Azure
 
-### Missing Citation Metadata
+### Links Not Working
 
-**Problem**: Some citation fields (URL, filepath, score) are missing
+**Problem**: `[docX]` references are not clickable
 
-**Solution**: These fields are optional. Azure AI Search may not return all fields depending on your index configuration. The pipeline gracefully handles missing fields.
+**Solutions**:
+1. Ensure citations have valid `url` or `filepath` fields
+2. Check that the document URL is accessible
+3. Verify the markdown link format is being generated correctly
 
 ## References
 
 - [OpenWebUI Pipelines Citation Feature Discussion](https://github.com/open-webui/pipelines/issues/229)
 - [OpenWebUI Event Emitter Documentation](https://docs.openwebui.com/features/plugin/development/events)
 - [Azure AI Search Documentation](https://learn.microsoft.com/en-us/azure/search/)
+- [Azure On Your Data API Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data)
 
 ## Version History
 
-- **v2.6.0**: Added native OpenWebUI citations support
-- **v2.5.x**: Markdown/HTML citation display only
+- **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
+- **v2.5.x**: Dual citation modes (OpenWebUI events + markdown/HTML)
