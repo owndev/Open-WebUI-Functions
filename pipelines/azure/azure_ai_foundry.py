@@ -222,12 +222,6 @@ class Pipe:
             description="If True, automatically add 'include_contexts' with 'all_retrieved_documents' to Azure AI Search requests to get relevance scores (original_search_score and rerank_score). This enables relevance percentage display in citation cards.",
         )
 
-        # Enable [docX] to markdown link conversion
-        AZURE_AI_LINK_CITATIONS: bool = Field(
-            default=True,
-            description="If True, convert [doc1], [doc2], etc. references in the response content to clickable markdown links pointing to the document URL.",
-        )
-
     def __init__(self):
         self.valves = self.Valves()
         self.name: str = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}:"
@@ -668,18 +662,24 @@ class Pipe:
 
         # Prefer rerank_score (semantic ranker), then original_search_score, then legacy score
         if rerank_score is not None:
-            # Reranker scores are typically 0-4 range, normalize to 0-1 for display
-            # Azure AI Search semantic reranker returns scores in 0-4 range
-            normalized_score = min(float(rerank_score) / 4.0, 1.0)
+            # Azure AI Search reranker scores are typically already 0-1
+            # Use as-is if <= 1, normalize if > 1 (some models may return 0-4 range)
+            score_val = float(rerank_score)
+            if score_val > 1.0:
+                # Normalize scores > 1 (some semantic rerankers use 0-4 range)
+                normalized_score = min(score_val / 4.0, 1.0)
+            else:
+                normalized_score = score_val
             citation_data["distances"] = [normalized_score]
             log.debug(
                 f"Using rerank_score {rerank_score} -> normalized {normalized_score}"
             )
         elif original_search_score is not None:
-            # Original search scores can vary widely, use as-is if <= 1, otherwise normalize
+            # Original search scores can vary widely (BM25 scores can be > 1)
+            # Use as-is if <= 1, otherwise normalize
             score_val = float(original_search_score)
             if score_val > 1.0:
-                # Normalize high scores (BM25 scores can be > 1)
+                # Normalize high scores (BM25 scores can be much greater than 1)
                 normalized_score = min(score_val / 100.0, 1.0)
             else:
                 normalized_score = score_val
@@ -850,12 +850,6 @@ class Pipe:
 
             # Enhance the content with better citation display (if enabled)
             enhanced_content = content
-
-            # Convert [docX] references to markdown links (if enabled)
-            if self.valves.AZURE_AI_LINK_CITATIONS and citations:
-                enhanced_content = self._convert_doc_refs_to_links(
-                    enhanced_content, citations
-                )
 
             # Add citation section at the end (if markdown/HTML citations are enabled)
             if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
@@ -1307,62 +1301,6 @@ class Pipe:
 
         # Convert to integers and return as a set
         return {int(match) for match in matches}
-
-    def _convert_doc_refs_to_links(
-        self, content: str, citations: List[Dict[str, Any]]
-    ) -> str:
-        """
-        Convert [docX] references in the content to markdown links pointing to the document URL.
-
-        This replaces plain [doc1], [doc2], etc. references with clickable markdown links
-        like [[doc1]](https://example.com/doc.pdf) when the cited document has a URL.
-
-        Args:
-            content: The response content containing citation references
-            citations: List of citation objects with URL information
-
-        Returns:
-            Content with [docX] references converted to markdown links
-        """
-        if not content or not citations:
-            return content
-
-        log = logging.getLogger("azure_ai._convert_doc_refs_to_links")
-
-        # Build a mapping of doc index to URL
-        doc_urls = {}
-        for i, citation in enumerate(citations, 1):
-            if not isinstance(citation, dict):
-                continue
-            # Get URL from citation (prefer url, then filepath)
-            url = citation.get("url") or citation.get("filepath") or ""
-            if url and url.strip():
-                doc_urls[i] = url.strip()
-
-        if not doc_urls:
-            log.debug("No URLs found in citations, skipping link conversion")
-            return content
-
-        # Track conversion count during replacement
-        conversion_count = 0
-
-        # Replace [docX] references with markdown links
-        def replace_doc_ref(match):
-            nonlocal conversion_count
-            doc_num = int(match.group(1))
-            if doc_num in doc_urls:
-                conversion_count += 1
-                # Convert [doc1] to [[doc1]](url)
-                return f"[[doc{doc_num}]]({doc_urls[doc_num]})"
-            return match.group(0)  # Return unchanged if no URL
-
-        converted_content = re.sub(self.DOC_REF_PATTERN, replace_doc_ref, content)
-
-        # Log how many conversions were made
-        if conversion_count > 0:
-            log.info(f"Converted {conversion_count} [docX] references to markdown links")
-
-        return converted_content
 
     def _format_citation_section(
         self,
