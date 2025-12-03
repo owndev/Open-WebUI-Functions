@@ -750,6 +750,67 @@ class Pipe:
 
         return citation_event
 
+    def _convert_doc_refs_to_source_tags(
+        self, content: str, citations: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Convert [docX] references in content to OpenWebUI <source> tags for citation linking.
+
+        OpenWebUI uses <source id="X" name="title">text</source> tags to create clickable
+        citation links in the response. This method converts Azure's [doc1], [doc2], etc.
+        references to this format.
+
+        Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+
+        Args:
+            content: The response content containing [docX] references
+            citations: List of citation objects with title, url, etc.
+
+        Returns:
+            Content with [docX] references converted to <source> tags
+        """
+        if not content or not citations:
+            return content
+
+        log = logging.getLogger("azure_ai._convert_doc_refs_to_source_tags")
+
+        # Build a mapping of citation index to source name
+        citation_names = {}
+        for i, citation in enumerate(citations, 1):
+            if isinstance(citation, dict):
+                # Get title with fallback chain
+                title = citation.get("title") or ""
+                filepath = citation.get("filepath") or ""
+                url = citation.get("url") or ""
+
+                source_name = (
+                    title.strip() or filepath.strip() or url.strip() or f"Document {i}"
+                )
+                citation_names[i] = source_name
+
+        def replace_doc_ref(match):
+            """Replace [docX] with <source id="X" name="title">[docX]</source>"""
+            doc_num = int(match.group(1))
+            source_name = citation_names.get(doc_num, f"Document {doc_num}")
+            # Escape special characters in source_name for HTML attribute
+            escaped_name = (
+                source_name.replace("&", "&amp;")
+                .replace('"', "&quot;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            return f'<source id="{doc_num}" name="{escaped_name}">[doc{doc_num}]</source>'
+
+        # Replace all [docX] references
+        converted = re.sub(self.DOC_REF_PATTERN, replace_doc_ref, content)
+
+        # Count conversions for logging
+        original_count = len(re.findall(self.DOC_REF_PATTERN, content))
+        if original_count > 0:
+            log.info(f"Converted {original_count} [docX] references to <source> tags")
+
+        return converted
+
     async def _emit_openwebui_citation_events(
         self,
         citations: List[Dict[str, Any]],
@@ -887,6 +948,13 @@ class Pipe:
 
             # Enhance the content with better citation display (if enabled)
             enhanced_content = content
+
+            # Convert [docX] references to <source> tags for OpenWebUI citation linking
+            # Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+            if self.valves.AZURE_AI_OPENWEBUI_CITATIONS:
+                enhanced_content = self._convert_doc_refs_to_source_tags(
+                    enhanced_content, citations
+                )
 
             # Add citation section at the end (if markdown/HTML citations are enabled)
             if self.valves.AZURE_AI_ENHANCE_CITATIONS and citation_details:
@@ -1228,7 +1296,71 @@ class Pipe:
                     except Exception as parse_error:
                         log.debug(f"Error parsing citations from chunk: {parse_error}")
 
-                # Always yield the original chunk first
+                # Convert [docX] references to <source> tags in the chunk content
+                # This enables OpenWebUI to link citations in streaming responses
+                # Reference: https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L1518
+                if self.valves.AZURE_AI_OPENWEBUI_CITATIONS and "[doc" in chunk_str:
+                    try:
+                        # Parse and modify each SSE data line
+                        modified_lines = []
+                        chunk_lines = chunk_str.split("\n")
+
+                        for line in chunk_lines:
+                            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                                json_str = line[6:].strip()
+                                if json_str and json_str != "[DONE]":
+                                    try:
+                                        data = json.loads(json_str)
+                                        if (
+                                            isinstance(data, dict)
+                                            and "choices" in data
+                                            and data["choices"]
+                                        ):
+                                            modified = False
+                                            for choice in data["choices"]:
+                                                if (
+                                                    "delta" in choice
+                                                    and "content" in choice["delta"]
+                                                ):
+                                                    content_val = choice["delta"]["content"]
+                                                    if "[doc" in content_val:
+                                                        # Convert [docX] to <source> tag inline
+                                                        # Format: <source id="X">[docX]</source>
+                                                        def replace_ref(m):
+                                                            doc_num = m.group(1)
+                                                            return f'<source id="{doc_num}">[doc{doc_num}]</source>'
+
+                                                        choice["delta"]["content"] = re.sub(
+                                                            self.DOC_REF_PATTERN,
+                                                            replace_ref,
+                                                            content_val,
+                                                        )
+                                                        modified = True
+
+                                            if modified:
+                                                modified_lines.append(f"data: {json.dumps(data)}")
+                                            else:
+                                                modified_lines.append(line)
+                                        else:
+                                            modified_lines.append(line)
+                                    except json.JSONDecodeError:
+                                        modified_lines.append(line)
+                                else:
+                                    modified_lines.append(line)
+                            else:
+                                modified_lines.append(line)
+
+                        # Reconstruct the chunk with modified content
+                        modified_chunk_str = "\n".join(modified_lines)
+                        if modified_chunk_str != chunk_str:
+                            log.debug("Converted [docX] references to <source> tags in streaming chunk")
+                            chunk = modified_chunk_str.encode("utf-8")
+
+                    except Exception as convert_err:
+                        log.debug(f"Error converting [docX] to source tags: {convert_err}")
+                        # Fall through to yield original chunk
+
+                # Yield the (possibly modified) chunk
                 yield chunk
 
                 # Check if this is the end of the stream
