@@ -199,13 +199,13 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 >
 > Future versions may extend these settings to also optimize generated images before upload/display.
 
-## Grounding with Google search
+## Web search and access 
 
-Grounding with Google search is enabled/disabled with the `google_search_tool` feature, which can be switched on/off in a Filter.
+[Grounding with Google search](https://ai.google.dev/gemini-api/docs/google-search) together with the [URL context tool](https://ai.google.dev/gemini-api/docs/url-context) are enabled/disabled together via the `google_search_tool` feature, which can be switched on/off in a Filter.
 
-For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with google search grounding.
+For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with Google search grounding + the URL context tool.
 
-When enabled, sources and google queries used by Gemini will be displayed with the response.
+When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
 ## Grounding with Vertex AI Search
 
