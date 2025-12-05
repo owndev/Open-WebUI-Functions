@@ -1778,8 +1778,6 @@ class Pipe:
         grounding_metadata_list: List[types.GroundingMetadata],
         text: str,
         __event_emitter__: Callable,
-        *,
-        emit_replace: bool = True,
     ):
         """Process and emit grounding metadata events."""
         grounding_chunks = []
@@ -1847,17 +1845,8 @@ class Pipe:
                 cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
 
             replaced_text = "".join(cited_chunks)
-            if emit_replace:
-                await __event_emitter__(
-                    {
-                        "type": "replace",
-                        "data": {"content": replaced_text},
-                    }
-                )
 
-        # Return the transformed text when requested by caller
-        if not emit_replace:
-            return replaced_text if replaced_text is not None else text
+        return replaced_text if replaced_text is not None else text
 
     async def _handle_streaming_response(
         self,
@@ -1995,12 +1984,10 @@ class Pipe:
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
             if grounding_metadata_list and __event_emitter__:
-                # Don't emit replace here; we'll compose final content below
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
                     final_answer_text,
                     __event_emitter__,
-                    emit_replace=False,
                 )
                 final_answer_text = cited or final_answer_text
 
@@ -2378,7 +2365,6 @@ class Pipe:
                             grounding_metadata_list,
                             final_answer,
                             __event_emitter__,
-                            emit_replace=False,
                         )
                         final_answer = cited or final_answer
 
