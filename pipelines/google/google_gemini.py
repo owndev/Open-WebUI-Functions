@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.7.0
+version: 1.8.4
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -33,6 +33,8 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
+  - Configurable thinking levels (low/high) for Gemini 3 models
+  - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
 """
 
 import os
@@ -167,6 +169,16 @@ class Pipe:
             default=os.getenv("GOOGLE_INCLUDE_THOUGHTS", "true").lower() == "true",
             description="Enable Gemini thoughts outputs (set false to disable).",
         )
+        THINKING_BUDGET: int = Field(
+            default=int(os.getenv("GOOGLE_THINKING_BUDGET", "-1")),
+            description="Thinking budget for Gemini 2.5 models (0=disabled, -1=dynamic, 1-32768=fixed token limit). "
+            "Not used for Gemini 3 models which use THINKING_LEVEL instead.",
+        )
+        THINKING_LEVEL: str = Field(
+            default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
+            description="Thinking level for Gemini 3 models ('low' or 'high'). "
+            "Ignored for other models. Empty string means use model default.",
+        )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
             description="Whether to use Google Cloud Vertex AI instead of the Google Generative AI API.",
@@ -180,11 +192,12 @@ class Pipe:
             description="The Google Cloud region to use with Vertex AI.",
         )
         VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("VERTEX_AI_RAG_STORE"),
+            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
+            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
+            == "true",
             description="Use permissive safety settings for content generation.",
         )
         MODEL_CACHE_TTL: int = Field(
@@ -194,6 +207,18 @@ class Pipe:
         RETRY_COUNT: int = Field(
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
+        )
+        DEFAULT_SYSTEM_PROMPT: str = Field(
+            default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
+            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
+            "this is prepended to it. Leave empty to disable.",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv(
+                "GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false"
+            ).lower()
+            == "true",
+            description="Whether to forward user information headers.",
         )
 
         # Image Processing Configuration
@@ -268,10 +293,44 @@ class Pipe:
                 if h in seen:
                     continue
                 seen.add(h)
-            except Exception:
-                pass
+            except Exception as e:
+                # Skip images with malformed or missing data, but log for debugging.
+                self.log.debug(f"Skipping image in deduplication due to error: {e}")
             result.append(part)
         return result
+
+    def _combine_system_prompts(
+        self, user_system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Combine default system prompt with user-defined system prompt.
+
+        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
+        the default is prepended to the user's prompt.
+        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
+        If only user_system_prompt is set, it is used as-is.
+
+        Args:
+            user_system_prompt: The user-defined system prompt from messages (may be None)
+
+        Returns:
+            Combined system prompt or None if neither is set
+        """
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
+        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
+
+        if default_prompt and user_prompt:
+            combined = f"{default_prompt}\n\n{user_prompt}"
+            self.log.debug(
+                f"Combined system prompts: default ({len(default_prompt)} chars) + "
+                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
+            )
+            return combined
+        elif default_prompt:
+            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
+            return default_prompt
+        elif user_prompt:
+            return user_prompt
+        return None
 
     def _apply_order_and_limit(
         self,
@@ -363,11 +422,14 @@ class Pipe:
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
-        # Extract system instruction first
-        system_instruction = next(
+        # Extract user-defined system instruction first
+        user_system_instruction = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_instruction = self._combine_system_prompts(user_system_instruction)
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -427,7 +489,7 @@ class Pipe:
                 {
                     "index": i + 1,
                     "label": (
-                        f"Image {i+1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
+                        f"Image {i + 1}" if self.valves.IMAGE_ADD_LABELS else str(i + 1)
                     ),
                     "reused": reused_flags[i],
                     "origin": "history" if reused_flags[i] else "current",
@@ -512,8 +574,44 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
+            headers = {}
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
+
+                def sanitize_header_value(value: Any, max_length: int = 255) -> str:
+                    if value is None:
+                        return ""
+                    # Convert to string and remove all control characters
+                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    sanitized = sanitized.strip()
+                    return (
+                        sanitized[:max_length]
+                        if len(sanitized) > max_length
+                        else sanitized
+                    )
+
+                user_attrs = {
+                    "X-OpenWebUI-User-Name": sanitize_header_value(
+                        getattr(self.user, "name", None)
+                    ),
+                    "X-OpenWebUI-User-Id": sanitize_header_value(
+                        getattr(self.user, "id", None)
+                    ),
+                    "X-OpenWebUI-User-Email": sanitize_header_value(
+                        getattr(self.user, "email", None)
+                    ),
+                    "X-OpenWebUI-User-Role": sanitize_header_value(
+                        getattr(self.user, "role", None)
+                    ),
+                }
+                headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
             options = types.HttpOptions(
-                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
+                api_version=self.valves.API_VERSION,
+                base_url=self.valves.BASE_URL,
+                headers=headers,
             )
             return genai.Client(
                 api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
@@ -681,6 +779,90 @@ class Pipe:
         # By default, assume models support thinking
         return True
 
+    def _check_thinking_level_support(self, model_id: str) -> bool:
+        """
+        Check if a model supports the thinking_level parameter.
+
+        Gemini 3 models support thinking_level and should NOT use thinking_budget.
+        Other models (like Gemini 2.5) use thinking_budget instead.
+
+        Args:
+            model_id: The model ID to check
+
+        Returns:
+            True if the model supports thinking_level, False otherwise
+        """
+        # Gemini 3 models support thinking_level (not thinking_budget)
+        gemini_3_patterns = [
+            "gemini-3-",
+        ]
+
+        model_lower = model_id.lower()
+        for pattern in gemini_3_patterns:
+            if pattern in model_lower:
+                return True
+
+        return False
+
+    def _validate_thinking_level(self, level: str) -> Optional[str]:
+        """
+        Validate and normalize the thinking level value.
+
+        Args:
+            level: The thinking level string to validate
+
+        Returns:
+            Normalized level string ('low', 'high') or None if invalid/empty
+        """
+        if not level:
+            return None
+
+        normalized = level.strip().lower()
+        valid_levels = ["low", "high"]
+
+        if normalized in valid_levels:
+            return normalized
+
+        self.log.warning(
+            f"Invalid thinking level '{level}'. Valid values are: {', '.join(valid_levels)}. "
+            "Falling back to model default."
+        )
+        return None
+
+    def _validate_thinking_budget(self, budget: int) -> int:
+        """
+        Validate and normalize the thinking budget value.
+
+        Args:
+            budget: The thinking budget integer to validate
+
+        Returns:
+            Validated budget: -1 for dynamic, 0 to disable, or 1-32768 for fixed limit
+        """
+        # -1 means dynamic thinking (let the model decide)
+        if budget == -1:
+            return -1
+
+        # 0 means disable thinking
+        if budget == 0:
+            return 0
+
+        # Validate positive range (1-32768)
+        if budget > 0:
+            if budget > 32768:
+                self.log.warning(
+                    f"Thinking budget {budget} exceeds maximum of 32768. Clamping to 32768."
+                )
+                return 32768
+            return budget
+
+        # Negative values (except -1) are invalid, treat as -1 (dynamic)
+        self.log.warning(
+            f"Invalid thinking budget {budget}. Only -1 (dynamic), 0 (disabled), or 1-32768 are valid. "
+            "Falling back to dynamic thinking."
+        )
+        return -1
+
     def pipes(self) -> List[Dict[str, str]]:
         """
         Returns a list of available Google Gemini models for the UI.
@@ -753,11 +935,14 @@ class Pipe:
         Returns:
             Tuple of (prepared content list, system message string or None)
         """
-        # Extract system message
-        system_message = next(
+        # Extract user-defined system message
+        user_system_message = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_message = self._combine_system_prompts(user_system_message)
 
         # Prepare contents for the API
         contents = []
@@ -1379,20 +1564,111 @@ class Pipe:
         if enable_image_generation:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
 
-        # Enable Gemini "Thinking" when requested (default: on) and supported by the model
-        include_thoughts = body.get("include_thoughts", True)
-        if not self.valves.INCLUDE_THOUGHTS:
-            include_thoughts = False
-            self.log.debug("Thoughts disabled via GOOGLE_INCLUDE_THOUGHTS")
-
-        if include_thoughts and self._check_thinking_support(model_id):
+        # Configure Gemini thinking/reasoning for models that support it
+        # This is independent of include_thoughts - thinking config controls HOW the model reasons,
+        # while include_thoughts controls whether the reasoning is shown in the output
+        if self._check_thinking_support(model_id):
             try:
+                thinking_config_params: Dict[str, Any] = {}
+
+                # Determine include_thoughts setting
+                include_thoughts = body.get("include_thoughts", True)
+                if not self.valves.INCLUDE_THOUGHTS:
+                    include_thoughts = False
+                    self.log.debug(
+                        "Thoughts output disabled via GOOGLE_INCLUDE_THOUGHTS"
+                    )
+                thinking_config_params["include_thoughts"] = include_thoughts
+
+                # Check if model supports thinking_level (Gemini 3 models)
+                if self._check_thinking_level_support(model_id):
+                    # For Gemini 3 models, use thinking_level (not thinking_budget)
+                    # Per-chat reasoning_effort overrides environment-level THINKING_LEVEL
+                    reasoning_effort = body.get("reasoning_effort")
+                    validated_level = None
+                    source = None
+
+                    if reasoning_effort:
+                        validated_level = self._validate_thinking_level(
+                            reasoning_effort
+                        )
+                        if validated_level:
+                            source = "per-chat reasoning_effort"
+                        else:
+                            self.log.debug(
+                                f"Invalid reasoning_effort '{reasoning_effort}', falling back to THINKING_LEVEL"
+                            )
+
+                    # Fall back to environment-level THINKING_LEVEL if no valid reasoning_effort
+                    if not validated_level:
+                        validated_level = self._validate_thinking_level(
+                            self.valves.THINKING_LEVEL
+                        )
+                        if validated_level:
+                            source = "THINKING_LEVEL"
+
+                    if validated_level:
+                        thinking_config_params["thinking_level"] = validated_level
+                        self.log.debug(
+                            f"Using thinking_level='{validated_level}' from {source} for model {model_id}"
+                        )
+                    else:
+                        self.log.debug(
+                            f"Using default thinking level for model {model_id}"
+                        )
+                else:
+                    # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
+                    # Body-level thinking_budget overrides environment-level THINKING_BUDGET
+                    body_thinking_budget = body.get("thinking_budget")
+                    validated_budget = None
+                    source = None
+
+                    if body_thinking_budget is not None:
+                        validated_budget = self._validate_thinking_budget(
+                            body_thinking_budget
+                        )
+                        if validated_budget is not None:
+                            source = "body thinking_budget"
+                        else:
+                            self.log.debug(
+                                f"Invalid body thinking_budget '{body_thinking_budget}', falling back to THINKING_BUDGET"
+                            )
+
+                    # Fall back to environment-level THINKING_BUDGET
+                    if validated_budget is None:
+                        validated_budget = self._validate_thinking_budget(
+                            self.valves.THINKING_BUDGET
+                        )
+                        if validated_budget is not None:
+                            source = "THINKING_BUDGET"
+
+                    if validated_budget == 0:
+                        # Disable thinking if budget is 0
+                        thinking_config_params["thinking_budget"] = 0
+                        self.log.debug(
+                            f"Thinking disabled via thinking_budget=0 from {source} for model {model_id}"
+                        )
+                    elif validated_budget is not None and validated_budget > 0:
+                        thinking_config_params["thinking_budget"] = validated_budget
+                        self.log.debug(
+                            f"Using thinking_budget={validated_budget} from {source} for model {model_id}"
+                        )
+                    else:
+                        # -1 or None means dynamic thinking
+                        thinking_config_params["thinking_budget"] = -1
+                        self.log.debug(
+                            f"Using dynamic thinking (model decides) for model {model_id}"
+                        )
+
                 gen_config_params["thinking_config"] = types.ThinkingConfig(
-                    include_thoughts=True
+                    **thinking_config_params
                 )
-            except Exception:
-                # Fall back silently if SDK/model does not support ThinkingConfig
-                pass
+            except (AttributeError, TypeError) as e:
+                # Fall back if SDK/model does not support ThinkingConfig
+                self.log.debug(f"ThinkingConfig not supported: {e}")
+            except Exception as e:
+                # Log unexpected errors but continue without thinking config
+                self.log.warning(f"Unexpected error configuring ThinkingConfig: {e}")
 
         # Configure safety settings
         if self.valves.USE_PERMISSIVE_SAFETY:
@@ -1630,13 +1906,8 @@ class Pipe:
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
                     # Check prompt feedback
-                    if (
-                        response_iterator.prompt_feedback
-                        and response_iterator.prompt_feedback.block_reason
-                    ):
-                        block_reason = (
-                            response_iterator.prompt_feedback.block_reason.name
-                        )
+                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                        block_reason = chunk.prompt_feedback.block_reason.name
                         message = f"[Blocked due to Prompt Safety: {block_reason}]"
                         await emit_chat_event(
                             "chat:finish",
@@ -1789,6 +2060,10 @@ class Pipe:
                 {"role": "assistant", "content": final_content, "done": True},
             )
 
+            # Yield final content to ensure the async iterator completes properly.
+            # This ensures the response is persisted even if the user navigates away.
+            yield final_content
+
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
             # Check if it's a chunk size error and provide specific guidance
@@ -1937,7 +2212,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"

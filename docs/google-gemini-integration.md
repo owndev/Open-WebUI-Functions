@@ -26,7 +26,10 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 > Streaming is automatically disabled for image generation models to prevent chunk size issues.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks.
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models.
+
+  > [!Note]
+  > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
 
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions with configurable image optimization.
@@ -77,6 +80,12 @@ GOOGLE_MODEL_CACHE_TTL=600
 # Default: 2
 GOOGLE_RETRY_COUNT=2
 
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+# Leave empty to disable
+# Default: "" (empty, disabled)
+GOOGLE_DEFAULT_SYSTEM_PROMPT=""
+
 # Image processing optimization settings
 # Maximum image size in MB before compression is applied
 # Default: 15.0
@@ -122,6 +131,20 @@ GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 # Enable Gemini thoughts outputs globally
 # Default: true
 GOOGLE_INCLUDE_THOUGHTS=true
+
+# Thinking budget for Gemini 2.5 models (not used for Gemini 3 models)
+# -1 = dynamic (model decides), 0 = disabled, 1-32768 = fixed token limit
+# Default: -1 (dynamic)
+# Note: Gemini 3 models use GOOGLE_THINKING_LEVEL instead
+GOOGLE_THINKING_BUDGET=-1
+
+# Thinking level for Gemini 3 models only
+# Valid values: "low", "high", or empty string for model default
+# - "low": Minimizes latency and cost, suitable for simple tasks
+# - "high": Maximizes reasoning depth, ideal for complex problem-solving
+# Default: "" (empty, uses model default)
+# Note: This setting is ignored for non-Gemini 3 models
+GOOGLE_THINKING_LEVEL=""
 
 # Enable streaming responses globally
 # Default: true
@@ -227,3 +250,173 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 ## Native tool calling support
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
+
+## Default System Prompt
+
+The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
+
+### How It Works
+
+- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
+- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
+- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
+
+### Configuration
+
+Set via environment variable:
+
+```bash
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Example
+
+If your default system prompt is:
+
+```
+You are a helpful AI assistant.
+```
+
+And your model-specific system prompt is:
+
+```
+Always respond in formal English.
+```
+
+The combined system prompt sent to Gemini will be:
+
+```
+You are a helpful AI assistant.
+
+Always respond in formal English.
+```
+
+## Thinking Configuration
+
+The Google Gemini pipeline supports advanced thinking configuration to control how much reasoning and computation is applied by the model.
+
+> [!Note]
+> For detailed information about thinking capabilities, see the [Google Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking).
+
+### Thinking Levels (Gemini 3 models)
+
+Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
+
+- **`"low"`**: Minimizes latency and cost, suitable for simple tasks, chat, or high-throughput APIs.
+- **`"high"`**: Maximizes reasoning depth, ideal for complex problem-solving, code analysis, and agentic workflows.
+
+> [!Note]
+> Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
+
+Set via environment variable:
+
+```bash
+# Use low thinking level for faster responses
+GOOGLE_THINKING_LEVEL="low"
+
+# Use high thinking level for complex reasoning
+GOOGLE_THINKING_LEVEL="high"
+```
+
+#### Per-Chat Override (Reasoning Effort)
+
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (e.g., "low" or "high"), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
+
+**Example API Usage:**
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+response = client.models.generate_content(
+    model="gemini-3-pro-preview",
+    contents="Provide a list of 3 famous physicists and their key contributions",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="low")
+    ),
+)
+
+print(response.text)
+```
+
+### Thinking Budget (Gemini 2.5 models)
+
+For Gemini 2.5 models, you can control the maximum number of tokens used during internal reasoning using `thinking_budget`:
+
+- **`0`**: Disables thinking entirely for fastest responses
+- **`-1`**: Dynamic thinking (model decides based on query complexity) - default
+- **`1-32768`**: Fixed token limit for reasoning
+
+> [!Note]
+> Gemini 3 models do **not** use `thinking_budget`. Use `GOOGLE_THINKING_LEVEL` for Gemini 3 models instead.
+
+Set via environment variable:
+
+```bash
+# Disable thinking for fastest responses
+GOOGLE_THINKING_BUDGET=0
+
+# Use dynamic thinking (model decides)
+GOOGLE_THINKING_BUDGET=-1
+
+# Set a specific token budget for reasoning
+GOOGLE_THINKING_BUDGET=1024
+```
+
+#### Per-Chat Override (thinking_budget)
+
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
+
+**Example API Usage:**
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+# Example with a specific thinking budget
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Provide a list of 3 famous physicists and their key contributions",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=1024)
+    ),
+)
+print(response.text)
+
+# Turn off thinking entirely
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="What is 2+2?",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    ),
+)
+print(response.text)
+
+# Use dynamic thinking (model decides based on query complexity)
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Explain quantum computing",
+    config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=-1)
+    ),
+)
+print(response.text)
+```
+
+### Model Compatibility
+
+| Model                     | thinking_level               | thinking_budget        |
+| ------------------------- | ---------------------------- | ---------------------- |
+| gemini-3-\*               | ✅ Supported ("low", "high") | ❌ Not used            |
+| gemini-2.5-\*             | ❌ Not used                  | ✅ Supported (0-32768) |
+| gemini-2.5-flash-image-\* | ❌ Not supported             | ❌ Not supported       |
+| Other models              | ❌ Not used                  | ✅ May be supported    |

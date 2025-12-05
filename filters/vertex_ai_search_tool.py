@@ -41,4 +41,3 @@ class Filter:
                         "vertex_ai_search enabled but vertex_rag_store not provided in params or VERTEX_AI_RAG_STORE env var"
                     )
         return body
-
