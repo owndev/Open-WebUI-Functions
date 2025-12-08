@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.9.1
+version: 1.9.2
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -1359,15 +1359,20 @@ class Pipe:
             else:
                 fid = file_url.split("/files/")[-1].split("/")[0].split("?")[0]
 
+            from pathlib import Path
             from open_webui.models.files import Files
+            from open_webui.storage.provider import Storage
 
             file_obj = Files.get_file_by_id(fid)
             if file_obj and file_obj.path:
-                async with aiofiles.open(file_obj.path, "rb") as fp:
-                    raw = await fp.read()
-                enc = base64.b64encode(raw).decode()
-                mime = file_obj.meta.get("content_type", "image/png")
-                return f"data:{mime};base64,{enc}"
+                file_path = Storage.get_file(file_obj.path)
+                file_path = Path(file_path)
+                if file_path.is_file():
+                    async with aiofiles.open(file_path, "rb") as fp:
+                        raw = await fp.read()
+                    enc = base64.b64encode(raw).decode()
+                    mime = file_obj.meta.get("content_type", "image/png")
+                    return f"data:{mime};base64,{enc}"
         except Exception as e:
             self.log.warning(f"Could not fetch file {file_url}: {e}")
         return None
