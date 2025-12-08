@@ -149,11 +149,11 @@ class Pipe:
     # User-overridable configuration valves
     class UserValves(BaseModel):
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "default"),
             description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
         )
         IMAGE_GENERATION_RESOLUTION: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
             description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
         )
 
@@ -1684,20 +1684,35 @@ class Pipe:
             # ImageConfig is only supported by Gemini 3 models
             if self._check_image_config_support(model_id):
                 # Body parameters override valve defaults for per-request customization
+                # Get aspect_ratio: body > user_valves (if not "default") > default from UserValves
+                user_aspect_ratio = None
+                if __user__ and "valves" in __user__:
+                    user_aspect_ratio = __user__["valves"].IMAGE_GENERATION_ASPECT_RATIO
+                    if user_aspect_ratio == "default":
+                        user_aspect_ratio = None
+
                 aspect_ratio = body.get(
                     "aspect_ratio",
                     (
-                        __user__["valves"].IMAGE_GENERATION_ASPECT_RATIO
-                        if __user__ and "valves" in __user__
-                        else self.values.IMAGE_GENERATION_ASPECT_RATIO
+                        user_aspect_ratio
+                        if user_aspect_ratio
+                        else self.user_valves.IMAGE_GENERATION_ASPECT_RATIO
                     ),
                 )
+
+                # Get resolution: body > user_valves (if not "default") > default from UserValves
+                user_resolution = None
+                if __user__ and "valves" in __user__:
+                    user_resolution = __user__["valves"].IMAGE_GENERATION_RESOLUTION
+                    if user_resolution == "default":
+                        user_resolution = None
+
                 resolution = body.get(
                     "image_size",
                     (
-                        __user__["valves"].IMAGE_GENERATION_RESOLUTION
-                        if __user__ and "valves" in __user__
-                        else self.values.IMAGE_GENERATION_RESOLUTION
+                        user_resolution
+                        if user_resolution
+                        else self.user_valves.IMAGE_GENERATION_RESOLUTION
                     ),
                 )
 
