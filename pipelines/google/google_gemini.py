@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.9.2
+version: 1.10.0
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -35,6 +35,7 @@ features:
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
+  - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
 """
 
 import os
@@ -258,6 +259,14 @@ class Pipe:
         IMAGE_HISTORY_FIRST: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
+        )
+        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
+            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
+        )
+        IMAGE_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
+            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
         )
 
     # ---------------- Internal Helpers ---------------- #
@@ -862,6 +871,69 @@ class Pipe:
             "Falling back to dynamic thinking."
         )
         return -1
+
+    def _validate_aspect_ratio(self, aspect_ratio: str) -> Optional[str]:
+        """
+        Validate and normalize the aspect ratio value.
+
+        Args:
+            aspect_ratio: The aspect ratio string to validate
+
+        Returns:
+            Validated aspect ratio string or None if invalid
+        """
+        if not aspect_ratio:
+            return None
+
+        # Valid aspect ratios according to Google's API
+        valid_ratios = [
+            "1:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9",
+            "21:9",
+        ]
+
+        normalized = aspect_ratio.strip()
+        if normalized in valid_ratios:
+            return normalized
+
+        self.log.warning(
+            f"Invalid aspect ratio '{aspect_ratio}'. Valid values are: {', '.join(valid_ratios)}. "
+            "Using default '1:1'."
+        )
+        return "1:1"
+
+    def _validate_resolution(self, resolution: str) -> Optional[str]:
+        """
+        Validate and normalize the resolution value.
+
+        Args:
+            resolution: The resolution string to validate
+
+        Returns:
+            Validated resolution string or None if invalid
+        """
+        if not resolution:
+            return None
+
+        # Valid resolutions according to Google's API
+        valid_resolutions = ["1K", "2K", "4K"]
+
+        normalized = resolution.strip().upper()
+        if normalized in valid_resolutions:
+            return normalized
+
+        self.log.warning(
+            f"Invalid resolution '{resolution}'. Valid values are: {', '.join(valid_resolutions)}. "
+            "Using default '2K'."
+        )
+        return "2K"
 
     def pipes(self) -> List[Dict[str, str]]:
         """
@@ -1568,6 +1640,36 @@ class Pipe:
         # Enable image generation if requested
         if enable_image_generation:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
+
+            # Configure image generation parameters (aspect ratio and resolution)
+            # Body parameters override valve defaults for per-request customization
+            aspect_ratio = body.get(
+                "aspect_ratio", self.valves.IMAGE_GENERATION_ASPECT_RATIO
+            )
+            resolution = body.get("image_size", self.valves.IMAGE_GENERATION_RESOLUTION)
+
+            # Validate and normalize the values
+            validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
+            validated_resolution = self._validate_resolution(resolution)
+
+            # Create image config if we have valid values
+            if validated_aspect_ratio and validated_resolution:
+                try:
+                    gen_config_params["image_config"] = types.ImageConfig(
+                        aspect_ratio=validated_aspect_ratio,
+                        image_size=validated_resolution,
+                    )
+                    self.log.debug(
+                        f"Image generation config: aspect_ratio={validated_aspect_ratio}, resolution={validated_resolution}"
+                    )
+                except (AttributeError, TypeError) as e:
+                    # Fall back if SDK does not support ImageConfig
+                    self.log.warning(
+                        f"ImageConfig not supported by SDK version: {e}. Image generation will use default settings."
+                    )
+                except Exception as e:
+                    # Log unexpected errors but continue without image config
+                    self.log.warning(f"Unexpected error configuring ImageConfig: {e}")
 
         # Configure Gemini thinking/reasoning for models that support it
         # This is independent of include_thoughts - thinking config controls HOW the model reasons,
