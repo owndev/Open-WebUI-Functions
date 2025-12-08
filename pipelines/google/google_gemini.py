@@ -739,10 +739,12 @@ class Pipe:
         Returns:
             True if the model supports image generation, False otherwise
         """
-        # Known image generation models
+        # Known image generation models (both Gemini 2.5 and Gemini 3)
         image_generation_models = [
             "gemini-2.5-flash-image-preview",
             "gemini-2.5-flash-image",
+            "gemini-3-pro-image-preview",
+            "gemini-3-flash-image-preview",
         ]
 
         # Check for exact matches or pattern matches
@@ -757,6 +759,29 @@ class Pipe:
             return True
 
         return False
+
+    def _check_image_config_support(self, model_id: str) -> bool:
+        """
+        Check if a model supports ImageConfig (aspect_ratio and image_size parameters).
+
+        ImageConfig is only supported by Gemini 3 image generation models.
+        Gemini 2.5 image models support image generation but not ImageConfig.
+
+        Args:
+            model_id: The model ID to check
+
+        Returns:
+            True if the model supports ImageConfig, False otherwise
+        """
+        # ImageConfig is only supported by Gemini 3 models
+        model_lower = model_id.lower()
+
+        # Check if it's a Gemini 3 model
+        if "gemini-3-" not in model_lower:
+            return False
+
+        # Check if it's an image generation model
+        return self._check_image_generation_support(model_id)
 
     def _check_thinking_support(self, model_id: str) -> bool:
         """
@@ -1642,34 +1667,45 @@ class Pipe:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
 
             # Configure image generation parameters (aspect ratio and resolution)
-            # Body parameters override valve defaults for per-request customization
-            aspect_ratio = body.get(
-                "aspect_ratio", self.valves.IMAGE_GENERATION_ASPECT_RATIO
-            )
-            resolution = body.get("image_size", self.valves.IMAGE_GENERATION_RESOLUTION)
+            # ImageConfig is only supported by Gemini 3 models
+            if self._check_image_config_support(model_id):
+                # Body parameters override valve defaults for per-request customization
+                aspect_ratio = body.get(
+                    "aspect_ratio", self.valves.IMAGE_GENERATION_ASPECT_RATIO
+                )
+                resolution = body.get(
+                    "image_size", self.valves.IMAGE_GENERATION_RESOLUTION
+                )
 
-            # Validate and normalize the values
-            validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
-            validated_resolution = self._validate_resolution(resolution)
+                # Validate and normalize the values
+                validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
+                validated_resolution = self._validate_resolution(resolution)
 
-            # Create image config if we have valid values
-            if validated_aspect_ratio and validated_resolution:
-                try:
-                    gen_config_params["image_config"] = types.ImageConfig(
-                        aspect_ratio=validated_aspect_ratio,
-                        image_size=validated_resolution,
-                    )
-                    self.log.debug(
-                        f"Image generation config: aspect_ratio={validated_aspect_ratio}, resolution={validated_resolution}"
-                    )
-                except (AttributeError, TypeError) as e:
-                    # Fall back if SDK does not support ImageConfig
-                    self.log.warning(
-                        f"ImageConfig not supported by SDK version: {e}. Image generation will use default settings."
-                    )
-                except Exception as e:
-                    # Log unexpected errors but continue without image config
-                    self.log.warning(f"Unexpected error configuring ImageConfig: {e}")
+                # Create image config if we have valid values
+                if validated_aspect_ratio and validated_resolution:
+                    try:
+                        gen_config_params["image_config"] = types.ImageConfig(
+                            aspect_ratio=validated_aspect_ratio,
+                            image_size=validated_resolution,
+                        )
+                        self.log.debug(
+                            f"Image generation config: aspect_ratio={validated_aspect_ratio}, resolution={validated_resolution}"
+                        )
+                    except (AttributeError, TypeError) as e:
+                        # Fall back if SDK does not support ImageConfig
+                        self.log.warning(
+                            f"ImageConfig not supported by SDK version: {e}. Image generation will use default settings."
+                        )
+                    except Exception as e:
+                        # Log unexpected errors but continue without image config
+                        self.log.warning(
+                            f"Unexpected error configuring ImageConfig: {e}"
+                        )
+            else:
+                self.log.debug(
+                    f"Model {model_id} does not support ImageConfig (aspect_ratio/resolution). "
+                    "ImageConfig is only available for Gemini 3 image models."
+                )
 
         # Configure Gemini thinking/reasoning for models that support it
         # This is independent of include_thoughts - thinking config controls HOW the model reasons,

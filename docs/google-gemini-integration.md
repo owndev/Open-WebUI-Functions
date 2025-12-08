@@ -128,7 +128,8 @@ GOOGLE_IMAGE_HISTORY_FIRST=true
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 
-# Image generation configuration (for image-capable models like gemini-2.5-flash-image-preview)
+# Image generation configuration (only for Gemini 3 image models like gemini-3-pro-image-preview)
+# Note: These settings do not apply to Gemini 2.5 image models
 # Default aspect ratio for generated images
 # Valid values: "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
 # Default: "1:1"
@@ -212,7 +213,10 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 
 ## Image Generation Configuration
 
-The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with image-capable models (e.g., `gemini-2.5-flash-image-preview`).
+The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3 image models** (e.g., `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
+
+> [!IMPORTANT]
+> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
 
 ### Aspect Ratio
 
@@ -263,9 +267,9 @@ from google.genai import types
 
 client = genai.Client(api_key="your-api-key")
 
-# Generate a 4K widescreen image
+# Generate a 4K widescreen image with Gemini 3
 response = client.models.generate_content(
-    model="gemini-2.5-flash-image-preview",
+    model="gemini-3-pro-image-preview",
     contents="A serene mountain landscape at sunset",
     config=types.GenerateContentConfig(
         response_modalities=["TEXT", "IMAGE"],
@@ -303,6 +307,16 @@ for part in response.parts:
 - Instagram Stories
 - TikTok content
 - Mobile app screens
+
+### Model Compatibility
+
+| Model                     | ImageConfig Support (aspect_ratio, image_size) |
+| ------------------------- | ----------------------------------------------- |
+| gemini-3-pro-image-\*     | ✅ Supported                                    |
+| gemini-3-flash-image-\*   | ✅ Supported                                    |
+| gemini-2.5-flash-image-\* | ❌ Not supported (uses defaults)                |
+| Other gemini-3-\* models  | ❌ Not image generation models                  |
+| Other models              | ❌ Not image generation models                  |
 
 ## Web search and access 
 
