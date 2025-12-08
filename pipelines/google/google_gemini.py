@@ -146,6 +146,17 @@ class Pipe:
     Pipeline for interacting with Google Gemini models.
     """
 
+    # User-overridable configuration valves
+    class UserValves(BaseModel):
+        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
+            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
+        )
+        IMAGE_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
+            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
+        )
+
     # Configuration valves for the pipeline
     class Valves(BaseModel):
         BASE_URL: str = Field(
@@ -1640,6 +1651,7 @@ class Pipe:
         system_instruction: Optional[str],
         __metadata__: Dict[str, Any],
         __tools__: dict[str, Any] | None = None,
+        __user__: Optional[dict] = None,
         enable_image_generation: bool = False,
         model_id: str = "",
     ) -> types.GenerateContentConfig:
@@ -1673,10 +1685,20 @@ class Pipe:
             if self._check_image_config_support(model_id):
                 # Body parameters override valve defaults for per-request customization
                 aspect_ratio = body.get(
-                    "aspect_ratio", self.valves.IMAGE_GENERATION_ASPECT_RATIO
+                    "aspect_ratio",
+                    (
+                        __user__["valves"].IMAGE_GENERATION_ASPECT_RATIO
+                        if __user__ and "valves" in __user__
+                        else self.values.IMAGE_GENERATION_ASPECT_RATIO
+                    ),
                 )
                 resolution = body.get(
-                    "image_size", self.valves.IMAGE_GENERATION_RESOLUTION
+                    "image_size",
+                    (
+                        __user__["valves"].IMAGE_GENERATION_RESOLUTION
+                        if __user__ and "valves" in __user__
+                        else self.values.IMAGE_GENERATION_RESOLUTION
+                    ),
                 )
 
                 # Validate and normalize the values
@@ -2365,6 +2387,7 @@ class Pipe:
                 system_instruction,
                 __metadata__,
                 __tools__,
+                __user__,
                 supports_image_generation,
                 model_id,
             )
