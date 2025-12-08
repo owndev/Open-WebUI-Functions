@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.4
+version: 1.9.1
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -28,6 +28,7 @@ features:
   - Intelligent grounding with Google search integration
   - Vertex AI Search grounding for RAG
   - Native tool calling support with automatic signature management
+  - URL context grounding for specified web pages
   - Unified image processing with consolidated helper methods
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
@@ -1692,14 +1693,17 @@ class Pipe:
             ]
             gen_config_params |= {"safety_settings": safety_settings}
 
+        # Add various tools to Gemini as required
         features = __metadata__.get("features", {})
+        params = __metadata__.get("params", {})
+        tools = []
+
         if features.get("google_search_tool", False):
             self.log.debug("Enabling Google search grounding")
-            gen_config_params.setdefault("tools", []).append(
-                types.Tool(google_search=types.GoogleSearch())
-            )
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+            self.log.debug("Enabling URL context grounding")
+            tools.append(types.Tool(url_context=types.UrlContext()))
 
-        params = __metadata__.get("params", {})
         if features.get("vertex_ai_search", False) or (
             self.valves.USE_VERTEX_AI
             and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
@@ -1713,7 +1717,7 @@ class Pipe:
                 self.log.debug(
                     f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
                 )
-                gen_config_params.setdefault("tools", []).append(
+                tools.append(
                     types.Tool(
                         retrieval=types.Retrieval(
                             vertex_ai_search=types.VertexAISearch(
@@ -1726,6 +1730,7 @@ class Pipe:
                 self.log.warning(
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
+
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
                 if not name.startswith("_"):
@@ -1733,7 +1738,10 @@ class Pipe:
                     self.log.debug(
                         f"Adding tool '{name}' with signature {tool.__signature__}"
                     )
-                    gen_config_params.setdefault("tools", []).append(tool)
+                    tools.append(tool)
+
+        if tools:
+            gen_config_params["tools"] = tools
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -1783,8 +1791,6 @@ class Pipe:
         grounding_metadata_list: List[types.GroundingMetadata],
         text: str,
         __event_emitter__: Callable,
-        *,
-        emit_replace: bool = True,
     ):
         """Process and emit grounding metadata events."""
         grounding_chunks = []
@@ -1852,17 +1858,8 @@ class Pipe:
                 cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
 
             replaced_text = "".join(cited_chunks)
-            if emit_replace:
-                await __event_emitter__(
-                    {
-                        "type": "replace",
-                        "data": {"content": replaced_text},
-                    }
-                )
 
-        # Return the transformed text when requested by caller
-        if not emit_replace:
-            return replaced_text if replaced_text is not None else text
+        return replaced_text if replaced_text is not None else text
 
     async def _handle_streaming_response(
         self,
@@ -2000,12 +1997,10 @@ class Pipe:
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
             if grounding_metadata_list and __event_emitter__:
-                # Don't emit replace here; we'll compose final content below
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
                     final_answer_text,
                     __event_emitter__,
-                    emit_replace=False,
                 )
                 final_answer_text = cited or final_answer_text
 
@@ -2383,7 +2378,6 @@ class Pipe:
                             grounding_metadata_list,
                             final_answer,
                             __event_emitter__,
-                            emit_replace=False,
                         )
                         final_answer = cited or final_answer
 
