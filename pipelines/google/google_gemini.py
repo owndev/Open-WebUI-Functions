@@ -223,6 +223,14 @@ class Pipe:
         )
 
         # Image Processing Configuration
+        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
+            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
+        )
+        IMAGE_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
+            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
+        )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
             description="Maximum image size in MB before compression is applied",
@@ -259,14 +267,6 @@ class Pipe:
         IMAGE_HISTORY_FIRST: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
-        )
-        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
-            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
-        )
-        IMAGE_GENERATION_RESOLUTION: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
-            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
         )
 
     # ---------------- Internal Helpers ---------------- #
@@ -741,10 +741,12 @@ class Pipe:
         """
         # Known image generation models (both Gemini 2.5 and Gemini 3)
         image_generation_models = [
-            "gemini-2.5-flash-image-preview",
             "gemini-2.5-flash-image",
-            "gemini-3-pro-image-preview",
+            "gemini-2.5-flash-image-preview",
+            "gemini-3-flash-image",
             "gemini-3-flash-image-preview",
+            "gemini-3-pro-image",
+            "gemini-3-pro-image-preview",
         ]
 
         # Check for exact matches or pattern matches
