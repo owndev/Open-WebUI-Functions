@@ -62,6 +62,27 @@ from open_webui.routers.files import upload_file
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
 
+ASPECT_RATIO_OPTIONS: List[str] = [
+    "default",
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
+]
+
+RESOLUTION_OPTIONS: List[str] = [
+    "default",
+    "1K",
+    "2K",
+    "4K",
+]
+
 
 # Simplified encryption implementation with automatic handling
 class EncryptedStr(str):
@@ -150,11 +171,13 @@ class Pipe:
     class UserValves(BaseModel):
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
             default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "default"),
-            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
+            description="Default aspect ratio for image generation.",
+            json_schema_extra={"enum": ASPECT_RATIO_OPTIONS},
         )
         IMAGE_GENERATION_RESOLUTION: str = Field(
             default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
-            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
+            description="Default resolution for image generation.",
+            json_schema_extra={"enum": RESOLUTION_OPTIONS},
         )
 
     # Configuration valves for the pipeline
@@ -236,11 +259,13 @@ class Pipe:
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
             default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
-            description="Default aspect ratio for image generation. Valid values: '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'",
+            description="Default aspect ratio for image generation.",
+            json_schema_extra={"enum": ASPECT_RATIO_OPTIONS},
         )
         IMAGE_GENERATION_RESOLUTION: str = Field(
             default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
-            description="Default resolution for image generation. Valid values: '1K', '2K', '4K'",
+            description="Default resolution for image generation.",
+            json_schema_extra={"enum": RESOLUTION_OPTIONS},
         )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
@@ -920,24 +945,13 @@ class Pipe:
         Returns:
             Validated aspect ratio string or None if invalid
         """
-        if not aspect_ratio:
+        if not aspect_ratio or aspect_ratio == "default":
+            self.log.debug("Using default aspect ratio (None)")
             return None
 
-        # Valid aspect ratios according to Google's API
-        valid_ratios = [
-            "1:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
-        ]
-
         normalized = aspect_ratio.strip()
+        valid_ratios = [r for r in ASPECT_RATIO_OPTIONS if r != "default"]
+
         if normalized in valid_ratios:
             return normalized
 
@@ -957,13 +971,13 @@ class Pipe:
         Returns:
             Validated resolution string or None if invalid
         """
-        if not resolution:
+        if not resolution or resolution.lower() == "default":
+            self.log.debug("Using default resolution (None)")
             return None
 
-        # Valid resolutions according to Google's API
-        valid_resolutions = ["1K", "2K", "4K"]
-
         normalized = resolution.strip().upper()
+        valid_resolutions = [r for r in RESOLUTION_OPTIONS if r.lower() != "default"]
+
         if normalized in valid_resolutions:
             return normalized
 
@@ -1696,7 +1710,7 @@ class Pipe:
                     (
                         user_aspect_ratio
                         if user_aspect_ratio
-                        else self.user_valves.IMAGE_GENERATION_ASPECT_RATIO
+                        else self.valves.IMAGE_GENERATION_ASPECT_RATIO
                     ),
                 )
 
@@ -1712,7 +1726,7 @@ class Pipe:
                     (
                         user_resolution
                         if user_resolution
-                        else self.user_valves.IMAGE_GENERATION_RESOLUTION
+                        else self.valves.IMAGE_GENERATION_RESOLUTION
                     ),
                 )
 
