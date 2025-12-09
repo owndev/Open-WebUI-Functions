@@ -258,12 +258,12 @@ class Pipe:
 
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "1:1"),
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "default"),
             description="Default aspect ratio for image generation.",
             json_schema_extra={"enum": ASPECT_RATIO_OPTIONS},
         )
         IMAGE_GENERATION_RESOLUTION: str = Field(
-            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "2K"),
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
             description="Default resolution for image generation.",
             json_schema_extra={"enum": RESOLUTION_OPTIONS},
         )
@@ -943,7 +943,7 @@ class Pipe:
             aspect_ratio: The aspect ratio string to validate
 
         Returns:
-            Validated aspect ratio string or None if invalid
+            Validated aspect ratio string, None for "default", or "1:1" as fallback for invalid values
         """
         if not aspect_ratio or aspect_ratio == "default":
             self.log.debug("Using default aspect ratio (None)")
@@ -969,7 +969,7 @@ class Pipe:
             resolution: The resolution string to validate
 
         Returns:
-            Validated resolution string or None if invalid
+            Validated resolution string, None for "default", or "2K" as fallback for invalid values
         """
         if not resolution or resolution.lower() == "default":
             self.log.debug("Using default resolution (None)")
@@ -1659,6 +1659,16 @@ class Pipe:
             # Fallback to data URL if upload fails
             return f"data:{mime_type};base64,{image_data}"
 
+    def _get_user_valve_value(
+        self, __user__: Optional[dict], valve_name: str
+    ) -> Optional[str]:
+        """Get a user valve value, returning None if not set or set to 'default'"""
+        if __user__ and "valves" in __user__:
+            value = getattr(__user__["valves"], valve_name, None)
+            if value and value != "default":
+                return value
+        return None
+
     def _configure_generation(
         self,
         body: Dict[str, Any],
@@ -1698,48 +1708,38 @@ class Pipe:
             # ImageConfig is only supported by Gemini 3 models
             if self._check_image_config_support(model_id):
                 # Body parameters override valve defaults for per-request customization
-                # Get aspect_ratio: body > user_valves (if not "default") > default from UserValves
-                user_aspect_ratio = None
-                if __user__ and "valves" in __user__:
-                    user_aspect_ratio = __user__["valves"].IMAGE_GENERATION_ASPECT_RATIO
-                    if user_aspect_ratio == "default":
-                        user_aspect_ratio = None
-
+                # Get aspect_ratio: body > user_valves (if not "default") > system valves
+                user_aspect_ratio = self._get_user_valve_value(
+                    __user__, "IMAGE_GENERATION_ASPECT_RATIO"
+                )
                 aspect_ratio = body.get(
                     "aspect_ratio",
-                    (
-                        user_aspect_ratio
-                        if user_aspect_ratio
-                        else self.valves.IMAGE_GENERATION_ASPECT_RATIO
-                    ),
+                    user_aspect_ratio or self.valves.IMAGE_GENERATION_ASPECT_RATIO,
                 )
 
-                # Get resolution: body > user_valves (if not "default") > default from UserValves
-                user_resolution = None
-                if __user__ and "valves" in __user__:
-                    user_resolution = __user__["valves"].IMAGE_GENERATION_RESOLUTION
-                    if user_resolution == "default":
-                        user_resolution = None
-
+                # Get resolution: body > user_valves (if not "default") > system valves
+                user_resolution = self._get_user_valve_value(
+                    __user__, "IMAGE_GENERATION_RESOLUTION"
+                )
                 resolution = body.get(
-                    "image_size",
-                    (
-                        user_resolution
-                        if user_resolution
-                        else self.valves.IMAGE_GENERATION_RESOLUTION
-                    ),
+                    "resolution",
+                    user_resolution or self.valves.IMAGE_GENERATION_RESOLUTION,
                 )
 
                 # Validate and normalize the values
                 validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
                 validated_resolution = self._validate_resolution(resolution)
 
-                # Create image config if we have valid values
-                if validated_aspect_ratio and validated_resolution:
+                # Create image config if we have at least one valid value
+                if validated_aspect_ratio or validated_resolution:
                     try:
+                        image_config_params = {}
+                        if validated_aspect_ratio:
+                            image_config_params["aspect_ratio"] = validated_aspect_ratio
+                        if validated_resolution:
+                            image_config_params["image_size"] = validated_resolution
                         gen_config_params["image_config"] = types.ImageConfig(
-                            aspect_ratio=validated_aspect_ratio,
-                            image_size=validated_resolution,
+                            **image_config_params
                         )
                         self.log.debug(
                             f"Image generation config: aspect_ratio={validated_aspect_ratio}, resolution={validated_resolution}"
