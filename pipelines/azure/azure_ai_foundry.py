@@ -147,7 +147,7 @@ async def cleanup_response(
 
 class Pipe:
     # Regex pattern for matching [docX] citation references
-    DOC_REF_PATTERN = r"\[doc(\d+)\]"
+    DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\]")
 
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
@@ -182,19 +182,26 @@ class Pipe:
 
         # Switch for sending model name in request body
         AZURE_AI_MODEL_IN_BODY: bool = Field(
-            default=os.getenv("AZURE_AI_MODEL_IN_BODY", False),
+            default=bool(
+                os.getenv("AZURE_AI_MODEL_IN_BODY", "false").lower() == "true"
+            ),
             description="If True, include the model name in the request body instead of as a header.",
         )
 
         # Flag to indicate if predefined Azure AI models should be used
         USE_PREDEFINED_AZURE_AI_MODELS: bool = Field(
-            default=os.getenv("USE_PREDEFINED_AZURE_AI_MODELS", False),
+            default=bool(
+                os.getenv("USE_PREDEFINED_AZURE_AI_MODELS", "false").lower() == "true"
+            ),
             description="Flag to indicate if predefined Azure AI models should be used.",
         )
 
         # If True, use Authorization header with Bearer token instead of api-key header.
         USE_AUTHORIZATION_HEADER: bool = Field(
-            default=bool(os.getenv("AZURE_AI_USE_AUTHORIZATION_HEADER", False)),
+            default=bool(
+                os.getenv("AZURE_AI_USE_AUTHORIZATION_HEADER", "false").lower()
+                == "true"
+            ),
             description="Set to True to use Authorization header with Bearer token instead of api-key header.",
         )
 
@@ -207,8 +214,28 @@ class Pipe:
 
         # Enable relevance scores from Azure AI Search
         AZURE_AI_INCLUDE_SEARCH_SCORES: bool = Field(
-            default=True,
+            default=bool(
+                os.getenv("AZURE_AI_INCLUDE_SEARCH_SCORES", "true").lower() == "true"
+            ),
             description="If True, automatically add 'include_contexts' with 'all_retrieved_documents' to Azure AI Search requests to get relevance scores (original_search_score and rerank_score). This enables relevance percentage display in citation cards.",
+        )
+
+        # BM25 score normalization factor for relevance percentage display
+        # BM25 scores are unbounded and vary by collection. This value is used to normalize
+        # scores to 0-1 range: normalized = min(score / BM25_SCORE_MAX, 1.0)
+        # See: https://learn.microsoft.com/en-us/azure/search/index-ranking-similarity
+        BM25_SCORE_MAX: float = Field(
+            default=float(os.getenv("AZURE_AI_BM25_SCORE_MAX", "100.0")),
+            description="Normalization divisor for BM25 search scores (0-1 range). Adjust based on your index characteristics. Default 100.0 is suitable for typical collections; higher values (e.g., 200.0) reduce saturation for large documents.",
+        )
+
+        # Rerank score normalization factor for relevance percentage display
+        # Cohere rerankers via Azure return 0-4, most others 0-1. This value normalizes
+        # scores above 1.0 to 0-1 range: normalized = min(score / RERANK_SCORE_MAX, 1.0)
+        # See: https://learn.microsoft.com/en-us/azure/search/semantic-ranking
+        RERANK_SCORE_MAX: float = Field(
+            default=float(os.getenv("AZURE_AI_RERANK_SCORE_MAX", "4.0")),
+            description="Normalization divisor for rerank scores (0-1 range). Use 4.0 for Cohere rerankers, 1.0 for standard semantic rerankers.",
         )
 
     def __init__(self):
@@ -579,7 +606,9 @@ class Pipe:
 
             if doc_data:
                 if doc_data.get("original_search_score") is not None:
-                    citation["original_search_score"] = doc_data["original_search_score"]
+                    citation["original_search_score"] = doc_data[
+                        "original_search_score"
+                    ]
                 if doc_data.get("rerank_score") is not None:
                     citation["rerank_score"] = doc_data["rerank_score"]
                 if doc_data.get("filter_reason") is not None:
@@ -667,49 +696,56 @@ class Pipe:
         # - filter_reason="score" or not present: Document filtered by/passed original search score, use original_search_score
         if filter_reason == "rerank" and rerank_score is not None:
             # Document filtered by rerank score - use rerank_score
-            # Azure AI Search semantic rerankers typically return scores in 0-1 range.
-            # However, some Cohere rerankers (via Azure AI) may use 0-4 range.
+            # Cohere rerankers via Azure AI return scores in 0-4 range (source: Azure AI Search documentation)
+            # Most semantic rerankers return 0-1, so we normalize 0-4 range down to 0-1 for consistency.
+            # Reference: https://learn.microsoft.com/en-us/azure/search/semantic-ranking
             score_val = float(rerank_score)
             if score_val > 1.0:
-                normalized_score = min(score_val / 4.0, 1.0)
+                normalized_score = min(score_val / self.valves.RERANK_SCORE_MAX, 1.0)
             else:
                 normalized_score = score_val
             log.debug(
-                f"Using rerank_score (filter_reason=rerank): {rerank_score} -> {normalized_score}"
+                f"Using rerank_score (filter_reason=rerank): {rerank_score} -> {normalized_score} "
+                f"(normalized via {self.valves.RERANK_SCORE_MAX})"
             )
         elif (
             filter_reason is None or filter_reason == "score"
         ) and original_search_score is not None:
             # filter_reason is "score" or not present - use original_search_score
-            # BM25/keyword search scores vary based on term frequency and document collection.
-            # Typical BM25 scores in Azure AI Search range from ~0 to ~50 but can go higher.
+            # BM25 scores are unbounded and vary by collection size and term distribution.
+            # We normalize by dividing by BM25_SCORE_MAX to produce a value in 0-1 range.
+            # This preserves relative ranking without hard-capping high-relevance documents.
+            # Reference: https://learn.microsoft.com/en-us/azure/search/index-ranking-similarity
             score_val = float(original_search_score)
             if score_val > 1.0:
-                normalized_score = min(score_val / 100.0, 1.0)
+                normalized_score = min(score_val / self.valves.BM25_SCORE_MAX, 1.0)
             else:
                 normalized_score = score_val
             log.debug(
-                f"Using original_search_score (filter_reason={filter_reason}): {original_search_score} -> {normalized_score}"
+                f"Using original_search_score (filter_reason={filter_reason}): {original_search_score} -> {normalized_score} "
+                f"(normalized via {self.valves.BM25_SCORE_MAX})"
             )
         elif original_search_score is not None:
             # Fallback for unknown filter_reason values - use original_search_score
             score_val = float(original_search_score)
             if score_val > 1.0:
-                normalized_score = min(score_val / 100.0, 1.0)
+                normalized_score = min(score_val / self.valves.BM25_SCORE_MAX, 1.0)
             else:
                 normalized_score = score_val
             log.debug(
-                f"Using original_search_score (fallback, filter_reason={filter_reason}): {original_search_score} -> {normalized_score}"
+                f"Using original_search_score (fallback, filter_reason={filter_reason}): {original_search_score} -> {normalized_score} "
+                f"(normalized via {self.valves.BM25_SCORE_MAX})"
             )
         elif rerank_score is not None:
             # Fallback to rerank_score if available but filter_reason doesn't match
             score_val = float(rerank_score)
             if score_val > 1.0:
-                normalized_score = min(score_val / 4.0, 1.0)
+                normalized_score = min(score_val / self.valves.RERANK_SCORE_MAX, 1.0)
             else:
                 normalized_score = score_val
             log.debug(
-                f"Using rerank_score (fallback): {rerank_score} -> {normalized_score}"
+                f"Using rerank_score (fallback): {rerank_score} -> {normalized_score} "
+                f"(normalized via {self.valves.RERANK_SCORE_MAX})"
             )
         elif legacy_score is not None:
             normalized_score = float(legacy_score)
@@ -766,9 +802,7 @@ class Pipe:
 
         return citation_urls
 
-    def _format_citation_link(
-        self, doc_num: int, url: Optional[str] = None
-    ) -> str:
+    def _format_citation_link(self, doc_num: int, url: Optional[str] = None) -> str:
         """
         Format a markdown link for a [docX] reference.
 
@@ -824,9 +858,13 @@ class Pipe:
 
         # Count conversions for logging
         original_count = len(re.findall(self.DOC_REF_PATTERN, content))
-        linked_count = sum(1 for i in range(1, len(citations) + 1) if citation_urls.get(i))
+        linked_count = sum(
+            1 for i in range(1, len(citations) + 1) if citation_urls.get(i)
+        )
         if original_count > 0:
-            log.info(f"Converted {original_count} [docX] references to markdown links ({linked_count} with URLs)")
+            log.info(
+                f"Converted {original_count} [docX] references to markdown links ({linked_count} with URLs)"
+            )
 
         return converted
 
@@ -1144,6 +1182,13 @@ class Pipe:
             full_response_buffer = ""
             response_content = ""  # Track the actual response content
             citations_data = None
+            citation_urls = {}  # Pre-allocate citation URLs map
+
+            # Pre-define the replacement function outside the loop to avoid repeated creation
+            def replace_ref(m, urls_map):
+                doc_num = int(m.group(1))
+                url = urls_map.get(doc_num)
+                return self._format_citation_link(doc_num, url)
 
             async for chunk in content:
                 chunk_str = chunk.decode("utf-8", errors="ignore")
@@ -1259,11 +1304,23 @@ class Pipe:
                                         # Use citations if found, otherwise use all_retrieved_documents
                                         if citations_found and not citations_data:
                                             citations_data = citations_found
+                                            # Build citation URLs map once when citations are found
+                                            citation_urls = (
+                                                self._build_citation_urls_map(
+                                                    citations_data
+                                                )
+                                            )
                                             log.info(
                                                 f"Successfully extracted {len(citations_data)} citations from stream"
                                             )
                                         elif all_docs_found and not citations_data:
                                             citations_data = all_docs_found
+                                            # Build citation URLs map once when citations are found
+                                            citation_urls = (
+                                                self._build_citation_urls_map(
+                                                    citations_data
+                                                )
+                                            )
                                             log.info(
                                                 f"Using {len(citations_data)} all_retrieved_documents as citations"
                                             )
@@ -1280,23 +1337,23 @@ class Pipe:
                 # Convert [docX] references to markdown links in the chunk content
                 # This creates clickable links to source documents in streaming responses
                 chunk_modified = False
-                if "[doc" in chunk_str:
+                if "[doc" in chunk_str and citation_urls:
                     try:
-                        # Build citation URLs map using shared helper
-                        citation_urls = self._build_citation_urls_map(citations_data)
-
-                        # Define replacement function once, outside inner loops
-                        def replace_ref(m):
-                            doc_num = int(m.group(1))
-                            url = citation_urls.get(doc_num)
-                            return self._format_citation_link(doc_num, url)
-
                         # Parse and modify each SSE data line
                         modified_lines = []
                         chunk_lines = chunk_str.split("\n")
 
                         for line in chunk_lines:
-                            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                            # Early exit: skip lines without [doc references
+                            if "[doc" not in line:
+                                modified_lines.append(line)
+                                continue
+
+                            # Process only SSE data lines
+                            if (
+                                line.startswith("data: ")
+                                and line.strip() != "data: [DONE]"
+                            ):
                                 json_str = line[6:].strip()
                                 if json_str and json_str != "[DONE]":
                                     try:
@@ -1307,23 +1364,34 @@ class Pipe:
                                             and data["choices"]
                                         ):
                                             line_modified = False
+                                            # Process choices until we find and modify content
                                             for choice in data["choices"]:
                                                 if (
                                                     "delta" in choice
                                                     and "content" in choice["delta"]
                                                 ):
-                                                    content_val = choice["delta"]["content"]
+                                                    content_val = choice["delta"][
+                                                        "content"
+                                                    ]
                                                     if "[doc" in content_val:
-                                                        # Convert [docX] to markdown link
-                                                        choice["delta"]["content"] = re.sub(
-                                                            self.DOC_REF_PATTERN,
-                                                            replace_ref,
-                                                            content_val,
+                                                        # Convert [docX] to markdown link using pre-compiled pattern
+                                                        # Use lambda to pass citation_urls to pre-defined function
+                                                        choice["delta"]["content"] = (
+                                                            self.DOC_REF_PATTERN.sub(
+                                                                lambda m: replace_ref(
+                                                                    m, citation_urls
+                                                                ),
+                                                                content_val,
+                                                            )
                                                         )
                                                         line_modified = True
+                                                        # Early exit: content found and modified
+                                                        break
 
                                             if line_modified:
-                                                modified_lines.append(f"data: {json.dumps(data)}")
+                                                modified_lines.append(
+                                                    f"data: {json.dumps(data)}"
+                                                )
                                                 chunk_modified = True
                                             else:
                                                 modified_lines.append(line)
@@ -1345,7 +1413,9 @@ class Pipe:
                             chunk = modified_chunk_str.encode("utf-8")
 
                     except Exception as convert_err:
-                        log.debug(f"Error converting [docX] to markdown links: {convert_err}")
+                        log.debug(
+                            f"Error converting [docX] to markdown links: {convert_err}"
+                        )
                         # Fall through to yield original chunk
 
                 # Yield the (possibly modified) chunk
