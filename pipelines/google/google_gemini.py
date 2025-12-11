@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.8.0
+version: 1.10.0
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -28,12 +28,14 @@ features:
   - Intelligent grounding with Google search integration
   - Vertex AI Search grounding for RAG
   - Native tool calling support with automatic signature management
+  - URL context grounding for specified web pages
   - Unified image processing with consolidated helper methods
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
+  - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
 """
 
 import os
@@ -59,6 +61,27 @@ from fastapi import Request, UploadFile, BackgroundTasks
 from open_webui.routers.files import upload_file
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
+
+ASPECT_RATIO_OPTIONS: List[str] = [
+    "default",
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
+]
+
+RESOLUTION_OPTIONS: List[str] = [
+    "default",
+    "1K",
+    "2K",
+    "4K",
+]
 
 
 # Simplified encryption implementation with automatic handling
@@ -144,6 +167,19 @@ class Pipe:
     Pipeline for interacting with Google Gemini models.
     """
 
+    # User-overridable configuration valves
+    class UserValves(BaseModel):
+        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "default"),
+            description="Default aspect ratio for image generation.",
+            json_schema_extra={"enum": ASPECT_RATIO_OPTIONS},
+        )
+        IMAGE_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
+            description="Default resolution for image generation.",
+            json_schema_extra={"enum": RESOLUTION_OPTIONS},
+        )
+
     # Configuration valves for the pipeline
     class Valves(BaseModel):
         BASE_URL: str = Field(
@@ -191,11 +227,12 @@ class Pipe:
             description="The Google Cloud region to use with Vertex AI.",
         )
         VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("VERTEX_AI_RAG_STORE"),
+            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=os.getenv("USE_PERMISSIVE_SAFETY", "false").lower() == "true",
+            default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
+            == "true",
             description="Use permissive safety settings for content generation.",
         )
         MODEL_CACHE_TTL: int = Field(
@@ -206,8 +243,30 @@ class Pipe:
             default=int(os.getenv("GOOGLE_RETRY_COUNT", "2")),
             description="Number of times to retry API calls on temporary failures",
         )
+        DEFAULT_SYSTEM_PROMPT: str = Field(
+            default=os.getenv("GOOGLE_DEFAULT_SYSTEM_PROMPT", ""),
+            description="Default system prompt applied to all chats. If a user-defined system prompt exists, "
+            "this is prepended to it. Leave empty to disable.",
+        )
+        ENABLE_FORWARD_USER_INFO_HEADERS: bool = Field(
+            default=os.getenv(
+                "GOOGLE_ENABLE_FORWARD_USER_INFO_HEADERS", "false"
+            ).lower()
+            == "true",
+            description="Whether to forward user information headers.",
+        )
 
         # Image Processing Configuration
+        IMAGE_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_ASPECT_RATIO", "default"),
+            description="Default aspect ratio for image generation.",
+            json_schema_extra={"enum": ASPECT_RATIO_OPTIONS},
+        )
+        IMAGE_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
+            description="Default resolution for image generation.",
+            json_schema_extra={"enum": RESOLUTION_OPTIONS},
+        )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
             description="Maximum image size in MB before compression is applied",
@@ -279,10 +338,44 @@ class Pipe:
                 if h in seen:
                     continue
                 seen.add(h)
-            except Exception:
-                pass
+            except Exception as e:
+                # Skip images with malformed or missing data, but log for debugging.
+                self.log.debug(f"Skipping image in deduplication due to error: {e}")
             result.append(part)
         return result
+
+    def _combine_system_prompts(
+        self, user_system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Combine default system prompt with user-defined system prompt.
+
+        If DEFAULT_SYSTEM_PROMPT is set and user_system_prompt exists,
+        the default is prepended to the user's prompt.
+        If only DEFAULT_SYSTEM_PROMPT is set, it is used as the system prompt.
+        If only user_system_prompt is set, it is used as-is.
+
+        Args:
+            user_system_prompt: The user-defined system prompt from messages (may be None)
+
+        Returns:
+            Combined system prompt or None if neither is set
+        """
+        default_prompt = self.valves.DEFAULT_SYSTEM_PROMPT.strip()
+        user_prompt = user_system_prompt.strip() if user_system_prompt else ""
+
+        if default_prompt and user_prompt:
+            combined = f"{default_prompt}\n\n{user_prompt}"
+            self.log.debug(
+                f"Combined system prompts: default ({len(default_prompt)} chars) + "
+                f"user ({len(user_prompt)} chars) = {len(combined)} chars"
+            )
+            return combined
+        elif default_prompt:
+            self.log.debug(f"Using default system prompt ({len(default_prompt)} chars)")
+            return default_prompt
+        elif user_prompt:
+            return user_prompt
+        return None
 
     def _apply_order_and_limit(
         self,
@@ -374,11 +467,14 @@ class Pipe:
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
-        # Extract system instruction first
-        system_instruction = next(
+        # Extract user-defined system instruction first
+        user_system_instruction = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_instruction = self._combine_system_prompts(user_system_instruction)
 
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -523,8 +619,44 @@ class Pipe:
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
+            headers = {}
+            if (
+                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
+                and hasattr(self, "user")
+                and self.user
+            ):
+
+                def sanitize_header_value(value: Any, max_length: int = 255) -> str:
+                    if value is None:
+                        return ""
+                    # Convert to string and remove all control characters
+                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    sanitized = sanitized.strip()
+                    return (
+                        sanitized[:max_length]
+                        if len(sanitized) > max_length
+                        else sanitized
+                    )
+
+                user_attrs = {
+                    "X-OpenWebUI-User-Name": sanitize_header_value(
+                        getattr(self.user, "name", None)
+                    ),
+                    "X-OpenWebUI-User-Id": sanitize_header_value(
+                        getattr(self.user, "id", None)
+                    ),
+                    "X-OpenWebUI-User-Email": sanitize_header_value(
+                        getattr(self.user, "email", None)
+                    ),
+                    "X-OpenWebUI-User-Role": sanitize_header_value(
+                        getattr(self.user, "role", None)
+                    ),
+                }
+                headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
             options = types.HttpOptions(
-                api_version=self.valves.API_VERSION, base_url=self.valves.BASE_URL
+                api_version=self.valves.API_VERSION,
+                base_url=self.valves.BASE_URL,
+                headers=headers,
             )
             return genai.Client(
                 api_key=EncryptedStr.decrypt(self.valves.GOOGLE_API_KEY),
@@ -643,10 +775,14 @@ class Pipe:
         Returns:
             True if the model supports image generation, False otherwise
         """
-        # Known image generation models
+        # Known image generation models (both Gemini 2.5 and Gemini 3)
         image_generation_models = [
-            "gemini-2.5-flash-image-preview",
             "gemini-2.5-flash-image",
+            "gemini-2.5-flash-image-preview",
+            "gemini-3-flash-image",
+            "gemini-3-flash-image-preview",
+            "gemini-3-pro-image",
+            "gemini-3-pro-image-preview",
         ]
 
         # Check for exact matches or pattern matches
@@ -661,6 +797,29 @@ class Pipe:
             return True
 
         return False
+
+    def _check_image_config_support(self, model_id: str) -> bool:
+        """
+        Check if a model supports ImageConfig (aspect_ratio and image_size parameters).
+
+        ImageConfig is only supported by Gemini 3 image generation models.
+        Gemini 2.5 image models support image generation but not ImageConfig.
+
+        Args:
+            model_id: The model ID to check
+
+        Returns:
+            True if the model supports ImageConfig, False otherwise
+        """
+        # ImageConfig is only supported by Gemini 3 models
+        model_lower = model_id.lower()
+
+        # Check if it's a Gemini 3 model
+        if "gemini-3-" not in model_lower:
+            return False
+
+        # Check if it's an image generation model
+        return self._check_image_generation_support(model_id)
 
     def _check_thinking_support(self, model_id: str) -> bool:
         """
@@ -776,6 +935,58 @@ class Pipe:
         )
         return -1
 
+    def _validate_aspect_ratio(self, aspect_ratio: str) -> Optional[str]:
+        """
+        Validate and normalize the aspect ratio value.
+
+        Args:
+            aspect_ratio: The aspect ratio string to validate
+
+        Returns:
+            Validated aspect ratio string, None for "default", or "1:1" as fallback for invalid values
+        """
+        if not aspect_ratio or aspect_ratio == "default":
+            self.log.debug("Using default aspect ratio (None)")
+            return None
+
+        normalized = aspect_ratio.strip()
+        valid_ratios = [r for r in ASPECT_RATIO_OPTIONS if r != "default"]
+
+        if normalized in valid_ratios:
+            return normalized
+
+        self.log.warning(
+            f"Invalid aspect ratio '{aspect_ratio}'. Valid values are: {', '.join(valid_ratios)}. "
+            "Using default '1:1'."
+        )
+        return "1:1"
+
+    def _validate_resolution(self, resolution: str) -> Optional[str]:
+        """
+        Validate and normalize the resolution value.
+
+        Args:
+            resolution: The resolution string to validate
+
+        Returns:
+            Validated resolution string, None for "default", or "2K" as fallback for invalid values
+        """
+        if not resolution or resolution.lower() == "default":
+            self.log.debug("Using default resolution (None)")
+            return None
+
+        normalized = resolution.strip().upper()
+        valid_resolutions = [r for r in RESOLUTION_OPTIONS if r.lower() != "default"]
+
+        if normalized in valid_resolutions:
+            return normalized
+
+        self.log.warning(
+            f"Invalid resolution '{resolution}'. Valid values are: {', '.join(valid_resolutions)}. "
+            "Using default '2K'."
+        )
+        return "2K"
+
     def pipes(self) -> List[Dict[str, str]]:
         """
         Returns a list of available Google Gemini models for the UI.
@@ -848,11 +1059,14 @@ class Pipe:
         Returns:
             Tuple of (prepared content list, system message string or None)
         """
-        # Extract system message
-        system_message = next(
+        # Extract user-defined system message
+        user_system_message = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
             None,
         )
+
+        # Combine with default system prompt if configured
+        system_message = self._combine_system_prompts(user_system_message)
 
         # Prepare contents for the API
         contents = []
@@ -1269,15 +1483,20 @@ class Pipe:
             else:
                 fid = file_url.split("/files/")[-1].split("/")[0].split("?")[0]
 
+            from pathlib import Path
             from open_webui.models.files import Files
+            from open_webui.storage.provider import Storage
 
             file_obj = Files.get_file_by_id(fid)
             if file_obj and file_obj.path:
-                async with aiofiles.open(file_obj.path, "rb") as fp:
-                    raw = await fp.read()
-                enc = base64.b64encode(raw).decode()
-                mime = file_obj.meta.get("content_type", "image/png")
-                return f"data:{mime};base64,{enc}"
+                file_path = Storage.get_file(file_obj.path)
+                file_path = Path(file_path)
+                if file_path.is_file():
+                    async with aiofiles.open(file_path, "rb") as fp:
+                        raw = await fp.read()
+                    enc = base64.b64encode(raw).decode()
+                    mime = file_obj.meta.get("content_type", "image/png")
+                    return f"data:{mime};base64,{enc}"
         except Exception as e:
             self.log.warning(f"Could not fetch file {file_url}: {e}")
         return None
@@ -1440,12 +1659,23 @@ class Pipe:
             # Fallback to data URL if upload fails
             return f"data:{mime_type};base64,{image_data}"
 
+    def _get_user_valve_value(
+        self, __user__: Optional[dict], valve_name: str
+    ) -> Optional[str]:
+        """Get a user valve value, returning None if not set or set to 'default'"""
+        if __user__ and "valves" in __user__:
+            value = getattr(__user__["valves"], valve_name, None)
+            if value and value != "default":
+                return value
+        return None
+
     def _configure_generation(
         self,
         body: Dict[str, Any],
         system_instruction: Optional[str],
         __metadata__: Dict[str, Any],
         __tools__: dict[str, Any] | None = None,
+        __user__: Optional[dict] = None,
         enable_image_generation: bool = False,
         model_id: str = "",
     ) -> types.GenerateContentConfig:
@@ -1474,6 +1704,62 @@ class Pipe:
         if enable_image_generation:
             gen_config_params["response_modalities"] = ["TEXT", "IMAGE"]
 
+            # Configure image generation parameters (aspect ratio and resolution)
+            # ImageConfig is only supported by Gemini 3 models
+            if self._check_image_config_support(model_id):
+                # Body parameters override valve defaults for per-request customization
+                # Get aspect_ratio: body > user_valves (if not "default") > system valves
+                user_aspect_ratio = self._get_user_valve_value(
+                    __user__, "IMAGE_GENERATION_ASPECT_RATIO"
+                )
+                aspect_ratio = body.get(
+                    "aspect_ratio",
+                    user_aspect_ratio or self.valves.IMAGE_GENERATION_ASPECT_RATIO,
+                )
+
+                # Get resolution: body > user_valves (if not "default") > system valves
+                user_resolution = self._get_user_valve_value(
+                    __user__, "IMAGE_GENERATION_RESOLUTION"
+                )
+                resolution = body.get(
+                    "resolution",
+                    user_resolution or self.valves.IMAGE_GENERATION_RESOLUTION,
+                )
+
+                # Validate and normalize the values
+                validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
+                validated_resolution = self._validate_resolution(resolution)
+
+                # Create image config if we have at least one valid value
+                if validated_aspect_ratio or validated_resolution:
+                    try:
+                        image_config_params = {}
+                        if validated_aspect_ratio:
+                            image_config_params["aspect_ratio"] = validated_aspect_ratio
+                        if validated_resolution:
+                            image_config_params["image_size"] = validated_resolution
+                        gen_config_params["image_config"] = types.ImageConfig(
+                            **image_config_params
+                        )
+                        self.log.debug(
+                            f"Image generation config: aspect_ratio={validated_aspect_ratio}, resolution={validated_resolution}"
+                        )
+                    except (AttributeError, TypeError) as e:
+                        # Fall back if SDK does not support ImageConfig
+                        self.log.warning(
+                            f"ImageConfig not supported by SDK version: {e}. Image generation will use default settings."
+                        )
+                    except Exception as e:
+                        # Log unexpected errors but continue without image config
+                        self.log.warning(
+                            f"Unexpected error configuring ImageConfig: {e}"
+                        )
+            else:
+                self.log.debug(
+                    f"Model {model_id} does not support ImageConfig (aspect_ratio/resolution). "
+                    "ImageConfig is only available for Gemini 3 image models."
+                )
+
         # Configure Gemini thinking/reasoning for models that support it
         # This is independent of include_thoughts - thinking config controls HOW the model reasons,
         # while include_thoughts controls whether the reasoning is shown in the output
@@ -1493,13 +1779,34 @@ class Pipe:
                 # Check if model supports thinking_level (Gemini 3 models)
                 if self._check_thinking_level_support(model_id):
                     # For Gemini 3 models, use thinking_level (not thinking_budget)
-                    validated_level = self._validate_thinking_level(
-                        self.valves.THINKING_LEVEL
-                    )
+                    # Per-chat reasoning_effort overrides environment-level THINKING_LEVEL
+                    reasoning_effort = body.get("reasoning_effort")
+                    validated_level = None
+                    source = None
+
+                    if reasoning_effort:
+                        validated_level = self._validate_thinking_level(
+                            reasoning_effort
+                        )
+                        if validated_level:
+                            source = "per-chat reasoning_effort"
+                        else:
+                            self.log.debug(
+                                f"Invalid reasoning_effort '{reasoning_effort}', falling back to THINKING_LEVEL"
+                            )
+
+                    # Fall back to environment-level THINKING_LEVEL if no valid reasoning_effort
+                    if not validated_level:
+                        validated_level = self._validate_thinking_level(
+                            self.valves.THINKING_LEVEL
+                        )
+                        if validated_level:
+                            source = "THINKING_LEVEL"
+
                     if validated_level:
                         thinking_config_params["thinking_level"] = validated_level
                         self.log.debug(
-                            f"Using thinking_level='{validated_level}' for model {model_id}"
+                            f"Using thinking_level='{validated_level}' from {source} for model {model_id}"
                         )
                     else:
                         self.log.debug(
@@ -1507,22 +1814,43 @@ class Pipe:
                         )
                 else:
                     # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
-                    validated_budget = self._validate_thinking_budget(
-                        self.valves.THINKING_BUDGET
-                    )
+                    # Body-level thinking_budget overrides environment-level THINKING_BUDGET
+                    body_thinking_budget = body.get("thinking_budget")
+                    validated_budget = None
+                    source = None
+
+                    if body_thinking_budget is not None:
+                        validated_budget = self._validate_thinking_budget(
+                            body_thinking_budget
+                        )
+                        if validated_budget is not None:
+                            source = "body thinking_budget"
+                        else:
+                            self.log.debug(
+                                f"Invalid body thinking_budget '{body_thinking_budget}', falling back to THINKING_BUDGET"
+                            )
+
+                    # Fall back to environment-level THINKING_BUDGET
+                    if validated_budget is None:
+                        validated_budget = self._validate_thinking_budget(
+                            self.valves.THINKING_BUDGET
+                        )
+                        if validated_budget is not None:
+                            source = "THINKING_BUDGET"
+
                     if validated_budget == 0:
                         # Disable thinking if budget is 0
                         thinking_config_params["thinking_budget"] = 0
                         self.log.debug(
-                            f"Thinking disabled via thinking_budget=0 for model {model_id}"
+                            f"Thinking disabled via thinking_budget=0 from {source} for model {model_id}"
                         )
-                    elif validated_budget > 0:
+                    elif validated_budget is not None and validated_budget > 0:
                         thinking_config_params["thinking_budget"] = validated_budget
                         self.log.debug(
-                            f"Using thinking_budget={validated_budget} for model {model_id}"
+                            f"Using thinking_budget={validated_budget} from {source} for model {model_id}"
                         )
                     else:
-                        # -1 means dynamic thinking
+                        # -1 or None means dynamic thinking
                         thinking_config_params["thinking_budget"] = -1
                         self.log.debug(
                             f"Using dynamic thinking (model decides) for model {model_id}"
@@ -1556,14 +1884,17 @@ class Pipe:
             ]
             gen_config_params |= {"safety_settings": safety_settings}
 
+        # Add various tools to Gemini as required
         features = __metadata__.get("features", {})
+        params = __metadata__.get("params", {})
+        tools = []
+
         if features.get("google_search_tool", False):
             self.log.debug("Enabling Google search grounding")
-            gen_config_params.setdefault("tools", []).append(
-                types.Tool(google_search=types.GoogleSearch())
-            )
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+            self.log.debug("Enabling URL context grounding")
+            tools.append(types.Tool(url_context=types.UrlContext()))
 
-        params = __metadata__.get("params", {})
         if features.get("vertex_ai_search", False) or (
             self.valves.USE_VERTEX_AI
             and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
@@ -1577,7 +1908,7 @@ class Pipe:
                 self.log.debug(
                     f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
                 )
-                gen_config_params.setdefault("tools", []).append(
+                tools.append(
                     types.Tool(
                         retrieval=types.Retrieval(
                             vertex_ai_search=types.VertexAISearch(
@@ -1590,6 +1921,7 @@ class Pipe:
                 self.log.warning(
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
+
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
                 if not name.startswith("_"):
@@ -1597,7 +1929,10 @@ class Pipe:
                     self.log.debug(
                         f"Adding tool '{name}' with signature {tool.__signature__}"
                     )
-                    gen_config_params.setdefault("tools", []).append(tool)
+                    tools.append(tool)
+
+        if tools:
+            gen_config_params["tools"] = tools
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -1647,8 +1982,6 @@ class Pipe:
         grounding_metadata_list: List[types.GroundingMetadata],
         text: str,
         __event_emitter__: Callable,
-        *,
-        emit_replace: bool = True,
     ):
         """Process and emit grounding metadata events."""
         grounding_chunks = []
@@ -1716,17 +2049,8 @@ class Pipe:
                 cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
 
             replaced_text = "".join(cited_chunks)
-            if emit_replace:
-                await __event_emitter__(
-                    {
-                        "type": "replace",
-                        "data": {"content": replaced_text},
-                    }
-                )
 
-        # Return the transformed text when requested by caller
-        if not emit_replace:
-            return replaced_text if replaced_text is not None else text
+        return replaced_text if replaced_text is not None else text
 
     async def _handle_streaming_response(
         self,
@@ -1767,13 +2091,8 @@ class Pipe:
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
                     # Check prompt feedback
-                    if (
-                        response_iterator.prompt_feedback
-                        and response_iterator.prompt_feedback.block_reason
-                    ):
-                        block_reason = (
-                            response_iterator.prompt_feedback.block_reason.name
-                        )
+                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                        block_reason = chunk.prompt_feedback.block_reason.name
                         message = f"[Blocked due to Prompt Safety: {block_reason}]"
                         await emit_chat_event(
                             "chat:finish",
@@ -1869,12 +2188,10 @@ class Pipe:
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
             if grounding_metadata_list and __event_emitter__:
-                # Don't emit replace here; we'll compose final content below
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
                     final_answer_text,
                     __event_emitter__,
-                    emit_replace=False,
                 )
                 final_answer_text = cited or final_answer_text
 
@@ -1925,6 +2242,10 @@ class Pipe:
                 "chat:finish",
                 {"role": "assistant", "content": final_content, "done": True},
             )
+
+            # Yield final content to ensure the async iterator completes properly.
+            # This ensures the response is persisted even if the user navigates away.
+            yield final_content
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
@@ -2074,7 +2395,7 @@ class Pipe:
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
                     self.log.debug(
-                        f"Image generation mode: system instruction integrated into prompt"
+                        "Image generation mode: system instruction integrated into prompt"
                     )
                 except ValueError as ve:
                     return f"Error: {ve}"
@@ -2095,6 +2416,7 @@ class Pipe:
                 system_instruction,
                 __metadata__,
                 __tools__,
+                __user__,
                 supports_image_generation,
                 model_id,
             )
@@ -2248,7 +2570,6 @@ class Pipe:
                             grounding_metadata_list,
                             final_answer,
                             __event_emitter__,
-                            emit_replace=False,
                         )
                         final_answer = cited or final_answer
 

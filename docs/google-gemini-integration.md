@@ -80,6 +80,12 @@ GOOGLE_MODEL_CACHE_TTL=600
 # Default: 2
 GOOGLE_RETRY_COUNT=2
 
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+# Leave empty to disable
+# Default: "" (empty, disabled)
+GOOGLE_DEFAULT_SYSTEM_PROMPT=""
+
 # Image processing optimization settings
 # Maximum image size in MB before compression is applied
 # Default: 15.0
@@ -121,6 +127,18 @@ GOOGLE_IMAGE_HISTORY_FIRST=true
 # Enable fallback to data URL when image upload fails
 # Default: true
 GOOGLE_IMAGE_UPLOAD_FALLBACK=true
+
+# Image generation configuration (only for Gemini 3 image models like gemini-3-pro-image-preview)
+# Note: These settings do not apply to Gemini 2.5 image models
+# Default aspect ratio for generated images
+# Valid values: "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+# Default: "1:1"
+GOOGLE_IMAGE_GENERATION_ASPECT_RATIO="1:1"
+
+# Default resolution for generated images
+# Valid values: "1K", "2K", "4K"
+# Default: "2K"
+GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
 
 # Enable Gemini thoughts outputs globally
 # Default: true
@@ -193,13 +211,120 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 >
 > Future versions may extend these settings to also optimize generated images before upload/display.
 
-## Grounding with Google search
+## Image Generation Configuration
 
-Grounding with Google search is enabled/disabled with the `google_search_tool` feature, which can be switched on/off in a Filter.
+The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3 image models** (e.g., `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
 
-For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with google search grounding.
+> [!IMPORTANT]
+> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
 
-When enabled, sources and google queries used by Gemini will be displayed with the response.
+### Aspect Ratio
+
+Control the shape and proportions of generated images using the aspect ratio setting:
+
+**Valid Values:**
+- `1:1` - Square (default)
+- `2:3`, `3:2` - Classic photo ratios
+- `3:4`, `4:3` - Standard display ratios
+- `4:5`, `5:4` - Portrait/landscape variants
+- `9:16`, `16:9` - Mobile and widescreen ratios
+- `21:9` - Ultra-wide format
+
+**Configuration:**
+```bash
+# Set via environment variable (global default)
+GOOGLE_IMAGE_GENERATION_ASPECT_RATIO="16:9"
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Resolution
+
+Control the quality and size of generated images:
+
+**Valid Values:**
+- `1K` - Lower resolution, faster generation
+- `2K` - Balanced quality and speed (default)
+- `4K` - Highest quality, slower generation
+
+**Configuration:**
+```bash
+# Set via environment variable (global default)
+GOOGLE_IMAGE_GENERATION_RESOLUTION="4K"
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Per-Request Override
+
+You can override the default settings on a per-request basis by including these parameters in the request body:
+
+**Example API Usage:**
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="your-api-key")
+
+# Generate a 4K widescreen image with Gemini 3
+response = client.models.generate_content(
+    model="gemini-3-pro-image-preview",
+    contents="A serene mountain landscape at sunset",
+    config=types.GenerateContentConfig(
+        response_modalities=["TEXT", "IMAGE"],
+        image_config=types.ImageConfig(
+            aspect_ratio="16:9",
+            image_size="4K"
+        ),
+    )
+)
+
+for part in response.parts:
+    if part.text:
+        print(part.text)
+    elif image := part.as_image():
+        image.save("landscape.png")
+```
+
+### Use Cases
+
+**Portrait Photography (`3:4` or `4:5`)**
+- Social media profile images
+- Portrait-oriented artwork
+
+**Widescreen Content (`16:9` or `21:9`)**
+- Desktop wallpapers
+- YouTube thumbnails
+- Presentation slides
+
+**Square Images (`1:1`)**
+- Instagram posts
+- Icons and logos
+- Product photos
+
+**Mobile-First (`9:16`)**
+- Instagram Stories
+- TikTok content
+- Mobile app screens
+
+### Model Compatibility
+
+| Model                     | ImageConfig Support (aspect_ratio, image_size) |
+| ------------------------- | ----------------------------------------------- |
+| gemini-3-pro-image-\*     | ✅ Supported                                    |
+| gemini-3-flash-image-\*   | ✅ Supported                                    |
+| gemini-2.5-flash-image-\* | ❌ Not supported (uses defaults)                |
+| Other gemini-3-\* models  | ❌ Not image generation models                  |
+| Other models              | ❌ Not image generation models                  |
+
+## Web search and access 
+
+[Grounding with Google search](https://ai.google.dev/gemini-api/docs/google-search) together with the [URL context tool](https://ai.google.dev/gemini-api/docs/url-context) are enabled/disabled together via the `google_search_tool` feature, which can be switched on/off in a Filter.
+
+For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with Google search grounding + the URL context tool.
+
+When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
 ## Grounding with Vertex AI Search
 
@@ -245,6 +370,50 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
 
+## Default System Prompt
+
+The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
+
+### How It Works
+
+- **Default Only**: If only `GOOGLE_DEFAULT_SYSTEM_PROMPT` is set and no user-defined system prompt exists, the default prompt is used as the system instruction.
+- **User Only**: If only a user-defined system prompt exists (from model settings), it is used as-is.
+- **Both**: If both are set, the default system prompt is **prepended** to the user-defined prompt, separated by a blank line. This allows you to have base instructions that apply to all chats while still allowing model-specific customization.
+
+### Configuration
+
+Set via environment variable:
+
+```bash
+# Default system prompt applied to all chats
+# If a user-defined system prompt exists, this is prepended to it
+GOOGLE_DEFAULT_SYSTEM_PROMPT="You are a helpful AI assistant. Always be concise and accurate."
+```
+
+Or configure through the pipeline valves in Open WebUI's Admin panel.
+
+### Example
+
+If your default system prompt is:
+
+```
+You are a helpful AI assistant.
+```
+
+And your model-specific system prompt is:
+
+```
+Always respond in formal English.
+```
+
+The combined system prompt sent to Gemini will be:
+
+```
+You are a helpful AI assistant.
+
+Always respond in formal English.
+```
+
 ## Thinking Configuration
 
 The Google Gemini pipeline supports advanced thinking configuration to control how much reasoning and computation is applied by the model.
@@ -271,6 +440,10 @@ GOOGLE_THINKING_LEVEL="low"
 # Use high thinking level for complex reasoning
 GOOGLE_THINKING_LEVEL="high"
 ```
+
+#### Per-Chat Override (Reasoning Effort)
+
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (e.g., "low" or "high"), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
 
 **Example API Usage:**
 
@@ -315,6 +488,10 @@ GOOGLE_THINKING_BUDGET=-1
 GOOGLE_THINKING_BUDGET=1024
 ```
 
+#### Per-Chat Override (thinking_budget)
+
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
+
 **Example API Usage:**
 
 ```python
@@ -356,9 +533,9 @@ print(response.text)
 
 ### Model Compatibility
 
-| Model | thinking_level | thinking_budget |
-|-------|---------------|-----------------|
-| gemini-3-* | ✅ Supported ("low", "high") | ❌ Not used |
-| gemini-2.5-* | ❌ Not used | ✅ Supported (0-32768) |
-| gemini-2.5-flash-image-* | ❌ Not supported | ❌ Not supported |
-| Other models | ❌ Not used | ✅ May be supported |
+| Model                     | thinking_level               | thinking_budget        |
+| ------------------------- | ---------------------------- | ---------------------- |
+| gemini-3-\*               | ✅ Supported ("low", "high") | ❌ Not used            |
+| gemini-2.5-\*             | ❌ Not used                  | ✅ Supported (0-32768) |
+| gemini-2.5-flash-image-\* | ❌ Not supported             | ❌ Not supported       |
+| Other models              | ❌ Not used                  | ✅ May be supported    |
