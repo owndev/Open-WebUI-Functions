@@ -1515,7 +1515,6 @@ class Pipe:
                 except Exception as process_err:
                     log.debug(f"Error processing streaming chunk: {process_err}")
                     # Fall through to yield original chunk
-                    # Fall through to yield original chunk
 
                 # Yield the (possibly modified) chunk
                 yield chunk
