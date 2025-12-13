@@ -147,7 +147,8 @@ async def cleanup_response(
 
 class Pipe:
     # Regex pattern for matching [docX] citation references
-    DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\]")
+    # Uses negative lookahead to avoid matching [docX] already followed by (url)
+    DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\](?!\()")
 
     # Regex patterns for cleaning malformed bracket patterns from followup generation
     # These can occur when Azure AI followup generation doesn't format citations properly
@@ -155,6 +156,8 @@ class Pipe:
     EXTRA_BRACKETS_PATTERN = re.compile(r"\[+(\[\[doc\d+\]\]\([^)]+\))\]+")
     # Pattern 2: Empty brackets [] -> (removed)
     EMPTY_BRACKETS_PATTERN = re.compile(r"\[\]")
+    # Pattern 3: Duplicate URL after markdown link [[docX]](url)(url) -> [[docX]](url)
+    DUPLICATE_URL_PATTERN = re.compile(r"(\[\[doc\d+\]\]\([^)]+\))\([^)]+\)")
 
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
@@ -860,6 +863,7 @@ class Pipe:
         - [[[doc3]](url)]] - extra brackets around link
         - [] - empty brackets
         - [[[doc1]](url)] - inconsistent bracket counts
+        - [[doc2]](url)(url) - duplicate URL after markdown link
 
         This method normalizes these patterns to ensure proper markdown rendering.
 
@@ -880,6 +884,10 @@ class Pipe:
 
         # Remove empty brackets
         result = self.EMPTY_BRACKETS_PATTERN.sub("", result)
+
+        # Remove duplicate URLs: [[doc1]](url)(url) -> [[doc1]](url)
+        # This can occur when Azure AI adds a URL that we also added during conversion
+        result = self.DUPLICATE_URL_PATTERN.sub(r"\1", result)
 
         return result
 
@@ -1071,7 +1079,11 @@ class Pipe:
             enhanced_content = self._convert_doc_refs_to_links(content, citations)
 
             # Clean up malformed brackets from followup generation
-            if "[[" in enhanced_content or "[]" in enhanced_content:
+            if (
+                "[[" in enhanced_content
+                or "[]" in enhanced_content
+                or "](" in enhanced_content
+            ):
                 enhanced_content = self._clean_malformed_brackets(enhanced_content)
 
             # Update the message content
@@ -1477,6 +1489,7 @@ class Pipe:
                                                     if (
                                                         "[[" in modified_content
                                                         or "[]" in modified_content
+                                                        or "](" in modified_content
                                                     ):
                                                         modified_content = self._clean_malformed_brackets(
                                                             modified_content
