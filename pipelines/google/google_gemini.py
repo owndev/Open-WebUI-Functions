@@ -304,6 +304,10 @@ class Pipe:
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
         )
+        MODEL_WHITELIST: str = Field(
+            default=os.getenv("GOOGLE_MODEL_WHITELIST", ""),
+            description="A comma-separated list of model IDs to manually add to the list of available models.",
+        )
 
     # ---------------- Internal Helpers ---------------- #
     async def _gather_history_images(
@@ -724,7 +728,19 @@ class Pipe:
         try:
             client = self._get_client()
             self.log.debug("Fetching models from Google API")
-            models = client.models.list()
+            models = list(client.models.list())
+
+            # Process model whitelist
+            whitelist = self.valves.MODEL_WHITELIST
+            if whitelist:
+                self.log.debug(f"Processing whitelist: {whitelist}")
+                existing_model_names = {self.strip_prefix(m.name) for m in models}
+                whitelisted_ids = set(re.findall(r"[^,\s]+", whitelist))
+
+                for model_id in whitelisted_ids.difference(existing_model_names):
+                    self.log.debug(f"Adding whitelisted model '{model_id}'.")
+                    models.append(types.Model(name=f"models/{model_id}"))
+
             available_models = []
             for model in models:
                 actions = model.supported_actions
