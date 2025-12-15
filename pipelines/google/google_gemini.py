@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.10.0
+version: 1.10.1
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -255,6 +255,10 @@ class Pipe:
             == "true",
             description="Whether to forward user information headers.",
         )
+        MODEL_WHITELIST: str = Field(
+            default=os.getenv("GOOGLE_MODEL_WHITELIST", ""),
+            description="A comma-separated list of model IDs to manually add to the list of available models.",
+        )
 
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
@@ -303,10 +307,6 @@ class Pipe:
         IMAGE_HISTORY_FIRST: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
-        )
-        MODEL_WHITELIST: str = Field(
-            default=os.getenv("GOOGLE_MODEL_WHITELIST", ""),
-            description="A comma-separated list of model IDs to manually add to the list of available models.",
         )
 
     # ---------------- Internal Helpers ---------------- #
