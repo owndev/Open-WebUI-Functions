@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
-version: 2.0.1
+version: 2.1.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
 features:
@@ -19,7 +19,6 @@ features:
 from typing import List, Union, Generator, Iterator, Optional, Dict, Any
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
-from starlette.background import BackgroundTask
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
@@ -186,7 +185,7 @@ class Pipe:
         }
         return headers
 
-    def get_api_url(self, endpoint: str = "chat/completions") -> str:
+    def get_api_url(self, endpoint: str = "v1/chat/completions") -> str:
         """
         Constructs the API URL for Infomaniak requests.
 
@@ -196,7 +195,7 @@ class Pipe:
         Returns:
             Full API URL
         """
-        return f"{self.valves.INFOMANIAK_BASE_URL}/1/ai/{self.valves.INFOMANIAK_PRODUCT_ID}/openai/{endpoint}"
+        return f"{self.valves.INFOMANIAK_BASE_URL}/2/ai/{self.valves.INFOMANIAK_PRODUCT_ID}/openai/{endpoint}"
 
     def validate_body(self, body: Dict[str, Any]) -> None:
         """
@@ -219,7 +218,7 @@ class Pipe:
             List of dictionaries containing model id and name.
         """
         log = logging.getLogger("infomaniak_ai_tools.get_models")
-        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
         headers = self.get_headers()
         models = []
@@ -301,7 +300,7 @@ class Pipe:
             Response from Infomaniak AI API, which could be a string, dictionary or streaming response
         """
         log = logging.getLogger("infomaniak_ai_tools.pipe")
-        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
         # Validate the request body
         self.validate_body(body)
@@ -363,13 +362,30 @@ class Pipe:
             # Check if response is SSE
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
+
+                streaming_resp = request
+                streaming_session = session
+
+                async def stream_response(
+                    resp: aiohttp.ClientResponse, client: aiohttp.ClientSession
+                ):
+                    try:
+                        async for chunk in resp.content.iter_any():
+                            yield chunk
+                    finally:
+                        try:
+                            await cleanup_response(resp, client)
+                        except Exception as cleanup_error:
+                            log.warning(
+                                "Suppressing cleanup error in streaming response",
+                                exc_info=cleanup_error,
+                            )
+
                 return StreamingResponse(
-                    request.content,
-                    status_code=request.status,
-                    headers=dict(request.headers),
-                    background=BackgroundTask(
-                        cleanup_response, response=request, session=session
-                    ),
+                    stream_response(streaming_resp, streaming_session),
+                    status_code=streaming_resp.status,
+                    headers=dict(streaming_resp.headers),
+                    media_type=streaming_resp.headers.get("Content-Type"),
                 )
             else:
                 try:
@@ -393,7 +409,5 @@ class Pipe:
 
             return f"Error: {detail}"
         finally:
-            if not streaming and session:
-                if request:
-                    request.close()
-                await session.close()
+            if not streaming:
+                await cleanup_response(request, session)
