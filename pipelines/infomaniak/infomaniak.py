@@ -363,6 +363,9 @@ class Pipe:
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
 
+                streaming_resp = request
+                streaming_session = session
+
                 async def stream_response(
                     resp: aiohttp.ClientResponse, client: aiohttp.ClientSession
                 ):
@@ -370,13 +373,19 @@ class Pipe:
                         async for chunk in resp.content.iter_any():
                             yield chunk
                     finally:
-                        await cleanup_response(resp, client)
+                        try:
+                            await cleanup_response(resp, client)
+                        except Exception as cleanup_error:
+                            log.warning(
+                                "Suppressing cleanup error in streaming response",
+                                exc_info=cleanup_error,
+                            )
 
                 return StreamingResponse(
-                    stream_response(request, session),
-                    status_code=request.status,
-                    headers=dict(request.headers),
-                    media_type=request.headers.get("Content-Type"),
+                    stream_response(streaming_resp, streaming_session),
+                    status_code=streaming_resp.status,
+                    headers=dict(streaming_resp.headers),
+                    media_type=streaming_resp.headers.get("Content-Type"),
                 )
             else:
                 try:
