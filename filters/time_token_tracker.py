@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.1
+version: 2.5.2
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
 features:
@@ -213,7 +213,7 @@ class Filter:
             return False
 
         log = logging.getLogger("time_token_tracker._send_to_log_analytics_async")
-        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
         method = "POST"
         content_type = "application/json"
@@ -364,7 +364,7 @@ class Filter:
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
         log = logging.getLogger("time_token_tracker.outlet")
-        log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
         global start_time, request_token_count, response_token_count
         end_time = time.time()
