@@ -86,6 +86,19 @@ GOOGLE_RETRY_COUNT=2
 # Default: "" (empty, disabled)
 GOOGLE_DEFAULT_SYSTEM_PROMPT=""
 
+# Model configuration
+# Add models that the SDK doesn't return but you want to make available
+# Comma-separated list of model IDs (e.g., "gemini-exp-1206,gemini-2.0-flash-exp")
+# Default: "" (empty, no additional models)
+GOOGLE_MODEL_ADDITIONAL=""
+
+# Filter models to only show specific ones in the model list
+# Comma-separated list of model IDs to show (e.g., "gemini-2.0-flash-exp,gemini-1.5-pro")
+# If empty, all models are shown. If set, only these models will be available.
+# This filter is applied AFTER MODEL_ADDITIONAL, so you can add and then filter models.
+# Default: "" (empty, show all models)
+GOOGLE_MODEL_WHITELIST=""
+
 # Image processing optimization settings
 # Maximum image size in MB before compression is applied
 # Default: 15.0
@@ -317,6 +330,100 @@ for part in response.parts:
 | gemini-2.5-flash-image-\* | ❌ Not supported (uses defaults)                |
 | Other gemini-3-\* models  | ❌ Not image generation models                  |
 | Other models              | ❌ Not image generation models                  |
+
+## Model Configuration
+
+The Google Gemini pipeline provides two complementary mechanisms for controlling which models appear in the model list: `MODEL_ADDITIONAL` and `MODEL_WHITELIST`.
+
+### MODEL_ADDITIONAL
+
+Use `MODEL_ADDITIONAL` to add models that are not returned by the Google AI SDK but that you want to make available. This is useful for:
+
+- **Experimental models** that haven't been added to the SDK yet (e.g., `gemini-exp-1206`)
+- **Preview models** that require explicit configuration
+- **Custom model endpoints** that follow the Gemini API format
+
+**Configuration:**
+```bash
+# Add experimental models not in the SDK
+GOOGLE_MODEL_ADDITIONAL="gemini-exp-1206,gemini-2.0-flash-exp"
+```
+
+**Example Use Case:**
+```bash
+# Google releases a new experimental model that's not in the SDK yet
+GOOGLE_MODEL_ADDITIONAL="gemini-exp-1206"
+# This model will now appear in your model list alongside SDK-provided models
+```
+
+### MODEL_WHITELIST
+
+Use `MODEL_WHITELIST` to restrict which models appear in the model list. This is useful for:
+
+- **Limiting choices** to prevent users from selecting deprecated models
+- **Cost control** by only showing economical models
+- **Feature-specific deployments** (e.g., only showing image-capable models)
+- **Organizational policies** requiring specific model versions
+
+**Configuration:**
+```bash
+# Only show specific models in the list
+GOOGLE_MODEL_WHITELIST="gemini-2.0-flash-exp,gemini-1.5-pro,gemini-1.5-flash"
+```
+
+**Example Use Case:**
+```bash
+# Only allow the latest production models
+GOOGLE_MODEL_WHITELIST="gemini-2.0-flash-exp,gemini-1.5-pro"
+# Users will only see these two models, even if more are available
+```
+
+### Using Both Together
+
+`MODEL_ADDITIONAL` and `MODEL_WHITELIST` work together in the following order:
+
+1. **Fetch** models from the Google AI SDK
+2. **Add** models specified in `MODEL_ADDITIONAL`
+3. **Filter** to only show models in `MODEL_WHITELIST` (if configured)
+
+**Example Combined Use:**
+```bash
+# Add an experimental model and limit the list to specific models
+GOOGLE_MODEL_ADDITIONAL="gemini-exp-1206"
+GOOGLE_MODEL_WHITELIST="gemini-exp-1206,gemini-2.0-flash-exp,gemini-1.5-pro"
+# Result: Users see only the experimental model plus two production models
+```
+
+**Practical Scenarios:**
+
+1. **Beta Testing Environment**
+   ```bash
+   # Add experimental models and limit to testing models only
+   GOOGLE_MODEL_ADDITIONAL="gemini-exp-1206,gemini-3-flash-preview"
+   GOOGLE_MODEL_WHITELIST="gemini-exp-1206,gemini-3-flash-preview"
+   ```
+
+2. **Cost-Controlled Production**
+   ```bash
+   # Only show flash models (most economical)
+   GOOGLE_MODEL_WHITELIST="gemini-2.0-flash-exp,gemini-1.5-flash"
+   ```
+
+3. **Image Generation Only**
+   ```bash
+   # Only show image-capable models
+   GOOGLE_MODEL_WHITELIST="gemini-2.5-flash-image-preview,gemini-3-pro-image-preview"
+   ```
+
+4. **Adding Preview Model Not in SDK**
+   ```bash
+   # Add a preview model and include it in the whitelist
+   GOOGLE_MODEL_ADDITIONAL="gemini-2.5-flash-preview-0514"
+   GOOGLE_MODEL_WHITELIST="gemini-2.5-flash-preview-0514,gemini-1.5-pro"
+   ```
+
+> [!TIP]
+> Leave both variables empty (default) to show all available models from the SDK.
 
 ## Web search and access 
 
