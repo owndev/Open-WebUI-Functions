@@ -260,7 +260,8 @@ class Pipe:
         MODEL_ADDITIONAL: str = Field(
             default=os.getenv("GOOGLE_MODEL_ADDITIONAL", ""),
             description="A comma-separated list of model IDs to manually add to the list of available models. "
-            "These are models not returned by the SDK but that you want to make available.",
+            "These are models not returned by the SDK but that you want to make available. "
+            "Non-Gemini model IDs must be explicitly included in MODEL_WHITELIST to be available.",
         )
         MODEL_WHITELIST: str = Field(
             default=os.getenv("GOOGLE_MODEL_WHITELIST", ""),
@@ -774,21 +775,24 @@ class Pipe:
 
             model_map = {model["id"]: model for model in available_models}
 
-            # Filter map to only include models starting with 'gemini-'
-            filtered_models = {
-                k: v for k, v in model_map.items() if k.startswith("gemini-")
-            }
-
-            # Apply MODEL_WHITELIST filter if configured
+            # Apply MODEL_WHITELIST filter if configured (takes priority)
             whitelist = self.valves.MODEL_WHITELIST
             if whitelist:
                 self.log.debug(f"Applying model whitelist: {whitelist}")
                 whitelisted_ids = set(re.findall(r"[^,\s]+", whitelist))
                 # Filter to only include whitelisted models
                 filtered_models = {
-                    k: v for k, v in filtered_models.items() if k in whitelisted_ids
+                    k: v for k, v in model_map.items() if k in whitelisted_ids
                 }
                 self.log.debug(f"After whitelist filter: {len(filtered_models)} models")
+            else:
+                # If no whitelist, filter to only include models starting with 'gemini-' for safety
+                filtered_models = {
+                    k: v for k, v in model_map.items() if k.startswith("gemini-")
+                }
+                self.log.debug(
+                    f"After gemini-prefix filter: {len(filtered_models)} models"
+                )
 
             # Update cache
             self._model_cache = list(filtered_models.values())
