@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.10.1
+version: 1.11.0
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -36,6 +36,8 @@ features:
   - Configurable thinking levels (low/high) for Gemini 3 models
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
   - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
+  - Model whitelist for filtering available models
+  - Additional model support for SDK-unsupported models
 """
 
 import os
@@ -255,9 +257,17 @@ class Pipe:
             == "true",
             description="Whether to forward user information headers.",
         )
+        MODEL_ADDITIONAL: str = Field(
+            default=os.getenv("GOOGLE_MODEL_ADDITIONAL", ""),
+            description="A comma-separated list of model IDs to manually add to the list of available models. "
+            "These are models not returned by the SDK but that you want to make available. "
+            "Non-Gemini model IDs must be explicitly included in MODEL_WHITELIST to be available.",
+        )
         MODEL_WHITELIST: str = Field(
             default=os.getenv("GOOGLE_MODEL_WHITELIST", ""),
-            description="A comma-separated list of model IDs to manually add to the list of available models.",
+            description="A comma-separated list of model IDs to show in the models list. "
+            "If set, only these models will be available (after MODEL_ADDITIONAL is applied). "
+            "Leave empty to show all models.",
         )
 
         # Image Processing Configuration
@@ -730,15 +740,15 @@ class Pipe:
             self.log.debug("Fetching models from Google API")
             models = list(client.models.list())
 
-            # Process model whitelist
-            whitelist = self.valves.MODEL_WHITELIST
-            if whitelist:
-                self.log.debug(f"Processing whitelist: {whitelist}")
+            # Process additional models (models not returned by SDK but that we want to add)
+            additional = self.valves.MODEL_ADDITIONAL
+            if additional:
+                self.log.debug(f"Processing additional models: {additional}")
                 existing_model_names = {self.strip_prefix(m.name) for m in models}
-                whitelisted_ids = set(re.findall(r"[^,\s]+", whitelist))
+                additional_ids = set(re.findall(r"[^,\s]+", additional))
 
-                for model_id in whitelisted_ids.difference(existing_model_names):
-                    self.log.debug(f"Adding whitelisted model '{model_id}'.")
+                for model_id in additional_ids.difference(existing_model_names):
+                    self.log.debug(f"Adding additional model '{model_id}'.")
                     models.append(types.Model(name=f"models/{model_id}"))
 
             available_models = []
@@ -765,10 +775,24 @@ class Pipe:
 
             model_map = {model["id"]: model for model in available_models}
 
-            # Filter map to only include models starting with 'gemini-'
-            filtered_models = {
-                k: v for k, v in model_map.items() if k.startswith("gemini-")
-            }
+            # Apply MODEL_WHITELIST filter if configured (takes priority)
+            whitelist = self.valves.MODEL_WHITELIST
+            if whitelist:
+                self.log.debug(f"Applying model whitelist: {whitelist}")
+                whitelisted_ids = set(re.findall(r"[^,\s]+", whitelist))
+                # Filter to only include whitelisted models
+                filtered_models = {
+                    k: v for k, v in model_map.items() if k in whitelisted_ids
+                }
+                self.log.debug(f"After whitelist filter: {len(filtered_models)} models")
+            else:
+                # If no whitelist, filter to only include models starting with 'gemini-' for safety
+                filtered_models = {
+                    k: v for k, v in model_map.items() if k.startswith("gemini-")
+                }
+                self.log.debug(
+                    f"After gemini-prefix filter: {len(filtered_models)} models"
+                )
 
             # Update cache
             self._model_cache = list(filtered_models.values())
