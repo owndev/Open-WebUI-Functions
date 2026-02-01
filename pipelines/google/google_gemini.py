@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.11.0
+version: 1.11.1
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -213,7 +213,7 @@ class Pipe:
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
-            description="Thinking level for Gemini 3 models ('low' or 'high'). "
+            description="Thinking level for Gemini 3 models ('minimal', 'low', 'medium', or 'high'). "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -924,13 +924,13 @@ class Pipe:
             level: The thinking level string to validate
 
         Returns:
-            Normalized level string ('low', 'high') or None if invalid/empty
+            Normalized level string ('minimal', 'low', 'medium', 'high') or None if invalid/empty
         """
         if not level:
             return None
 
         normalized = level.strip().lower()
-        valid_levels = ["low", "high"]
+        valid_levels = ["minimal", "low", "medium", "high"]
 
         if normalized in valid_levels:
             return normalized
