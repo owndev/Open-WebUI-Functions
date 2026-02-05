@@ -147,7 +147,17 @@ async def cleanup_response(
 
 class Pipe:
     # Regex pattern for matching [docX] citation references
-    DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\]")
+    # Uses negative lookahead to avoid matching [docX] already followed by (url)
+    DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\](?!\()")
+
+    # Regex patterns for cleaning malformed bracket patterns from followup generation
+    # These can occur when Azure AI followup generation doesn't format citations properly
+    # Pattern 1: Extra brackets around valid links [+[[docX]](url)]+ -> [[docX]](url)
+    EXTRA_BRACKETS_PATTERN = re.compile(r"\[+(\[\[doc\d+\]\]\([^)]+\))\]+")
+    # Pattern 2: Empty brackets [] -> (removed)
+    EMPTY_BRACKETS_PATTERN = re.compile(r"\[\]")
+    # Pattern 3: Duplicate URL after markdown link [[docX]](url)(url) -> [[docX]](url)
+    DUPLICATE_URL_PATTERN = re.compile(r"(\[\[doc\d+\]\]\([^)]+\))\([^)]+\)")
 
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
@@ -802,6 +812,85 @@ class Pipe:
 
         return citation_urls
 
+    def _strip_context_from_response(
+        self, response_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Strip citations and all_retrieved_documents from the response context.
+
+        This prevents OpenWebUI from displaying duplicate citations from both
+        the raw SSE JSON and the emitted citation events. The citation events
+        are filtered to only include referenced documents, but the raw context
+        would show all documents.
+
+        Args:
+            response_data: Response data dict (modified in-place)
+
+        Returns:
+            The modified response data with context stripped
+        """
+        if not isinstance(response_data, dict) or "choices" not in response_data:
+            return response_data
+
+        for choice in response_data.get("choices", []):
+            # Handle delta (streaming) context
+            if "delta" in choice and isinstance(choice["delta"], dict):
+                context = choice["delta"].get("context")
+                if context and isinstance(context, dict):
+                    context.pop("citations", None)
+                    context.pop("all_retrieved_documents", None)
+                    # Remove empty context
+                    if not context:
+                        del choice["delta"]["context"]
+
+            # Handle message (non-streaming) context
+            if "message" in choice and isinstance(choice["message"], dict):
+                context = choice["message"].get("context")
+                if context and isinstance(context, dict):
+                    context.pop("citations", None)
+                    context.pop("all_retrieved_documents", None)
+                    # Remove empty context
+                    if not context:
+                        del choice["message"]["context"]
+
+        return response_data
+
+    def _clean_malformed_brackets(self, content: str) -> str:
+        """
+        Clean up malformed bracket patterns from followup generation.
+
+        Azure AI followup generation can produce malformed citations like:
+        - [[[doc3]](url)]] - extra brackets around link
+        - [] - empty brackets
+        - [[[doc1]](url)] - inconsistent bracket counts
+        - [[doc2]](url)(url) - duplicate URL after markdown link
+
+        This method normalizes these patterns to ensure proper markdown rendering.
+
+        Args:
+            content: The response content to clean
+
+        Returns:
+            Content with malformed brackets cleaned up
+        """
+        if not content:
+            return content
+
+        result = content
+
+        # Fix extra outer brackets: [[[doc1]](url)]] -> [[doc1]](url)
+        # Uses capture group to preserve the valid inner markdown link
+        result = self.EXTRA_BRACKETS_PATTERN.sub(r"\1", result)
+
+        # Remove empty brackets
+        result = self.EMPTY_BRACKETS_PATTERN.sub("", result)
+
+        # Remove duplicate URLs: [[doc1]](url)(url) -> [[doc1]](url)
+        # This can occur when Azure AI adds a URL that we also added during conversion
+        result = self.DUPLICATE_URL_PATTERN.sub(r"\1", result)
+
+        return result
+
     def _format_citation_link(self, doc_num: int, url: Optional[str] = None) -> str:
         """
         Format a markdown link for a [docX] reference.
@@ -957,13 +1046,14 @@ class Pipe:
     def enhance_azure_search_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """
         Enhance Azure AI Search responses by converting [docX] references to markdown links.
+        Also cleans up malformed brackets and strips context to prevent duplicate citations.
         Modifies the response in-place and returns it.
 
         Args:
             response: The original response from Azure AI (modified in-place)
 
         Returns:
-            The enhanced response with markdown links for citations
+            The enhanced response with markdown links for citations and cleaned content
         """
         if not isinstance(response, dict):
             return response
@@ -988,8 +1078,20 @@ class Pipe:
             # Convert [docX] references to markdown links
             enhanced_content = self._convert_doc_refs_to_links(content, citations)
 
+            # Clean up malformed brackets from followup generation
+            if (
+                "[[" in enhanced_content
+                or "[]" in enhanced_content
+                or "](" in enhanced_content
+            ):
+                enhanced_content = self._clean_malformed_brackets(enhanced_content)
+
             # Update the message content
             message["content"] = enhanced_content
+
+            # Strip context to prevent OpenWebUI from showing duplicate citations
+            # The citations are emitted separately via _emit_openwebui_citation_events
+            self._strip_context_from_response(response)
 
             return response
 
@@ -1334,38 +1436,32 @@ class Pipe:
                     except Exception as parse_error:
                         log.debug(f"Error parsing citations from chunk: {parse_error}")
 
-                # Convert [docX] references to markdown links in the chunk content
-                # This creates clickable links to source documents in streaming responses
+                # Process SSE chunk to:
+                # 1. Strip context (citations, all_retrieved_documents) to prevent duplicate display
+                # 2. Convert [docX] references to markdown links
+                # 3. Clean up malformed bracket patterns from followup generation
                 chunk_modified = False
-                if "[doc" in chunk_str and citation_urls:
-                    try:
-                        # Parse and modify each SSE data line
-                        modified_lines = []
-                        chunk_lines = chunk_str.split("\n")
+                try:
+                    modified_lines = []
+                    chunk_lines = chunk_str.split("\n")
 
-                        for line in chunk_lines:
-                            # Early exit: skip lines without [doc references
-                            if "[doc" not in line:
-                                modified_lines.append(line)
-                                continue
+                    for line in chunk_lines:
+                        # Process only SSE data lines
+                        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                            json_str = line[6:].strip()
+                            if json_str and json_str != "[DONE]":
+                                try:
+                                    data = json.loads(json_str)
+                                    if isinstance(data, dict):
+                                        line_modified = False
 
-                            # Process only SSE data lines
-                            if (
-                                line.startswith("data: ")
-                                and line.strip() != "data: [DONE]"
-                            ):
-                                json_str = line[6:].strip()
-                                if json_str and json_str != "[DONE]":
-                                    try:
-                                        data = json.loads(json_str)
-                                        if (
-                                            isinstance(data, dict)
-                                            and "choices" in data
-                                            and data["choices"]
-                                        ):
-                                            line_modified = False
-                                            # Process choices until we find and modify content
-                                            for choice in data["choices"]:
+                                        # Strip context to prevent OpenWebUI from showing unfiltered citations
+                                        if "choices" in data:
+                                            self._strip_context_from_response(data)
+                                            line_modified = True
+
+                                            # Process content in choices
+                                            for choice in data.get("choices", []):
                                                 if (
                                                     "delta" in choice
                                                     and "content" in choice["delta"]
@@ -1373,50 +1469,65 @@ class Pipe:
                                                     content_val = choice["delta"][
                                                         "content"
                                                     ]
-                                                    if "[doc" in content_val:
-                                                        # Convert [docX] to markdown link using pre-compiled pattern
-                                                        # Use lambda to pass citation_urls to pre-defined function
-                                                        choice["delta"]["content"] = (
+                                                    modified_content = content_val
+
+                                                    # Convert [docX] to markdown links
+                                                    if (
+                                                        "[doc" in content_val
+                                                        and citation_urls
+                                                    ):
+                                                        modified_content = (
                                                             self.DOC_REF_PATTERN.sub(
                                                                 lambda m: replace_ref(
                                                                     m, citation_urls
                                                                 ),
-                                                                content_val,
+                                                                modified_content,
                                                             )
                                                         )
-                                                        line_modified = True
-                                                        # Early exit: content found and modified
-                                                        break
 
-                                            if line_modified:
-                                                modified_lines.append(
-                                                    f"data: {json.dumps(data)}"
-                                                )
-                                                chunk_modified = True
-                                            else:
-                                                modified_lines.append(line)
+                                                    # Clean malformed brackets from followup generation
+                                                    if (
+                                                        "[[" in modified_content
+                                                        or "[]" in modified_content
+                                                        or "](" in modified_content
+                                                    ):
+                                                        modified_content = self._clean_malformed_brackets(
+                                                            modified_content
+                                                        )
+
+                                                    if modified_content != content_val:
+                                                        choice["delta"]["content"] = (
+                                                            modified_content
+                                                        )
+                                                        line_modified = True
+
+                                        if line_modified:
+                                            modified_lines.append(
+                                                f"data: {json.dumps(data)}"
+                                            )
+                                            chunk_modified = True
                                         else:
                                             modified_lines.append(line)
-                                    except json.JSONDecodeError:
+                                    else:
                                         modified_lines.append(line)
-                                else:
+                                except json.JSONDecodeError:
                                     modified_lines.append(line)
                             else:
                                 modified_lines.append(line)
+                        else:
+                            modified_lines.append(line)
 
-                        # Reconstruct the chunk only if something was modified
-                        if chunk_modified:
-                            modified_chunk_str = "\n".join(modified_lines)
-                            log.debug(
-                                "Converted [docX] references to markdown links in streaming chunk"
-                            )
-                            chunk = modified_chunk_str.encode("utf-8")
-
-                    except Exception as convert_err:
+                    # Reconstruct the chunk if modified
+                    if chunk_modified:
+                        chunk_str = "\n".join(modified_lines)
+                        chunk = chunk_str.encode("utf-8")
                         log.debug(
-                            f"Error converting [docX] to markdown links: {convert_err}"
+                            "Processed streaming chunk: stripped context, converted links, cleaned brackets"
                         )
-                        # Fall through to yield original chunk
+
+                except Exception as process_err:
+                    log.debug(f"Error processing streaming chunk: {process_err}")
+                    # Fall through to yield original chunk
 
                 # Yield the (possibly modified) chunk
                 yield chunk
