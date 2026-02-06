@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.1
+version: 2.7.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -18,6 +18,7 @@ features:
   - Azure AI Search / RAG integration with native OpenWebUI citations (Azure OpenAI only)
   - Automatic [docX] to markdown link conversion for clickable citations
   - Relevance scores from Azure AI Search displayed in citation cards
+  - Automatic max_tokens to max_completion_tokens conversion for GPT-5+ and o-series models
 """
 
 from typing import (
@@ -1484,6 +1485,42 @@ class Pipe:
         # Convert to integers and return as a set
         return {int(match) for match in matches}
 
+    def _is_new_generation_model(self, model_name: str) -> bool:
+        """
+        Determine if a model requires max_completion_tokens instead of max_tokens.
+
+        GPT-5, o-series (o1, o3, o4), and reasoning models use max_completion_tokens
+        to distinguish between internal reasoning tokens and output completion tokens.
+
+        Args:
+            model_name: The model identifier (e.g., "gpt-5", "o1", "gpt-4")
+
+        Returns:
+            True if the model requires max_completion_tokens, False otherwise
+        """
+        if not model_name:
+            return False
+
+        model_lower = model_name.lower()
+
+        # GPT-5 series models
+        if model_lower.startswith("gpt-5") or model_lower.startswith("gpt‑5"):
+            return True
+
+        # o-series reasoning models (o1, o3, o4, etc.)
+        if model_lower.startswith("o1") or model_lower.startswith("o3") or model_lower.startswith("o4"):
+            return True
+
+        # GPT-4.5 preview and newer
+        if "gpt-4.5" in model_lower:
+            return True
+
+        # Model router and other reasoning models
+        if "reasoning" in model_lower or model_lower == "model-router":
+            return True
+
+        return False
+
     async def stream_processor(
         self,
         content: aiohttp.StreamReader,
@@ -1579,6 +1616,7 @@ class Pipe:
             "deployment",
             "frequency_penalty",
             "max_tokens",
+            "max_completion_tokens",
             "max_citations",
             "presence_penalty",
             "reasoning_effort",
@@ -1593,6 +1631,27 @@ class Pipe:
             "data_sources",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
+
+        # Determine the actual model name that will be used for the request
+        effective_model = selected_model
+        if not effective_model and self.valves.AZURE_AI_MODEL:
+            models = self.parse_models(self.valves.AZURE_AI_MODEL)
+            if models and len(models) > 0:
+                effective_model = models[0]
+            else:
+                effective_model = self.valves.AZURE_AI_MODEL
+        # Also consider model name extracted from URL
+        if not effective_model:
+            effective_model = self._extracted_model_name
+
+        # Convert max_tokens to max_completion_tokens for new generation models (GPT-5, o-series, etc.)
+        if effective_model and self._is_new_generation_model(effective_model):
+            if "max_tokens" in filtered_body and "max_completion_tokens" not in filtered_body:
+                # New models require max_completion_tokens instead of max_tokens
+                filtered_body["max_completion_tokens"] = filtered_body.pop("max_tokens")
+                log.debug(
+                    f"Converted max_tokens to max_completion_tokens for model '{effective_model}'"
+                )
 
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             # If a model was explicitly selected in the request, use that
