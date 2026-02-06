@@ -285,6 +285,38 @@ class Pipe:
 
         return None
 
+    def _extract_model_name(self, model_name: str) -> str:
+        """
+        Extract the actual model name from a potentially prefixed model string.
+
+        Open WebUI may prefix model names with pipeline identifiers like "Azure AI: .gpt-5".
+        This method strips the prefix only if it looks like a pipeline prefix (contains ": "),
+        preserving version numbers in model names like "gpt-5.2-chat" or "gpt-4.5-preview".
+
+        Args:
+            model_name: The model name string (e.g., "Azure AI: .gpt-5", "gpt-5.2-chat")
+
+        Returns:
+            The extracted model name without pipeline prefix
+
+        Examples:
+            "Azure AI: .gpt-5" -> "gpt-5"
+            "gpt-5.2-chat" -> "gpt-5.2-chat"
+            "gpt-4.5-preview" -> "gpt-4.5-preview"
+        """
+        if not model_name:
+            return model_name
+
+        # Only strip prefix if it contains ": " (pipeline prefix format)
+        # This preserves version numbers like gpt-5.2, gpt-4.5, etc.
+        if "." in model_name:
+            prefix = model_name.split(".", 1)[0]
+            if ": " in prefix:
+                # This looks like a pipeline prefix, strip it
+                return model_name.split(".", 1)[1]
+
+        return model_name
+
     def validate_environment(self) -> None:
         """
         Validates that required environment variables are set.
@@ -1603,12 +1635,8 @@ class Pipe:
 
         if "model" in body and body["model"]:
             selected_model = body["model"]
-            # Safer model extraction with split
-            selected_model = (
-                selected_model.split(".", 1)[1]
-                if "." in selected_model
-                else selected_model
-            )
+            # Extract model name, handling pipeline prefixes while preserving version numbers
+            selected_model = self._extract_model_name(selected_model)
 
         # Construct headers with selected model
         headers = self.get_headers(selected_model)
@@ -1670,12 +1698,8 @@ class Pipe:
                     # Fallback to the original value
                     filtered_body["model"] = self.valves.AZURE_AI_MODEL
         elif "model" in filtered_body and filtered_body["model"]:
-            # Safer model extraction with split
-            filtered_body["model"] = (
-                filtered_body["model"].split(".", 1)[1]
-                if "." in filtered_body["model"]
-                else filtered_body["model"]
-            )
+            # Extract model name, handling pipeline prefixes while preserving version numbers
+            filtered_body["model"] = self._extract_model_name(filtered_body["model"])
 
         # Add Azure AI data sources if configured and not already present in request
         if "data_sources" not in filtered_body:
