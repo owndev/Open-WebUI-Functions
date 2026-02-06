@@ -1679,6 +1679,20 @@ class Pipe:
             if azure_ai_data_sources:
                 filtered_body["data_sources"] = azure_ai_data_sources
 
+        # Azure AI Search (data sources) does not support max_tokens or max_completion_tokens
+        # Remove these parameters to avoid validation errors when using "on your data" feature
+        if "data_sources" in filtered_body and filtered_body["data_sources"]:
+            if "max_tokens" in filtered_body:
+                filtered_body.pop("max_tokens")
+                log.debug(
+                    "Removed max_tokens parameter (not supported with Azure AI Search data sources)"
+                )
+            if "max_completion_tokens" in filtered_body:
+                filtered_body.pop("max_completion_tokens")
+                log.debug(
+                    "Removed max_completion_tokens parameter (not supported with Azure AI Search data sources)"
+                )
+
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
 
