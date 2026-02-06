@@ -1489,11 +1489,11 @@ class Pipe:
         """
         Determine if a model requires max_completion_tokens instead of max_tokens.
 
-        GPT-5, o-series (o1, o3, o4), and reasoning models use max_completion_tokens
+        GPT-4o, GPT-5, o-series (o1, o3, o4), and reasoning models use max_completion_tokens
         to distinguish between internal reasoning tokens and output completion tokens.
 
         Args:
-            model_name: The model identifier (e.g., "gpt-5", "o1", "gpt-4")
+            model_name: The model identifier (e.g., "gpt-4o", "gpt-5", "o1", "gpt-4")
 
         Returns:
             True if the model requires max_completion_tokens, False otherwise
@@ -1502,6 +1502,10 @@ class Pipe:
             return False
 
         model_lower = model_name.lower()
+
+        # GPT-4o series models (gpt-4o, gpt-4o-mini, gpt-4o-2024-*, gpt-4o-realtime-preview, etc.)
+        if "gpt-4o" in model_lower or model_lower.startswith("gpt-4o"):
+            return True
 
         # GPT-5 series models
         if model_lower.startswith("gpt-5") or model_lower.startswith("gpt‑5"):
