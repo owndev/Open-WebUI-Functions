@@ -1963,13 +1963,27 @@ class Pipe:
                 )
 
         if __tools__ is not None and params.get("function_calling") == "native":
+            function_declarations = []
             for name, tool_def in __tools__.items():
                 if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
-                    )
-                    tools.append(tool)
+                    tool_callable = tool_def["callable"]
+                    try:
+                        # Convert the callable to a FunctionDeclaration
+                        func_declaration = types.FunctionDeclaration.from_callable(
+                            callable=tool_callable
+                        )
+                        function_declarations.append(func_declaration)
+                        self.log.debug(
+                            f"Added function declaration for tool '{name}' with signature {tool_callable.__signature__}"
+                        )
+                    except Exception as e:
+                        self.log.error(
+                            f"Failed to create function declaration for tool '{name}': {e}"
+                        )
+
+            # Add all function declarations as a single Tool if any were successfully created
+            if function_declarations:
+                tools.append(types.Tool(function_declarations=function_declarations))
 
         if tools:
             gen_config_params["tools"] = tools
