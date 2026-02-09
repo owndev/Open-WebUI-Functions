@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.11.2
+version: 1.11.3
 required_open_webui_version: 0.6.26
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -1535,7 +1535,8 @@ class Pipe:
                     async with aiofiles.open(file_path, "rb") as fp:
                         raw = await fp.read()
                     enc = base64.b64encode(raw).decode()
-                    mime = file_obj.meta.get("content_type", "image/png")
+                    # Handle case where file_obj.meta might be None
+                    mime = (file_obj.meta or {}).get("content_type", "image/png")
                     return f"data:{mime};base64,{enc}"
         except Exception as e:
             self.log.warning(f"Could not fetch file {file_url}: {e}")
