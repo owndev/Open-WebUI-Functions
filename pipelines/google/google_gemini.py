@@ -1925,8 +1925,10 @@ class Pipe:
             gen_config_params |= {"safety_settings": safety_settings}
 
         # Add various tools to Gemini as required
-        features = __metadata__.get("features", {})
-        params = __metadata__.get("params", {})
+        # Handle case where __metadata__ might be None
+        metadata = __metadata__ or {}
+        features = metadata.get("features", {})
+        params = metadata.get("params", {})
         tools = []
 
         if features.get("google_search_tool", False):
