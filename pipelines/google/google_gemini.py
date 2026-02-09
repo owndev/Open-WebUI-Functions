@@ -434,7 +434,7 @@ class Pipe:
         ordered_stats: stats list in the exact order images will be sent (same length as combined image list)
         reused_flags: parallel list indicating whether image originated from history
         """
-        if not ordered_stats:
+        if not ordered_stats or not __event_emitter__:
             return
         for idx, stat in enumerate(ordered_stats, start=1):
             reused = reused_flags[idx - 1] if idx - 1 < len(reused_flags) else False
@@ -555,17 +555,18 @@ class Pipe:
                 }
                 for i in range(len(combined))
             ]
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "image_reference_map",
-                        "description": f"{len(combined)} image(s) included (limit {self.valves.IMAGE_HISTORY_MAX_REFERENCES}).",
-                        "images": mapping,
-                        "done": True,
-                    },
-                }
-            )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "image_reference_map",
+                            "description": f"{len(combined)} image(s) included (limit {self.valves.IMAGE_HISTORY_MAX_REFERENCES}).",
+                            "images": mapping,
+                            "done": True,
+                        },
+                    }
+                )
 
         # Build parts
         parts: List[Dict[str, Any]] = []
@@ -1535,7 +1536,8 @@ class Pipe:
                     async with aiofiles.open(file_path, "rb") as fp:
                         raw = await fp.read()
                     enc = base64.b64encode(raw).decode()
-                    mime = file_obj.meta.get("content_type", "image/png")
+                    # Defensive check: file_obj.meta can be None
+                    mime = (file_obj.meta or {}).get("content_type", "image/png")
                     return f"data:{mime};base64,{enc}"
         except Exception as e:
             self.log.warning(f"Could not fetch file {file_url}: {e}")
@@ -1556,18 +1558,21 @@ class Pipe:
             URL to uploaded image or data URL fallback
         """
         try:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "image_upload",
-                        "description": "Uploading generated image to your library...",
-                        "done": False,
-                    },
-                }
-            )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "image_upload",
+                            "description": "Uploading generated image to your library...",
+                            "done": False,
+                        },
+                    }
+                )
 
-            self.user = user = Users.get_user_by_id(__user__["id"])
+            self.user = user = (
+                Users.get_user_by_id(__user__["id"]) if __user__ else None
+            )
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -1582,16 +1587,17 @@ class Pipe:
                 mime_type=mime_type,
             )
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "image_upload",
-                        "description": "Image uploaded successfully!",
-                        "done": True,
-                    },
-                }
-            )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "image_upload",
+                            "description": "Image uploaded successfully!",
+                            "done": True,
+                        },
+                    }
+                )
 
             return image_url
 
@@ -1603,16 +1609,17 @@ class Pipe:
             else:
                 image_data_b64 = str(image_data)
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "image_upload",
-                        "description": "Using inline image (upload failed)",
-                        "done": True,
-                    },
-                }
-            )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "image_upload",
+                            "description": "Using inline image (upload failed)",
+                            "done": True,
+                        },
+                    }
+                )
 
             return f"data:{mime_type};base64,{image_data_b64}"
 
@@ -1925,8 +1932,10 @@ class Pipe:
             gen_config_params |= {"safety_settings": safety_settings}
 
         # Add various tools to Gemini as required
-        features = __metadata__.get("features", {})
-        params = __metadata__.get("params", {})
+        # Defensive check: __metadata__ can be None when no filters are installed
+        metadata = __metadata__ or {}
+        features = metadata.get("features", {})
+        params = metadata.get("params", {})
         tools = []
 
         if features.get("google_search_tool", False):
@@ -2037,14 +2046,14 @@ class Pipe:
                 grounding_supports.extend(metadata.grounding_supports)
 
         # Add sources to the response
-        if grounding_chunks:
+        if grounding_chunks and __event_emitter__:
             sources = self._format_grounding_chunks_as_sources(grounding_chunks)
             await __event_emitter__(
                 {"type": "chat:completion", "data": {"sources": sources}}
             )
 
         # Add status specifying google queries used for grounding
-        if web_search_queries:
+        if web_search_queries and __event_emitter__:
             await __event_emitter__(
                 {
                     "type": "status",
@@ -2171,15 +2180,16 @@ class Pipe:
                     self.log.warning(f"Failed to access content parts: {parts_error}")
                     if hasattr(chunk, "text") and chunk.text:
                         answer_chunks.append(chunk.text)
-                        await __event_emitter__(
-                            {
-                                "type": "chat:message:delta",
-                                "data": {
-                                    "role": "assistant",
-                                    "content": chunk.text,
-                                },
-                            }
-                        )
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": chunk.text,
+                                    },
+                                }
+                            )
                     continue
 
                 for part in parts:
@@ -2196,30 +2206,32 @@ class Pipe:
                             MAX_PREVIEW = 120
                             if len(preview) > MAX_PREVIEW:
                                 preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                            await __event_emitter__(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "action": "thinking",
-                                        "description": f"Thinking… {preview}",
-                                        "done": False,
-                                        "hidden": False,
-                                    },
-                                }
-                            )
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "action": "thinking",
+                                            "description": f"Thinking… {preview}",
+                                            "done": False,
+                                            "hidden": False,
+                                        },
+                                    }
+                                )
 
                         # Regular answer text
                         elif getattr(part, "text", None):
                             answer_chunks.append(part.text)
-                            await __event_emitter__(
-                                {
-                                    "type": "chat:message:delta",
-                                    "data": {
-                                        "role": "assistant",
-                                        "content": part.text,
-                                    },
-                                }
-                            )
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {
+                                        "type": "chat:message:delta",
+                                        "data": {
+                                            "role": "assistant",
+                                            "content": part.text,
+                                        },
+                                    }
+                                )
                     except Exception as part_error:
                         # Log part processing errors but continue with the stream
                         self.log.warning(f"Error processing content part: {part_error}")
@@ -2271,12 +2283,17 @@ class Pipe:
 
             if thought_chunks:
                 # Clear the thinking status without a summary in the status emitter
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"action": "thinking", "done": True, "hidden": True},
-                    }
-                )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "thinking",
+                                "done": True,
+                                "hidden": True,
+                            },
+                        }
+                    )
 
             await emit_chat_event(
                 "chat:finish",
@@ -2401,7 +2418,8 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        self.user = Users.get_user_by_id(__user__["id"])
+        # Defensive check: __user__ can be None in some contexts
+        self.user = Users.get_user_by_id(__user__["id"]) if __user__ else None
 
         try:
             # Parse and validate model ID
@@ -2509,7 +2527,7 @@ class Pipe:
                     start_ts = time.time()
 
                     # Send processing status for image generation
-                    if supports_image_generation:
+                    if supports_image_generation and __event_emitter__:
                         await __event_emitter__(
                             {
                                 "type": "status",
@@ -2525,7 +2543,7 @@ class Pipe:
                     self.log.debug(f"Request {request_id}: Got non-streaming response")
 
                     # Clear processing status for image generation
-                    if supports_image_generation:
+                    if supports_image_generation and __event_emitter__:
                         await __event_emitter__(
                             {
                                 "type": "status",
