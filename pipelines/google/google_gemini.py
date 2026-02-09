@@ -328,6 +328,9 @@ class Pipe:
     ) -> List[Dict[str, Any]]:
         history_images: List[Dict[str, Any]] = []
         for msg in messages:
+            # Defensive check: msg can be None in some cases
+            if not msg:
+                continue
             if msg is last_user_msg:
                 continue
             if msg.get("role") not in {"user", "assistant"}:
@@ -1112,6 +1115,9 @@ class Pipe:
         # Prepare contents for the API
         contents = []
         for message in messages:
+            # Defensive check: message can be None in some cases
+            if not message:
+                continue
             role = message.get("role")
             if role == "system":
                 continue  # Skip system messages, handled separately
@@ -1150,6 +1156,9 @@ class Pipe:
         parts = []
 
         for item in content_list:
+            # Defensive check: item can be None in some cases
+            if not item:
+                continue
             if item.get("type") == "text":
                 parts.append({"text": item.get("text", "")})
             elif item.get("type") == "image_url":
@@ -1249,6 +1258,9 @@ class Pipe:
         # Structured multimodal array
         if isinstance(content, list):
             for item in content:
+                # Defensive check: item can be None in some cases
+                if not item:
+                    continue
                 if item.get("type") == "text":
                     txt = item.get("text", "")
                     text_segments.append(txt)
