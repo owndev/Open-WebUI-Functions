@@ -71,6 +71,7 @@ Each citation is emitted as a separate event to ensure all sources appear in the
 ```
 
 Key points:
+
 - Each source document gets its own citation event
 - The `source.name` includes the doc index (`[doc1]`, `[doc2]`, etc.) to prevent grouping
 - The `distances` array contains relevance scores from Azure AI Search, which OpenWebUI displays as a percentage on the citation cards
@@ -159,6 +160,171 @@ This ensures every citation has a meaningful display name.
 
 Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI.
 
+## Index Schema Requirements for Citations
+
+For citations to work correctly, your Azure AI Search index must contain the right fields with the right attributes. This section explains exactly which fields the pipeline reads and how they map to citation cards in OpenWebUI.
+
+### Required and Recommended Index Fields
+
+| Index Field | Type | Required? | Must Be Retrievable? | Citation Purpose |
+|---|---|---|---|---|
+| `content` | `Edm.String` | Yes | Yes | Provides the text snippet shown in the citation preview |
+| `title` | `Edm.String` | Recommended | Yes | Displayed as the citation card title |
+| `filepath` | `Edm.String` | Recommended | Yes | Used as the citation name in the response; fallback for title |
+| `url` | `Edm.String` | Recommended | Yes | Makes `[docX]` references into clickable links |
+| `chunk_id` | `Edm.String` | Optional | Yes | Helps match citations with relevance scores |
+| `contentVector` | `Collection(Edm.Single)` | For vector search | N/A | Enables vector/hybrid search |
+
+> **Key point**: The `title`, `filepath`, and `url` fields must be marked as **retrievable** in your index schema. If they are not retrievable, Azure will not include them in the citation response, and the pipeline cannot display them.
+
+### Title Fallback Chain
+
+The pipeline determines each citation's display title using this fallback chain:
+
+1. `title` field → if present and non-empty
+2. `filepath` field → if title is empty
+3. `url` field → if both title and filepath are empty
+4. `"Unknown Document"` → if all are empty
+
+To avoid seeing "Unknown Document", ensure at least one of `title`, `filepath`, or `url` is populated in your index documents.
+
+### Custom Field Names and `fields_mapping`
+
+If your index uses different field names (e.g., `body` instead of `content`, or `doc_title` instead of `title`), you must tell Azure OpenAI how to map them using the `fields_mapping` parameter in your `AZURE_AI_DATA_SOURCES` configuration.
+
+**`fields_mapping` properties:**
+
+| Property | Type | Maps To |
+|---|---|---|
+| `content_fields` | `string[]` | The index fields to use as document content |
+| `title_field` | `string` | The index field to use as the document title |
+| `filepath_field` | `string` | The index field to use as the file path/name |
+| `url_field` | `string` | The index field to use as the document URL |
+| `vector_fields` | `string[]` | The index fields containing vector embeddings |
+| `content_fields_separator` | `string` | Separator pattern between content fields (default: `\n`) |
+
+**Example with custom field names:**
+
+```json
+[
+  {
+    "type": "azure_search",
+    "parameters": {
+      "endpoint": "https://my-search.search.windows.net",
+      "index_name": "my-custom-index",
+      "authentication": {
+        "type": "api_key",
+        "key": "YOUR-SEARCH-API-KEY"
+      },
+      "fields_mapping": {
+        "content_fields": ["body", "summary"],
+        "title_field": "doc_title",
+        "filepath_field": "source_file",
+        "url_field": "source_url",
+        "vector_fields": ["embedding"]
+      }
+    }
+  }
+]
+```
+
+### Creating an Index with the Right Fields
+
+If you are creating a new index manually, here is a minimal schema that supports all citation features:
+
+```json
+{
+  "name": "my-docs-index",
+  "fields": [
+    { "name": "id", "type": "Edm.String", "key": true, "filterable": true },
+    { "name": "content", "type": "Edm.String", "searchable": true, "retrievable": true },
+    { "name": "title", "type": "Edm.String", "searchable": true, "retrievable": true, "filterable": true },
+    { "name": "filepath", "type": "Edm.String", "retrievable": true, "filterable": true },
+    { "name": "url", "type": "Edm.String", "retrievable": true },
+    { "name": "chunk_id", "type": "Edm.String", "retrievable": true, "filterable": true }
+  ]
+}
+```
+
+For vector/hybrid search, add a vector field:
+
+```json
+{ "name": "contentVector", "type": "Collection(Edm.Single)", "searchable": true, "dimensions": 1536, "vectorSearchProfile": "my-vector-profile" }
+```
+
+### Indexer Field Mappings (Blob Storage)
+
+If you index documents from Azure Blob Storage using an indexer, you need to map blob metadata to your index fields. Common blob metadata fields:
+
+| Blob Metadata Field | Description | Typical Index Mapping |
+|---|---|---|
+| `metadata_storage_name` | Blob filename (e.g., `report.pdf`) | `title` |
+| `metadata_storage_path` | Full blob URL (e.g., `https://account.blob.core.windows.net/container/file.pdf`) | `filepath` and `url` |
+| `metadata_storage_last_modified` | Last modified timestamp | `last_modified` (optional, useful for sorting) |
+| `metadata_storage_content_type` | MIME type | (optional, useful for filtering) |
+| `content` | Extracted text from the document | `content` (auto-mapped if names match) |
+
+**Example indexer with field mappings:**
+
+```json
+{
+  "name": "my-blob-indexer",
+  "dataSourceName": "my-blob-datasource",
+  "targetIndexName": "my-docs-index",
+  "fieldMappings": [
+    {
+      "sourceFieldName": "metadata_storage_name",
+      "targetFieldName": "title"
+    },
+    {
+      "sourceFieldName": "metadata_storage_path",
+      "targetFieldName": "filepath"
+    },
+    {
+      "sourceFieldName": "metadata_storage_path",
+      "targetFieldName": "url"
+    },
+    {
+      "sourceFieldName": "metadata_storage_last_modified",
+      "targetFieldName": "last_modified"
+    }
+  ],
+  "parameters": {
+    "configuration": {
+      "dataToExtract": "contentAndMetadata"
+    }
+  }
+}
+```
+
+> **Note**: The `content` field is automatically mapped when the source and target field names match. The blob indexer also **automatically** maps `metadata_storage_path` (base64-encoded) to the `id` key field — no explicit mapping is needed for `id`. Mapping `metadata_storage_name` → `title` gives citation cards a readable name from the blob filename.
+
+### How the Pipeline Reads Citation Fields
+
+When Azure OpenAI returns a response with citations, each citation object looks like this:
+
+```json
+{
+  "title": "Architecture Overview",
+  "content": "The system uses a microservices architecture...",
+  "url": "https://storageaccount.blob.core.windows.net/docs/architecture.pdf",
+  "filepath": "architecture.pdf",
+  "chunk_id": "0",
+  "original_search_score": 12.5,
+  "rerank_score": 3.2,
+  "filter_reason": "rerank"
+}
+```
+
+The pipeline maps these fields to the OpenWebUI citation event:
+
+| Azure Citation Field | OpenWebUI Citation Property | Display |
+|---|---|---|
+| `title` | `source.name` | `[doc1] - Architecture Overview` |
+| `content` | `document[0]` | Preview text in citation card |
+| `url` / `filepath` | `source.url` | Clickable link |
+| `rerank_score` / `original_search_score` | `distances[0]` | Relevance percentage |
+
 ## Troubleshooting
 
 ### Citations Not Appearing
@@ -166,16 +332,38 @@ Citations are filtered to only show documents that are actually referenced in th
 **Problem**: Citations don't appear in the OpenWebUI frontend
 
 **Solutions**:
+
 1. Check that Azure AI Search is properly configured (`AZURE_AI_DATA_SOURCES`)
 2. Ensure you're using an Azure OpenAI endpoint (not a generic Azure AI endpoint)
 3. Verify the response contains `[docX]` references
 4. Check browser console and server logs for errors
+
+### Citations Showing "Unknown Document"
+
+**Problem**: Citation cards display "Unknown Document" instead of a meaningful title
+
+**Solutions**:
+
+1. Verify your index has `title`, `filepath`, or `url` fields and that they are marked as **retrievable**
+2. If using custom field names, add `fields_mapping` with `title_field`, `filepath_field`, and `url_field` to your `AZURE_AI_DATA_SOURCES` JSON
+3. Verify the fields are actually populated in your indexed documents (empty fields cause fallback to "Unknown Document")
+
+### No Clickable Links on [docX] References
+
+**Problem**: `[docX]` references appear as plain text, not clickable links
+
+**Solutions**:
+
+1. Your index needs a `url` field (or mapped `url_field`) that contains valid URLs
+2. If your index stores URLs in a field with a different name, map it using `"url_field": "your_field_name"` in `fields_mapping`
+3. Verify that the `url` field is marked as **retrievable** in your index schema
 
 ### Relevance Scores Showing 0%
 
 **Problem**: All citation cards show 0% relevance
 
 **Solutions**:
+
 1. Verify `AZURE_AI_INCLUDE_SEARCH_SCORES=true` is set
 2. Check that your Azure Search index supports scoring
 3. Enable DEBUG logging to see the raw score values from Azure
@@ -185,6 +373,7 @@ Citations are filtered to only show documents that are actually referenced in th
 **Problem**: `[docX]` references are not clickable
 
 **Solutions**:
+
 1. Ensure citations have valid `url` or `filepath` fields
 2. Check that the document URL is accessible
 3. Verify the markdown link format is being generated correctly
@@ -195,6 +384,9 @@ Citations are filtered to only show documents that are actually referenced in th
 - [OpenWebUI Event Emitter Documentation](https://docs.openwebui.com/features/plugin/development/events)
 - [Azure AI Search Documentation](https://learn.microsoft.com/en-us/azure/search/)
 - [Azure On Your Data API Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data)
+- [Azure Search Fields Mapping Options](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/azure-search#fields-mapping-options)
+- [Azure AI Search Indexer Field Mappings](https://learn.microsoft.com/en-us/azure/search/search-indexer-field-mappings)
+- [Azure OpenAI On Your Data - Index Field Mapping](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/use-your-data#index-field-mapping)
 
 ## Version History
 
