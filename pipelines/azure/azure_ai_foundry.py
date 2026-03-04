@@ -4,7 +4,8 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.1
+version: 2.7.0
+required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
 features:
@@ -161,6 +162,7 @@ class Pipe:
         AZURE_AI_API_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_AI_API_KEY", "API_KEY"),
             description="API key for Azure AI",
+            json_schema_extra={"input": {"type": "password"}},
         )
 
         # Endpoint for Azure AI (e.g. "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview" or "https://<your-endpoint>/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview")
@@ -1206,18 +1208,16 @@ class Pipe:
                             if json_str and json_str != "[DONE]":
                                 try:
                                     response_data = json.loads(json_str)
-                                    if (
-                                        isinstance(response_data, dict)
-                                        and "choices" in response_data
-                                    ):
-                                        for choice in response_data["choices"]:
-                                            if (
-                                                "delta" in choice
-                                                and "content" in choice["delta"]
-                                            ):
-                                                response_content += choice["delta"][
-                                                    "content"
-                                                ]
+                                    if isinstance(response_data, dict):
+                                        if "choices" in response_data:
+                                            for choice in response_data["choices"]:
+                                                if (
+                                                    "delta" in choice
+                                                    and "content" in choice["delta"]
+                                                ):
+                                                    response_content += choice["delta"][
+                                                        "content"
+                                                    ]
                                 except json.JSONDecodeError:
                                     # Malformed or incomplete JSON is expected in streamed chunks; safely skip.
                                     pass
@@ -1591,8 +1591,13 @@ class Pipe:
             "tools",
             "top_p",
             "data_sources",
+            "stream_options",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
+
+        # Request usage data in streaming responses so the middleware can extract it
+        if filtered_body.get("stream"):
+            filtered_body["stream_options"] = {"include_usage": True}
 
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             # If a model was explicitly selected in the request, use that
