@@ -107,6 +107,7 @@ VIDEO_RESOLUTION_OPTIONS: List[str] = [
 VIDEO_DURATION_OPTIONS: List[str] = [
     "default",
     "4",
+    "5",
     "6",
     "8",
 ]
@@ -226,7 +227,7 @@ class Pipe:
         )
         VIDEO_GENERATION_DURATION: str = Field(
             default=os.getenv("GOOGLE_VIDEO_GENERATION_DURATION", "default"),
-            description="Default duration in seconds for video generation (4, 6, or 8).",
+            description="Default duration in seconds for video generation (4, 5, 6, or 8 - availability varies by model).",
             json_schema_extra={"enum": VIDEO_DURATION_OPTIONS},
         )
 
@@ -381,7 +382,7 @@ class Pipe:
         )
         VIDEO_GENERATION_DURATION: str = Field(
             default=os.getenv("GOOGLE_VIDEO_GENERATION_DURATION", "default"),
-            description="Default duration in seconds for video generation (4, 6, or 8).",
+            description="Default duration in seconds for video generation (4, 5, 6, or 8 - availability varies by model).",
             json_schema_extra={"enum": VIDEO_DURATION_OPTIONS},
         )
         VIDEO_GENERATION_NEGATIVE_PROMPT: str = Field(
@@ -401,6 +402,10 @@ class Pipe:
         VIDEO_POLL_INTERVAL: int = Field(
             default=int(os.getenv("GOOGLE_VIDEO_POLL_INTERVAL", "10")),
             description="Polling interval in seconds when waiting for video generation to complete.",
+        )
+        VIDEO_POLL_TIMEOUT: int = Field(
+            default=int(os.getenv("GOOGLE_VIDEO_POLL_TIMEOUT", "600")),
+            description="Maximum time in seconds to wait for video generation before timing out (0=no limit).",
         )
 
     # ---------------- Internal Helpers ---------------- #
@@ -1126,9 +1131,9 @@ class Pipe:
 
     def _check_video_generation_support(self, model_id: str) -> bool:
         model_lower = model_id.lower()
-        if "veo" in model_lower and "generate" in model_lower:
-            return True
-        return False
+        return model_lower.startswith("veo-") or (
+            "veo" in model_lower and "generate" in model_lower
+        )
 
     def _check_veo_3_1_support(self, model_id: str) -> bool:
         """Check if a Veo model is version 3.1 (supports reference images, interpolation, 4k, extension)."""
@@ -1218,14 +1223,15 @@ class Pipe:
     def _validate_video_duration(self, duration: str) -> Optional[int]:
         if not duration or duration.lower() == "default":
             return None
+        valid = {int(d) for d in VIDEO_DURATION_OPTIONS if d != "default"}
         try:
             val = int(duration)
-            if val in (4, 6, 8):
+            if val in valid:
                 return val
         except (ValueError, TypeError):
             pass
         self.log.warning(
-            f"Invalid video duration '{duration}'. Valid: 4, 6, 8. Using default."
+            f"Invalid video duration '{duration}'. Valid: {', '.join(str(v) for v in sorted(valid))}. Using default."
         )
         return None
 
@@ -1265,16 +1271,32 @@ class Pipe:
         )
         person_generation = None
         if person_generation_raw and person_generation_raw != "default":
-            person_generation = person_generation_raw
+            valid_person_values = [
+                v for v in VIDEO_PERSON_GENERATION_OPTIONS if v != "default"
+            ]
+            if person_generation_raw in valid_person_values:
+                person_generation = person_generation_raw
+            else:
+                self.log.warning(
+                    f"Invalid person_generation '{person_generation_raw}'. "
+                    f"Valid: {', '.join(valid_person_values)}. Ignoring."
+                )
 
         enhance_prompt = body.get(
             "enhance_prompt", self.valves.VIDEO_GENERATION_ENHANCE_PROMPT
         )
 
-        number_of_videos = body.get("number_of_videos", 1)
+        number_of_videos_raw = body.get("number_of_videos", 1)
+        try:
+            number_of_videos = int(number_of_videos_raw)
+        except (ValueError, TypeError):
+            self.log.warning(
+                f"Invalid number_of_videos '{number_of_videos_raw}', defaulting to 1"
+            )
+            number_of_videos = 1
 
         config_params: Dict[str, Any] = {
-            "number_of_videos": min(max(int(number_of_videos), 1), caps["max_videos"]),
+            "number_of_videos": min(max(number_of_videos, 1), caps["max_videos"]),
         }
 
         # enhance_prompt: not supported by Fast models or Veo 2
@@ -2820,10 +2842,28 @@ class Pipe:
             return f"Error starting video generation: {e}"
 
         poll_interval = max(self.valves.VIDEO_POLL_INTERVAL, 5)
+        poll_timeout = max(self.valves.VIDEO_POLL_TIMEOUT, 0)
         elapsed = 0
         while not operation.done:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
+            if poll_timeout > 0 and elapsed >= poll_timeout:
+                error_msg = (
+                    f"Video generation timed out after {elapsed}s "
+                    f"(limit: {poll_timeout}s)"
+                )
+                self.log.error(error_msg)
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "video_generation",
+                            "description": error_msg,
+                            "done": True,
+                        },
+                    }
+                )
+                return f"Error: {error_msg}"
             try:
                 operation = await client.aio.operations.get(operation)
             except Exception as e:
@@ -2889,6 +2929,7 @@ class Pipe:
 
             # Fallback: save to temp file via SDK
             if not video_bytes:
+                tmp_path = None
                 try:
                     import tempfile
 
@@ -2899,13 +2940,18 @@ class Pipe:
                     await asyncio.to_thread(video.save, tmp_path)
                     async with aiofiles.open(tmp_path, "rb") as f:
                         video_bytes = await f.read()
-                    os.unlink(tmp_path)
                     self.log.debug(
                         f"Video {idx}: temp-file download complete, "
                         f"size={len(video_bytes)} bytes"
                     )
                 except Exception as save_err:
                     self.log.warning(f"Video {idx} temp-file save failed: {save_err}")
+                finally:
+                    if tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
 
             if not video_bytes:
                 self.log.warning(f"Video {idx}: could not obtain video bytes")
@@ -3024,7 +3070,10 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        self.user = Users.get_user_by_id(__user__["id"])
+        if __user__:
+            self.user = Users.get_user_by_id(__user__["id"])
+        else:
+            self.user = None
 
         try:
             # Parse and validate model ID

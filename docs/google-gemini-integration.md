@@ -435,13 +435,13 @@ Attach an image to your message when using any Veo model to use it as the starti
 
 1. Select a Veo model (marked with 🎬) from the model list
 2. Type your video description prompt
-3. Optionally attach an image for image-to-video (Veo 3.1 only)
+3. Optionally attach an image for image-to-video (supported by all Veo models)
 4. The pipeline submits the request and shows polling status updates
 5. Once complete, the video is uploaded to Open WebUI and embedded with a `<video>` player
 
 ### Vertex AI Note
 
-When using Vertex AI, video download via `files.download()` is not available. If the Veo API returns a GCS URI instead of raw bytes, the pipeline will link to that URI directly.
+When using Vertex AI, video download via `files.download()` is not available. If the Veo API returns a GCS URI instead of raw bytes, the current pipeline does not yet surface that URI or attach the video output in the chat. You may need to retrieve the generated video directly from Vertex AI or the underlying GCS bucket.
 
 ## Model Configuration
 
