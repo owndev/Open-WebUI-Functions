@@ -297,6 +297,7 @@ class Pipe:
 
         Args:
             body: The request body containing messages and other parameters
+            __event_emitter__: Event emitter for status updates (optional, for interface consistency)
 
         Returns:
             Response from Infomaniak AI API, which could be a string, dictionary or streaming response

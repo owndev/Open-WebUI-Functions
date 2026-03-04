@@ -2099,7 +2099,7 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
 
@@ -2285,25 +2285,9 @@ class Pipe:
                 )
 
             # Yield usage data as dict so the middleware can extract and save it to DB
-            if stream_usage_metadata:
-                usage = {}
-                if (
-                    getattr(stream_usage_metadata, "prompt_token_count", None)
-                    is not None
-                ):
-                    usage["prompt_tokens"] = stream_usage_metadata.prompt_token_count
-                if (
-                    getattr(stream_usage_metadata, "candidates_token_count", None)
-                    is not None
-                ):
-                    usage["completion_tokens"] = (
-                        stream_usage_metadata.candidates_token_count
-                    )
-                if usage:
-                    usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get(
-                        "completion_tokens", 0
-                    )
-                    yield {"usage": usage}
+            usage = self._build_usage_dict(stream_usage_metadata)
+            if usage:
+                yield {"usage": usage}
 
             await emit_chat_event(
                 "chat:finish",
@@ -2334,6 +2318,23 @@ class Pipe:
                 },
             )
             yield message
+
+    @staticmethod
+    def _build_usage_dict(usage_metadata: Any) -> Optional[Dict[str, int]]:
+        """Extract token usage from Gemini usage_metadata into a standardised dict."""
+        if not usage_metadata:
+            return None
+        usage: Dict[str, int] = {}
+        if getattr(usage_metadata, "prompt_token_count", None) is not None:
+            usage["prompt_tokens"] = usage_metadata.prompt_token_count
+        if getattr(usage_metadata, "candidates_token_count", None) is not None:
+            usage["completion_tokens"] = usage_metadata.candidates_token_count
+        if usage:
+            usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get(
+                "completion_tokens", 0
+            )
+            return usage
+        return None
 
     def _get_safety_block_message(self, response: Any) -> Optional[str]:
         """Check for safety blocks and return appropriate message."""
@@ -2409,7 +2410,7 @@ class Pipe:
         __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-    ) -> Union[str, AsyncIterator[str]]:
+    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
@@ -2671,26 +2672,9 @@ class Pipe:
                         full_response += "\n\n".join(generated_images)
 
                     # Build response with usage for middleware to extract and save to DB
-                    usage_metadata = getattr(response, "usage_metadata", None)
-                    usage = None
-                    if usage_metadata:
-                        usage = {}
-                        if (
-                            getattr(usage_metadata, "prompt_token_count", None)
-                            is not None
-                        ):
-                            usage["prompt_tokens"] = usage_metadata.prompt_token_count
-                        if (
-                            getattr(usage_metadata, "candidates_token_count", None)
-                            is not None
-                        ):
-                            usage["completion_tokens"] = (
-                                usage_metadata.candidates_token_count
-                            )
-                        if usage:
-                            usage["total_tokens"] = usage.get(
-                                "prompt_tokens", 0
-                            ) + usage.get("completion_tokens", 0)
+                    usage = self._build_usage_dict(
+                        getattr(response, "usage_metadata", None)
+                    )
 
                     content = (
                         full_response if full_response else "[No content generated]"

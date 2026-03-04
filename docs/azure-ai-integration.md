@@ -484,3 +484,48 @@ For more details, see the [Azure AI Citations Documentation](azure-ai-citations.
 
 > [!TIP]  
 > To use **Azure OpenAI** and other **Azure AI** models **simultaneously**, you can use the following URL: `https://<your project>.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview`
+
+## Authentication Modes
+
+The pipeline supports two authentication headers:
+
+| Mode | Header | When to use |
+| --- | --- | --- |
+| `api-key` (default) | `api-key: <key>` | Standard Azure AI API key authentication |
+| Bearer token | `Authorization: Bearer <token>` | Managed identity, Entra ID tokens, or services that require Bearer auth |
+
+**Configuration:**
+
+```bash
+# Use Bearer token instead of api-key header
+AZURE_AI_USE_AUTHORIZATION_HEADER=true
+```
+
+## Token Usage Tracking
+
+The pipeline automatically requests token usage metadata and returns it to Open WebUI so it is saved to the database and shown in the UI.
+
+### How it works
+
+- **Streaming mode**: `stream_options: {"include_usage": true}` is automatically added to every streaming request. The final SSE chunk contains the usage object which the Open WebUI middleware extracts.
+- **Non-streaming mode**: The response body already contains the standard `usage` field returned by the Azure / OpenAI API.
+
+No additional configuration is required.
+
+## Model Selection
+
+The pipeline resolves which model(s) to expose in Open WebUI in the following priority order:
+
+1. **`AZURE_AI_MODEL`** – Explicit model name(s). Supports semicolons, commas, or spaces as separators (e.g. `gpt-4o;gpt-4o-mini`). Each model becomes its own entry in the model list.
+2. **URL extraction** – If `AZURE_AI_MODEL` is empty and the endpoint URL follows the Azure OpenAI pattern `…/deployments/<model>/chat/completions`, the model name is extracted automatically.
+3. **`USE_PREDEFINED_AZURE_AI_MODELS=true`** – Exposes a curated catalogue of the most popular Azure AI Foundry models including GPT-4o, GPT-5, o3, o4-mini, Phi-4, DeepSeek-R1/V3, Mistral, Llama 3.x, Cohere Command, Grok and more.
+4. **Fallback** – A single generic `azure_ai` entry using the pipeline prefix.
+
+### Model in Body vs Header
+
+By default the model name is sent via the `x-ms-model-mesh-model-name` HTTP header (used by the Azure AI Models-as-a-Service endpoint). Set `AZURE_AI_MODEL_IN_BODY=true` to place the model name in the JSON request body instead — required for Azure OpenAI deployments.
+
+```bash
+# Include model name in request body (required for Azure OpenAI)
+AZURE_AI_MODEL_IN_BODY=true
+```

@@ -44,23 +44,23 @@
 > [!NOTE]
 > You must be an admin in Open WebUI to install functions.
 
-2. **Access Admin Settings**:
+1. **Access Admin Settings**:
    - Navigate to the **Admin Settings** section in Open WebUI.
 
-3. **Go to the Function Tab**:
+2. **Go to the Function Tab**:
    - Open the **Functions** tab in the admin panel.
 
-4. **Create a New Function**:
+3. **Create a New Function**:
    - Click **Add New Function**.
    - Copy the function code from this repository and paste it into the function editor.
 
-5. **Set Environment Variables (if required)**:
+4. **Set Environment Variables (if required)**:
    - Some functions require API keys or specific configurations via environment variables.
 
 > [!IMPORTANT]
 > Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
 
-6. **Save and Activate**:
+1. **Save and Activate**:
    - Save the function, and it will be available for use within Open WebUI.
 
 ## Security Features 🛡️
@@ -98,15 +98,17 @@ The functions include a built-in encryption mechanism for sensitive information:
 > This pipeline provides seamless integration with Azure OpenAI and other Azure AI models with advanced features like Azure Search integration and multiple model support.
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
-- Supports Azure Search integration for enhanced document retrieval.
-- **Native OpenWebUI Citations Support** 🎯: Rich citation cards, source previews, and inline citation correlations for Azure AI Search responses (Azure OpenAI only).
-- Supports multiple Azure AI models selection via the `AZURE_AI_MODEL` environment variable (e.g. `gpt-4o;gpt-4o-mini`).
-- Customizable pipeline display with configurable prefix via `AZURE_AI_PIPELINE_PREFIX`.
-- Azure AI Search / RAG integration with enhanced collapsible citation display (Azure OpenAI only).
+- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only).
+- **Native OpenWebUI Citations Support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion (Azure OpenAI only).
+- **Relevance Scores**: BM25 keyword and semantic rerank scores from Azure AI Search displayed as a relevance percentage on citation cards; independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
+- Supports multiple models via `AZURE_AI_MODEL` (semicolon/comma-separated, e.g. `gpt-4o;gpt-4o-mini`) or automatic model extraction from the Azure OpenAI URL.
+- **Large predefined model catalogue** (GPT-4o, GPT-5, o3, o4-mini, Phi-4, DeepSeek-R1/V3, Mistral, Llama 3.x, Cohere, Grok and more) via `USE_PREDEFINED_AZURE_AI_MODELS`.
+- Customizable pipeline display prefix via `AZURE_AI_PIPELINE_PREFIX`.
+- **Flexible authentication**: `api-key` header (default) or `Authorization: Bearer` token via `AZURE_AI_USE_AUTHORIZATION_HEADER`.
+- **Token Usage Tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database.
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.
-- Predefined models for easy access.
 - Supports encryption of sensitive information like API keys.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai)
@@ -157,10 +159,14 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Sends messages from Open WebUI to **Google Gemini**.
 - Supports encryption of sensitive information like API keys.
 - Supports both streaming and non-streaming responses (streaming automatically disabled for image generation models).
-- Supports thinking and reasoning capabilities.
+- **Thinking & Reasoning**: Configurable thinking levels (`low`/`high`) for Gemini 3 models and thinking budgets (0–32 768 tokens) for Gemini 2.5 models; per-chat override support.
 - Provides configurable error handling and timeouts.
 - **Advanced Image Processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
+- **Multi-Image History**: Configurable history image limit, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
+- **Image Generation (Gemini 3)**: Configurable aspect ratio (e.g. `16:9`, `1:1`) and resolution (`1K`/`2K`/`4K`) for Gemini 3 image models; per-user valve overrides supported.
+- **Token Usage Tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic saving to the database.
+- **Model Whitelist & Additional Models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`.
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search with [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
 - Native tool calling support

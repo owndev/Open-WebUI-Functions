@@ -1595,10 +1595,6 @@ class Pipe:
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
 
-        # Request usage data in streaming responses so the middleware can extract it
-        if filtered_body.get("stream"):
-            filtered_body["stream_options"] = {"include_usage": True}
-
         if self.valves.AZURE_AI_MODEL and self.valves.AZURE_AI_MODEL_IN_BODY:
             # If a model was explicitly selected in the request, use that
             if selected_model:
@@ -1611,6 +1607,39 @@ class Pipe:
                 else:
                     # Fallback to the original value
                     filtered_body["model"] = self.valves.AZURE_AI_MODEL
+
+        elif "model" in filtered_body and filtered_body["model"]:
+            # Safer model extraction with split
+            filtered_body["model"] = (
+                filtered_body["model"].split(".", 1)[1]
+                if "." in filtered_body["model"]
+                else filtered_body["model"]
+            )
+
+        # Add Azure AI data sources if configured and not already present in request
+        if "data_sources" not in filtered_body:
+            azure_ai_data_sources = self.get_azure_ai_data_sources()
+            if azure_ai_data_sources:
+                filtered_body["data_sources"] = azure_ai_data_sources
+
+        # Request usage data in streaming responses so the middleware can extract it.
+        # Azure AI Search / "on your data" endpoints do not support `stream_options`,
+        # so only include it when no data_sources are present in the final payload.
+        if filtered_body.get("stream") and "data_sources" not in filtered_body:
+            filtered_body["stream_options"] = {"include_usage": True}
+
+            # If a model was explicitly selected in the request, use that
+            if selected_model:
+                filtered_body["model"] = selected_model
+            else:
+                # Otherwise, if AZURE_AI_MODEL contains multiple models, only use the first one to avoid errors
+                models = self.parse_models(self.valves.AZURE_AI_MODEL)
+                if models and len(models) > 0:
+                    filtered_body["model"] = models[0]
+                else:
+                    # Fallback to the original value
+                    filtered_body["model"] = self.valves.AZURE_AI_MODEL
+
         elif "model" in filtered_body and filtered_body["model"]:
             # Safer model extraction with split
             filtered_body["model"] = (
