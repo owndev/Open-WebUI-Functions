@@ -2777,6 +2777,24 @@ class Pipe:
         __user__: Optional[dict] = None,
     ) -> Union[str, Dict[str, Any]]:
         """Generate video using Google Veo models (long-running operation with polling)."""
+
+        async def emit_status(description: str, done: bool) -> None:
+            if not __event_emitter__:
+                return
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "video_generation",
+                            "description": description,
+                            "done": done,
+                        },
+                    }
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit video status event: {e}")
+
         messages = body.get("messages", [])
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -2806,16 +2824,7 @@ class Pipe:
 
         config = self._build_video_generation_config(body, __user__, model_id=model_id)
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "action": "video_generation",
-                    "description": f"Starting video generation with {model_id}...",
-                    "done": False,
-                },
-            }
-        )
+        await emit_status(f"Starting video generation with {model_id}...", False)
 
         client = self._get_client()
         try:
@@ -2829,16 +2838,7 @@ class Pipe:
             operation = await client.aio.models.generate_videos(**generate_kwargs)
         except Exception as e:
             self.log.exception(f"Video generation request failed: {e}")
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "video_generation",
-                        "description": f"Video generation failed: {e}",
-                        "done": True,
-                    },
-                }
-            )
+            await emit_status(f"Video generation failed: {e}", True)
             return f"Error starting video generation: {e}"
 
         poll_interval = max(self.valves.VIDEO_POLL_INTERVAL, 5)
@@ -2853,45 +2853,18 @@ class Pipe:
                     f"(limit: {poll_timeout}s)"
                 )
                 self.log.error(error_msg)
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "action": "video_generation",
-                            "description": error_msg,
-                            "done": True,
-                        },
-                    }
-                )
+                await emit_status(error_msg, True)
                 return f"Error: {error_msg}"
             try:
                 operation = await client.aio.operations.get(operation)
             except Exception as e:
                 self.log.warning(f"Polling error (will retry): {e}")
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "video_generation",
-                        "description": f"Generating video... ({elapsed}s elapsed)",
-                        "done": False,
-                    },
-                }
-            )
+            await emit_status(f"Generating video... ({elapsed}s elapsed)", False)
 
         if operation.error:
             error_msg = str(operation.error)
             self.log.error(f"Video generation failed: {error_msg}")
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "video_generation",
-                        "description": f"Video generation failed: {error_msg}",
-                        "done": True,
-                    },
-                }
-            )
+            await emit_status(f"Video generation failed: {error_msg}", True)
             return f"Video generation failed: {error_msg}"
 
         generated_videos = []
@@ -2979,16 +2952,7 @@ class Pipe:
                     f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
                 )
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "action": "video_generation",
-                    "description": f"Video generation complete ({elapsed}s)",
-                    "done": True,
-                },
-            }
-        )
+        await emit_status(f"Video generation complete ({elapsed}s)", True)
 
         content = (
             "\n\n".join(generated_videos)

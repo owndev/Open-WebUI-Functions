@@ -372,11 +372,15 @@ Not all parameters are supported by every Veo model. The pipeline automatically 
 | Person Generation    | Yes               | Yes               | Yes               | Yes               | Yes               |
 | Enhance Prompt       | Yes               | —                 | Yes               | —                 | —                 |
 | Image-to-Video       | Yes               | Yes               | Yes               | Yes               | Yes               |
-| Reference Images     | Yes (up to 3)     | Yes (up to 3)     | —                 | —                 | —                 |
-| Last Frame (interp.) | Yes               | Yes               | Yes               | Yes               | Yes               |
-| Video Extension      | Yes               | Yes               | —                 | —                 | —                 |
+| Reference Images     | ⚠️ API only¹      | ⚠️ API only¹      | —                 | —                 | —                 |
+| Last Frame (interp.) | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       |
+| Video Extension      | ⚠️ Not yet²       | ⚠️ Not yet²       | —                 | —                 | —                 |
 | Audio                | Native            | Native            | Native            | Native            | Silent only       |
 | Max Videos/Request   | 1                 | 1                 | 1                 | 1                 | 2                 |
+
+> ¹ The Veo API supports up to 3 reference images for Veo 3.1, but the pipeline currently only forwards a single attached image via the `image` parameter.
+>
+> ² Last-frame interpolation and video extension are Veo API capabilities not yet exposed by the pipeline.
 
 ### Environment Variables
 
@@ -414,6 +418,11 @@ GOOGLE_VIDEO_GENERATION_ENHANCE_PROMPT=true
 # Polling interval in seconds when waiting for video generation
 # Default: 10
 GOOGLE_VIDEO_POLL_INTERVAL=10
+
+# Maximum time in seconds to wait for video generation before timing out
+# Set to 0 to disable timeout (not recommended)
+# Default: 600
+GOOGLE_VIDEO_POLL_TIMEOUT=600
 ```
 
 ### User-Configurable Settings
@@ -429,7 +438,7 @@ Users can override the following settings per-user via Open WebUI valve override
 Attach an image to your message when using any Veo model to use it as the starting frame for video generation. The pipeline automatically detects attached images and passes the first one to the Veo API via the `image` parameter.
 
 > [!NOTE]
-> All Veo models support image-to-video. **Reference images** (up to 3 style/content guides) and **last-frame interpolation** are Veo 3.1 only.
+> All Veo models support single-image image-to-video. **Multi-reference images** (up to 3 style/content guides, Veo 3.1 only) and **last-frame interpolation** are Veo API capabilities not yet exposed by the pipeline.
 
 ### How It Works
 
