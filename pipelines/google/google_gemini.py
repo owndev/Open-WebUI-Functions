@@ -4,8 +4,8 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.11.1
-required_open_webui_version: 0.6.26
+version: 1.12.0
+required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -193,6 +193,7 @@ class Pipe:
         GOOGLE_API_KEY: EncryptedStr = Field(
             default=os.getenv("GOOGLE_API_KEY", ""),
             description="API key for Google Generative AI (used if USE_VERTEX_AI is false).",
+            json_schema_extra={"input": {"type": "password"}},
         )
         API_VERSION: str = Field(
             default=os.getenv("GOOGLE_API_VERSION", "v1alpha"),
@@ -2098,7 +2099,7 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
 
@@ -2125,9 +2126,14 @@ class Pipe:
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
         thinking_started_at: Optional[float] = None
+        stream_usage_metadata = None
 
         try:
             async for chunk in response_iterator:
+                # Capture usage metadata (final chunk has complete data)
+                if getattr(chunk, "usage_metadata", None):
+                    stream_usage_metadata = chunk.usage_metadata
+
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
                     # Check prompt feedback
@@ -2278,6 +2284,11 @@ class Pipe:
                     }
                 )
 
+            # Yield usage data as dict so the middleware can extract and save it to DB
+            usage = self._build_usage_dict(stream_usage_metadata)
+            if usage:
+                yield {"usage": usage}
+
             await emit_chat_event(
                 "chat:finish",
                 {"role": "assistant", "content": final_content, "done": True},
@@ -2307,6 +2318,23 @@ class Pipe:
                 },
             )
             yield message
+
+    @staticmethod
+    def _build_usage_dict(usage_metadata: Any) -> Optional[Dict[str, int]]:
+        """Extract token usage from Gemini usage_metadata into a standardised dict."""
+        if not usage_metadata:
+            return None
+        usage: Dict[str, int] = {}
+        if getattr(usage_metadata, "prompt_token_count", None) is not None:
+            usage["prompt_tokens"] = usage_metadata.prompt_token_count
+        if getattr(usage_metadata, "candidates_token_count", None) is not None:
+            usage["completion_tokens"] = usage_metadata.candidates_token_count
+        if usage:
+            usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get(
+                "completion_tokens", 0
+            )
+            return usage
+        return None
 
     def _get_safety_block_message(self, response: Any) -> Optional[str]:
         """Check for safety blocks and return appropriate message."""
@@ -2382,7 +2410,7 @@ class Pipe:
         __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-    ) -> Union[str, AsyncIterator[str]]:
+    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
         """
         Main method for sending requests to the Google Gemini endpoint.
 
@@ -2643,7 +2671,22 @@ class Pipe:
                             full_response += "\n\n"
                         full_response += "\n\n".join(generated_images)
 
-                    return full_response if full_response else "[No content generated]"
+                    # Build response with usage for middleware to extract and save to DB
+                    usage = self._build_usage_dict(
+                        getattr(response, "usage_metadata", None)
+                    )
+
+                    content = (
+                        full_response if full_response else "[No content generated]"
+                    )
+                    result = {
+                        "choices": [
+                            {"message": {"role": "assistant", "content": content}}
+                        ],
+                    }
+                    if usage:
+                        result["usage"] = usage
+                    return result
 
                 except Exception as e:
                     self.log.exception(

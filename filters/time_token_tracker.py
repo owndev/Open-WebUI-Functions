@@ -4,7 +4,8 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.5.2
+version: 2.6.0
+required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
 features:
@@ -168,6 +169,7 @@ class Filter:
         LOG_ANALYTICS_SHARED_KEY: EncryptedStr = Field(
             default=os.getenv("LOG_ANALYTICS_SHARED_KEY", ""),
             description="Azure Log Analytics Workspace Shared Key",
+            json_schema_extra={"input": {"type": "password"}},
         )
         LOG_ANALYTICS_LOG_TYPE: str = Field(
             default="OpenWebuiMetrics", description="Log Analytics log type name."

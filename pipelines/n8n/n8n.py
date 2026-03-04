@@ -5,7 +5,8 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
-version: 2.2.0
+version: 2.3.0
+required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats. Now includes configurable AI Agent tool usage display with three verbosity levels (minimal, compact, detailed) and customizable length limits for tool inputs/outputs (non-streaming mode only).
 features:
@@ -281,6 +282,7 @@ class Pipe:
         N8N_BEARER_TOKEN: EncryptedStr = Field(
             default="",
             description="Bearer token for authenticating with the N8N webhook",
+            json_schema_extra={"input": {"type": "password"}},
         )
         INPUT_FIELD: str = Field(
             default="chatInput",
@@ -309,10 +311,12 @@ class Pipe:
         CF_ACCESS_CLIENT_ID: EncryptedStr = Field(
             default="",
             description="Only if behind Cloudflare: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/",
+            json_schema_extra={"input": {"type": "password"}},
         )
         CF_ACCESS_CLIENT_SECRET: EncryptedStr = Field(
             default="",
             description="Only if behind Cloudflare: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/",
+            json_schema_extra={"input": {"type": "password"}},
         )
 
     def __init__(self):
@@ -1358,6 +1362,16 @@ class Pipe:
                                     f"Added {len(intermediate_steps)} tool calls to non-streaming response"
                                 )
 
+                        # Extract token usage from N8N response (best-effort)
+                        usage = None
+                        if isinstance(response_json, dict):
+                            usage = response_json.get("usage")
+                        elif isinstance(response_json, list):
+                            for item in response_json:
+                                if isinstance(item, dict) and "usage" in item:
+                                    usage = item["usage"]
+                                    break
+
                         # Cleanup
                         await cleanup_response(response, session)
                         session = None
@@ -1370,7 +1384,21 @@ class Pipe:
                         await self.emit_simple_status(
                             __event_emitter__, "complete", "Complete", True
                         )
-                        return n8n_response  # Return string like streaming branch
+
+                        # Return OpenAI-format dict with usage so the middleware saves it to DB
+                        if usage:
+                            return {
+                                "choices": [
+                                    {
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": n8n_response,
+                                        }
+                                    }
+                                ],
+                                "usage": usage,
+                            }
+                        return n8n_response
 
                 else:
                     error_text = await response.text()

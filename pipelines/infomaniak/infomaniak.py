@@ -5,7 +5,8 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
-version: 2.1.0
+version: 2.2.0
+required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
 features:
@@ -16,7 +17,7 @@ features:
   - Encrypted storage of sensitive API keys
 """
 
-from typing import List, Union, Generator, Iterator, Optional, Dict, Any
+from typing import List, Union, Generator, Iterator, Optional, Dict, Any, Callable
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
@@ -133,6 +134,7 @@ class Pipe:
         INFOMANIAK_API_KEY: EncryptedStr = Field(
             default=os.getenv("INFOMANIAK_API_KEY", "API_KEY"),
             description="API key for Infomaniak AI TOOLS API",
+            json_schema_extra={"input": {"type": "password"}},
         )
         # Product ID for Infomaniak
         INFOMANIAK_PRODUCT_ID: int = Field(
@@ -288,13 +290,14 @@ class Pipe:
         return await self.get_infomaniak_models()
 
     async def pipe(
-        self, body: Dict[str, Any]
+        self, body: Dict[str, Any], __event_emitter__: Callable = None
     ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the Infomaniak AI endpoint.
 
         Args:
             body: The request body containing messages and other parameters
+            __event_emitter__: Event emitter for status updates (optional, for interface consistency)
 
         Returns:
             Response from Infomaniak AI API, which could be a string, dictionary or streaming response
@@ -325,8 +328,13 @@ class Pipe:
             "temperature",
             "top_logprobs",
             "top_p",
+            "stream_options",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
+
+        # Request usage data in streaming responses so the middleware can extract it
+        if filtered_body.get("stream"):
+            filtered_body["stream_options"] = {"include_usage": True}
 
         # Handle model extraction for Infomaniak
         if "model" in filtered_body and filtered_body["model"]:
@@ -395,6 +403,7 @@ class Pipe:
                     response = await request.text()
 
                 request.raise_for_status()
+
                 return response
 
         except Exception as e:
