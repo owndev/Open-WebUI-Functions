@@ -165,6 +165,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Configurable Parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - **Multi-Image History**: Configurable history image limit, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
 - **Image Generation (Gemini 3)**: Configurable aspect ratio (e.g. `16:9`, `1:1`) and resolution (`1K`/`2K`/`4K`) for Gemini 3 image models; per-user valve overrides supported.
+- **Video Generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
 - **Token Usage Tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic saving to the database.
 - **Model Whitelist & Additional Models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`.
 - Grounding with Google search with [google_search_tool.py filter](./filters/google_search_tool.py)
