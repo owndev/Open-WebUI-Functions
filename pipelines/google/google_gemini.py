@@ -4,10 +4,10 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.12.0
+version: 1.13.0
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
-description: Highly optimized Google Gemini pipeline with advanced image generation capabilities, intelligent compression, and streamlined processing workflows.
+description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
   - Optimized asynchronous API calls for maximum performance
   - Intelligent model caching with configurable TTL
@@ -38,6 +38,12 @@ features:
   - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
   - Model whitelist for filtering available models
   - Additional model support for SDK-unsupported models
+  - Video generation with Google Veo models (Veo 3.1, 3, 2)
+  - Configurable video generation parameters (aspect ratio, resolution, duration)
+  - Asynchronous video generation with progressive polling status updates
+  - Automatic video upload to Open WebUI with embedded playback
+  - Image-to-video generation support for Veo models
+  - Negative prompt and person generation controls for video
 """
 
 import os
@@ -83,6 +89,34 @@ RESOLUTION_OPTIONS: List[str] = [
     "1K",
     "2K",
     "4K",
+]
+
+VIDEO_ASPECT_RATIO_OPTIONS: List[str] = [
+    "default",
+    "16:9",
+    "9:16",
+]
+
+VIDEO_RESOLUTION_OPTIONS: List[str] = [
+    "default",
+    "720p",
+    "1080p",
+    "4k",
+]
+
+VIDEO_DURATION_OPTIONS: List[str] = [
+    "default",
+    "4",
+    "5",
+    "6",
+    "8",
+]
+
+VIDEO_PERSON_GENERATION_OPTIONS: List[str] = [
+    "default",
+    "allow_all",
+    "allow_adult",
+    "dont_allow",
 ]
 
 
@@ -180,6 +214,21 @@ class Pipe:
             default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
             description="Default resolution for image generation.",
             json_schema_extra={"enum": RESOLUTION_OPTIONS},
+        )
+        VIDEO_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_ASPECT_RATIO", "default"),
+            description="Default aspect ratio for video generation (16:9 landscape or 9:16 portrait).",
+            json_schema_extra={"enum": VIDEO_ASPECT_RATIO_OPTIONS},
+        )
+        VIDEO_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_RESOLUTION", "default"),
+            description="Default resolution for video generation (720p, 1080p, or 4k).",
+            json_schema_extra={"enum": VIDEO_RESOLUTION_OPTIONS},
+        )
+        VIDEO_GENERATION_DURATION: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_DURATION", "default"),
+            description="Default duration in seconds for video generation (4, 5, 6, or 8 - availability varies by model).",
+            json_schema_extra={"enum": VIDEO_DURATION_OPTIONS},
         )
 
     # Configuration valves for the pipeline
@@ -318,6 +367,45 @@ class Pipe:
         IMAGE_HISTORY_FIRST: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_HISTORY_FIRST", "true").lower() == "true",
             description="If true (default), history images precede current message images; if false, current images first.",
+        )
+
+        # Video Generation Configuration (Veo models)
+        VIDEO_GENERATION_ASPECT_RATIO: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_ASPECT_RATIO", "default"),
+            description="Default aspect ratio for video generation (16:9 landscape or 9:16 portrait).",
+            json_schema_extra={"enum": VIDEO_ASPECT_RATIO_OPTIONS},
+        )
+        VIDEO_GENERATION_RESOLUTION: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_RESOLUTION", "default"),
+            description="Default resolution for video generation (720p, 1080p, or 4k).",
+            json_schema_extra={"enum": VIDEO_RESOLUTION_OPTIONS},
+        )
+        VIDEO_GENERATION_DURATION: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_DURATION", "default"),
+            description="Default duration in seconds for video generation (4, 5, 6, or 8 - availability varies by model).",
+            json_schema_extra={"enum": VIDEO_DURATION_OPTIONS},
+        )
+        VIDEO_GENERATION_NEGATIVE_PROMPT: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_NEGATIVE_PROMPT", ""),
+            description="Default negative prompt for video generation (describes what not to include).",
+        )
+        VIDEO_GENERATION_PERSON_GENERATION: str = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_PERSON_GENERATION", "default"),
+            description="Controls generation of people in videos (allow_all, allow_adult, dont_allow).",
+            json_schema_extra={"enum": VIDEO_PERSON_GENERATION_OPTIONS},
+        )
+        VIDEO_GENERATION_ENHANCE_PROMPT: bool = Field(
+            default=os.getenv("GOOGLE_VIDEO_GENERATION_ENHANCE_PROMPT", "true").lower()
+            == "true",
+            description="Enable prompt enhancement for video generation.",
+        )
+        VIDEO_POLL_INTERVAL: int = Field(
+            default=int(os.getenv("GOOGLE_VIDEO_POLL_INTERVAL", "10")),
+            description="Polling interval in seconds when waiting for video generation to complete.",
+        )
+        VIDEO_POLL_TIMEOUT: int = Field(
+            default=int(os.getenv("GOOGLE_VIDEO_POLL_TIMEOUT", "600")),
+            description="Maximum time in seconds to wait for video generation before timing out (0=no limit).",
         )
 
     # ---------------- Internal Helpers ---------------- #
@@ -755,8 +843,13 @@ class Pipe:
             available_models = []
             for model in models:
                 actions = model.supported_actions
-                if actions is None or "generateContent" in actions:
-                    model_id = self.strip_prefix(model.name)
+                model_id_stripped = self.strip_prefix(model.name)
+                is_content_model = actions is None or "generateContent" in actions
+                is_video_model = (
+                    actions is not None and "generateVideos" in actions
+                ) or model_id_stripped.startswith("veo-")
+                if is_content_model or is_video_model:
+                    model_id = model_id_stripped
                     model_name = model.display_name or model_id
 
                     # Check if model supports image generation
@@ -766,11 +859,19 @@ class Pipe:
                     if supports_image_generation:
                         model_name += " 🎨"  # Add image generation indicator
 
+                    # Check if model supports video generation
+                    supports_video_generation = self._check_video_generation_support(
+                        model_id
+                    )
+                    if supports_video_generation:
+                        model_name += " 🎬"  # Add video generation indicator
+
                     available_models.append(
                         {
                             "id": model_id,
                             "name": model_name,
                             "image_generation": supports_image_generation,
+                            "video_generation": supports_video_generation,
                         }
                     )
 
@@ -787,13 +888,13 @@ class Pipe:
                 }
                 self.log.debug(f"After whitelist filter: {len(filtered_models)} models")
             else:
-                # If no whitelist, filter to only include models starting with 'gemini-' for safety
+                # If no whitelist, filter to only include models starting with 'gemini-' or 'veo-'
                 filtered_models = {
-                    k: v for k, v in model_map.items() if k.startswith("gemini-")
+                    k: v
+                    for k, v in model_map.items()
+                    if k.startswith("gemini-") or k.startswith("veo-")
                 }
-                self.log.debug(
-                    f"After gemini-prefix filter: {len(filtered_models)} models"
-                )
+                self.log.debug(f"After prefix filter: {len(filtered_models)} models")
 
             # Update cache
             self._model_cache = list(filtered_models.values())
@@ -1028,6 +1129,211 @@ class Pipe:
         )
         return "2K"
 
+    def _check_video_generation_support(self, model_id: str) -> bool:
+        model_lower = model_id.lower()
+        return model_lower.startswith("veo-") or (
+            "veo" in model_lower and "generate" in model_lower
+        )
+
+    def _check_veo_3_1_support(self, model_id: str) -> bool:
+        """Check if a Veo model is version 3.1 (supports reference images, interpolation, 4k, extension)."""
+        return "veo-3.1" in model_id.lower()
+
+    def _get_veo_model_capabilities(self, model_id: str) -> Dict[str, Any]:
+        """Return per-model feature support matrix based on official Google Veo documentation."""
+        model_lower = model_id.lower()
+        is_fast = "fast" in model_lower
+
+        if "veo-3.1" in model_lower:
+            return {
+                "version": "3.1",
+                "is_fast": is_fast,
+                "supports_enhance_prompt": not is_fast,
+                "supports_resolution": True,
+                "valid_resolutions": ["720p", "1080p", "4k"],
+                "valid_durations": [4, 6, 8],
+                "max_videos": 1,
+                "supports_reference_images": True,
+                "supports_last_frame": True,
+                "supports_extension": True,
+            }
+        if "veo-3" in model_lower:
+            return {
+                "version": "3",
+                "is_fast": is_fast,
+                "supports_enhance_prompt": not is_fast,
+                "supports_resolution": True,
+                "valid_resolutions": ["720p", "1080p"],
+                "valid_durations": [8],
+                "max_videos": 1,
+                "supports_reference_images": False,
+                "supports_last_frame": True,
+                "supports_extension": False,
+            }
+        if "veo-2" in model_lower:
+            return {
+                "version": "2",
+                "is_fast": False,
+                "supports_enhance_prompt": False,
+                "supports_resolution": False,
+                "valid_resolutions": [],
+                "valid_durations": [5, 6, 8],
+                "max_videos": 2,
+                "supports_reference_images": False,
+                "supports_last_frame": True,
+                "supports_extension": False,
+            }
+        return {
+            "version": "unknown",
+            "is_fast": is_fast,
+            "supports_enhance_prompt": False,
+            "supports_resolution": False,
+            "valid_resolutions": [],
+            "valid_durations": [8],
+            "max_videos": 1,
+            "supports_reference_images": False,
+            "supports_last_frame": False,
+            "supports_extension": False,
+        }
+
+    def _validate_video_aspect_ratio(self, aspect_ratio: str) -> Optional[str]:
+        if not aspect_ratio or aspect_ratio == "default":
+            return None
+        normalized = aspect_ratio.strip()
+        valid = [r for r in VIDEO_ASPECT_RATIO_OPTIONS if r != "default"]
+        if normalized in valid:
+            return normalized
+        self.log.warning(
+            f"Invalid video aspect ratio '{aspect_ratio}'. Valid: {', '.join(valid)}. Using default."
+        )
+        return None
+
+    def _validate_video_resolution(self, resolution: str) -> Optional[str]:
+        if not resolution or resolution.lower() == "default":
+            return None
+        normalized = resolution.strip().lower()
+        valid = [r for r in VIDEO_RESOLUTION_OPTIONS if r.lower() != "default"]
+        if normalized in valid:
+            return normalized
+        self.log.warning(
+            f"Invalid video resolution '{resolution}'. Valid: {', '.join(valid)}. Using default."
+        )
+        return None
+
+    def _validate_video_duration(self, duration: str) -> Optional[int]:
+        if not duration or duration.lower() == "default":
+            return None
+        valid = {int(d) for d in VIDEO_DURATION_OPTIONS if d != "default"}
+        try:
+            val = int(duration)
+            if val in valid:
+                return val
+        except (ValueError, TypeError):
+            pass
+        self.log.warning(
+            f"Invalid video duration '{duration}'. Valid: {', '.join(str(v) for v in sorted(valid))}. Using default."
+        )
+        return None
+
+    def _build_video_generation_config(
+        self,
+        body: Dict[str, Any],
+        __user__: Optional[dict] = None,
+        model_id: str = "",
+    ) -> types.GenerateVideosConfig:
+        """Build GenerateVideosConfig from valves, user overrides, and model capabilities."""
+        caps = self._get_veo_model_capabilities(model_id)
+
+        user_ar = self._get_user_valve_value(__user__, "VIDEO_GENERATION_ASPECT_RATIO")
+        aspect_ratio = self._validate_video_aspect_ratio(
+            body.get(
+                "aspect_ratio", user_ar or self.valves.VIDEO_GENERATION_ASPECT_RATIO
+            )
+        )
+
+        user_res = self._get_user_valve_value(__user__, "VIDEO_GENERATION_RESOLUTION")
+        resolution = self._validate_video_resolution(
+            body.get("resolution", user_res or self.valves.VIDEO_GENERATION_RESOLUTION)
+        )
+
+        user_dur = self._get_user_valve_value(__user__, "VIDEO_GENERATION_DURATION")
+        duration_seconds = self._validate_video_duration(
+            body.get("duration", user_dur or self.valves.VIDEO_GENERATION_DURATION)
+        )
+
+        negative_prompt = (
+            body.get("negative_prompt", self.valves.VIDEO_GENERATION_NEGATIVE_PROMPT)
+            or None
+        )
+
+        person_generation_raw = body.get(
+            "person_generation", self.valves.VIDEO_GENERATION_PERSON_GENERATION
+        )
+        person_generation = None
+        if person_generation_raw and person_generation_raw != "default":
+            valid_person_values = [
+                v for v in VIDEO_PERSON_GENERATION_OPTIONS if v != "default"
+            ]
+            if person_generation_raw in valid_person_values:
+                person_generation = person_generation_raw
+            else:
+                self.log.warning(
+                    f"Invalid person_generation '{person_generation_raw}'. "
+                    f"Valid: {', '.join(valid_person_values)}. Ignoring."
+                )
+
+        enhance_prompt = body.get(
+            "enhance_prompt", self.valves.VIDEO_GENERATION_ENHANCE_PROMPT
+        )
+
+        number_of_videos_raw = body.get("number_of_videos", 1)
+        try:
+            number_of_videos = int(number_of_videos_raw)
+        except (ValueError, TypeError):
+            self.log.warning(
+                f"Invalid number_of_videos '{number_of_videos_raw}', defaulting to 1"
+            )
+            number_of_videos = 1
+
+        config_params: Dict[str, Any] = {
+            "number_of_videos": min(max(number_of_videos, 1), caps["max_videos"]),
+        }
+
+        # enhance_prompt: not supported by Fast models or Veo 2
+        if caps["supports_enhance_prompt"] and enhance_prompt:
+            config_params["enhance_prompt"] = enhance_prompt
+
+        if aspect_ratio:
+            config_params["aspect_ratio"] = aspect_ratio
+
+        # Resolution: not supported by Veo 2; model-specific valid values
+        if resolution and caps["supports_resolution"]:
+            if resolution in caps["valid_resolutions"]:
+                config_params["resolution"] = resolution
+            else:
+                self.log.warning(
+                    f"Resolution '{resolution}' not supported by {model_id}. "
+                    f"Valid: {', '.join(caps['valid_resolutions'])}. Using default."
+                )
+
+        # Duration: model-specific valid values
+        if duration_seconds:
+            if duration_seconds in caps["valid_durations"]:
+                config_params["duration_seconds"] = duration_seconds
+            else:
+                self.log.warning(
+                    f"Duration {duration_seconds}s not supported by {model_id}. "
+                    f"Valid: {', '.join(str(d) for d in caps['valid_durations'])}. Using default."
+                )
+
+        if negative_prompt:
+            config_params["negative_prompt"] = negative_prompt
+        if person_generation:
+            config_params["person_generation"] = person_generation
+
+        self.log.debug(f"Video generation config for {model_id}: {config_params}")
+        return types.GenerateVideosConfig(**config_params)
+
     def pipes(self) -> List[Dict[str, str]]:
         """
         Returns a list of available Google Gemini models for the UI.
@@ -1065,20 +1371,21 @@ class Pipe:
         original_model_id = model_id
         model_id = self.strip_prefix(model_id)
 
-        # If the model ID doesn't look like a Gemini model, try to find it by name
-        if not model_id.startswith("gemini-"):
+        valid_prefixes = ("gemini-", "veo-")
+
+        # If the model ID doesn't match a known prefix, try to find it by name
+        if not model_id.startswith(valid_prefixes):
             models_list = self.get_google_models()
             found_model = next(
                 (m["id"] for m in models_list if m["name"] == original_model_id), None
             )
-            if found_model and found_model.startswith("gemini-"):
+            if found_model and found_model.startswith(valid_prefixes):
                 model_id = found_model
                 self.log.debug(
                     f"Mapped model name '{original_model_id}' to model ID '{model_id}'"
                 )
             else:
-                # If we still don't have a valid ID, raise an error
-                if not model_id.startswith("gemini-"):
+                if not model_id.startswith(valid_prefixes):
                     self.log.error(
                         f"Invalid or unsupported model ID: '{original_model_id}'"
                     )
@@ -1699,6 +2006,108 @@ class Pipe:
             self.log.exception(f"Image upload failed, using data URL fallback: {e}")
             # Fallback to data URL if upload fails
             return f"data:{mime_type};base64,{image_data}"
+
+    def _upload_video(
+        self,
+        __request__: Request,
+        user: UserModel,
+        video_data: bytes,
+        mime_type: str = "video/mp4",
+    ) -> Tuple[str, str]:
+        """Upload generated video to Open WebUI's file system.
+
+        Returns:
+            Tuple of (content_url, file_id)
+        """
+        bio = io.BytesIO(video_data)
+        bio.seek(0)
+
+        extension = "mp4"
+        if "webm" in mime_type:
+            extension = "webm"
+
+        filename = f"veo-generated-{uuid.uuid4().hex}.{extension}"
+
+        up_obj = upload_file(
+            request=__request__,
+            background_tasks=BackgroundTasks(),
+            file=UploadFile(
+                file=bio,
+                filename=filename,
+                headers=Headers({"content-type": mime_type}),
+            ),
+            process=False,
+            user=user,
+            metadata={"mime_type": mime_type, "source": "veo_video_generation"},
+        )
+
+        content_url = __request__.app.url_path_for(
+            "get_file_content_by_id", id=up_obj.id
+        )
+        self.log.debug(
+            f"Video upload completed. File ID: {up_obj.id}, Size: {len(video_data)} bytes"
+        )
+        return content_url, up_obj.id
+
+    async def _upload_video_with_status(
+        self,
+        video_data: bytes,
+        mime_type: str,
+        __request__: Request,
+        __user__: dict,
+        __event_emitter__: Callable,
+    ) -> Tuple[str, Optional[str]]:
+        """Upload video with status updates and data-URL fallback.
+
+        Returns:
+            Tuple of (content_url_or_data_url, file_id_or_None)
+        """
+        try:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "video_upload",
+                        "description": "Uploading generated video to your library...",
+                        "done": False,
+                    },
+                }
+            )
+
+            self.user = user = Users.get_user_by_id(__user__["id"])
+            video_url, file_id = self._upload_video(
+                __request__=__request__,
+                user=user,
+                video_data=video_data,
+                mime_type=mime_type,
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "video_upload",
+                        "description": "Video uploaded successfully!",
+                        "done": True,
+                    },
+                }
+            )
+            return video_url, file_id
+
+        except Exception as e:
+            self.log.warning(f"Video upload failed, falling back to data URL: {e}")
+            video_data_b64 = base64.b64encode(video_data).decode("utf-8")
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "video_upload",
+                        "description": "Using inline video (upload failed)",
+                        "done": True,
+                    },
+                }
+            )
+            return f"data:{mime_type};base64,{video_data_b64}", None
 
     def _get_user_valve_value(
         self, __user__: Optional[dict], valve_name: str
@@ -2359,6 +2768,202 @@ class Pipe:
 
         return None
 
+    async def _generate_video(
+        self,
+        body: Dict[str, Any],
+        model_id: str,
+        __event_emitter__: Callable,
+        __request__: Optional[Request] = None,
+        __user__: Optional[dict] = None,
+    ) -> Union[str, Dict[str, Any]]:
+        """Generate video using Google Veo models (long-running operation with polling)."""
+
+        async def emit_status(description: str, done: bool) -> None:
+            if not __event_emitter__:
+                return
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "video_generation",
+                            "description": description,
+                            "done": done,
+                        },
+                    }
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit video status event: {e}")
+
+        messages = body.get("messages", [])
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if not last_user_msg:
+            return "Error: No user message found for video generation"
+
+        prompt, images = await self._extract_images_from_message(last_user_msg)
+        if not prompt:
+            return "Error: No prompt provided for video generation"
+
+        # Convert first attached image to types.Image for image-to-video
+        reference_image = None
+        if images:
+            first_img = images[0]
+            try:
+                img_data = first_img.get("inline_data", {})
+                raw_data = img_data.get("data", "")
+                img_bytes = base64.b64decode(raw_data)
+                reference_image = types.Image(
+                    image_bytes=img_bytes,
+                    mime_type=img_data.get("mime_type", "image/png"),
+                )
+                self.log.debug("Using attached image for image-to-video generation")
+            except Exception as e:
+                self.log.warning(f"Failed to convert image for Veo: {e}")
+
+        config = self._build_video_generation_config(body, __user__, model_id=model_id)
+
+        await emit_status(f"Starting video generation with {model_id}...", False)
+
+        client = self._get_client()
+        try:
+            generate_kwargs: Dict[str, Any] = {
+                "model": model_id,
+                "prompt": prompt,
+                "config": config,
+            }
+            if reference_image:
+                generate_kwargs["image"] = reference_image
+            operation = await client.aio.models.generate_videos(**generate_kwargs)
+        except Exception as e:
+            self.log.exception(f"Video generation request failed: {e}")
+            await emit_status(f"Video generation failed: {e}", True)
+            return f"Error starting video generation: {e}"
+
+        poll_interval = max(self.valves.VIDEO_POLL_INTERVAL, 5)
+        poll_timeout = max(self.valves.VIDEO_POLL_TIMEOUT, 0)
+        elapsed = 0
+        while not operation.done:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            if poll_timeout > 0 and elapsed >= poll_timeout:
+                error_msg = (
+                    f"Video generation timed out after {elapsed}s "
+                    f"(limit: {poll_timeout}s)"
+                )
+                self.log.error(error_msg)
+                await emit_status(error_msg, True)
+                return f"Error: {error_msg}"
+            try:
+                operation = await client.aio.operations.get(operation)
+            except Exception as e:
+                self.log.warning(f"Polling error (will retry): {e}")
+            await emit_status(f"Generating video... ({elapsed}s elapsed)", False)
+
+        if operation.error:
+            error_msg = str(operation.error)
+            self.log.error(f"Video generation failed: {error_msg}")
+            await emit_status(f"Video generation failed: {error_msg}", True)
+            return f"Video generation failed: {error_msg}"
+
+        generated_videos = []
+        response = operation.response
+        if not response or not response.generated_videos:
+            return "Error: No videos were generated"
+
+        for idx, gen_video in enumerate(response.generated_videos):
+            video = gen_video.video
+            if not video:
+                self.log.warning(f"Video {idx}: no video object in response")
+                continue
+
+            self.log.debug(
+                f"Video {idx}: uri={getattr(video, 'uri', None)}, "
+                f"name={getattr(video, 'name', None)}, "
+                f"has_bytes={bool(getattr(video, 'video_bytes', None))}"
+            )
+
+            video_bytes = None
+            if getattr(video, "video_bytes", None):
+                video_bytes = video.video_bytes
+
+            # Download video bytes via SDK (sync version is more reliable)
+            if not video_bytes:
+                try:
+                    await asyncio.to_thread(client.files.download, file=video)
+                    video_bytes = getattr(video, "video_bytes", None)
+                    self.log.debug(
+                        f"Video {idx}: SDK download complete, "
+                        f"has_bytes={bool(video_bytes)}"
+                    )
+                except Exception as dl_err:
+                    self.log.warning(f"Video {idx} SDK download failed: {dl_err}")
+
+            # Fallback: save to temp file via SDK
+            if not video_bytes:
+                tmp_path = None
+                try:
+                    import tempfile
+
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".mp4", delete=False
+                    ) as tmp:
+                        tmp_path = tmp.name
+                    await asyncio.to_thread(video.save, tmp_path)
+                    async with aiofiles.open(tmp_path, "rb") as f:
+                        video_bytes = await f.read()
+                    self.log.debug(
+                        f"Video {idx}: temp-file download complete, "
+                        f"size={len(video_bytes)} bytes"
+                    )
+                except Exception as save_err:
+                    self.log.warning(f"Video {idx} temp-file save failed: {save_err}")
+                finally:
+                    if tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+
+            if not video_bytes:
+                self.log.warning(f"Video {idx}: could not obtain video bytes")
+                continue
+
+            mime_type = getattr(video, "mime_type", "video/mp4") or "video/mp4"
+
+            file_id = None
+            video_url = None
+            if __request__ and __user__:
+                video_url, file_id = await self._upload_video_with_status(
+                    video_bytes, mime_type, __request__, __user__, __event_emitter__
+                )
+            else:
+                video_data_b64 = base64.b64encode(video_bytes).decode("utf-8")
+                video_url = f"data:{mime_type};base64,{video_data_b64}"
+
+            # Wrap in <div> so marked.lexer recognizes it as block-level HTML;
+            # HTMLToken.svelte then detects the inner <video> and renders a native player
+            if file_id:
+                video_src = f"/api/v1/files/{file_id}/content"
+                generated_videos.append(f"<div>\n<video>{video_src}</video>\n</div>")
+            else:
+                generated_videos.append(
+                    f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
+                )
+
+        await emit_status(f"Video generation complete ({elapsed}s)", True)
+
+        content = (
+            "\n\n".join(generated_videos)
+            if generated_videos
+            else "[No video content generated]"
+        )
+
+        return {
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+        }
+
     async def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
         """
         Retry a function with exponential backoff.
@@ -2429,7 +3034,10 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        self.user = Users.get_user_by_id(__user__["id"])
+        if __user__:
+            self.user = Users.get_user_by_id(__user__["id"])
+        else:
+            self.user = None
 
         try:
             # Parse and validate model ID
@@ -2439,6 +3047,13 @@ class Pipe:
                 self.log.debug(f"Using model: {model_id}")
             except ValueError as ve:
                 return f"Model Error: {ve}"
+
+            # Route Veo video generation models to dedicated handler
+            if self._check_video_generation_support(model_id):
+                self.log.debug(f"Routing to video generation for model: {model_id}")
+                return await self._generate_video(
+                    body, model_id, __event_emitter__, __request__, __user__
+                )
 
             # Check if this model supports image generation
             supports_image_generation = self._check_image_generation_support(model_id)

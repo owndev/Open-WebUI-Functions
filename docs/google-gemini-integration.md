@@ -37,6 +37,9 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Advanced Image Generation**  
   Support for text-to-image and image-to-image generation with Gemini 2.5 Flash Image Preview models.
 
+- **Video Generation with Google Veo**  
+  Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
+
 - **Flexible Error Handling**  
   Retries failed requests and logs errors for transparency.
 
@@ -338,6 +341,116 @@ for part in response.parts:
 | gemini-2.5-flash-image-\* | ❌ Not supported (uses defaults)                |
 | Other gemini-3-\* models  | ❌ Not image generation models                  |
 | Other models              | ❌ Not image generation models                  |
+
+## Video Generation Configuration
+
+The Google Gemini pipeline supports video generation using **Google Veo models** (Veo 3.1, 3, and 2). Veo models appear automatically in the model list with a 🎬 indicator.
+
+> [!IMPORTANT]
+> Video generation uses a different API path than text/image generation. Requests are **always non-streaming** — the pipeline submits a video generation job, polls for completion, and returns the result with embedded video playback.
+
+### Supported Models
+
+| Model ID                          | Description                           |
+| --------------------------------- | ------------------------------------- |
+| `veo-3.1-generate-preview`        | Veo 3.1 — highest quality, 4k, reference images |
+| `veo-3.1-fast-generate-preview`   | Veo 3.1 Fast — faster generation      |
+| `veo-3-generate-preview`          | Veo 3 — balanced quality              |
+| `veo-3.0-fast-generate-001`       | Veo 3 Fast                            |
+| `veo-2.0-generate-001`            | Veo 2 — legacy model                  |
+
+### Per-Model Feature Support
+
+Not all parameters are supported by every Veo model. The pipeline automatically gates features based on the model used. Unsupported parameters are silently skipped to avoid API errors.
+
+| Feature              | Veo 3.1           | Veo 3.1 Fast      | Veo 3             | Veo 3 Fast        | Veo 2             |
+| -------------------- | ----------------- | ----------------- | ----------------- | ----------------- | ----------------- |
+| Aspect Ratio         | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        |
+| Resolution           | 720p, 1080p, 4k   | 720p, 1080p, 4k   | 720p, 1080p       | 720p, 1080p       | —                 |
+| Duration (seconds)   | 4, 6, 8           | 4, 6, 8           | 8 only            | 8 only            | 5, 6, 8           |
+| Negative Prompt      | Yes               | Yes               | Yes               | Yes               | Yes               |
+| Person Generation    | Yes               | Yes               | Yes               | Yes               | Yes               |
+| Enhance Prompt       | Yes               | —                 | Yes               | —                 | —                 |
+| Image-to-Video       | Yes               | Yes               | Yes               | Yes               | Yes               |
+| Reference Images     | ⚠️ API only¹      | ⚠️ API only¹      | —                 | —                 | —                 |
+| Last Frame (interp.) | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       |
+| Video Extension      | ⚠️ Not yet²       | ⚠️ Not yet²       | —                 | —                 | —                 |
+| Audio                | Native            | Native            | Native            | Native            | Silent only       |
+| Max Videos/Request   | 1                 | 1                 | 1                 | 1                 | 2                 |
+
+> ¹ The Veo API supports up to 3 reference images for Veo 3.1, but the pipeline currently only forwards a single attached image via the `image` parameter.
+>
+> ² Last-frame interpolation and video extension are Veo API capabilities not yet exposed by the pipeline.
+
+### Environment Variables
+
+```bash
+# Default aspect ratio for videos (16:9 landscape or 9:16 portrait)
+# Supported by: all Veo models
+# Default: "default" (API decides)
+GOOGLE_VIDEO_GENERATION_ASPECT_RATIO="default"
+
+# Default video resolution (720p, 1080p, or 4k)
+# Supported by: Veo 3.1/3 only (ignored for Veo 2; 4k only on Veo 3.1)
+# Default: "default" (API decides)
+GOOGLE_VIDEO_GENERATION_RESOLUTION="default"
+
+# Default video duration in seconds
+# Veo 3.1: 4, 6, 8 | Veo 3: 8 only | Veo 2: 5, 6, 8
+# Default: "default" (API decides)
+GOOGLE_VIDEO_GENERATION_DURATION="default"
+
+# Negative prompt — describes what to avoid in the generated video
+# Supported by: all Veo models
+# Default: "" (empty)
+GOOGLE_VIDEO_GENERATION_NEGATIVE_PROMPT=""
+
+# Controls generation of people in videos
+# Valid values: "allow_all", "allow_adult", "dont_allow"
+# Default: "default" (API decides)
+GOOGLE_VIDEO_GENERATION_PERSON_GENERATION="default"
+
+# Enable prompt enhancement for video generation
+# Supported by: Veo 3.1 and Veo 3 (non-Fast variants only; ignored for Fast models and Veo 2)
+# Default: true
+GOOGLE_VIDEO_GENERATION_ENHANCE_PROMPT=true
+
+# Polling interval in seconds when waiting for video generation
+# Default: 10
+GOOGLE_VIDEO_POLL_INTERVAL=10
+
+# Maximum time in seconds to wait for video generation before timing out
+# Set to 0 to disable timeout (not recommended)
+# Default: 600
+GOOGLE_VIDEO_POLL_TIMEOUT=600
+```
+
+### User-Configurable Settings
+
+Users can override the following settings per-user via Open WebUI valve overrides:
+
+- **Aspect Ratio**: `VIDEO_GENERATION_ASPECT_RATIO`
+- **Resolution**: `VIDEO_GENERATION_RESOLUTION`
+- **Duration**: `VIDEO_GENERATION_DURATION`
+
+### Image-to-Video
+
+Attach an image to your message when using any Veo model to use it as the starting frame for video generation. The pipeline automatically detects attached images and passes the first one to the Veo API via the `image` parameter.
+
+> [!NOTE]
+> All Veo models support single-image image-to-video. **Multi-reference images** (up to 3 style/content guides, Veo 3.1 only) and **last-frame interpolation** are Veo API capabilities not yet exposed by the pipeline.
+
+### How It Works
+
+1. Select a Veo model (marked with 🎬) from the model list
+2. Type your video description prompt
+3. Optionally attach an image for image-to-video (supported by all Veo models)
+4. The pipeline submits the request and shows polling status updates
+5. Once complete, the video is uploaded to Open WebUI and embedded with a `<video>` player
+
+### Vertex AI Note
+
+When using Vertex AI, video download via `files.download()` is not available. If the Veo API returns a GCS URI instead of raw bytes, the current pipeline does not yet surface that URI or attach the video output in the chat. You may need to retrieve the generated video directly from Vertex AI or the underlying GCS bucket.
 
 ## Model Configuration
 
