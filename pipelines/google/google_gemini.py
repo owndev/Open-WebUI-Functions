@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.13.0
+version: 1.14.0
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -318,6 +318,12 @@ class Pipe:
             description="A comma-separated list of model IDs to show in the models list. "
             "If set, only these models will be available (after MODEL_ADDITIONAL is applied). "
             "Leave empty to show all models.",
+        )
+        USE_ENTERPRISE_WEB_SEARCH: bool = Field(
+            default=os.getenv("GOOGLE_USE_ENTERPRISE_WEB_SEARCH", "false").lower()
+            == "true",
+            description="Whether to use Enterprise Web Search instead of standard Google search when grounding is enabled. "
+            "Only available on Vertex AI.",
         )
 
         # Image Processing Configuration
@@ -2340,8 +2346,14 @@ class Pipe:
         tools = []
 
         if features.get("google_search_tool", False):
-            self.log.debug("Enabling Google search grounding")
-            tools.append(types.Tool(google_search=types.GoogleSearch()))
+            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+                self.log.debug("Enabling Enterprise Web Search grounding")
+                tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                self.log.debug("Enabling Google search grounding")
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
             self.log.debug("Enabling URL context grounding")
             tools.append(types.Tool(url_context=types.UrlContext()))
 
