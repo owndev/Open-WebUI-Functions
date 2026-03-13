@@ -563,6 +563,16 @@ For instance, the following [Filter (google_search_tool.py)](../filters/google_s
 
 When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
+### Enterprise Search
+
+The pipeline supports **Enterprise Web Search** for grounding, which provides organization-level management of search results.
+
+To enable Enterprise Search:
+1.  Set `GOOGLE_USE_ENTERPRISE_SEARCH=true` (or toggle the Valve in the UI).
+2.  Ensure `GOOGLE_GENAI_USE_VERTEXAI=true` (Enterprise Search is a Vertex AI feature).
+
+When enabled, the pipeline will use the `enterprise_web_search` tool instead of the standard `google_search` tool whenever grounding is requested.
+
 ## Grounding with Vertex AI Search
 
 Improve the accuracy and recency of Gemini responses by grounding them with your own data in Vertex AI Search.

@@ -319,6 +319,12 @@ class Pipe:
             "If set, only these models will be available (after MODEL_ADDITIONAL is applied). "
             "Leave empty to show all models.",
         )
+        USE_ENTERPRISE_WEB_SEARCH: bool = Field(
+            default=os.getenv("GOOGLE_USE_ENTERPRISE_WEB_SEARCH", "false").lower()
+            == "true",
+            description="Whether to use Enterprise Web Search instead of standard Google search when grounding is enabled. "
+            "Only available on Vertex AI.",
+        )
 
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
@@ -2340,8 +2346,14 @@ class Pipe:
         tools = []
 
         if features.get("google_search_tool", False):
-            self.log.debug("Enabling Google search grounding")
-            tools.append(types.Tool(google_search=types.GoogleSearch()))
+            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+                self.log.debug("Enabling Enterprise Web Search grounding")
+                tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                self.log.debug("Enabling Google search grounding")
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
             self.log.debug("Enabling URL context grounding")
             tools.append(types.Tool(url_context=types.UrlContext()))
 
