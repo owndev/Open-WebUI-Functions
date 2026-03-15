@@ -44,7 +44,7 @@ on:
         "release/**",
         "dev",
         "develop",
-        "feature/**",
+        "feature/**"
       ]
     tags: ["v*"] # Trigger on version tags (e.g., v1.0.0)
   workflow_dispatch:

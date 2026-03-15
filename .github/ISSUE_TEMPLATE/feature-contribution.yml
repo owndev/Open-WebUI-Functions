@@ -19,7 +19,7 @@ body:
       label: Contribution checklist
       description: Please confirm the essentials.
       options:
-        - label: I reviewed the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/CONTRIBUTING.md).
+        - label: I reviewed the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md).
           required: true
         - label: I reviewed the [Code of Conduct](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CODE_OF_CONDUCT.md).
           required: true
