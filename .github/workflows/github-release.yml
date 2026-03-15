@@ -1,0 +1,77 @@
+# GitHub Release Workflow Example
+# Copy this file to .github/workflows/ in your repository and configure as needed.
+# Configure GitHub Variables for organization-wide settings (see documentation).
+# Current Version: https://github.com/owndev-public/workflows/blob/main/examples/github-release.yml
+#
+# QUICK START:
+# 1. Configure GitHub Variables for your release settings (see documentation)
+# 2. Push to main/master branches or create tags to trigger releases
+# 3. Workflow automatically uses GitVersion for semantic versioning
+# 4. Environment-aware releases (Development/Staging/Production)
+#
+# AI RELEASE NOTES (optional):
+# 1. Set RELEASE_AI_ENABLED = "true" (GitHub Variable)
+# 2. Ensure the calling workflow has 'permissions: models: read' (GITHUB_TOKEN is used by default)
+#    Alternatively, create a RELEASE_AI_TOKEN secret with a PERSONAL PAT (models:read scope)
+#    Note: Organization-scoped PATs do NOT work (403) — only personal PATs or GITHUB_TOKEN
+# 3. Create "Release-Review" GitHub Environment with Required Reviewers
+# 4. Optionally configure: RELEASE_AI_MODEL, RELEASE_AI_LANGUAGE, RELEASE_AI_TEMPERATURE
+# See: https://github.com/owndev-public/workflows/blob/main/README.md
+#
+# FEATURES: GitVersion integration, Environment support, Automatic versioning,
+#            AI-generated release notes (optional), Review approval workflow
+
+name: 🏷️ GitHub Release
+
+permissions:
+  contents: write
+  actions: read
+  discussions: write
+  models: read
+
+# Prevent concurrent runs on same ref
+concurrency:
+  group: github-release-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags: ["v*"] # Trigger on version tags (e.g., v1.0.0)
+    # branches: ["release/**", "dev", "develop"]
+
+  # All shared configuration is handled via GitHub Variables
+  workflow_dispatch:
+
+# https://github.com/owndev-public/workflows/tree/main/.github/workflows/github-release.yml
+jobs:
+  # Create GitHub Release with GitVersion and Environment support
+  # Optional: AI-generated release notes with review approval
+  create-release:
+    name: 🏷️ Create GitHub Release
+    uses: owndev-public/workflows/.github/workflows/github-release.yml@main
+    with:
+      release_github_use_gitversion: ${{ vars.RELEASE_GITHUB_USE_GITVERSION }}
+      gitversion_version_spec: ${{ vars.GITVERSION_VERSION_SPEC }}
+      release_github_tag_name: ${{ vars.RELEASE_GITHUB_TAG_NAME }}
+      release_github_name: ${{ vars.RELEASE_GITHUB_NAME }}
+      release_github_draft: ${{ vars.RELEASE_GITHUB_DRAFT }}
+      release_github_generate_notes: ${{ vars.RELEASE_GITHUB_GENERATE_NOTES }}
+      release_github_append_body: ${{ vars.RELEASE_GITHUB_APPEND_BODY }}
+      release_github_artifact_pattern: ${{ vars.RELEASE_GITHUB_ARTIFACT_PATTERN }}
+      release_github_artifact_path: ${{ vars.RELEASE_GITHUB_ARTIFACT_PATH }}
+      release_github_files_pattern: ${{ vars.RELEASE_GITHUB_FILES_PATTERN }}
+      release_github_environment_url: ${{ vars.RELEASE_GITHUB_ENVIRONMENT_URL }}
+      release_github_custom_body: ${{ vars.RELEASE_GITHUB_CUSTOM_BODY }}
+      release_github_discussion_enabled: ${{ vars.RELEASE_GITHUB_DISCUSSION_ENABLED }}
+      release_github_discussion_category: ${{ vars.RELEASE_GITHUB_DISCUSSION_CATEGORY }}
+      release_ai_enabled: ${{ vars.RELEASE_AI_ENABLED }}
+      release_ai_model: ${{ vars.RELEASE_AI_MODEL }}
+      release_ai_language: ${{ vars.RELEASE_AI_LANGUAGE }}
+      release_ai_max_tokens: ${{ vars.RELEASE_AI_MAX_TOKENS }}
+      release_ai_temperature: ${{ vars.RELEASE_AI_TEMPERATURE }}
+      release_ai_custom_prompt: ${{ vars.RELEASE_AI_CUSTOM_PROMPT }}
+      release_ai_project_description: ${{ vars.RELEASE_AI_PROJECT_DESCRIPTION }}
+      release_ai_max_commits: ${{ vars.RELEASE_AI_MAX_COMMITS }}
+      release_ai_review_environment: ${{ vars.RELEASE_AI_REVIEW_ENVIRONMENT }}
+    secrets:
+      release_ai_token: ${{ secrets.RELEASE_AI_TOKEN }}
