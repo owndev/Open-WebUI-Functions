@@ -1,0 +1,80 @@
+name: Feature request
+description: Request a new capability or meaningful improvement for the project.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing an idea.
+
+        Use this form when you want to request a feature but are not planning to implement it yourself right now. If you do plan to build it, please use **Feature contribution proposal** instead.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and feature requests first.
+          required: true
+        - label: I reviewed the contribution guidelines and understand this request may need discussion before implementation.
+          required: true
+
+  - type: input
+    id: title
+    attributes:
+      label: Feature title
+      placeholder: Add configurable tool-call output formatting for all providers
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Related area
+      options:
+        - pipelines/azure
+        - pipelines/google
+        - pipelines/infomaniak
+        - pipelines/n8n
+        - filters
+        - docs
+        - CI / GitHub workflows
+        - Cross-cutting / multiple areas
+        - New provider integration
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What limitation, workflow gap, or user need is behind this request?
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired-solution
+    attributes:
+      label: Desired solution
+      description: Describe the capability you would like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workaround, related approach, or alternative you already evaluated.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, screenshots, upstream API links, or references.
+    validations:
+      required: false

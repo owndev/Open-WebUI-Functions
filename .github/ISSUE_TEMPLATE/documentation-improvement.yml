@@ -1,0 +1,64 @@
+name: Documentation improvement
+description: Suggest missing, unclear, outdated, or incorrect documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us keep the docs sharp, current, and friendly for contributors.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the current documentation and existing issues first.
+          required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Documentation area
+      description: Which area should be updated?
+      options:
+        - README.md
+        - CONTRIBUTING.md
+        - docs/azure*
+        - docs/google*
+        - docs/n8n*
+        - docs/infomaniak*
+        - filters
+        - pipelines
+        - GitHub templates / workflows
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What needs to change?
+      description: Describe the gap, ambiguity, or incorrect information.
+      placeholder: The setup guide skips the required environment variable for ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: improvement
+    attributes:
+      label: Suggested improvement
+      description: Tell us how the docs could be improved.
+      placeholder: Add a short prerequisites section and an example configuration block.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References or examples
+      description: Link related files, screenshots, external docs, or examples.
+    validations:
+      required: false
