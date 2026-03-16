@@ -167,9 +167,9 @@ GOOGLE_INCLUDE_THOUGHTS=true
 GOOGLE_THINKING_BUDGET=-1
 
 # Thinking level for Gemini 3 models only
-# Valid values: "low", "high", or empty string for model default
-# - "low": Minimizes latency and cost, suitable for simple tasks
-# - "high": Maximizes reasoning depth, ideal for complex problem-solving
+# Most Gemini 3 models accept "low" or "high"
+# gemini-3.1-flash-image-preview accepts "minimal" or "high"
+# The pipeline automatically maps unsupported values to the closest supported level
 # Default: "" (empty, uses model default)
 # Note: This setting is ignored for non-Gemini 3 models
 GOOGLE_THINKING_LEVEL=""
@@ -229,10 +229,10 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 
 ## Image Generation Configuration
 
-The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3 image models** (e.g., `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
+The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
 
 > [!IMPORTANT]
-> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
+> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3/3.1 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
 
 ### Aspect Ratio
 
@@ -334,13 +334,14 @@ for part in response.parts:
 
 ### Model Compatibility
 
-| Model                     | ImageConfig Support (aspect_ratio, image_size) |
-| ------------------------- | ----------------------------------------------- |
-| gemini-3-pro-image-\*     | ✅ Supported                                    |
-| gemini-3-flash-image-\*   | ✅ Supported                                    |
-| gemini-2.5-flash-image-\* | ❌ Not supported (uses defaults)                |
-| Other gemini-3-\* models  | ❌ Not image generation models                  |
-| Other models              | ❌ Not image generation models                  |
+| Model                       | ImageConfig Support (aspect_ratio, image_size) |
+| --------------------------- | ---------------------------------------------- |
+| gemini-3.1-flash-image-\*   | ✅ Supported                                   |
+| gemini-3-pro-image-\*       | ✅ Supported                                   |
+| gemini-3-flash-image-\*     | ✅ Supported                                   |
+| gemini-2.5-flash-image-\*   | ❌ Not supported (uses defaults)               |
+| Other gemini-3 / gemini-3.1 | ❌ Not image generation models                 |
+| Other models                | ❌ Not image generation models                 |
 
 ## Video Generation Configuration
 
@@ -351,32 +352,32 @@ The Google Gemini pipeline supports video generation using **Google Veo models**
 
 ### Supported Models
 
-| Model ID                          | Description                           |
-| --------------------------------- | ------------------------------------- |
-| `veo-3.1-generate-preview`        | Veo 3.1 — highest quality, 4k, reference images |
-| `veo-3.1-fast-generate-preview`   | Veo 3.1 Fast — faster generation      |
-| `veo-3-generate-preview`          | Veo 3 — balanced quality              |
-| `veo-3.0-fast-generate-001`       | Veo 3 Fast                            |
-| `veo-2.0-generate-001`            | Veo 2 — legacy model                  |
+| Model ID                        | Description                                     |
+| ------------------------------- | ----------------------------------------------- |
+| `veo-3.1-generate-preview`      | Veo 3.1 — highest quality, 4k, reference images |
+| `veo-3.1-fast-generate-preview` | Veo 3.1 Fast — faster generation                |
+| `veo-3-generate-preview`        | Veo 3 — balanced quality                        |
+| `veo-3.0-fast-generate-001`     | Veo 3 Fast                                      |
+| `veo-2.0-generate-001`          | Veo 2 — legacy model                            |
 
 ### Per-Model Feature Support
 
 Not all parameters are supported by every Veo model. The pipeline automatically gates features based on the model used. Unsupported parameters are silently skipped to avoid API errors.
 
-| Feature              | Veo 3.1           | Veo 3.1 Fast      | Veo 3             | Veo 3 Fast        | Veo 2             |
-| -------------------- | ----------------- | ----------------- | ----------------- | ----------------- | ----------------- |
-| Aspect Ratio         | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        | 16:9, 9:16        |
-| Resolution           | 720p, 1080p, 4k   | 720p, 1080p, 4k   | 720p, 1080p       | 720p, 1080p       | —                 |
-| Duration (seconds)   | 4, 6, 8           | 4, 6, 8           | 8 only            | 8 only            | 5, 6, 8           |
-| Negative Prompt      | Yes               | Yes               | Yes               | Yes               | Yes               |
-| Person Generation    | Yes               | Yes               | Yes               | Yes               | Yes               |
-| Enhance Prompt       | Yes               | —                 | Yes               | —                 | —                 |
-| Image-to-Video       | Yes               | Yes               | Yes               | Yes               | Yes               |
-| Reference Images     | ⚠️ API only¹      | ⚠️ API only¹      | —                 | —                 | —                 |
-| Last Frame (interp.) | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       | ⚠️ Not yet²       |
-| Video Extension      | ⚠️ Not yet²       | ⚠️ Not yet²       | —                 | —                 | —                 |
-| Audio                | Native            | Native            | Native            | Native            | Silent only       |
-| Max Videos/Request   | 1                 | 1                 | 1                 | 1                 | 2                 |
+| Feature              | Veo 3.1         | Veo 3.1 Fast    | Veo 3       | Veo 3 Fast  | Veo 2       |
+| -------------------- | --------------- | --------------- | ----------- | ----------- | ----------- |
+| Aspect Ratio         | 16:9, 9:16      | 16:9, 9:16      | 16:9, 9:16  | 16:9, 9:16  | 16:9, 9:16  |
+| Resolution           | 720p, 1080p, 4k | 720p, 1080p, 4k | 720p, 1080p | 720p, 1080p | —           |
+| Duration (seconds)   | 4, 6, 8         | 4, 6, 8         | 8 only      | 8 only      | 5, 6, 8     |
+| Negative Prompt      | Yes             | Yes             | Yes         | Yes         | Yes         |
+| Person Generation    | Yes             | Yes             | Yes         | Yes         | Yes         |
+| Enhance Prompt       | Yes             | —               | Yes         | —           | —           |
+| Image-to-Video       | Yes             | Yes             | Yes         | Yes         | Yes         |
+| Reference Images     | ⚠️ API only¹    | ⚠️ API only¹    | —           | —           | —           |
+| Last Frame (interp.) | ⚠️ Not yet²     | ⚠️ Not yet²     | ⚠️ Not yet² | ⚠️ Not yet² | ⚠️ Not yet² |
+| Video Extension      | ⚠️ Not yet²     | ⚠️ Not yet²     | —           | —           | —           |
+| Audio                | Native          | Native          | Native      | Native      | Silent only |
+| Max Videos/Request   | 1               | 1               | 1           | 1           | 2           |
 
 > ¹ The Veo API supports up to 3 reference images for Veo 3.1, but the pipeline currently only forwards a single attached image via the `image` parameter.
 >
@@ -568,8 +569,9 @@ When enabled, sources and google queries from the search used by Gemini will be 
 The pipeline supports **Enterprise Web Search** for grounding, which provides organization-level management of search results.
 
 To enable Enterprise Search:
-1.  Set `GOOGLE_USE_ENTERPRISE_SEARCH=true` (or toggle the Valve in the UI).
-2.  Ensure `GOOGLE_GENAI_USE_VERTEXAI=true` (Enterprise Search is a Vertex AI feature).
+
+1. Set `GOOGLE_USE_ENTERPRISE_SEARCH=true` (or toggle the Valve in the UI).
+2. Ensure `GOOGLE_GENAI_USE_VERTEXAI=true` (Enterprise Search is a Vertex AI feature).
 
 When enabled, the pipeline will use the `enterprise_web_search` tool instead of the standard `google_search` tool whenever grounding is requested.
 
@@ -672,25 +674,30 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 
 Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
-- **`"low"`**: Minimizes latency and cost, suitable for simple tasks, chat, or high-throughput APIs.
-- **`"high"`**: Maximizes reasoning depth, ideal for complex problem-solving, code analysis, and agentic workflows.
+- **Most Gemini 3 models**: support **`"low"`** and **`"high"`**.
+- **`gemini-3.1-flash-image-preview`**: supports **`"minimal"`** and **`"high"`**.
 
 > [!Note]
 > Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
 
+If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request.
+
 Set via environment variable:
 
 ```bash
-# Use low thinking level for faster responses
+# Use low thinking level for most Gemini 3 models
 GOOGLE_THINKING_LEVEL="low"
 
 # Use high thinking level for complex reasoning
 GOOGLE_THINKING_LEVEL="high"
+
+# Use minimal thinking level for gemini-3.1-flash-image-preview
+GOOGLE_THINKING_LEVEL="minimal"
 ```
 
 #### Per-Chat Override (Reasoning Effort)
 
-The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (e.g., "low" or "high"), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (for example, `"low"`, `"minimal"`, or `"high"`), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
 
 **Example API Usage:**
 
@@ -784,11 +791,11 @@ The pipeline automatically extracts token usage metadata from every Gemini respo
 
 ### What is tracked
 
-| Field | Description |
-| --- | --- |
-| `prompt_tokens` | Number of tokens in the input (messages + system prompt) |
-| `completion_tokens` | Number of tokens generated by the model |
-| `total_tokens` | Sum of prompt and completion tokens |
+| Field               | Description                                              |
+| ------------------- | -------------------------------------------------------- |
+| `prompt_tokens`     | Number of tokens in the input (messages + system prompt) |
+| `completion_tokens` | Number of tokens generated by the model                  |
+| `total_tokens`      | Sum of prompt and completion tokens                      |
 
 ### How it works
 
@@ -800,11 +807,10 @@ No additional configuration is required. Token usage is tracked automatically fo
 > [!NOTE]
 > Thinking tokens consumed during internal reasoning are **not** included in `completion_tokens` — they are captured separately by the Gemini API in `thoughts_token_count` but are not forwarded to Open WebUI at this time.
 
-### Model Compatibility
+### Thinking Compatibility
 
-| Model                     | thinking_level               | thinking_budget        |
-| ------------------------- | ---------------------------- | ---------------------- |
-| gemini-3-\*               | ✅ Supported ("low", "high") | ❌ Not used            |
-| gemini-2.5-\*             | ❌ Not used                  | ✅ Supported (0-32768) |
-| gemini-2.5-flash-image-\* | ❌ Not supported             | ❌ Not supported       |
-| Other models              | ❌ Not used                  | ✅ May be supported    |
+- **`gemini-3.1-flash-image-*`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
+- **Other `gemini-3-*` models**: `thinking_level` supports `"low"` and `"high"`; `thinking_budget` is not used.
+- **`gemini-2.5-*` models**: `thinking_level` is not used; `thinking_budget` supports `0-32768`.
+- **`gemini-2.5-flash-image-*`**: neither `thinking_level` nor `thinking_budget` is supported.
+- **Other models**: `thinking_level` is not used; `thinking_budget` may be supported depending on the model.

@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.14.0
+version: 1.14.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -33,7 +33,7 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
-  - Configurable thinking levels (low/high) for Gemini 3 models
+  - Configurable thinking levels for Gemini 3 models with model-specific validation
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
   - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
   - Model whitelist for filtering available models
@@ -263,7 +263,8 @@ class Pipe:
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
-            description="Thinking level for Gemini 3 models ('minimal', 'low', 'medium', or 'high'). "
+            description="Thinking level for Gemini 3 models. Most Gemini 3 models support 'low'/'high', "
+            "while gemini-3.1-flash-image-preview supports 'minimal'/'high'. "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -929,6 +930,7 @@ class Pipe:
             "gemini-2.5-flash-image-preview",
             "gemini-3-flash-image",
             "gemini-3-flash-image-preview",
+            "gemini-3.1-flash-image-preview",
             "gemini-3-pro-image",
             "gemini-3-pro-image-preview",
         ]
@@ -946,6 +948,19 @@ class Pipe:
 
         return False
 
+    def _is_gemini_3_family_model(self, model_id: str) -> bool:
+        """Return True for Gemini 3.x model IDs, including Gemini 3.1."""
+        model_lower = model_id.lower()
+        return model_lower.startswith("gemini-3-") or model_lower.startswith(
+            "gemini-3."
+        )
+
+    def _is_gemini_3_image_model(self, model_id: str) -> bool:
+        """Return True for Gemini 3.x image generation models."""
+        return self._is_gemini_3_family_model(
+            model_id
+        ) and self._check_image_generation_support(model_id)
+
     def _check_image_config_support(self, model_id: str) -> bool:
         """
         Check if a model supports ImageConfig (aspect_ratio and image_size parameters).
@@ -959,15 +974,7 @@ class Pipe:
         Returns:
             True if the model supports ImageConfig, False otherwise
         """
-        # ImageConfig is only supported by Gemini 3 models
-        model_lower = model_id.lower()
-
-        # Check if it's a Gemini 3 model
-        if "gemini-3-" not in model_lower:
-            return False
-
-        # Check if it's an image generation model
-        return self._check_image_generation_support(model_id)
+        return self._is_gemini_3_image_model(model_id)
 
     def _check_thinking_support(self, model_id: str) -> bool:
         """
@@ -990,7 +997,11 @@ class Pipe:
             if model_id == pattern or pattern in model_id:
                 return False
 
-        # Additional pattern checking - image generation models typically don't support thinking
+        # Gemini 3 image models support thinking and thinking-level controls.
+        if self._is_gemini_3_image_model(model_id):
+            return True
+
+        # Older image generation preview models typically don't support thinking.
         if "image" in model_id.lower() and (
             "generation" in model_id.lower() or "preview" in model_id.lower()
         ):
@@ -1012,27 +1023,57 @@ class Pipe:
         Returns:
             True if the model supports thinking_level, False otherwise
         """
-        # Gemini 3 models support thinking_level (not thinking_budget)
-        gemini_3_patterns = [
-            "gemini-3-",
-        ]
+        return self._is_gemini_3_family_model(model_id)
 
+    def _get_supported_thinking_levels(self, model_id: str) -> List[str]:
+        """Return the supported thinking levels for a specific Gemini 3 model."""
         model_lower = model_id.lower()
-        for pattern in gemini_3_patterns:
-            if pattern in model_lower:
-                return True
 
-        return False
+        if model_lower.startswith("gemini-3.1-flash-image"):
+            return ["minimal", "high"]
 
-    def _validate_thinking_level(self, level: str) -> Optional[str]:
+        if self._is_gemini_3_family_model(model_id):
+            return ["low", "high"]
+
+        return []
+
+    def _coerce_thinking_level(
+        self, requested_level: str, supported_levels: List[str]
+    ) -> Optional[str]:
+        """Map unsupported thinking levels to the closest supported level."""
+        if not supported_levels:
+            return None
+
+        level_rank = {"minimal": 0, "low": 1, "medium": 2, "high": 3}
+        requested_rank = level_rank.get(requested_level)
+        if requested_rank is None:
+            return None
+
+        supported_ranks = sorted(
+            (level_rank[level], level)
+            for level in supported_levels
+            if level in level_rank
+        )
+        if not supported_ranks:
+            return None
+
+        best_rank, best_level = min(
+            supported_ranks,
+            key=lambda item: (abs(item[0] - requested_rank), -item[0]),
+        )
+        _ = best_rank
+        return best_level
+
+    def _validate_thinking_level(self, level: str, model_id: str = "") -> Optional[str]:
         """
-        Validate and normalize the thinking level value.
+        Validate and normalize the thinking level value for the current model.
 
         Args:
             level: The thinking level string to validate
+            model_id: The model ID used to determine supported levels
 
         Returns:
-            Normalized level string ('minimal', 'low', 'medium', 'high') or None if invalid/empty
+            Supported thinking level string or None if invalid/empty
         """
         if not level:
             return None
@@ -1040,11 +1081,27 @@ class Pipe:
         normalized = level.strip().lower()
         valid_levels = ["minimal", "low", "medium", "high"]
 
-        if normalized in valid_levels:
+        if normalized not in valid_levels:
+            self.log.warning(
+                f"Invalid thinking level '{level}'. Valid values are: {', '.join(valid_levels)}. "
+                "Falling back to model default."
+            )
+            return None
+
+        supported_levels = self._get_supported_thinking_levels(model_id)
+        if not supported_levels or normalized in supported_levels:
             return normalized
 
+        coerced_level = self._coerce_thinking_level(normalized, supported_levels)
+        if coerced_level:
+            self.log.warning(
+                f"Thinking level '{level}' is not supported for model '{model_id}'. "
+                f"Using '{coerced_level}' instead. Supported values: {', '.join(supported_levels)}."
+            )
+            return coerced_level
+
         self.log.warning(
-            f"Invalid thinking level '{level}'. Valid values are: {', '.join(valid_levels)}. "
+            f"Thinking level '{level}' is not supported for model '{model_id}'. Supported values: {', '.join(supported_levels)}. "
             "Falling back to model default."
         )
         return None
@@ -2242,7 +2299,7 @@ class Pipe:
 
                     if reasoning_effort:
                         validated_level = self._validate_thinking_level(
-                            reasoning_effort
+                            reasoning_effort, model_id
                         )
                         if validated_level:
                             source = "per-chat reasoning_effort"
@@ -2254,7 +2311,7 @@ class Pipe:
                     # Fall back to environment-level THINKING_LEVEL if no valid reasoning_effort
                     if not validated_level:
                         validated_level = self._validate_thinking_level(
-                            self.valves.THINKING_LEVEL
+                            self.valves.THINKING_LEVEL, model_id
                         )
                         if validated_level:
                             source = "THINKING_LEVEL"
