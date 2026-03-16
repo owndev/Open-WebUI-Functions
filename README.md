@@ -96,8 +96,8 @@ This repository focuses on reusable Python functions for Open WebUI. It includes
 
 1. **Ensure admin access**
 
-   > [!NOTE]
-   > You must be an admin in Open WebUI to install functions.
+> [!NOTE]
+> You must be an admin in Open WebUI to install functions.
 
 2. **Open Admin Settings**
    - Navigate to the **Admin Settings** section in Open WebUI.
@@ -112,8 +112,8 @@ This repository focuses on reusable Python functions for Open WebUI. It includes
 5. **Set environment variables if required**
    - Some functions require API keys or provider-specific configuration through environment variables.
 
-   > [!IMPORTANT]
-   > Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
+> [!IMPORTANT]
+> Set [WEBUI_SECRET_KEY](https://docs.openwebui.com/getting-started/env-configuration/#webui_secret_key) for secure encryption of sensitive API keys. This is **required** for the encryption features to work properly.
 
 6. **Save and activate**
    - Save the function, and it will be available inside Open WebUI.
