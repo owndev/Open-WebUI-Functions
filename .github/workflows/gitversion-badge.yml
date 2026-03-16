@@ -1,0 +1,64 @@
+# 🏷️ GitVersion Badge Workflow
+# Copy this file to .github/workflows/ in your repository and configure as needed.
+# Configure GitHub Variables for organization-wide settings (see documentation).
+# Current Version: https://github.com/owndev-public/workflows/blob/main/examples/gitversion-badge.yml
+#
+# This shows how to use the GitVersion Badge workflow.
+# Badges are automatically created and stored in the central badge repository.
+# Supports GitFlow branching strategy with branch-specific colors.
+#
+# 🔧 Setup Steps:
+# 1. Create a Personal Access Token with 'repo' scope for owndev-public/badges
+# 2. Add the token as GITVERSION_BADGE_REPO_TOKEN secret
+# 3. Configure optional variables
+#
+# 📝 Badge is automatically created with current GitVersion
+# 🏷️ Filename: {branch-type}.svg
+# 🔗 Badge URL: https://owndev-public.github.io/badges/{org}/{repo}/version/{branch-type}.svg
+#
+# 🖼️ Badge Naming Logic:
+#   - main/master     → main.svg
+#   - dev/develop     → dev.svg
+#   - release/1.2.3   → release.svg
+#   - feature/xyz     → feature.svg
+#   - hotfix/abc      → hotfix.svg
+#   - other-branch    → other-branch.svg
+
+name: 🏷️ GitVersion Badge
+
+permissions:
+  contents: read
+
+# Prevent concurrent runs on same ref
+concurrency:
+  group: gitversion-badge-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      [
+        "main",
+        "master",
+        "hotfix/**",
+        "release/**",
+        "dev",
+        "develop",
+        "feature/**"
+      ]
+    tags: ["v*"] # Trigger on version tags (e.g., v1.0.0)
+  workflow_dispatch:
+
+# https://github.com/owndev-public/workflows/tree/main/.github/workflows/gitversion-badge.yml
+jobs:
+  gitversion-badge:
+    name: 🏷️ Create GitVersion Badge
+    uses: owndev-public/workflows/.github/workflows/gitversion-badge.yml@main
+    with:
+      badge_repo: ${{ vars.GITVERSION_BADGE_REPO }}
+      badge_label: ${{ vars.GITVERSION_BADGE_LABEL }}
+      badge_color: ${{ vars.GITVERSION_BADGE_COLOR }}
+      badge_style: ${{ vars.GITVERSION_BADGE_STYLE }}
+      gitversion_version_spec: ${{ vars.GITVERSION_VERSION_SPEC }}
+    secrets:
+      badge_repo_token: ${{ secrets.GITVERSION_BADGE_REPO_TOKEN }}

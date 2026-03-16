@@ -1,0 +1,67 @@
+name: Support question
+description: Ask for help using, configuring, or understanding the project.
+title: "[Support]: "
+labels:
+  - question
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for setup help, usage questions, configuration problems, or clarification requests.
+
+        Please check the README, relevant docs in `docs/`, and existing issues first. For confirmed defects, use **Bug report** instead.
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Help topic
+      options:
+        - Installation or setup
+        - Pipeline configuration
+        - Filter configuration
+        - Model selection or provider behavior
+        - Streaming behavior
+        - Documentation clarification
+        - Contribution workflow
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: Question summary
+      placeholder: How do I enable Google Search grounding for Gemini requests?
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Describe what you are trying to do and where you are getting stuck.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried already?
+      description: Share troubleshooting steps, docs consulted, or experiments you already ran.
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment details
+      description: Include relevant setup details if they matter for the question.
+      placeholder: |
+        - OS:
+        - Python version:
+        - Open WebUI version:
+        - Provider / model:
+        - Deployment method:
+    validations:
+      required: false

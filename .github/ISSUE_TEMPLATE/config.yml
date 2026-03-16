@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the documentation
+    url: https://github.com/owndev/Open-WebUI-Functions/blob/main/README.md
+    about: Start with the README and provider-specific docs before opening a support request.
+  - name: Review the contributing guide
+    url: https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md
+    about: Learn the preferred workflow for feature proposals, pull requests, and repository contributions.

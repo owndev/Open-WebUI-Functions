@@ -1,0 +1,52 @@
+name: Idea or proposal
+description: Start a higher-level discussion about a direction, concept, or future opportunity.
+title: "[Proposal]: "
+labels:
+  - idea
+  - discussion
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for exploratory ideas, strategic proposals, or concepts that need discussion before becoming a specific feature request.
+
+  - type: input
+    id: title
+    attributes:
+      label: Proposal title
+      placeholder: Unify shared helper utilities across provider pipelines
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Proposal summary
+      description: Explain the core idea and why it is worth discussing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Why now?
+      description: What pain point, opportunity, or long-term benefit makes this relevant?
+    validations:
+      required: true
+
+  - type: textarea
+    id: options
+    attributes:
+      label: Possible directions
+      description: Share approaches, trade-offs, risks, or open questions.
+    validations:
+      required: false
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Supporting context
+      description: Add links to related issues, PRs, docs, external references, or experiments.
+    validations:
+      required: false

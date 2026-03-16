@@ -1,0 +1,100 @@
+name: Feature contribution proposal
+description: Coordinate a feature you plan to implement yourself and submit as a pull request.
+title: "[Contribution]: "
+labels:
+  - enhancement
+  - contribution
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when you intend to build the feature yourself.
+
+        Opening this issue first helps maintainers confirm fit, avoid duplicate work, and share early guidance before you invest serious implementation time.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Contribution checklist
+      description: Please confirm the essentials.
+      options:
+        - label: I reviewed the [Contributing Guide](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CONTRIBUTING.md).
+          required: true
+        - label: I reviewed the [Code of Conduct](https://github.com/owndev/Open-WebUI-Functions/blob/main/.github/CODE_OF_CONDUCT.md).
+          required: true
+        - label: I plan to implement this myself and open a pull request.
+          required: true
+
+  - type: input
+    id: title
+    attributes:
+      label: Proposed feature title
+      description: Give the contribution a short and descriptive name.
+      placeholder: Add retry backoff controls to the Azure AI Foundry pipeline
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options:
+        - pipelines/azure
+        - pipelines/google
+        - pipelines/infomaniak
+        - pipelines/n8n
+        - filters
+        - docs
+        - CI / GitHub workflows
+        - Cross-cutting / multiple areas
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What user or maintainer problem does this work solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed implementation
+      description: Describe your planned technical approach, affected files, and important design choices.
+      placeholder: |
+        - Add new valves for ...
+        - Update request validation in ...
+        - Extend docs in ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: milestones
+    attributes:
+      label: Delivery plan
+      description: Outline tasks, milestones, or an expected PR breakdown.
+      placeholder: |
+        1. Prototype request validation changes
+        2. Add tests or manual verification notes
+        3. Update docs
+    validations:
+      required: false
+
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Feedback requested from maintainers
+      description: List decisions, constraints, or open questions where early guidance would help.
+    validations:
+      required: false
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Additional context
+      description: Link related issues, PRs, docs, upstream APIs, or examples.
+    validations:
+      required: false

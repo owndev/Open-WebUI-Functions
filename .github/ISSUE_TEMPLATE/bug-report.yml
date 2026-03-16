@@ -1,0 +1,115 @@
+name: Bug report
+description: Report a reproducible defect in a pipeline, filter, documentation flow, or repository automation.
+title: "[Bug]: "
+labels:
+  - bug
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Please include enough detail for maintainers to reproduce the issue quickly. If the bug involves credentials or sensitive configuration, redact secrets before posting.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      description: Confirm the basics so we can focus on the fix instead of detective work.
+      options:
+        - label: I searched existing issues and did not find a matching report.
+          required: true
+        - label: I can reproduce this issue on the latest version of the repository or current `main` branch.
+          required: true
+        - label: I removed or masked secrets, tokens, and private endpoints from my report.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Which part of the project is affected?
+      options:
+        - pipelines/azure
+        - pipelines/google
+        - pipelines/infomaniak
+        - pipelines/n8n
+        - filters
+        - docs
+        - CI / GitHub workflows
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: Bug summary
+      description: A short, specific summary of the problem.
+      placeholder: Streaming stops after the first chunk when using the n8n pipeline
+    validations:
+      required: true
+
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: Current behavior
+      description: What happened? Include the visible failure, incorrect output, or broken workflow.
+      placeholder: |
+        The request starts correctly, then the stream closes without a completion event.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+      placeholder: The stream should continue until the final event and emit a completion status.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal, numbered reproduction.
+      placeholder: |
+        1. Configure the n8n pipeline with ...
+        2. Send a chat request with ...
+        3. Observe that ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs, errors, or screenshots
+      description: Paste stack traces, HTTP payload snippets, or screenshots when helpful.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment details
+      description: Include the versions and environment details that matter.
+      placeholder: |
+        - OS:
+        - Python version:
+        - Open WebUI version:
+        - Repository commit or release:
+        - Provider / model:
+        - Deployment method:
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Link related issues, PRs, docs, or anything else that could speed up diagnosis.
+    validations:
+      required: false
