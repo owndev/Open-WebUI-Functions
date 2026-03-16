@@ -8,7 +8,6 @@
 ![GitHub License](https://img.shields.io/github/license/owndev/Open-WebUI-Functions)
 
 ![Main Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/main.svg)
-![Dev Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/dev.svg)
 
 [![GitVersion Badge](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/gitversion-badge.yml/badge.svg)](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/gitversion-badge.yml)
 [![GitHub Release](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/github-release.yml/badge.svg)](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/github-release.yml)
