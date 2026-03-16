@@ -7,7 +7,7 @@
 ![GitHub contributors](https://img.shields.io/github/contributors/owndev/Open-WebUI-Functions)
 ![GitHub License](https://img.shields.io/github/license/owndev/Open-WebUI-Functions)
 
-![Main Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/main.svg)
+![Main Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/main.svg)
 
 [![GitVersion Badge](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/gitversion-badge.yml/badge.svg)](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/gitversion-badge.yml)
 [![GitHub Release](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/github-release.yml/badge.svg)](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/github-release.yml)
@@ -39,11 +39,11 @@ This repository focuses on reusable Python functions for Open WebUI. It includes
 
 | Branch | Version |
 | --- | --- |
-| **`main`** | ![Main Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/main.svg) |
-| **`hotfix/*`** | ![Hotfix Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/hotfix.svg) |
-| **`release/*`** | ![Release Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/release.svg) |
-| **`dev`** | ![Dev Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/dev.svg) |
-| **`feature/*`** | ![Feature Version](https://owndev-public.github.io/badges/owndev-public/Open-WebUI-Functions/version/feature.svg) |
+| **`main`** | ![Main Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/main.svg) |
+| **`hotfix/*`** | ![Hotfix Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/hotfix.svg) |
+| **`release/*`** | ![Release Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/release.svg) |
+| **`dev`** | ![Dev Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/dev.svg) |
+| **`feature/*`** | ![Feature Version](https://owndev-public.github.io/badges/owndev/Open-WebUI-Functions/version/feature.svg) |
 
 > These badges are generated and updated automatically by the [GitVersion Badge workflow](https://github.com/owndev/Open-WebUI-Functions/actions/workflows/gitversion-badge.yml) for all GitFlow branch types.
 
