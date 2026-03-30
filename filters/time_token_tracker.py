@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.0
+version: 2.6.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
@@ -14,6 +14,8 @@ features:
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
   - Sends metrics to Azure Log Analytics.
+changelog:
+  - 2.6.1 - Replaced global variables with module-level storage to fix concurrency issues.
 """
 
 import time
@@ -33,11 +35,46 @@ import tiktoken
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
-# Global variables to track start time and token counts
-global start_time, request_token_count, response_token_count
-start_time = 0
-request_token_count = 0
-response_token_count = 0
+# Module-level storage for per-request data, keyed by chat_id or fallback.
+# Replaces the original global variables (start_time, request_token_count,
+# response_token_count) to fix incorrect stats under concurrent requests.
+# See _get_storage_key() for key selection logic.
+# See inlet() and outlet() for usage.
+_request_data = {}
+
+
+def _get_storage_key(body: dict) -> str:
+    """
+    Extract the best available unique key for per-request storage.
+
+    Open WebUI provides different body schemas at different pipeline stages:
+    - inlet body keys: stream, model, messages, features, metadata, options
+    - outlet body keys: model, messages, chat_id, session_id, id
+
+    chat_id is only available as a top-level key in the outlet body.
+    During inlet it may be nested inside metadata, or absent entirely.
+    This function checks multiple locations so that inlet and outlet
+    can use a consistent key to store and retrieve per-request data.
+
+    Priority:
+    1. Top-level chat_id (present in outlet)
+    2. metadata.chat_id (may be present in inlet on some OW versions)
+    3. __ttt_fallback__ (when no chat_id is available anywhere)
+    """
+    # First, check top-level chat_id (available in outlet)
+    chat_id = body.get("chat_id")
+    if chat_id:
+        return chat_id
+
+    # Second, check metadata.chat_id (may be available in inlet)
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        chat_id = metadata.get("chat_id")
+        if chat_id:
+            return chat_id
+
+    # Fallback for when no chat_id is available anywhere
+    return "__ttt_fallback__"
 
 
 # Simplified encryption implementation with automatic handling
@@ -85,10 +122,10 @@ class EncryptedStr(str):
 
         key = cls._get_encryption_key()
         if not key:  # No decryption if no key
-            return value[len("encrypted:") :]  # Return without prefix
+            return value[len("encrypted:"):]  # Return without prefix
 
         try:
-            encrypted_part = value[len("encrypted:") :]
+            encrypted_part = value[len("encrypted:"):]
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
@@ -272,54 +309,6 @@ class Filter:
         finally:
             await cleanup_response(response, session)
 
-    async def inlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
-    ) -> dict:
-        global start_time, request_token_count
-        start_time = time.time()
-
-        model = body.get("model", "default-model")
-        all_messages = body.get("messages", [])
-
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-
-        # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
-        if self.valves.CALCULATE_ALL_MESSAGES:
-            request_messages = [
-                m for m in all_messages if m.get("role") in ("user", "system")
-            ]
-        else:
-            # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
-            # (one user and one system), sum them both.
-            request_user_system = [
-                m for m in all_messages if m.get("role") in ("user", "system")
-            ]
-            if len(request_user_system) == 2:
-                request_messages = request_user_system
-            else:
-                # Otherwise, take only the last "user" or "system" message if any
-                reversed_messages = list(reversed(all_messages))
-                last_user_system = next(
-                    (
-                        m
-                        for m in reversed_messages
-                        if m.get("role") in ("user", "system")
-                    ),
-                    None,
-                )
-                request_messages = [last_user_system] if last_user_system else []
-
-        request_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
-            for m in request_messages
-            if m
-        )
-
-        return body
-
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""
         content = message.get("content", "")
@@ -362,15 +351,83 @@ class Filter:
         except:  # noqa: E722
             return ""
 
+    async def inlet(
+        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+    ) -> dict:
+        # Store per-request data in module-level dict keyed by chat_id or
+        # fallback. Replaces the original global variable assignments.
+        # chat_id may not be available in inlet body; _get_storage_key()
+        # handles the fallback strategy.
+        storage_key = _get_storage_key(body)
+
+        model = body.get("model", "default-model")
+        all_messages = body.get("messages", [])
+
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
+        if self.valves.CALCULATE_ALL_MESSAGES:
+            request_messages = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
+        else:
+            # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
+            # (one user and one system), sum them both.
+            request_user_system = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
+            if len(request_user_system) == 2:
+                request_messages = request_user_system
+            else:
+                # Otherwise, take only the last "user" or "system" message if any
+                reversed_messages = list(reversed(all_messages))
+                last_user_system = next(
+                    (
+                        m
+                        for m in reversed_messages
+                        if m.get("role") in ("user", "system")
+                    ),
+                    None,
+                )
+                request_messages = [last_user_system] if last_user_system else []
+
+        request_token_count = sum(
+            len(encoding.encode(self._get_message_content(m)))
+            for m in request_messages
+            if m
+        )
+
+        # Store start time and token count for this request.
+        # outlet() will retrieve these by the same key.
+        _request_data[storage_key] = {
+            "start_time": time.time(),
+            "request_token_count": request_token_count,
+        }
+
+        return body
+
     async def outlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
         log = logging.getLogger("time_token_tracker.outlet")
         log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
-        global start_time, request_token_count, response_token_count
+        # Retrieve per-request data stored by inlet(). Outlet has chat_id
+        # as a top-level key; inlet may have stored under a fallback key
+        # if chat_id was not available at inlet time. Try the exact key
+        # first, then fall back to __ttt_fallback__.
+        storage_key = _get_storage_key(body)
+        request_data = _request_data.pop(storage_key, None)
+        if request_data is None:
+            # inlet stored under fallback key because chat_id was unavailable
+            request_data = _request_data.pop("__ttt_fallback__", {})
+
         end_time = time.time()
-        response_time = end_time - start_time
+        response_time = end_time - request_data.get("start_time", end_time)
+        request_token_count = request_data.get("request_token_count", 0)
 
         model = body.get("model", "default-model")
         all_messages = body.get("messages", [])
@@ -394,6 +451,8 @@ class Filter:
             )
             assistant_messages = [last_assistant] if last_assistant else []
 
+        # response_token_count is a local variable here; unlike the original
+        # global, it does not need to persist beyond this method.
         response_token_count = sum(
             len(encoding.encode(self._get_message_content(m)))
             for m in assistant_messages
