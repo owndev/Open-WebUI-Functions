@@ -15,7 +15,7 @@ features:
   - Calculates the tokens per second.
   - Sends metrics to Azure Log Analytics.
 changelog:
-  - 2.6.1 - Replaced global variables with module-level storage to fix concurrency issues.
+  - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
 import time
@@ -35,46 +35,61 @@ import tiktoken
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
-# Module-level storage for per-request data, keyed by chat_id or fallback.
-# Replaces the original global variables (start_time, request_token_count,
-# response_token_count) to fix incorrect stats under concurrent requests.
-# See _get_storage_key() for key selection logic.
-# See inlet() and outlet() for usage.
-_request_data = {}
+# Per-request storage keyed by a fingerprint derived from user, model, and
+# last user message. Replaces the original global variables to fix incorrect
+# stats under concurrent requests.
+_request_data: dict[str, dict] = {}
+
+# Entries older than this (seconds) are pruned to prevent unbounded growth
+# when outlet() is never reached (e.g. cancelled requests, crashes).
+_STALE_ENTRY_TIMEOUT = 600
 
 
-def _get_storage_key(body: dict) -> str:
+def _build_request_key(
+    body: dict, user: Optional[dict] = None
+) -> str:
     """
-    Extract the best available unique key for per-request storage.
+    Build a storage key that is unique per request and consistent between
+    inlet and outlet.
 
-    Open WebUI provides different body schemas at different pipeline stages:
-    - inlet body keys: stream, model, messages, features, metadata, options
-    - outlet body keys: model, messages, chat_id, session_id, id
+    Open WebUI reconstructs the body dict between inlet and outlet and only
+    exposes chat_id in outlet, so we cannot rely on a single ID field.
+    Instead we hash (user_id, model, number_of_user_messages,
+    last_user_message_content) — all of which are identical in both stages.
 
-    chat_id is only available as a top-level key in the outlet body.
-    During inlet it may be nested inside metadata, or absent entirely.
-    This function checks multiple locations so that inlet and outlet
-    can use a consistent key to store and retrieve per-request data.
-
-    Priority:
-    1. Top-level chat_id (present in outlet)
-    2. metadata.chat_id (may be present in inlet on some OW versions)
-    3. __ttt_fallback__ (when no chat_id is available anywhere)
+    Collisions are only possible if the same user sends the exact same
+    message at the exact same conversation depth to the same model
+    concurrently, which is not a realistic scenario.
     """
-    # First, check top-level chat_id (available in outlet)
-    chat_id = body.get("chat_id")
-    if chat_id:
-        return chat_id
+    model = body.get("model", "")
+    user_id = user.get("id", "") if user else ""
 
-    # Second, check metadata.chat_id (may be available in inlet)
-    metadata = body.get("metadata")
-    if isinstance(metadata, dict):
-        chat_id = metadata.get("chat_id")
-        if chat_id:
-            return chat_id
+    messages = body.get("messages", [])
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    num_user_messages = len(user_messages)
 
-    # Fallback for when no chat_id is available anywhere
-    return "__ttt_fallback__"
+    last_user_content = ""
+    if user_messages:
+        content = user_messages[-1].get("content", "")
+        if isinstance(content, str):
+            last_user_content = content
+        elif content is not None:
+            last_user_content = str(content)
+
+    raw = f"{user_id}:{model}:{num_user_messages}:{last_user_content}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _prune_stale_entries() -> None:
+    """Remove entries older than _STALE_ENTRY_TIMEOUT to prevent unbounded growth."""
+    now = time.time()
+    stale_keys = [
+        k
+        for k, v in _request_data.items()
+        if now - v.get("start_time", now) > _STALE_ENTRY_TIMEOUT
+    ]
+    for k in stale_keys:
+        _request_data.pop(k, None)
 
 
 # Simplified encryption implementation with automatic handling
@@ -354,11 +369,8 @@ class Filter:
     async def inlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
-        # Store per-request data in module-level dict keyed by chat_id or
-        # fallback. Replaces the original global variable assignments.
-        # chat_id may not be available in inlet body; _get_storage_key()
-        # handles the fallback strategy.
-        storage_key = _get_storage_key(body)
+        _prune_stale_entries()
+        storage_key = _build_request_key(body, __user__)
 
         model = body.get("model", "default-model")
         all_messages = body.get("messages", [])
@@ -400,8 +412,6 @@ class Filter:
             if m
         )
 
-        # Store start time and token count for this request.
-        # outlet() will retrieve these by the same key.
         _request_data[storage_key] = {
             "start_time": time.time(),
             "request_token_count": request_token_count,
@@ -415,15 +425,8 @@ class Filter:
         log = logging.getLogger("time_token_tracker.outlet")
         log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
-        # Retrieve per-request data stored by inlet(). Outlet has chat_id
-        # as a top-level key; inlet may have stored under a fallback key
-        # if chat_id was not available at inlet time. Try the exact key
-        # first, then fall back to __ttt_fallback__.
-        storage_key = _get_storage_key(body)
-        request_data = _request_data.pop(storage_key, None)
-        if request_data is None:
-            # inlet stored under fallback key because chat_id was unavailable
-            request_data = _request_data.pop("__ttt_fallback__", {})
+        storage_key = _build_request_key(body, __user__)
+        request_data = _request_data.pop(storage_key, {})
 
         end_time = time.time()
         response_time = end_time - request_data.get("start_time", end_time)
