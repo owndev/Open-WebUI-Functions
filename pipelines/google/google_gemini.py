@@ -2187,7 +2187,6 @@ class Pipe:
         body: Dict[str, Any],
         system_instruction: Optional[str],
         __metadata__: Dict[str, Any],
-        __tools__: dict[str, Any] | None = None,
         __user__: Optional[dict] = None,
         enable_image_generation: bool = False,
         model_id: str = "",
@@ -2402,18 +2401,6 @@ class Pipe:
         params = __metadata__.get("params", {})
         tools = []
 
-        if features.get("google_search_tool", False):
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
-                self.log.debug("Enabling Enterprise Web Search grounding")
-                tools.append(
-                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
-                )
-            else:
-                self.log.debug("Enabling Google search grounding")
-                tools.append(types.Tool(google_search=types.GoogleSearch()))
-            self.log.debug("Enabling URL context grounding")
-            tools.append(types.Tool(url_context=types.UrlContext()))
-
         if features.get("vertex_ai_search", False) or (
             self.valves.USE_VERTEX_AI
             and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
@@ -2441,14 +2428,23 @@ class Pipe:
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
 
-        if __tools__ is not None and params.get("function_calling") == "native":
-            for name, tool_def in __tools__.items():
-                if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
-                    )
-                    tools.append(tool)
+        # metadata['tools'] is populated only in native tool calling mode,
+        # and contains all tools, not only user-defined tools, contrarily to __tools__
+        for name, tool_def in __metadata__.get("tools", {}).items():
+            if name == "search_web":
+                if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+                    self.log.debug("Enabling Enterprise Web Search grounding")
+                    tool = types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                else:
+                    self.log.debug("Enabling Google search grounding")
+                    tool = types.Tool(google_search=types.GoogleSearch())
+            elif name == "fetch_url":
+                self.log.debug("Enabling URL context grounding")
+                tool = types.Tool(url_context=types.UrlContext())
+            else:
+                tool = tool_def["callable"]
+            self.log.debug(f"Adding tool '{name}' with signature {tool.__signature__}")
+            tools.append(tool)
 
         if tools:
             gen_config_params["tools"] = tools
@@ -3081,7 +3077,6 @@ class Pipe:
         body: Dict[str, Any],
         __metadata__: dict[str, Any],
         __event_emitter__: Callable,
-        __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
     ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
@@ -3092,7 +3087,6 @@ class Pipe:
             body: The request body containing messages and other parameters.
             __metadata__: Request metadata
             __event_emitter__: Event emitter for status updates
-            __tools__: Available tools
             __request__: FastAPI request object (for image upload)
             __user__: User information (for image upload)
 
@@ -3167,7 +3161,6 @@ class Pipe:
                 body,
                 system_instruction,
                 __metadata__,
-                __tools__,
                 __user__,
                 supports_image_generation,
                 model_id,

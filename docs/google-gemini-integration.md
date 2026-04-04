@@ -55,8 +55,8 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Customizable Generation Settings**  
   Use environment variables to configure token limits, temperature, etc.
 
-- **Grounding with Google search**  
-  Improve the accuracy and recency of Gemini responses with Google search grounding.
+- **Grounding with Google search and URL Context**  
+  Improve the accuracy and recency of Gemini responses with Google search grounding and the URL Context tool, automatically enabled when native tool calling is active and appropriate tools (`search_web`, `fetch_url`) are provided.
 
 - **Ability to forward User Headers and change gemini base url**  
   Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
@@ -558,11 +558,15 @@ GOOGLE_MODEL_WHITELIST="gemini-exp-1206,gemini-2.0-flash-exp,gemini-1.5-pro"
 
 ## Web search and access
 
-[Grounding with Google search](https://ai.google.dev/gemini-api/docs/google-search) together with the [URL context tool](https://ai.google.dev/gemini-api/docs/url-context) are enabled/disabled together via the `google_search_tool` feature, which can be switched on/off in a Filter.
+[Grounding with Google search](https://ai.google.dev/gemini-api/docs/google-search) and the [URL context tool](https://ai.google.dev/gemini-api/docs/url-context) are natively integrated into the Gemini pipeline. They are automatically enabled when **Native tool calling** is toggled on in Open WebUI, and the corresponding tools are available to the pipeline:
 
-For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with Google search grounding + the URL context tool.
+- **`search_web`**: Maps to Google Search grounding (or Enterprise Search if configured).
+- **`fetch_url`**: Maps to the URL Context tool for accessing webpage content.
 
-When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
+When these tools are used, sources and Google search queries used by Gemini will be displayed with the response.
+
+> [!NOTE]
+> The separate `google_search_tool` filter is no longer required for Gemini grounding, as the pipeline now handles these tools natively when function calling is enabled.
 
 ### Enterprise Search
 
@@ -573,7 +577,7 @@ To enable Enterprise Search:
 1. Set `GOOGLE_USE_ENTERPRISE_SEARCH=true` (or toggle the Valve in the UI).
 2. Ensure `GOOGLE_GENAI_USE_VERTEXAI=true` (Enterprise Search is a Vertex AI feature).
 
-When enabled, the pipeline will use the `enterprise_web_search` tool instead of the standard `google_search` tool whenever grounding is requested.
+When enabled, the pipeline will use the `enterprise_web_search` tool instead of the standard `google_search` tool whenever the `search_web` tool is called.
 
 ## Grounding with Vertex AI Search
 

@@ -19,7 +19,7 @@ This repo extends Open WebUI with pluggable Python pipelines and filters. If you
   - Azure and N8N stream with SSE (`StreamingResponse`); always close `aiohttp` `ClientSession`/response in `finally` (see `cleanup_response`).
   - Gemini disables streaming for image-generation models; thinking is wrapped in `<details>` and emitted incrementally.
 - Cross-component integration:
-  - `filters/google_search_tool.py` converts `features.web_search` → `metadata.features.google_search_tool`; Gemini reads this to enable grounding tools.
+  - Gemini reads `search_web` and `fetch_url` tools from `__metadata__.get("tools", {})` to enable grounding tools natively when function calling is enabled.
   - N8N non-streaming responses can append a tool-calls section built by `_format_tool_calls_section` with verbosity and truncation valves.
 
 ## Dev workflow (local)
