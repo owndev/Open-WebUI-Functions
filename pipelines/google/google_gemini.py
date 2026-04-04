@@ -2433,17 +2433,21 @@ class Pipe:
         for name, tool_def in __metadata__.get("tools", {}).items():
             if name == "search_web":
                 if self.valves.USE_ENTERPRISE_WEB_SEARCH:
-                    self.log.debug("Enabling Enterprise Web Search grounding")
+                    self.log.debug(
+                        "Replacing 'search_web' with Enterprise Web Search grounding"
+                    )
                     tool = types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
                 else:
-                    self.log.debug("Enabling Google search grounding")
+                    self.log.debug(
+                        "Replacing 'search_web' with Google search grounding"
+                    )
                     tool = types.Tool(google_search=types.GoogleSearch())
             elif name == "fetch_url":
-                self.log.debug("Enabling URL context grounding")
+                self.log.debug("Replacing 'fetch_url' with URL context grounding")
                 tool = types.Tool(url_context=types.UrlContext())
             else:
                 tool = tool_def["callable"]
-            self.log.debug(f"Adding tool '{name}' with signature {tool.__signature__}")
+                self.log.debug(f"Adding tool '{name}'")
             tools.append(tool)
 
         if tools:
