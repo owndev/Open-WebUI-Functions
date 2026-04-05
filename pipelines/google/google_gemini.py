@@ -2179,7 +2179,7 @@ class Pipe:
                 return value
         return None
 
-    def _configure_generation(
+    async def _configure_generation(
         self,
         body: Dict[str, Any],
         system_instruction: Optional[str],
@@ -2421,8 +2421,9 @@ class Pipe:
             ):
                 try:
                     self.log.debug(f"Getting native Gemini tool: {name}")
-                    native_tool = tool_def["callable"]()
+                    native_tool = await tool_def["callable"]()
                     if isinstance(native_tool, types.Tool):
+                        self.log.debug(f"Adding tool '{name}'")
                         tools.append(native_tool)
                     else:
                         self.log.warning(f"'{name}' is not a 'types.Tool'. Skipping.")
@@ -3149,7 +3150,7 @@ class Pipe:
 
             # Configure generation parameters and safety settings
             self.log.debug(f"Supports image generation: {supports_image_generation}")
-            generation_config = self._configure_generation(
+            generation_config = await self._configure_generation(
                 body,
                 system_instruction,
                 __metadata__,
