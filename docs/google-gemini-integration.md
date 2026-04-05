@@ -58,14 +58,17 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 - **Grounding with Google search and URL Context**  
   Improve the accuracy and recency of Gemini responses with Google search grounding and the URL Context tool, automatically enabled when native tool calling is active and appropriate tools (`search_web`, `fetch_url`) are provided.
 
-- **Ability to forward User Headers and change gemini base url**  
-  Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
-
 - **Native tool calling support**  
   Leverage Google genai native function calling to orchestrate the use of tools.
 
 - **Native MCP Tool Support**  
   Directly integrate Model Context Protocol (MCP) tool sessions with Gemini's native tool calling capabilities.
+
+- **Extensible Native Gemini Tools**  
+  The pipeline automatically detects and executes Open WebUI tools that return a `google.genai.types.Tool` object. This allows for seamless integration of Gemini-specific features like Vertex AI Search grounding as standalone tools.
+
+- **Ability to forward User Headers and change gemini base url**  
+  Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
 
 
 ## Environment Variables
@@ -585,43 +588,23 @@ When enabled, the pipeline will use the `enterprise_web_search` tool instead of 
 
 ## Grounding with Vertex AI Search
 
-Improve the accuracy and recency of Gemini responses by grounding them with your own data in Vertex AI Search.
+Improve the accuracy and recency of Gemini responses by grounding them with your own data in Vertex AI Search. This feature is implemented as a [native Gemini tool](../tools/vertex_ai_search.py).
 
 ### Configuration
 
 To enable Vertex AI Search grounding, you need to:
 
 1. **Set up a Vertex AI Search Data Store**: Follow the [Google Cloud documentation](https://cloud.google.com/vertex-ai/docs/search/overview) to create a Data Store in Discovery Engine and ingest your documents.
-2. **Provide the RAG Store Path**: The path should be in the format `projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID` or `projects/PROJECT/locations/global/collections/default_collection/dataStores/DATA_STORE_ID`.
-   - Set the `VERTEX_AI_RAG_STORE` environment variable, or
-   - Use the [Filter (vertex_ai_search_tool.py)](../filters/vertex_ai_search_tool.py) to enable the feature and optionally pass the store ID via chat metadata.
-3. **Enable Vertex AI**: Set `GOOGLE_GENAI_USE_VERTEXAI=true` to use Vertex AI (required for Vertex AI Search grounding).
+2. **Configure the Tool**: Enable the **Vertex AI Search** tool in Open WebUI.
+3. **Set the RAG Store Path**: The path should be in the format `projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID` or `projects/PROJECT/locations/global/collections/default_collection/dataStores/DATA_STORE_ID`. 
+   - This is configured via the `VERTEX_AI_RAG_STORE` valve on the tool itself.
+4. **Enable Vertex AI**: Set `GOOGLE_GENAI_USE_VERTEXAI="true"` in the Gemini pipeline settings (required for Vertex AI Search grounding).
 
-When `USE_VERTEX_AI` is `true` and `VERTEX_AI_RAG_STORE` is configured, Vertex AI Search grounding will be automatically enabled. You can also explicitly enable it via the `vertex_ai_search` feature flag.
+### Usage
+
+Once the tool is configured, you can enable it for any chat by selecting the **Vertex AI Search** tool.
 
 When enabled, Gemini will use the specified Vertex AI Search Data Store to retrieve relevant information and ground its responses, providing citations to the source documents.
-
-### Example Filter Usage
-
-The [vertex_ai_search_tool.py](../filters/vertex_ai_search_tool.py) filter enables Vertex AI Search grounding when the `vertex_ai_search` feature is requested:
-
-```python
-# filters/vertex_ai_search_tool.py
-# ... (filter code) ...
-```
-
-To use this filter, ensure it's enabled in your Open WebUI configuration. Then, in your chat settings or via metadata, you can enable the `vertex_ai_search` feature:
-
-```json
-{
-  "features": {
-    "vertex_ai_search": true
-  },
-  "params": {
-    "vertex_rag_store": "projects/your-project/locations/global/collections/default_collection/dataStores/your-data-store-id"
-  }
-}
-```
 
 ## Native tool calling support
 

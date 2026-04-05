@@ -53,6 +53,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import inspect
 import io
 import uuid
 import aiofiles
@@ -278,10 +279,6 @@ class Pipe:
         VERTEX_LOCATION: str = Field(
             default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             description="The Google Cloud region to use with Vertex AI.",
-        )
-        VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
-            description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
@@ -2397,61 +2394,44 @@ class Pipe:
             gen_config_params |= {"safety_settings": safety_settings}
 
         # Add various tools to Gemini as required
-        features = __metadata__.get("features", {})
-        params = __metadata__.get("params", {})
         tools = []
-
-        if features.get("vertex_ai_search", False) or (
-            self.valves.USE_VERTEX_AI
-            and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
-        ):
-            vertex_rag_store = (
-                params.get("vertex_rag_store")
-                or self.valves.VERTEX_AI_RAG_STORE
-                or os.getenv("VERTEX_AI_RAG_STORE")
-            )
-            if vertex_rag_store:
-                self.log.debug(
-                    f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
-                )
-                tools.append(
-                    types.Tool(
-                        retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(
-                                datastore=vertex_rag_store
-                            )
-                        )
-                    )
-                )
-            else:
-                self.log.warning(
-                    "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
-                )
 
         # metadata['tools'] is populated only in native tool calling mode,
         # and contains all tools, not only user-defined tools, contrarily to __tools__
         for name, tool_def in __metadata__.get("tools", {}).items():
-            if name == "search_web":
-                if self.valves.USE_ENTERPRISE_WEB_SEARCH:
-                    self.log.debug(
-                        "Replacing 'search_web' with Enterprise Web Search grounding"
-                    )
-                    tool = types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
-                else:
-                    self.log.debug(
-                        "Replacing 'search_web' with Google search grounding"
-                    )
-                    tool = types.Tool(google_search=types.GoogleSearch())
+            if name == "search_web" and self.valves.USE_ENTERPRISE_WEB_SEARCH:
+                self.log.debug(
+                    "Replacing 'search_web' with Enterprise Web Search grounding"
+                )
+                tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            elif name == "search_web":
+                self.log.debug("Replacing 'search_web' with Google search grounding")
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
             elif name == "fetch_url":
                 self.log.debug("Replacing 'fetch_url' with URL context grounding")
-                tool = types.Tool(url_context=types.UrlContext())
+                tools.append(types.Tool(url_context=types.UrlContext()))
             elif tool_def.get("type") == "mcp":
-                # Don't add mcp tools one by one, add the mcp session directly
-                pass
+                # Don't add mcp tools one by one, add the mcp session directly later
+                self.log.debug(f"Skipping MCP tool {name}")
+                continue
+            elif (
+                inspect.signature(tool_def["callable"]).return_annotation is types.Tool
+            ):
+                try:
+                    self.log.debug(f"Getting native Gemini tool: {name}")
+                    native_tool = tool_def["callable"]()
+                    if isinstance(native_tool, types.Tool):
+                        tools.append(native_tool)
+                    else:
+                        self.log.warning(f"'{name}' is not a 'types.Tool'. Skipping.")
+                        continue
+                except Exception as e:
+                    self.log.warning(f"Failed to check/execute native tool {name}: {e}")
             else:
-                tool = tool_def["callable"]
                 self.log.debug(f"Adding tool '{name}'")
-            tools.append(tool)
+                tools.append(tool_def["callable"])
 
         # Add MCP server sessions
         for name, mcp_client in __metadata__.get("mcp_clients", {}).items():
