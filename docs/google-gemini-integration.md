@@ -573,7 +573,7 @@ GOOGLE_MODEL_WHITELIST="gemini-exp-1206,gemini-2.0-flash-exp,gemini-1.5-pro"
 When these tools are used, sources and Google search queries used by Gemini will be displayed with the response.
 
 > [!NOTE]
-> The separate `google_search_tool` filter is no longer required for Gemini grounding, as the pipeline now handles these tools natively when function calling is enabled.
+> The separate `google_search_tool` filter is no longer required for Gemini grounding, as the pipeline now handles these tools natively.
 
 ### Enterprise Search
 
@@ -605,6 +605,9 @@ To enable Vertex AI Search grounding, you need to:
 Once the tool is configured, you can enable it for any chat by selecting the **Vertex AI Search** tool.
 
 When enabled, Gemini will use the specified Vertex AI Search Data Store to retrieve relevant information and ground its responses, providing citations to the source documents.
+
+> [!NOTE]
+> The separate `vertex_ai_search_tool` filter is no longer required for Vertex AI grounding, as the pipeline now handles these tools natively.
 
 ## Native tool calling support
 
