@@ -62,7 +62,11 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
   Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
 
 - **Native tool calling support**  
-  Leverage Google genai native function calling to orchestrate the use of tools
+  Leverage Google genai native function calling to orchestrate the use of tools.
+
+- **Native MCP Tool Support**  
+  Directly integrate Model Context Protocol (MCP) tool sessions with Gemini's native tool calling capabilities.
+
 
 ## Environment Variables
 
@@ -622,6 +626,14 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 ## Native tool calling support
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
+
+## Native MCP Tool Support
+
+The Google Gemini pipeline supports **Native MCP Tool Support**, allowing Gemini models to directly use tools from any connected MCP (Model Context Protocol) servers when **Native tool calling** is enabled.
+
+When using this feature:
+- The pipeline automatically detects connected MCP clients and includes their entire sessions in the Gemini tool list.
+- **Important**: The standard Open Web UI **MCP function whitelist does not apply** when using native tool calling with Gemini. All tools provided by the connected MCP servers will be available to the model.
 
 ## Default System Prompt
 

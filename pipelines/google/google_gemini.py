@@ -2445,10 +2445,18 @@ class Pipe:
             elif name == "fetch_url":
                 self.log.debug("Replacing 'fetch_url' with URL context grounding")
                 tool = types.Tool(url_context=types.UrlContext())
+            elif tool_def.get("type") == "mcp":
+                # Don't add mcp tools one by one, add the mcp session directly
+                pass
             else:
                 tool = tool_def["callable"]
                 self.log.debug(f"Adding tool '{name}'")
             tools.append(tool)
+
+        # Add MCP server sessions
+        for name, mcp_client in __metadata__.get("mcp_clients", {}).items():
+            self.log.debug(f"Adding MCP server '{name}'")
+            tools.append(mcp_client.session)
 
         if tools:
             gen_config_params["tools"] = tools
