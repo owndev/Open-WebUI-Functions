@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.0
+version: 2.6.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
@@ -14,6 +14,8 @@ features:
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
   - Sends metrics to Azure Log Analytics.
+changelog:
+  - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
 import time
@@ -33,11 +35,61 @@ import tiktoken
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
-# Global variables to track start time and token counts
-global start_time, request_token_count, response_token_count
-start_time = 0
-request_token_count = 0
-response_token_count = 0
+# Per-request storage keyed by a fingerprint derived from user, model, and
+# last user message. Replaces the original global variables to fix incorrect
+# stats under concurrent requests.
+_request_data: dict[str, dict] = {}
+
+# Entries older than this (seconds) are pruned to prevent unbounded growth
+# when outlet() is never reached (e.g. cancelled requests, crashes).
+_STALE_ENTRY_TIMEOUT = 600
+
+
+def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
+    """
+    Build a storage key that is unique per request and consistent between
+    inlet and outlet.
+
+    Open WebUI reconstructs the body dict between inlet and outlet and only
+    exposes chat_id in outlet, so we cannot rely on a single ID field.
+    Instead we hash (user_id, model, number_of_user_messages,
+    last_user_message_content) — all of which are identical in both stages.
+
+    Collisions are only possible if the same user sends the exact same
+    message at the exact same conversation depth to the same model
+    concurrently, which is not a realistic scenario.
+    """
+    model = body.get("model", "")
+    user_id = user.get("id", "") if user else ""
+
+    messages = body.get("messages", [])
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    num_user_messages = len(user_messages)
+
+    last_user_content = ""
+    if user_messages:
+        content = user_messages[-1].get("content", "")
+        if isinstance(content, str):
+            last_user_content = content
+        elif content is not None:
+            last_user_content = str(content)
+
+    raw = f"{user_id}:{model}:{num_user_messages}:{last_user_content}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _prune_stale_entries(self) -> None:
+    """Remove entries older than _STALE_ENTRY_TIMEOUT to prevent unbounded growth."""
+    now = time.time()
+    stale_keys = [
+        k
+        for k, v in _request_data.items()
+        if now - v.get("start_time", now) > _STALE_ENTRY_TIMEOUT
+    ]
+    if stale_keys:
+        self.log.info(f"Pruning {len(stale_keys)} stale entries from _request_data")
+    for k in stale_keys:
+        _request_data.pop(k, None)
 
 
 # Simplified encryption implementation with automatic handling
@@ -85,10 +137,10 @@ class EncryptedStr(str):
 
         key = cls._get_encryption_key()
         if not key:  # No decryption if no key
-            return value[len("encrypted:") :]  # Return without prefix
+            return value[len("encrypted:"):]  # Return without prefix
 
         try:
-            encrypted_part = value[len("encrypted:") :]
+            encrypted_part = value[len("encrypted:"):]
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
@@ -178,6 +230,8 @@ class Filter:
     def __init__(self):
         self.name = "Time Token Tracker"
         self.valves = self.Valves()
+        self.log = logging.getLogger("time_token_tracker")
+        self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
     def _build_signature(self, date, content_length, method, content_type, resource):
         """Build the signature for Log Analytics authentication."""
@@ -212,10 +266,13 @@ class Filter:
             or not self.valves.LOG_ANALYTICS_WORKSPACE_ID
             or not self.valves.LOG_ANALYTICS_SHARED_KEY
         ):
+            self.log.debug("Log Analytics send skipped: not configured")
             return False
 
-        log = logging.getLogger("time_token_tracker._send_to_log_analytics_async")
-        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
+        self.log.debug(
+            f"Sending to Log Analytics (workspace={self.valves.LOG_ANALYTICS_WORKSPACE_ID}, "
+            f"log_type={self.valves.LOG_ANALYTICS_LOG_TYPE})"
+        )
 
         method = "POST"
         content_type = "application/json"
@@ -256,69 +313,22 @@ class Filter:
             )
 
             if response.status == 200:
+                self.log.debug("Log Analytics accepted the payload (HTTP 200)")
                 return True
             else:
                 response_text = await response.text()
-                log.error(
+                self.log.error(
                     f"Error sending to Log Analytics: {response.status} - {response_text}"
                 )
                 return False
 
         except Exception as e:
-            log.error(
+            self.log.error(
                 f"Exception when sending to Log Analytics asynchronously: {str(e)}"
             )
             return False
         finally:
             await cleanup_response(response, session)
-
-    async def inlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
-    ) -> dict:
-        global start_time, request_token_count
-        start_time = time.time()
-
-        model = body.get("model", "default-model")
-        all_messages = body.get("messages", [])
-
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-
-        # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
-        if self.valves.CALCULATE_ALL_MESSAGES:
-            request_messages = [
-                m for m in all_messages if m.get("role") in ("user", "system")
-            ]
-        else:
-            # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
-            # (one user and one system), sum them both.
-            request_user_system = [
-                m for m in all_messages if m.get("role") in ("user", "system")
-            ]
-            if len(request_user_system) == 2:
-                request_messages = request_user_system
-            else:
-                # Otherwise, take only the last "user" or "system" message if any
-                reversed_messages = list(reversed(all_messages))
-                last_user_system = next(
-                    (
-                        m
-                        for m in reversed_messages
-                        if m.get("role") in ("user", "system")
-                    ),
-                    None,
-                )
-                request_messages = [last_user_system] if last_user_system else []
-
-        request_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
-            for m in request_messages
-            if m
-        )
-
-        return body
 
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""
@@ -362,18 +372,106 @@ class Filter:
         except:  # noqa: E722
             return ""
 
+    async def inlet(
+        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+    ) -> dict:
+        user_id = __user__.get("id", "unknown") if __user__ else "unknown"
+        model = body.get("model", "default-model")
+        all_messages = body.get("messages", [])
+        self.log.debug(
+            f"Inlet called: model={model}, user={user_id}, "
+            f"messages={len(all_messages)}, body_keys={list(body.keys())}"
+        )
+
+        _prune_stale_entries(self)  # Clean up old entries on each inlet call
+        storage_key = _build_request_key(body, __user__)
+        self.log.debug(
+            f"Request key={storage_key}, active_entries={len(_request_data)}"
+        )
+
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+            self.log.debug(f"Using model-specific tiktoken encoding for '{model}'")
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            self.log.debug(
+                f"Model '{model}' not found in tiktoken, using cl100k_base fallback"
+            )
+
+        # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
+        if self.valves.CALCULATE_ALL_MESSAGES:
+            request_messages = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
+        else:
+            # If CALCULATE_ALL_MESSAGES is false and there are exactly two messages
+            # (one user and one system), sum them both.
+            request_user_system = [
+                m for m in all_messages if m.get("role") in ("user", "system")
+            ]
+            if len(request_user_system) == 2:
+                request_messages = request_user_system
+            else:
+                # Otherwise, take only the last "user" or "system" message if any
+                reversed_messages = list(reversed(all_messages))
+                last_user_system = next(
+                    (
+                        m
+                        for m in reversed_messages
+                        if m.get("role") in ("user", "system")
+                    ),
+                    None,
+                )
+                request_messages = [last_user_system] if last_user_system else []
+
+        request_token_count = sum(
+            len(encoding.encode(self._get_message_content(m)))
+            for m in request_messages
+            if m
+        )
+
+        _request_data[storage_key] = {
+            "start_time": time.time(),
+            "request_token_count": request_token_count,
+        }
+
+        self.log.info(
+            f"Inlet complete: key={storage_key}, model={model}, "
+            f"request_tokens={request_token_count}, "
+            f"counted_messages={len(request_messages)}"
+        )
+
+        return body
+
     async def outlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
-        log = logging.getLogger("time_token_tracker.outlet")
-        log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
-
-        global start_time, request_token_count, response_token_count
-        end_time = time.time()
-        response_time = end_time - start_time
-
         model = body.get("model", "default-model")
         all_messages = body.get("messages", [])
+        user_id = __user__.get("id", "unknown") if __user__ else "unknown"
+        self.log.debug(
+            f"Outlet called: model={model}, user={user_id}, "
+            f"messages={len(all_messages)}, body_keys={list(body.keys())}"
+        )
+
+        storage_key = _build_request_key(body, __user__)
+        request_data = _request_data.pop(storage_key, {})
+
+        if not request_data:
+            self.log.warning(
+                f"No inlet data found for key={storage_key}. "
+                f"Metrics will show zero values. "
+                f"Remaining entries={len(_request_data)}"
+            )
+        else:
+            self.log.debug(
+                f"Matched inlet data for key={storage_key}, "
+                f"remaining_entries={len(_request_data)}"
+            )
+
+        end_time = time.time()
+        response_time = end_time - request_data.get("start_time", end_time)
+        request_token_count = request_data.get("request_token_count", 0)
 
         try:
             encoding = tiktoken.encoding_for_model(model)
@@ -394,6 +492,8 @@ class Filter:
             )
             assistant_messages = [last_assistant] if last_assistant else []
 
+        # response_token_count is a local variable here; unlike the original
+        # global, it does not need to persist beyond this method.
         response_token_count = sum(
             len(encoding.encode(self._get_message_content(m)))
             for m in assistant_messages
@@ -441,6 +541,14 @@ class Filter:
             description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
         description = " | ".join(description_parts)
 
+        self.log.info(
+            f"Outlet complete: key={storage_key}, model={model}, "
+            f"response_time={response_time:.2f}s, "
+            f"req_tokens={request_token_count}, resp_tokens={response_token_count}, "
+            f"tokens_per_sec={resp_tokens_per_sec:.2f}"
+        )
+        self.log.debug(f"Status event: {description}")
+
         # Send event with description
         await __event_emitter__(
             {
@@ -481,11 +589,15 @@ class Filter:
             try:
                 result = await self._send_to_log_analytics_async(log_data)
                 if result:
-                    log.info("Log Analytics data sent successfully")
+                    self.log.info(
+                        f"Log Analytics data sent successfully "
+                        f"(chat={chat_id}, message={message_id})"
+                    )
                 else:
-                    log.warning("Failed to send data to Log Analytics")
+                    self.log.warning(
+                        f"Failed to send data to Log Analytics " f"(chat={chat_id})"
+                    )
             except Exception as e:
-                # Handle exceptions during sending to Log Analytics
-                log.error(f"Error sending to Log Analytics: {e}")
+                self.log.error(f"Error sending to Log Analytics: {e}")
 
         return body
