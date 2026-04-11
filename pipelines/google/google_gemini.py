@@ -61,7 +61,17 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError, APIError
-from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
+from typing import (
+    List,
+    Union,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    AsyncIterator,
+    Callable,
+    Awaitable,
+)
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -2413,9 +2423,11 @@ class Pipe:
                 self.log.debug("Replacing 'fetch_url' with URL context grounding")
                 tools.append(types.Tool(url_context=types.UrlContext()))
             elif tool_def.get("type") == "mcp":
-                # Don't add mcp tools one by one, add the mcp session directly later
-                self.log.debug(f"Skipping MCP tool {name}")
-                continue
+                self.log.debug(f"Adding MCP tool '{name}'")
+                mcp_tool = self._create_callable_from_spec(
+                    name, tool_def["spec"], tool_def["callable"]
+                )
+                tools.append(mcp_tool)
             elif (
                 inspect.signature(tool_def["callable"]).return_annotation is types.Tool
             ):
@@ -2434,17 +2446,90 @@ class Pipe:
                 self.log.debug(f"Adding tool '{name}'")
                 tools.append(tool_def["callable"])
 
-        # Add MCP server sessions
-        for name, mcp_client in __metadata__.get("mcp_clients", {}).items():
-            self.log.debug(f"Adding MCP server '{name}'")
-            tools.append(mcp_client.session)
-
         if tools:
             gen_config_params["tools"] = tools
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
         return types.GenerateContentConfig(**filtered_params)
+
+    @staticmethod
+    def _create_callable_from_spec(
+        name: str, spec: dict, callable_func: Callable[..., Awaitable[Any]]
+    ) -> Callable[..., Awaitable[Any]]:
+        """
+        Dynamically creates a well-typed async function from an MCP-style tool specification.
+        This satisfies inspection-based SDKs (like Gemini) by providing proper
+        signatures, docstrings, and unique function names.
+        """
+        import inspect
+
+        description = spec.get("description", "")
+        parameters_spec = spec.get("parameters", spec.get("inputSchema", {}))
+        properties = parameters_spec.get("properties", {})
+        required_params = parameters_spec.get("required", [])
+
+        # Type mapping from JSON schema to Python
+        type_map = {
+            "string": str,
+            "number": float,
+            "integer": int,
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+        }
+
+        params = []
+        doc_params = []
+
+        # Sort properties so required parameters come first to avoid "non-default argument follows default argument"
+        sorted_properties = sorted(
+            properties.items(),
+            key=lambda item: item[0] not in required_params,
+        )
+
+        for param_name, param_info in sorted_properties:
+            if param_name.startswith("__"):
+                continue
+
+            param_type = type_map.get(param_info.get("type"), Any)
+            param_desc = param_info.get("description", "")
+
+            default = inspect.Parameter.empty
+            if param_name not in required_params:
+                # If not required, default to None or a provided default
+                default = param_info.get("default", None)
+
+            params.append(
+                inspect.Parameter(
+                    name=param_name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    default=default,
+                    annotation=param_type,
+                )
+            )
+
+            if param_desc:
+                doc_params.append(f":param {param_name}: {param_desc}")
+
+        # Build the docstring
+        docstring = description
+        if doc_params:
+            docstring += "\n\n" + "\n".join(doc_params)
+
+        # The actual wrapper function
+        async def wrapped_func(*args, **kwargs):
+            return await callable_func(*args, **kwargs)
+
+        # Set metadata to satisfy SDK inspection
+        wrapped_func.__name__ = name
+        wrapped_func.__qualname__ = name
+        wrapped_func.__doc__ = docstring
+        wrapped_func.__signature__ = inspect.Signature(
+            parameters=params, return_annotation=Any
+        )
+
+        return wrapped_func
 
     @staticmethod
     def _format_grounding_chunks_as_sources(
