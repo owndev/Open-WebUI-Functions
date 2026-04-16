@@ -415,6 +415,15 @@ class Pipe:
             description="Maximum time in seconds to wait for video generation before timing out (0=no limit).",
         )
 
+        TEXT_THOUGHT: str = Field(
+            default=os.getenv("GOOGLE_TEXT_THOUGHT", "Thought"),
+            description="Text shown as 'Thought'.",
+        )
+        TEXT_THINKING: str = Field(
+            default=os.getenv("GOOGLE_TEXT_THINKING", "Thinking"),
+            description="Text shown as 'Thinking'.",
+        )
+
     # ---------------- Internal Helpers ---------------- #
     async def _gather_history_images(
         self,
@@ -2685,7 +2694,7 @@ class Pipe:
                                     "type": "status",
                                     "data": {
                                         "action": "thinking",
-                                        "description": f"Thinking… {preview}",
+                                        "description": f"{self.valves.TEXT_THINKING}… {preview}",
                                         "done": False,
                                         "hidden": False,
                                     },
@@ -2734,7 +2743,7 @@ class Pipe:
                 quoted_content = "\n".join(quoted_lines)
 
                 details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+<summary>{self.valves.TEXT_THOUGHT} ({duration_s}s)</summary>
 
 {quoted_content}
 
@@ -3339,7 +3348,7 @@ class Pipe:
                         quoted_content = "\n".join(quoted_lines)
 
                         details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+<summary>{self.valves.TEXT_THOUGHT} ({duration_s}s)</summary>
 
 {quoted_content}
 
