@@ -76,6 +76,7 @@ from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
 from open_webui.env import SRC_LOG_LEVELS
+from open_webui.internal.db import get_async_db_context
 from fastapi import Request, UploadFile, BackgroundTasks
 from open_webui.routers.files import upload_file
 from open_webui.models.users import UserModel, Users
@@ -1905,9 +1906,9 @@ class Pipe:
             from open_webui.models.files import Files
             from open_webui.storage.provider import Storage
 
-            file_obj = Files.get_file_by_id(fid)
+            file_obj = await Files.get_file_by_id(fid)
             if file_obj and file_obj.path:
-                file_path = Storage.get_file(file_obj.path)
+                file_path = await asyncio.to_thread(Storage.get_file, file_obj.path)
                 file_path = Path(file_path)
                 if file_path.is_file():
                     async with aiofiles.open(file_path, "rb") as fp:
@@ -1945,7 +1946,7 @@ class Pipe:
                 }
             )
 
-            self.user = user = Users.get_user_by_id(__user__["id"])
+            self.user = user = await Users.get_user_by_id(__user__["id"])
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -1953,7 +1954,7 @@ class Pipe:
             else:
                 image_data_b64 = str(image_data)
 
-            image_url = self._upload_image(
+            image_url = await self._upload_image(
                 __request__=__request__,
                 user=user,
                 image_data=image_data_b64,
@@ -1994,7 +1995,7 @@ class Pipe:
 
             return f"data:{mime_type};base64,{image_data_b64}"
 
-    def _upload_image(
+    async def _upload_image(
         self, __request__: Request, user: UserModel, image_data: str, mime_type: str
     ) -> str:
         """
@@ -2052,18 +2053,20 @@ class Pipe:
             filename = f"gemini-generated-{uuid.uuid4().hex}.{extension}"
 
             # Upload with simple approach like reference
-            up_obj = upload_file(
-                request=__request__,
-                background_tasks=BackgroundTasks(),
-                file=UploadFile(
-                    file=bio,
-                    filename=filename,
-                    headers=Headers({"content-type": mime_type}),
-                ),
-                process=False,  # Matching reference - no heavy processing
-                user=user,
-                metadata={"mime_type": mime_type, "source": "gemini_image_generation"},
-            )
+            async with get_async_db_context() as db:
+                up_obj = await upload_file(
+                    request=__request__,
+                    background_tasks=BackgroundTasks(),
+                    file=UploadFile(
+                        file=bio,
+                        filename=filename,
+                        headers=Headers({"content-type": mime_type}),
+                    ),
+                    process=False,  # Matching reference - no heavy processing
+                    user=user,
+                    metadata={"mime_type": mime_type, "source": "gemini_image_generation"},
+                    db=db,
+                )
 
             self.log.debug(
                 f"Upload completed. File ID: {up_obj.id}, Decoded size: {len(decoded_data)} bytes"
@@ -2077,7 +2080,7 @@ class Pipe:
             # Fallback to data URL if upload fails
             return f"data:{mime_type};base64,{image_data}"
 
-    def _upload_video(
+    async def _upload_video(
         self,
         __request__: Request,
         user: UserModel,
@@ -2098,18 +2101,20 @@ class Pipe:
 
         filename = f"veo-generated-{uuid.uuid4().hex}.{extension}"
 
-        up_obj = upload_file(
-            request=__request__,
-            background_tasks=BackgroundTasks(),
-            file=UploadFile(
-                file=bio,
-                filename=filename,
-                headers=Headers({"content-type": mime_type}),
-            ),
-            process=False,
-            user=user,
-            metadata={"mime_type": mime_type, "source": "veo_video_generation"},
-        )
+        async with get_async_db_context() as db:
+            up_obj = await upload_file(
+                request=__request__,
+                background_tasks=BackgroundTasks(),
+                file=UploadFile(
+                    file=bio,
+                    filename=filename,
+                    headers=Headers({"content-type": mime_type}),
+                ),
+                process=False,
+                user=user,
+                metadata={"mime_type": mime_type, "source": "veo_video_generation"},
+                db=db,
+            )
 
         content_url = __request__.app.url_path_for(
             "get_file_content_by_id", id=up_obj.id
@@ -2144,8 +2149,8 @@ class Pipe:
                 }
             )
 
-            self.user = user = Users.get_user_by_id(__user__["id"])
-            video_url, file_id = self._upload_video(
+            self.user = user = await Users.get_user_by_id(__user__["id"])
+            video_url, file_id = await self._upload_video(
                 __request__=__request__,
                 user=user,
                 video_data=video_data,
@@ -2589,12 +2594,15 @@ class Pipe:
             if metadata.grounding_supports:
                 grounding_supports.extend(metadata.grounding_supports)
 
-        # Add sources to the response
+        # Add sources to the response.
+        # Emit each source individually via the "source" event type so that
+        # citations are persisted by Open WebUI across page refreshes.
+        # A "chat:completion" event with a "sources" payload renders citations
+        # in the live response but is not stored with the message.
         if grounding_chunks:
             sources = self._format_grounding_chunks_as_sources(grounding_chunks)
-            await __event_emitter__(
-                {"type": "chat:completion", "data": {"sources": sources}}
-            )
+            for source in sources:
+                await __event_emitter__({"type": "source", "data": source})
 
         # Add status specifying google queries used for grounding
         if web_search_queries:
@@ -3176,7 +3184,7 @@ class Pipe:
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
         if __user__:
-            self.user = Users.get_user_by_id(__user__["id"])
+            self.user = await Users.get_user_by_id(__user__["id"])
         else:
             self.user = None
 
