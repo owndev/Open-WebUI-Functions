@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.0
+version: 1.15.1
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -2520,12 +2520,15 @@ class Pipe:
             if metadata.grounding_supports:
                 grounding_supports.extend(metadata.grounding_supports)
 
-        # Add sources to the response
+        # Add sources to the response.
+        # Emit each source individually via the "source" event type so that
+        # citations are persisted by Open WebUI across page refreshes.
+        # A "chat:completion" event with a "sources" payload renders citations
+        # in the live response but is not stored with the message.
         if grounding_chunks:
             sources = self._format_grounding_chunks_as_sources(grounding_chunks)
-            await __event_emitter__(
-                {"type": "chat:completion", "data": {"sources": sources}}
-            )
+            for source in sources:
+                await __event_emitter__({"type": "source", "data": source})
 
         # Add status specifying google queries used for grounding
         if web_search_queries:
