@@ -41,7 +41,7 @@ features:
   - Video generation with Google Veo models (Veo 3.1, 3, 2)
   - Configurable video generation parameters (aspect ratio, resolution, duration)
   - Asynchronous video generation with progressive polling status updates
-    - Automatic video upload to Open WebUI with chat file attachments
+  - Automatic video upload to Open WebUI with chat file attachments
   - Image-to-video generation support for Veo models
   - Negative prompt and person generation controls for video
 """
@@ -1255,8 +1255,24 @@ class Pipe:
             return False
 
     @staticmethod
+    def _build_generated_image_file(
+        content_url: str,
+        mime_type: str,
+        name: str = "Generated Image",
+    ) -> Dict[str, Any]:
+        """Build a chat image entry matching Open WebUI's image attachment shape."""
+        return {
+            "type": "image",
+            "url": content_url,
+            "content_type": mime_type,
+            "name": name,
+            "meta": {"content_type": mime_type},
+        }
+
+    @staticmethod
     def _build_generated_video_file(
         file_id: str,
+        content_url: str,
         filename: str,
         mime_type: str,
         size: int,
@@ -1265,7 +1281,7 @@ class Pipe:
         return {
             "id": file_id,
             "type": "file",
-            "url": file_id,
+            "url": content_url,
             "name": filename,
             "filename": filename,
             "size": size,
@@ -2209,19 +2225,15 @@ class Pipe:
                         f"Failed to link generated video file to chat message: {chat_file_error}"
                     )
 
-        try:
-            content_url = str(
-                __request__.url_for("get_file_content_by_id", id=up_obj.id)
-            )
-        except Exception:
-            content_url = __request__.app.url_path_for(
-                "get_file_content_by_id", id=up_obj.id
-            )
+        content_url = str(
+            __request__.app.url_path_for("get_file_content_by_id", id=up_obj.id)
+        )
         self.log.debug(
             f"Video upload completed. File ID: {up_obj.id}, Size: {len(video_data)} bytes"
         )
         return content_url, self._build_generated_video_file(
             file_id=up_obj.id,
+            content_url=content_url,
             filename=filename,
             mime_type=mime_type,
             size=len(video_data),
@@ -3068,6 +3080,7 @@ class Pipe:
         generated_video_files: List[Dict[str, Any]] = []
         generated_video_links: List[str] = []
         upload_failure_count = 0
+        attachment_skipped_count = 0
         response = operation.response
         if not response or not response.generated_videos:
             return "Error: No videos were generated"
@@ -3134,7 +3147,9 @@ class Pipe:
 
             file_entry = None
             video_url = None
+            attachment_attempted = False
             if __request__ and __user__:
+                attachment_attempted = True
                 file_entry, video_url = await self._upload_video_with_status(
                     video_bytes,
                     mime_type,
@@ -3155,15 +3170,21 @@ class Pipe:
                     )
                 continue
 
-            upload_failure_count += 1
-            if video_url and not video_url.startswith("data:"):
+            if attachment_attempted:
+                upload_failure_count += 1
+            else:
+                attachment_skipped_count += 1
+
+            if attachment_attempted and video_url and not video_url.startswith("data:"):
                 generated_video_links.append(
                     f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
                 )
-            else:
+            elif attachment_attempted:
                 generated_video_links.append(
                     f"Generated video {idx + 1}, but it could not be attached to the chat."
                 )
+            else:
+                generated_video_links.append(f"Generated video {idx + 1}.")
 
         await emit_status(f"Video generation complete ({elapsed}s)", True)
 
@@ -3186,8 +3207,11 @@ class Pipe:
             content_parts.extend(generated_video_links)
 
         if upload_failure_count:
+            content_parts.append("Some videos could not be attached directly.")
+
+        if attachment_skipped_count:
             content_parts.append(
-                "Some videos could not be attached directly and may require an Open WebUI update for native playback."
+                "Video attachments were skipped because chat upload context was unavailable."
             )
 
         content = (
@@ -3482,12 +3506,10 @@ class Pipe:
                                 )
                             else:
                                 generated_image_files.append(
-                                    {
-                                        "type": "image",
-                                        "url": image_url,
-                                        "content_type": mime_type,
-                                        "name": "Generated Image",
-                                    }
+                                    self._build_generated_image_file(
+                                        content_url=image_url,
+                                        mime_type=mime_type,
+                                    )
                                 )
 
                         elif getattr(part, "inline_data", None):
