@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.1
+version: 1.15.2
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -41,7 +41,7 @@ features:
   - Video generation with Google Veo models (Veo 3.1, 3, 2)
   - Configurable video generation parameters (aspect ratio, resolution, duration)
   - Asynchronous video generation with progressive polling status updates
-  - Automatic video upload to Open WebUI with embedded playback
+  - Automatic video upload to Open WebUI with chat file attachments
   - Image-to-video generation support for Veo models
   - Negative prompt and person generation controls for video
 """
@@ -68,6 +68,7 @@ from open_webui.env import SRC_LOG_LEVELS
 from open_webui.internal.db import get_async_db_context
 from fastapi import Request, UploadFile, BackgroundTasks
 from open_webui.routers.files import upload_file
+from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
 
@@ -1199,6 +1200,98 @@ class Pipe:
             "veo" in model_lower and "generate" in model_lower
         )
 
+    @staticmethod
+    def _is_open_webui_image_tool(tool_name: str) -> bool:
+        """Return True for Open WebUI's built-in image generation tools."""
+        return tool_name in {"generate_image", "edit_image"}
+
+    @staticmethod
+    def _image_data_hash(image_data: Any) -> str:
+        """Build a stable hash for generated image data across bytes/str inputs."""
+        if isinstance(image_data, bytes):
+            return hashlib.sha256(image_data).hexdigest()
+        return hashlib.sha256(str(image_data).encode("utf-8")).hexdigest()
+
+    async def _emit_generated_image_files(
+        self,
+        image_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+    ) -> bool:
+        """Persist generated images on the assistant message via Open WebUI files."""
+        if not image_files or not __event_emitter__:
+            return False
+
+        try:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {"files": image_files},
+                }
+            )
+            return True
+        except Exception as emit_error:
+            self.log.warning(f"Failed to emit generated image files: {emit_error}")
+            return False
+
+    async def _emit_generated_video_files(
+        self,
+        video_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+    ) -> bool:
+        """Persist generated videos on the assistant message via Open WebUI files."""
+        if not video_files or not __event_emitter__:
+            return False
+
+        try:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {"files": video_files},
+                }
+            )
+            return True
+        except Exception as emit_error:
+            self.log.warning(f"Failed to emit generated video files: {emit_error}")
+            return False
+
+    @staticmethod
+    def _build_generated_image_file(
+        content_url: str,
+        mime_type: str,
+        name: str = "Generated Image",
+    ) -> Dict[str, Any]:
+        """Build a chat image entry matching Open WebUI's image attachment shape."""
+        return {
+            "type": "image",
+            "url": content_url,
+            "content_type": mime_type,
+            "name": name,
+            "meta": {"content_type": mime_type},
+        }
+
+    @staticmethod
+    def _build_generated_video_file(
+        file_id: str,
+        content_url: str,
+        filename: str,
+        mime_type: str,
+        size: int,
+    ) -> Dict[str, Any]:
+        """Build a chat file entry that matches Open WebUI's file attachment shape."""
+        return {
+            "id": file_id,
+            "type": "file",
+            "url": content_url,
+            "name": filename,
+            "filename": filename,
+            "size": size,
+            "content_type": mime_type,
+            "meta": {
+                "content_type": mime_type,
+                "size": size,
+            },
+        }
+
     def _check_veo_3_1_support(self, model_id: str) -> bool:
         """Check if a Veo model is version 3.1 (supports reference images, interpolation, 4k, extension)."""
         return "veo-3.1" in model_id.lower()
@@ -1208,11 +1301,15 @@ class Pipe:
         model_lower = model_id.lower()
         is_fast = "fast" in model_lower
 
+        # `enhance_prompt` is no longer accepted by any current Veo model in the
+        # Gemini API (it was a legacy Vertex-only parameter and the public Veo
+        # API parameter table no longer lists it). Sending it now produces
+        # `400 INVALID_ARGUMENT: enhancePrompt isn't supported by this model`.
         if "veo-3.1" in model_lower:
             return {
                 "version": "3.1",
                 "is_fast": is_fast,
-                "supports_enhance_prompt": not is_fast,
+                "supports_enhance_prompt": False,
                 "supports_resolution": True,
                 "valid_resolutions": ["720p", "1080p", "4k"],
                 "valid_durations": [4, 6, 8],
@@ -1225,7 +1322,7 @@ class Pipe:
             return {
                 "version": "3",
                 "is_fast": is_fast,
-                "supports_enhance_prompt": not is_fast,
+                "supports_enhance_prompt": False,
                 "supports_resolution": True,
                 "valid_resolutions": ["720p", "1080p"],
                 "valid_durations": [8],
@@ -2057,7 +2154,10 @@ class Pipe:
                     ),
                     process=False,  # Matching reference - no heavy processing
                     user=user,
-                    metadata={"mime_type": mime_type, "source": "gemini_image_generation"},
+                    metadata={
+                        "mime_type": mime_type,
+                        "source": "gemini_image_generation",
+                    },
                     db=db,
                 )
 
@@ -2079,11 +2179,13 @@ class Pipe:
         user: UserModel,
         video_data: bytes,
         mime_type: str = "video/mp4",
-    ) -> Tuple[str, str]:
+        chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
         """Upload generated video to Open WebUI's file system.
 
         Returns:
-            Tuple of (content_url, file_id)
+            Tuple of (content_url, file_entry)
         """
         bio = io.BytesIO(video_data)
         bio.seek(0)
@@ -2109,13 +2211,33 @@ class Pipe:
                 db=db,
             )
 
-        content_url = __request__.app.url_path_for(
-            "get_file_content_by_id", id=up_obj.id
+            if chat_id and message_id:
+                try:
+                    await Chats.insert_chat_files(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        file_ids=[up_obj.id],
+                        user_id=user.id,
+                        db=db,
+                    )
+                except Exception as chat_file_error:
+                    self.log.warning(
+                        f"Failed to link generated video file to chat message: {chat_file_error}"
+                    )
+
+        content_url = str(
+            __request__.app.url_path_for("get_file_content_by_id", id=up_obj.id)
         )
         self.log.debug(
             f"Video upload completed. File ID: {up_obj.id}, Size: {len(video_data)} bytes"
         )
-        return content_url, up_obj.id
+        return content_url, self._build_generated_video_file(
+            file_id=up_obj.id,
+            content_url=content_url,
+            filename=filename,
+            mime_type=mime_type,
+            size=len(video_data),
+        )
 
     async def _upload_video_with_status(
         self,
@@ -2124,11 +2246,12 @@ class Pipe:
         __request__: Request,
         __user__: dict,
         __event_emitter__: Callable,
-    ) -> Tuple[str, Optional[str]]:
+        __metadata__: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Upload video with status updates and data-URL fallback.
 
         Returns:
-            Tuple of (content_url_or_data_url, file_id_or_None)
+            Tuple of (file_entry_or_None, content_url_or_data_url_or_None)
         """
         try:
             await __event_emitter__(
@@ -2143,11 +2266,15 @@ class Pipe:
             )
 
             self.user = user = await Users.get_user_by_id(__user__["id"])
-            video_url, file_id = await self._upload_video(
+            chat_id = __metadata__.get("chat_id") if __metadata__ else None
+            message_id = __metadata__.get("message_id") if __metadata__ else None
+            video_url, file_entry = await self._upload_video(
                 __request__=__request__,
                 user=user,
                 video_data=video_data,
                 mime_type=mime_type,
+                chat_id=chat_id,
+                message_id=message_id,
             )
 
             await __event_emitter__(
@@ -2160,7 +2287,7 @@ class Pipe:
                     },
                 }
             )
-            return video_url, file_id
+            return file_entry, video_url
 
         except Exception as e:
             self.log.warning(f"Video upload failed, falling back to data URL: {e}")
@@ -2175,7 +2302,7 @@ class Pipe:
                     },
                 }
             )
-            return f"data:{mime_type};base64,{video_data_b64}", None
+            return None, f"data:{mime_type};base64,{video_data_b64}"
 
     def _get_user_valve_value(
         self, __user__: Optional[dict], valve_name: str
@@ -2448,6 +2575,11 @@ class Pipe:
 
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
+                if enable_image_generation and self._is_open_webui_image_tool(name):
+                    self.log.debug(
+                        f"Skipping Open WebUI built-in image tool '{name}' for native Gemini image generation"
+                    )
+                    continue
                 if not name.startswith("_"):
                     tool = tool_def["callable"]
                     self.log.debug(
@@ -2852,6 +2984,7 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> Union[str, Dict[str, Any]]:
         """Generate video using Google Veo models (long-running operation with polling)."""
 
@@ -2944,7 +3077,10 @@ class Pipe:
             await emit_status(f"Video generation failed: {error_msg}", True)
             return f"Video generation failed: {error_msg}"
 
-        generated_videos = []
+        generated_video_files: List[Dict[str, Any]] = []
+        generated_video_links: List[str] = []
+        upload_failure_count = 0
+        attachment_skipped_count = 0
         response = operation.response
         if not response or not response.generated_videos:
             return "Error: No videos were generated"
@@ -3009,31 +3145,78 @@ class Pipe:
 
             mime_type = getattr(video, "mime_type", "video/mp4") or "video/mp4"
 
-            file_id = None
+            file_entry = None
             video_url = None
+            attachment_attempted = False
             if __request__ and __user__:
-                video_url, file_id = await self._upload_video_with_status(
-                    video_bytes, mime_type, __request__, __user__, __event_emitter__
+                attachment_attempted = True
+                file_entry, video_url = await self._upload_video_with_status(
+                    video_bytes,
+                    mime_type,
+                    __request__,
+                    __user__,
+                    __event_emitter__,
+                    __metadata__,
                 )
             else:
                 video_data_b64 = base64.b64encode(video_bytes).decode("utf-8")
                 video_url = f"data:{mime_type};base64,{video_data_b64}"
 
-            # Wrap in <div> so marked.lexer recognizes it as block-level HTML;
-            # HTMLToken.svelte then detects the inner <video> and renders a native player
-            if file_id:
-                video_src = f"/api/v1/files/{file_id}/content"
-                generated_videos.append(f"<div>\n<video>{video_src}</video>\n</div>")
+            if file_entry:
+                generated_video_files.append(file_entry)
+                if video_url:
+                    generated_video_links.append(
+                        f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
+                    )
+                continue
+
+            if attachment_attempted:
+                upload_failure_count += 1
             else:
-                generated_videos.append(
+                attachment_skipped_count += 1
+
+            if attachment_attempted and video_url and not video_url.startswith("data:"):
+                generated_video_links.append(
                     f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
                 )
+            elif attachment_attempted:
+                generated_video_links.append(
+                    f"Generated video {idx + 1}, but it could not be attached to the chat."
+                )
+            else:
+                generated_video_links.append(f"Generated video {idx + 1}.")
 
         await emit_status(f"Video generation complete ({elapsed}s)", True)
 
+        files_emitted = await self._emit_generated_video_files(
+            generated_video_files, __event_emitter__
+        )
+
+        content_parts: List[str] = []
+        if generated_video_files and files_emitted:
+            video_count = len(generated_video_files)
+            content_parts.append(
+                "Generated video attached."
+                if video_count == 1
+                else f"Generated {video_count} videos attached."
+            )
+        else:
+            content_parts.extend(generated_video_links)
+
+        if generated_video_files and not files_emitted:
+            content_parts.extend(generated_video_links)
+
+        if upload_failure_count:
+            content_parts.append("Some videos could not be attached directly.")
+
+        if attachment_skipped_count:
+            content_parts.append(
+                "Video attachments were skipped because chat upload context was unavailable."
+            )
+
         content = (
-            "\n\n".join(generated_videos)
-            if generated_videos
+            "\n\n".join(part for part in content_parts if part)
+            if content_parts
             else "[No video content generated]"
         )
 
@@ -3129,7 +3312,12 @@ class Pipe:
             if self._check_video_generation_support(model_id):
                 self.log.debug(f"Routing to video generation for model: {model_id}")
                 return await self._generate_video(
-                    body, model_id, __event_emitter__, __request__, __user__
+                    body,
+                    model_id,
+                    __event_emitter__,
+                    __request__,
+                    __user__,
+                    __metadata__,
                 )
 
             # Check if this model supports image generation
@@ -3274,6 +3462,8 @@ class Pipe:
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
                     generated_images: list[str] = []
+                    generated_image_files: List[Dict[str, Any]] = []
+                    seen_generated_image_hashes: set[str] = set()
 
                     for part in parts:
                         if getattr(part, "thought", False) and getattr(
@@ -3295,6 +3485,14 @@ class Pipe:
                                 f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
                             )
 
+                            image_hash = self._image_data_hash(image_data)
+                            if image_hash in seen_generated_image_hashes:
+                                self.log.debug(
+                                    "Skipping duplicate generated image part from Gemini response"
+                                )
+                                continue
+                            seen_generated_image_hashes.add(image_hash)
+
                             image_url = await self._upload_image_with_status(
                                 image_data,
                                 mime_type,
@@ -3302,12 +3500,30 @@ class Pipe:
                                 __user__,
                                 __event_emitter__,
                             )
-                            generated_images.append(f"![Generated Image]({image_url})")
+                            if image_url.startswith("data:"):
+                                generated_images.append(
+                                    f"![Generated Image]({image_url})"
+                                )
+                            else:
+                                generated_image_files.append(
+                                    self._build_generated_image_file(
+                                        content_url=image_url,
+                                        mime_type=mime_type,
+                                    )
+                                )
 
                         elif getattr(part, "inline_data", None):
                             # Fallback: return as base64 data URL if no request/user context
                             mime_type = part.inline_data.mime_type
                             image_data = part.inline_data.data
+
+                            image_hash = self._image_data_hash(image_data)
+                            if image_hash in seen_generated_image_hashes:
+                                self.log.debug(
+                                    "Skipping duplicate generated image part from Gemini response"
+                                )
+                                continue
+                            seen_generated_image_hashes.add(image_hash)
 
                             if isinstance(image_data, bytes):
                                 image_data_b64 = base64.b64encode(image_data).decode(
@@ -3356,6 +3572,25 @@ class Pipe:
 
                     # Add the main answer
                     full_response += final_answer
+
+                    files_emitted = await self._emit_generated_image_files(
+                        generated_image_files, __event_emitter__
+                    )
+
+                    if generated_image_files and not files_emitted:
+                        generated_images.extend(
+                            f"![Generated Image]({image_file['url']})"
+                            for image_file in generated_image_files
+                        )
+
+                    if (
+                        generated_image_files
+                        and files_emitted
+                        and not final_answer.strip()
+                    ):
+                        if full_response:
+                            full_response += "\n\n"
+                        full_response += "Generated image."
 
                     # Add generated images
                     if generated_images:
