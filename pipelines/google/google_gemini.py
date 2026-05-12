@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.1
+version: 1.15.2
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -1199,6 +1199,39 @@ class Pipe:
             "veo" in model_lower and "generate" in model_lower
         )
 
+    @staticmethod
+    def _is_open_webui_image_tool(tool_name: str) -> bool:
+        """Return True for Open WebUI's built-in image generation tools."""
+        return tool_name in {"generate_image", "edit_image"}
+
+    @staticmethod
+    def _image_data_hash(image_data: Any) -> str:
+        """Build a stable hash for generated image data across bytes/str inputs."""
+        if isinstance(image_data, bytes):
+            return hashlib.sha256(image_data).hexdigest()
+        return hashlib.sha256(str(image_data).encode("utf-8")).hexdigest()
+
+    async def _emit_generated_image_files(
+        self,
+        image_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+    ) -> bool:
+        """Persist generated images on the assistant message via Open WebUI files."""
+        if not image_files or not __event_emitter__:
+            return False
+
+        try:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {"files": image_files},
+                }
+            )
+            return True
+        except Exception as emit_error:
+            self.log.warning(f"Failed to emit generated image files: {emit_error}")
+            return False
+
     def _check_veo_3_1_support(self, model_id: str) -> bool:
         """Check if a Veo model is version 3.1 (supports reference images, interpolation, 4k, extension)."""
         return "veo-3.1" in model_id.lower()
@@ -1208,11 +1241,15 @@ class Pipe:
         model_lower = model_id.lower()
         is_fast = "fast" in model_lower
 
+        # `enhance_prompt` is no longer accepted by any current Veo model in the
+        # Gemini API (it was a legacy Vertex-only parameter and the public Veo
+        # API parameter table no longer lists it). Sending it now produces
+        # `400 INVALID_ARGUMENT: enhancePrompt isn't supported by this model`.
         if "veo-3.1" in model_lower:
             return {
                 "version": "3.1",
                 "is_fast": is_fast,
-                "supports_enhance_prompt": not is_fast,
+                "supports_enhance_prompt": False,
                 "supports_resolution": True,
                 "valid_resolutions": ["720p", "1080p", "4k"],
                 "valid_durations": [4, 6, 8],
@@ -1225,7 +1262,7 @@ class Pipe:
             return {
                 "version": "3",
                 "is_fast": is_fast,
-                "supports_enhance_prompt": not is_fast,
+                "supports_enhance_prompt": False,
                 "supports_resolution": True,
                 "valid_resolutions": ["720p", "1080p"],
                 "valid_durations": [8],
@@ -2057,7 +2094,10 @@ class Pipe:
                     ),
                     process=False,  # Matching reference - no heavy processing
                     user=user,
-                    metadata={"mime_type": mime_type, "source": "gemini_image_generation"},
+                    metadata={
+                        "mime_type": mime_type,
+                        "source": "gemini_image_generation",
+                    },
                     db=db,
                 )
 
@@ -2448,6 +2488,11 @@ class Pipe:
 
         if __tools__ is not None and params.get("function_calling") == "native":
             for name, tool_def in __tools__.items():
+                if enable_image_generation and self._is_open_webui_image_tool(name):
+                    self.log.debug(
+                        f"Skipping Open WebUI built-in image tool '{name}' for native Gemini image generation"
+                    )
+                    continue
                 if not name.startswith("_"):
                     tool = tool_def["callable"]
                     self.log.debug(
@@ -3274,6 +3319,8 @@ class Pipe:
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
                     generated_images: list[str] = []
+                    generated_image_files: List[Dict[str, Any]] = []
+                    seen_generated_image_hashes: set[str] = set()
 
                     for part in parts:
                         if getattr(part, "thought", False) and getattr(
@@ -3295,6 +3342,14 @@ class Pipe:
                                 f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
                             )
 
+                            image_hash = self._image_data_hash(image_data)
+                            if image_hash in seen_generated_image_hashes:
+                                self.log.debug(
+                                    "Skipping duplicate generated image part from Gemini response"
+                                )
+                                continue
+                            seen_generated_image_hashes.add(image_hash)
+
                             image_url = await self._upload_image_with_status(
                                 image_data,
                                 mime_type,
@@ -3302,12 +3357,32 @@ class Pipe:
                                 __user__,
                                 __event_emitter__,
                             )
-                            generated_images.append(f"![Generated Image]({image_url})")
+                            if image_url.startswith("data:"):
+                                generated_images.append(
+                                    f"![Generated Image]({image_url})"
+                                )
+                            else:
+                                generated_image_files.append(
+                                    {
+                                        "type": "image",
+                                        "url": image_url,
+                                        "content_type": mime_type,
+                                        "name": "Generated Image",
+                                    }
+                                )
 
                         elif getattr(part, "inline_data", None):
                             # Fallback: return as base64 data URL if no request/user context
                             mime_type = part.inline_data.mime_type
                             image_data = part.inline_data.data
+
+                            image_hash = self._image_data_hash(image_data)
+                            if image_hash in seen_generated_image_hashes:
+                                self.log.debug(
+                                    "Skipping duplicate generated image part from Gemini response"
+                                )
+                                continue
+                            seen_generated_image_hashes.add(image_hash)
 
                             if isinstance(image_data, bytes):
                                 image_data_b64 = base64.b64encode(image_data).decode(
@@ -3356,6 +3431,25 @@ class Pipe:
 
                     # Add the main answer
                     full_response += final_answer
+
+                    files_emitted = await self._emit_generated_image_files(
+                        generated_image_files, __event_emitter__
+                    )
+
+                    if generated_image_files and not files_emitted:
+                        generated_images.extend(
+                            f"![Generated Image]({image_file['url']})"
+                            for image_file in generated_image_files
+                        )
+
+                    if (
+                        generated_image_files
+                        and files_emitted
+                        and not final_answer.strip()
+                    ):
+                        if full_response:
+                            full_response += "\n\n"
+                        full_response += "Generated image."
 
                     # Add generated images
                     if generated_images:
