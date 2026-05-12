@@ -223,7 +223,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Video generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video for all supported Veo models. Videos are automatically uploaded and embedded with playback controls.
 - **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database.
 - **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`.
-- Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
+- Grounding with Google Search and URL Context (natively supported via native tool calling)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
 - Native tool calling support
 - Configurable API version support

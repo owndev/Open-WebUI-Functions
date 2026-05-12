@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.2
+version: 2.0.0
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -53,6 +53,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import inspect
 import io
 import uuid
 import aiofiles
@@ -60,7 +61,17 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError, APIError
-from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
+from typing import (
+    List,
+    Union,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    AsyncIterator,
+    Callable,
+    Awaitable,
+)
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -280,10 +291,6 @@ class Pipe:
         VERTEX_LOCATION: str = Field(
             default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             description="The Google Cloud region to use with Vertex AI.",
-        )
-        VERTEX_AI_RAG_STORE: str | None = Field(
-            default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
-            description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=os.getenv("GOOGLE_USE_PERMISSIVE_SAFETY", "false").lower()
@@ -2314,12 +2321,11 @@ class Pipe:
                 return value
         return None
 
-    def _configure_generation(
+    async def _configure_generation(
         self,
         body: Dict[str, Any],
         system_instruction: Optional[str],
         __metadata__: Dict[str, Any],
-        __tools__: dict[str, Any] | None = None,
         __user__: Optional[dict] = None,
         enable_image_generation: bool = False,
         model_id: str = "",
@@ -2530,45 +2536,47 @@ class Pipe:
             gen_config_params |= {"safety_settings": safety_settings}
 
         # Add various tools to Gemini as required
-        features = __metadata__.get("features", {})
-        params = __metadata__.get("params", {})
         tools = []
 
-        if features.get("google_search_tool", False):
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
-                self.log.debug("Enabling Enterprise Web Search grounding")
+        # metadata['tools'] is populated only in native tool calling mode,
+        # and contains all tools, not only user-defined tools, contrarily to __tools__
+        for name, tool_def in __metadata__.get("tools", {}).items():
+            if name == "search_web" and self.valves.USE_ENTERPRISE_WEB_SEARCH:
+                self.log.debug(
+                    "Replacing 'search_web' with Enterprise Web Search grounding"
+                )
                 tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
                 )
-            else:
-                self.log.debug("Enabling Google search grounding")
+            elif name == "search_web":
+                self.log.debug("Replacing 'search_web' with Google search grounding")
                 tools.append(types.Tool(google_search=types.GoogleSearch()))
-            self.log.debug("Enabling URL context grounding")
-            tools.append(types.Tool(url_context=types.UrlContext()))
-
-        if features.get("vertex_ai_search", False) or (
-            self.valves.USE_VERTEX_AI
-            and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
-        ):
-            vertex_rag_store = (
-                params.get("vertex_rag_store")
-                or self.valves.VERTEX_AI_RAG_STORE
-                or os.getenv("VERTEX_AI_RAG_STORE")
-            )
-            if vertex_rag_store:
-                self.log.debug(
-                    f"Enabling Vertex AI Search grounding: {vertex_rag_store}"
+            elif name == "fetch_url":
+                self.log.debug("Replacing 'fetch_url' with URL context grounding")
+                tools.append(types.Tool(url_context=types.UrlContext()))
+            elif tool_def.get("type") == "mcp":
+                self.log.debug(f"Adding MCP tool '{name}'")
+                mcp_tool = self._create_callable_from_spec(
+                    name, tool_def["spec"], tool_def["callable"]
                 )
-                tools.append(
-                    types.Tool(
-                        retrieval=types.Retrieval(
-                            vertex_ai_search=types.VertexAISearch(
-                                datastore=vertex_rag_store
-                            )
-                        )
-                    )
-                )
+                tools.append(mcp_tool)
+            elif (
+                inspect.signature(tool_def["callable"]).return_annotation is types.Tool
+            ):
+                try:
+                    self.log.debug(f"Getting native Gemini tool: {name}")
+                    native_tool = await tool_def["callable"]()
+                    if isinstance(native_tool, types.Tool):
+                        self.log.debug(f"Adding tool '{name}'")
+                        tools.append(native_tool)
+                    else:
+                        self.log.warning(f"'{name}' is not a 'types.Tool'. Skipping.")
+                        continue
+                except Exception as e:
+                    self.log.warning(f"Failed to check/execute native tool {name}: {e}")
             else:
+                self.log.debug(f"Adding tool '{name}'")
+                tools.append(tool_def["callable"])
                 self.log.warning(
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
@@ -2593,6 +2601,84 @@ class Pipe:
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
         return types.GenerateContentConfig(**filtered_params)
+
+    @staticmethod
+    def _create_callable_from_spec(
+        name: str, spec: dict, callable_func: Callable[..., Awaitable[Any]]
+    ) -> Callable[..., Awaitable[Any]]:
+        """
+        Dynamically creates a well-typed async function from an MCP-style tool specification.
+        This satisfies inspection-based SDKs (like Gemini) by providing proper
+        signatures, docstrings, and unique function names.
+        """
+        import inspect
+
+        description = spec.get("description", "")
+        parameters_spec = spec.get("parameters", spec.get("inputSchema", {}))
+        properties = parameters_spec.get("properties", {})
+        required_params = parameters_spec.get("required", [])
+
+        # Type mapping from JSON schema to Python
+        type_map = {
+            "string": str,
+            "number": float,
+            "integer": int,
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+        }
+
+        params = []
+        doc_params = []
+
+        # Sort properties so required parameters come first to avoid "non-default argument follows default argument"
+        sorted_properties = sorted(
+            properties.items(),
+            key=lambda item: item[0] not in required_params,
+        )
+
+        for param_name, param_info in sorted_properties:
+            if param_name.startswith("__"):
+                continue
+
+            param_type = type_map.get(param_info.get("type"), Any)
+            param_desc = param_info.get("description", "")
+
+            default = inspect.Parameter.empty
+            if param_name not in required_params:
+                # If not required, default to None or a provided default
+                default = param_info.get("default", None)
+
+            params.append(
+                inspect.Parameter(
+                    name=param_name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    default=default,
+                    annotation=param_type,
+                )
+            )
+
+            if param_desc:
+                doc_params.append(f":param {param_name}: {param_desc}")
+
+        # Build the docstring
+        docstring = description
+        if doc_params:
+            docstring += "\n\n" + "\n".join(doc_params)
+
+        # The actual wrapper function
+        async def wrapped_func(*args, **kwargs):
+            return await callable_func(*args, **kwargs)
+
+        # Set metadata to satisfy SDK inspection
+        wrapped_func.__name__ = name
+        wrapped_func.__qualname__ = name
+        wrapped_func.__doc__ = docstring
+        wrapped_func.__signature__ = inspect.Signature(
+            parameters=params, return_annotation=Any
+        )
+
+        return wrapped_func
 
     @staticmethod
     def _format_grounding_chunks_as_sources(
@@ -3272,7 +3358,6 @@ class Pipe:
         body: Dict[str, Any],
         __metadata__: dict[str, Any],
         __event_emitter__: Callable,
-        __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
     ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
@@ -3283,7 +3368,6 @@ class Pipe:
             body: The request body containing messages and other parameters.
             __metadata__: Request metadata
             __event_emitter__: Event emitter for status updates
-            __tools__: Available tools
             __request__: FastAPI request object (for image upload)
             __user__: User information (for image upload)
 
@@ -3359,11 +3443,10 @@ class Pipe:
 
             # Configure generation parameters and safety settings
             self.log.debug(f"Supports image generation: {supports_image_generation}")
-            generation_config = self._configure_generation(
+            generation_config = await self._configure_generation(
                 body,
                 system_instruction,
                 __metadata__,
-                __tools__,
                 __user__,
                 supports_image_generation,
                 model_id,
