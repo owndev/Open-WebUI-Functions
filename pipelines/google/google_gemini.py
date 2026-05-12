@@ -41,7 +41,7 @@ features:
   - Video generation with Google Veo models (Veo 3.1, 3, 2)
   - Configurable video generation parameters (aspect ratio, resolution, duration)
   - Asynchronous video generation with progressive polling status updates
-  - Automatic video upload to Open WebUI with embedded playback
+    - Automatic video upload to Open WebUI with chat file attachments
   - Image-to-video generation support for Veo models
   - Negative prompt and person generation controls for video
 """
@@ -68,6 +68,7 @@ from open_webui.env import SRC_LOG_LEVELS
 from open_webui.internal.db import get_async_db_context
 from fastapi import Request, UploadFile, BackgroundTasks
 from open_webui.routers.files import upload_file
+from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
 
@@ -1232,6 +1233,49 @@ class Pipe:
             self.log.warning(f"Failed to emit generated image files: {emit_error}")
             return False
 
+    async def _emit_generated_video_files(
+        self,
+        video_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+    ) -> bool:
+        """Persist generated videos on the assistant message via Open WebUI files."""
+        if not video_files or not __event_emitter__:
+            return False
+
+        try:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {"files": video_files},
+                }
+            )
+            return True
+        except Exception as emit_error:
+            self.log.warning(f"Failed to emit generated video files: {emit_error}")
+            return False
+
+    @staticmethod
+    def _build_generated_video_file(
+        file_id: str,
+        filename: str,
+        mime_type: str,
+        size: int,
+    ) -> Dict[str, Any]:
+        """Build a chat file entry that matches Open WebUI's file attachment shape."""
+        return {
+            "id": file_id,
+            "type": "file",
+            "url": file_id,
+            "name": filename,
+            "filename": filename,
+            "size": size,
+            "content_type": mime_type,
+            "meta": {
+                "content_type": mime_type,
+                "size": size,
+            },
+        }
+
     def _check_veo_3_1_support(self, model_id: str) -> bool:
         """Check if a Veo model is version 3.1 (supports reference images, interpolation, 4k, extension)."""
         return "veo-3.1" in model_id.lower()
@@ -2119,11 +2163,13 @@ class Pipe:
         user: UserModel,
         video_data: bytes,
         mime_type: str = "video/mp4",
-    ) -> Tuple[str, str]:
+        chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
         """Upload generated video to Open WebUI's file system.
 
         Returns:
-            Tuple of (content_url, file_id)
+            Tuple of (content_url, file_entry)
         """
         bio = io.BytesIO(video_data)
         bio.seek(0)
@@ -2149,13 +2195,37 @@ class Pipe:
                 db=db,
             )
 
-        content_url = __request__.app.url_path_for(
-            "get_file_content_by_id", id=up_obj.id
-        )
+            if chat_id and message_id:
+                try:
+                    await Chats.insert_chat_files(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        file_ids=[up_obj.id],
+                        user_id=user.id,
+                        db=db,
+                    )
+                except Exception as chat_file_error:
+                    self.log.warning(
+                        f"Failed to link generated video file to chat message: {chat_file_error}"
+                    )
+
+        try:
+            content_url = str(
+                __request__.url_for("get_file_content_by_id", id=up_obj.id)
+            )
+        except Exception:
+            content_url = __request__.app.url_path_for(
+                "get_file_content_by_id", id=up_obj.id
+            )
         self.log.debug(
             f"Video upload completed. File ID: {up_obj.id}, Size: {len(video_data)} bytes"
         )
-        return content_url, up_obj.id
+        return content_url, self._build_generated_video_file(
+            file_id=up_obj.id,
+            filename=filename,
+            mime_type=mime_type,
+            size=len(video_data),
+        )
 
     async def _upload_video_with_status(
         self,
@@ -2164,11 +2234,12 @@ class Pipe:
         __request__: Request,
         __user__: dict,
         __event_emitter__: Callable,
-    ) -> Tuple[str, Optional[str]]:
+        __metadata__: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Upload video with status updates and data-URL fallback.
 
         Returns:
-            Tuple of (content_url_or_data_url, file_id_or_None)
+            Tuple of (file_entry_or_None, content_url_or_data_url_or_None)
         """
         try:
             await __event_emitter__(
@@ -2183,11 +2254,15 @@ class Pipe:
             )
 
             self.user = user = await Users.get_user_by_id(__user__["id"])
-            video_url, file_id = await self._upload_video(
+            chat_id = __metadata__.get("chat_id") if __metadata__ else None
+            message_id = __metadata__.get("message_id") if __metadata__ else None
+            video_url, file_entry = await self._upload_video(
                 __request__=__request__,
                 user=user,
                 video_data=video_data,
                 mime_type=mime_type,
+                chat_id=chat_id,
+                message_id=message_id,
             )
 
             await __event_emitter__(
@@ -2200,7 +2275,7 @@ class Pipe:
                     },
                 }
             )
-            return video_url, file_id
+            return file_entry, video_url
 
         except Exception as e:
             self.log.warning(f"Video upload failed, falling back to data URL: {e}")
@@ -2215,7 +2290,7 @@ class Pipe:
                     },
                 }
             )
-            return f"data:{mime_type};base64,{video_data_b64}", None
+            return None, f"data:{mime_type};base64,{video_data_b64}"
 
     def _get_user_valve_value(
         self, __user__: Optional[dict], valve_name: str
@@ -2897,6 +2972,7 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> Union[str, Dict[str, Any]]:
         """Generate video using Google Veo models (long-running operation with polling)."""
 
@@ -2989,7 +3065,9 @@ class Pipe:
             await emit_status(f"Video generation failed: {error_msg}", True)
             return f"Video generation failed: {error_msg}"
 
-        generated_videos = []
+        generated_video_files: List[Dict[str, Any]] = []
+        generated_video_links: List[str] = []
+        upload_failure_count = 0
         response = operation.response
         if not response or not response.generated_videos:
             return "Error: No videos were generated"
@@ -3054,31 +3132,67 @@ class Pipe:
 
             mime_type = getattr(video, "mime_type", "video/mp4") or "video/mp4"
 
-            file_id = None
+            file_entry = None
             video_url = None
             if __request__ and __user__:
-                video_url, file_id = await self._upload_video_with_status(
-                    video_bytes, mime_type, __request__, __user__, __event_emitter__
+                file_entry, video_url = await self._upload_video_with_status(
+                    video_bytes,
+                    mime_type,
+                    __request__,
+                    __user__,
+                    __event_emitter__,
+                    __metadata__,
                 )
             else:
                 video_data_b64 = base64.b64encode(video_bytes).decode("utf-8")
                 video_url = f"data:{mime_type};base64,{video_data_b64}"
 
-            # Wrap in <div> so marked.lexer recognizes it as block-level HTML;
-            # HTMLToken.svelte then detects the inner <video> and renders a native player
-            if file_id:
-                video_src = f"/api/v1/files/{file_id}/content"
-                generated_videos.append(f"<div>\n<video>{video_src}</video>\n</div>")
-            else:
-                generated_videos.append(
+            if file_entry:
+                generated_video_files.append(file_entry)
+                if video_url:
+                    generated_video_links.append(
+                        f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
+                    )
+                continue
+
+            upload_failure_count += 1
+            if video_url and not video_url.startswith("data:"):
+                generated_video_links.append(
                     f"[\U0001f3ac Generated Video {idx + 1}]({video_url})"
+                )
+            else:
+                generated_video_links.append(
+                    f"Generated video {idx + 1}, but it could not be attached to the chat."
                 )
 
         await emit_status(f"Video generation complete ({elapsed}s)", True)
 
+        files_emitted = await self._emit_generated_video_files(
+            generated_video_files, __event_emitter__
+        )
+
+        content_parts: List[str] = []
+        if generated_video_files and files_emitted:
+            video_count = len(generated_video_files)
+            content_parts.append(
+                "Generated video attached."
+                if video_count == 1
+                else f"Generated {video_count} videos attached."
+            )
+        else:
+            content_parts.extend(generated_video_links)
+
+        if generated_video_files and not files_emitted:
+            content_parts.extend(generated_video_links)
+
+        if upload_failure_count:
+            content_parts.append(
+                "Some videos could not be attached directly and may require an Open WebUI update for native playback."
+            )
+
         content = (
-            "\n\n".join(generated_videos)
-            if generated_videos
+            "\n\n".join(part for part in content_parts if part)
+            if content_parts
             else "[No video content generated]"
         )
 
@@ -3174,7 +3288,12 @@ class Pipe:
             if self._check_video_generation_support(model_id):
                 self.log.debug(f"Routing to video generation for model: {model_id}")
                 return await self._generate_video(
-                    body, model_id, __event_emitter__, __request__, __user__
+                    body,
+                    model_id,
+                    __event_emitter__,
+                    __request__,
+                    __user__,
+                    __metadata__,
                 )
 
             # Check if this model supports image generation

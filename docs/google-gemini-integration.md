@@ -348,7 +348,7 @@ for part in response.parts:
 The Google Gemini pipeline supports video generation using **Google Veo models** (Veo 3.1, 3, and 2). Veo models appear automatically in the model list with a 🎬 indicator.
 
 > [!IMPORTANT]
-> Video generation uses a different API path than text/image generation. Requests are **always non-streaming** — the pipeline submits a video generation job, polls for completion, and returns the result with embedded video playback.
+> Video generation uses a different API path than text/image generation. Requests are **always non-streaming** — the pipeline submits a video generation job, polls for completion, uploads the result to Open WebUI, and attaches it to the chat as a generated file entry. Native inline playback after reload depends on Open WebUI's frontend support for video files.
 
 ### Supported Models
 
