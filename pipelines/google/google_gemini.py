@@ -175,7 +175,10 @@ class EncryptedStr(str):
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
-        except (InvalidToken, Exception):
+        except (InvalidToken, ValueError, Exception) as e:
+            # Only swallow decryption errors; re-raise anything fatal
+            if isinstance(e, (KeyboardInterrupt, SystemExit, MemoryError)):
+                raise
             return value
 
     # Pydantic integration
@@ -3052,7 +3055,7 @@ class Pipe:
 {quoted_content}
 
 </details>""".strip()
-                final_content = f"{details_block}{combined_answer}"
+                final_content = f"{details_block}\n\n{combined_answer}"
 
             if not final_content:
                 final_content = ""
@@ -3902,6 +3905,8 @@ class Pipe:
 
 </details>""".strip()
                         full_response += details_block
+                        if combined_answer:
+                            full_response += "\n\n"
 
                     # Add tool call blocks + grounded answer
                     full_response += combined_answer
