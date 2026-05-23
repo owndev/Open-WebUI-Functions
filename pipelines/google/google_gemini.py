@@ -742,8 +742,9 @@ class Pipe:
                 def sanitize_header_value(value: Any, max_length: int = 255) -> str:
                     if value is None:
                         return ""
-                    # Convert to string and remove all control characters
-                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    # Convert to string, strip all control characters including CR/LF
+                    # to prevent HTTP header injection via newline sequences.
+                    sanitized = re.sub(r"[\x00-\x1F\x7F\r\n]", "", str(value))
                     sanitized = sanitized.strip()
                     return (
                         sanitized[:max_length]
@@ -2682,17 +2683,21 @@ class Pipe:
         # Add citations in the text body
         replaced_text: Optional[str] = None
         if grounding_supports:
-            # Citation indexes are in bytes
+            # Citation indexes are byte offsets into the UTF-8 encoded text
             ENCODING = "utf-8"
             text_bytes = text.encode(ENCODING)
+            text_len = len(text_bytes)
             last_byte_index = 0
             cited_chunks = []
 
             for support in grounding_supports:
+                end_index = getattr(support.segment, "end_index", None)
+                if end_index is None:
+                    continue
+                # Clamp to valid range to guard against out-of-bounds byte offsets
+                end_index = max(last_byte_index, min(end_index, text_len))
                 cited_chunks.append(
-                    text_bytes[last_byte_index : support.segment.end_index].decode(
-                        ENCODING
-                    )
+                    text_bytes[last_byte_index:end_index].decode(ENCODING, errors="replace")
                 )
 
                 # Generate and append citations (e.g., "[1][2]")
@@ -2702,11 +2707,11 @@ class Pipe:
                 cited_chunks.append(f" {footnotes}")
 
                 # Update index for the next segment
-                last_byte_index = support.segment.end_index
+                last_byte_index = end_index
 
             # Append any remaining text after the last citation
-            if last_byte_index < len(text_bytes):
-                cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
+            if last_byte_index < text_len:
+                cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING, errors="replace"))
 
             replaced_text = "".join(cited_chunks)
 
@@ -2896,6 +2901,13 @@ class Pipe:
                 if not can_execute:
                     break
 
+                if tool_call_iteration >= MAX_TOOL_ITERATIONS:
+                    self.log.warning(
+                        f"Native tool call loop reached MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}; "
+                        "stopping to prevent runaway agent."
+                    )
+                    break
+
                 tool_call_iteration += 1
                 self.log.debug(
                     f"Native tool call round {tool_call_iteration}: "
@@ -2920,8 +2932,12 @@ class Pipe:
                             # and other wrappers that fool iscoroutinefunction.
                             _raw = tool_callable(**tool_args)
                             tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                            # Normalise: None → empty string so the model gets clean text
+                            if tool_result is None:
+                                tool_result = ""
+                            tool_result = str(tool_result)
                             self.log.debug(
-                                f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
+                                f"Tool '{tool_name}' returned: {tool_result[:200]}"
                             )
                         except Exception as tool_err:
                             self.log.warning(
@@ -2936,7 +2952,7 @@ class Pipe:
                         types.Part(
                             function_response=types.FunctionResponse(
                                 name=tool_name,
-                                response={"result": str(tool_result)},
+                                response={"result": tool_result},
                             )
                         )
                     )
@@ -2944,6 +2960,13 @@ class Pipe:
                     tool_call_details.append(
                         f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
                     )
+
+                # If all tool calls failed (not found / errored), function_response_parts
+                # will still be populated with error strings — but if it's empty for some
+                # reason, don't push empty Content to Gemini (would cause an API error).
+                if not function_response_parts:
+                    self.log.warning("No function response parts built; aborting tool loop.")
+                    break
 
                 await emit_chat_event(
                     "status",
@@ -3573,6 +3596,8 @@ class Pipe:
 
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
+                    # Tool call <details> blocks kept separate so grounding only processes real text
+                    tool_call_blocks_ns: list[str] = []
                     generated_images: list[str] = []
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
@@ -3730,6 +3755,13 @@ class Pipe:
                         if not can_execute:
                             break
 
+                        if tool_call_iteration >= MAX_TOOL_ITERATIONS:
+                            self.log.warning(
+                                f"Native tool call loop reached MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}; "
+                                "stopping to prevent runaway agent."
+                            )
+                            break
+
                         tool_call_iteration += 1
                         self.log.debug(
                             f"Native tool call round {tool_call_iteration}: "
@@ -3753,7 +3785,7 @@ class Pipe:
                                         "type": "status",
                                         "data": {
                                             "action": "tool_calls",
-                                            "description": f"Running: {tool_name}",
+                                            "description": f"Calling: {tool_name}",
                                             "done": False,
                                         },
                                     }
@@ -3766,8 +3798,12 @@ class Pipe:
                                     # and other wrappers that fool iscoroutinefunction.
                                     _raw = tool_callable(**tool_args)
                                     tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    # Normalise: None → empty string so the model gets clean text
+                                    if tool_result is None:
+                                        tool_result = ""
+                                    tool_result = str(tool_result)
                                     self.log.debug(
-                                        f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
+                                        f"Tool '{tool_name}' returned: {tool_result[:200]}"
                                     )
                                 except Exception as tool_err:
                                     self.log.warning(
@@ -3782,7 +3818,7 @@ class Pipe:
                                 types.Part(
                                     function_response=types.FunctionResponse(
                                         name=tool_name,
-                                        response={"result": str(tool_result)},
+                                        response={"result": tool_result},
                                     )
                                 )
                             )
@@ -3790,6 +3826,11 @@ class Pipe:
                             tool_call_details.append(
                                 f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
                             )
+
+                        # Don't push empty Content to Gemini — would cause an API error
+                        if not function_response_parts:
+                            self.log.warning("No function response parts built; aborting tool loop.")
+                            break
 
                         if __event_emitter__:
                             await __event_emitter__(
@@ -3803,15 +3844,15 @@ class Pipe:
                                 }
                             )
 
-                        # Emit a <details type="tool_calls"> block so the chat history
-                        # shows what tools ran — matching the shape OWUI itself emits.
+                        # Accumulate <details type="tool_calls"> separately from answer text
+                        # so grounding citation processing only sees real model text.
                         if tool_call_details:
                             tool_calls_block = (
                                 '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
                                 + "\n\n".join(tool_call_details)
                                 + "\n\n</details>"
                             )
-                            answer_segments.append(tool_calls_block)
+                            tool_call_blocks_ns.append(tool_calls_block)
 
                         # Extend conversation with tool calls and their responses
                         current_contents = current_contents + [
@@ -3821,9 +3862,10 @@ class Pipe:
                             types.Content(role="user", parts=function_response_parts),
                         ]
 
+                    # Grounding only processes real model text — tool call blocks are HTML
+                    # and must be excluded to avoid malformed citation injection.
                     final_answer = "".join(answer_segments)
 
-                    # Apply grounding (if available) and send sources/status as needed
                     if grounding_metadata_list:
                         cited = await self._process_grounding_metadata(
                             grounding_metadata_list,
@@ -3831,6 +3873,14 @@ class Pipe:
                             __event_emitter__,
                         )
                         final_answer = cited or final_answer
+
+                    # Combine tool call blocks with the grounded answer text
+                    tool_calls_section = "\n\n".join(tool_call_blocks_ns)
+                    combined_answer = (
+                        (tool_calls_section + "\n\n" + final_answer)
+                        if (tool_calls_section and final_answer)
+                        else (tool_calls_section or final_answer)
+                    )
 
                     # Combine all content
                     full_response = ""
@@ -3853,8 +3903,8 @@ class Pipe:
 </details>""".strip()
                         full_response += details_block
 
-                    # Add the main answer
-                    full_response += final_answer
+                    # Add tool call blocks + grounded answer
+                    full_response += combined_answer
 
                     files_emitted = await self._emit_generated_image_files(
                         generated_image_files, __event_emitter__
@@ -3869,7 +3919,7 @@ class Pipe:
                     if (
                         generated_image_files
                         and files_emitted
-                        and not final_answer.strip()
+                        and not combined_answer.strip()
                     ):
                         if full_response:
                             full_response += "\n\n"
