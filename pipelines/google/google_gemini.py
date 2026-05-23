@@ -50,6 +50,7 @@ import os
 import re
 import time
 import asyncio
+import inspect
 import base64
 import hashlib
 import logging
@@ -2901,6 +2902,7 @@ class Pipe:
 
                 # Execute each tool call and build function response parts
                 function_response_parts: list = []
+                tool_call_details: list[str] = []
                 for fc_part in function_call_parts_this_round:
                     tool_name = fc_part.function_call.name
                     tool_args = (
@@ -2921,10 +2923,10 @@ class Pipe:
                     if tool_name in __tools__:
                         try:
                             tool_callable = __tools__[tool_name]["callable"]
-                            if asyncio.iscoroutinefunction(tool_callable):
-                                tool_result = await tool_callable(**tool_args)
-                            else:
-                                tool_result = tool_callable(**tool_args)
+                            # Call first, then check isawaitable — handles functools.partial
+                            # and other wrappers that fool iscoroutinefunction.
+                            _raw = tool_callable(**tool_args)
+                            tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                             self.log.debug(
                                 f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
                             )
@@ -2945,6 +2947,10 @@ class Pipe:
                             )
                         )
                     )
+                    args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                    tool_call_details.append(
+                        f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                    )
 
                 await emit_chat_event(
                     "status",
@@ -2954,6 +2960,20 @@ class Pipe:
                         "done": True,
                     },
                 )
+
+                # Emit a <details type="tool_calls"> block so the chat history shows
+                # what tools ran — matching the shape OWUI itself emits for native calls.
+                if tool_call_details:
+                    tool_calls_block = (
+                        '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
+                        + "\n\n".join(tool_call_details)
+                        + "\n\n</details>"
+                    )
+                    answer_chunks.append(tool_calls_block)
+                    await emit_chat_event(
+                        "chat:message:delta",
+                        {"role": "assistant", "content": tool_calls_block},
+                    )
 
                 # Extend the conversation with the model's tool calls and our responses
                 current_contents = current_contents + [
@@ -3714,6 +3734,7 @@ class Pipe:
 
                         # Execute each tool call and build function response parts
                         function_response_parts: list = []
+                        tool_call_details: list[str] = []
                         for fc_part in function_call_parts_this_round:
                             tool_name = fc_part.function_call.name
                             tool_args = (
@@ -3737,10 +3758,10 @@ class Pipe:
                             if tool_name in __tools__:
                                 try:
                                     tool_callable = __tools__[tool_name]["callable"]
-                                    if asyncio.iscoroutinefunction(tool_callable):
-                                        tool_result = await tool_callable(**tool_args)
-                                    else:
-                                        tool_result = tool_callable(**tool_args)
+                                    # Call first, then check isawaitable — handles functools.partial
+                                    # and other wrappers that fool iscoroutinefunction.
+                                    _raw = tool_callable(**tool_args)
+                                    tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                                     self.log.debug(
                                         f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
                                     )
@@ -3761,6 +3782,10 @@ class Pipe:
                                     )
                                 )
                             )
+                            args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                            tool_call_details.append(
+                                f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                            )
 
                         if __event_emitter__:
                             await __event_emitter__(
@@ -3773,6 +3798,16 @@ class Pipe:
                                     },
                                 }
                             )
+
+                        # Emit a <details type="tool_calls"> block so the chat history
+                        # shows what tools ran — matching the shape OWUI itself emits.
+                        if tool_call_details:
+                            tool_calls_block = (
+                                '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
+                                + "\n\n".join(tool_call_details)
+                                + "\n\n</details>"
+                            )
+                            answer_segments.append(tool_calls_block)
 
                         # Extend conversation with tool calls and their responses
                         current_contents = current_contents + [
