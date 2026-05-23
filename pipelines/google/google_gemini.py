@@ -2717,6 +2717,11 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
+        __tools__: Optional[dict] = None,
+        client: Optional[Any] = None,
+        model_id: Optional[str] = None,
+        contents: Optional[list] = None,
+        generation_config: Optional[Any] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
@@ -2724,6 +2729,11 @@ class Pipe:
         Args:
             response_iterator: Iterator from generate_content
             __event_emitter__: Event emitter for status updates
+            __tools__: Available OpenWebUI tools for native tool calling
+            client: Gemini API client (needed for tool call follow-up requests)
+            model_id: Model ID (needed for tool call follow-up requests)
+            contents: Conversation contents list (extended per tool call round)
+            generation_config: Generation config (reused for follow-up requests)
 
         Returns:
             Generator yielding text chunks
@@ -2740,114 +2750,230 @@ class Pipe:
         await emit_chat_event("chat:start", {"role": "assistant"})
 
         grounding_metadata_list = []
-        # Accumulate content separately for answer and thoughts
+        # Accumulate content separately for answer and thoughts (across all tool-call rounds)
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
         thinking_started_at: Optional[float] = None
         stream_usage_metadata = None
 
+        # Tool call loop: keep iterating as long as the model returns function calls
+        MAX_TOOL_ITERATIONS = 10
+        tool_call_iteration = 0
+        current_contents = list(contents) if contents is not None else []
+
         try:
-            async for chunk in response_iterator:
-                # Capture usage metadata (final chunk has complete data)
-                if getattr(chunk, "usage_metadata", None):
-                    stream_usage_metadata = chunk.usage_metadata
+            while tool_call_iteration <= MAX_TOOL_ITERATIONS:
+                function_call_parts_this_round: list = []
 
-                # Check for safety feedback or empty chunks
-                if not chunk.candidates:
-                    # Check prompt feedback
-                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
-                        block_reason = chunk.prompt_feedback.block_reason.name
-                        message = f"[Blocked due to Prompt Safety: {block_reason}]"
-                        await emit_chat_event(
-                            "chat:finish",
-                            {
-                                "role": "assistant",
-                                "content": message,
-                                "done": True,
-                                "error": True,
-                            },
-                        )
-                        yield message
-                    else:
-                        message = "[Blocked by safety settings]"
-                        await emit_chat_event(
-                            "chat:finish",
-                            {
-                                "role": "assistant",
-                                "content": message,
-                                "done": True,
-                                "error": True,
-                            },
-                        )
-                        yield message
-                    return  # Stop generation
+                async for chunk in response_iterator:
+                    # Capture usage metadata (final chunk has complete data)
+                    if getattr(chunk, "usage_metadata", None):
+                        stream_usage_metadata = chunk.usage_metadata
 
-                if chunk.candidates[0].grounding_metadata:
-                    grounding_metadata_list.append(
-                        chunk.candidates[0].grounding_metadata
-                    )
-                # Prefer fine-grained parts to split thoughts vs. normal text
-                parts = []
-                try:
-                    parts = chunk.candidates[0].content.parts or []
-                except Exception as parts_error:
-                    # Fallback: use aggregated text if parts aren't accessible
-                    self.log.warning(f"Failed to access content parts: {parts_error}")
-                    if hasattr(chunk, "text") and chunk.text:
-                        answer_chunks.append(chunk.text)
-                        await __event_emitter__(
-                            {
-                                "type": "chat:message:delta",
-                                "data": {
-                                    "role": "assistant",
-                                    "content": chunk.text,
-                                },
-                            }
-                        )
-                    continue
-
-                for part in parts:
-                    try:
-                        # Thought parts (internal reasoning)
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
-                            if thinking_started_at is None:
-                                thinking_started_at = time.time()
-                            thought_chunks.append(part.text)
-                            # Emit a live preview of what is currently being thought
-                            preview = part.text.replace("\n", " ").strip()
-                            MAX_PREVIEW = 120
-                            if len(preview) > MAX_PREVIEW:
-                                preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                            await __event_emitter__(
+                    # Check for safety feedback or empty chunks
+                    if not chunk.candidates:
+                        # Check prompt feedback
+                        if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                            block_reason = chunk.prompt_feedback.block_reason.name
+                            message = f"[Blocked due to Prompt Safety: {block_reason}]"
+                            await emit_chat_event(
+                                "chat:finish",
                                 {
-                                    "type": "status",
-                                    "data": {
-                                        "action": "thinking",
-                                        "description": f"Thinking… {preview}",
-                                        "done": False,
-                                        "hidden": False,
-                                    },
-                                }
+                                    "role": "assistant",
+                                    "content": message,
+                                    "done": True,
+                                    "error": True,
+                                },
                             )
+                            yield message
+                        else:
+                            message = "[Blocked by safety settings]"
+                            await emit_chat_event(
+                                "chat:finish",
+                                {
+                                    "role": "assistant",
+                                    "content": message,
+                                    "done": True,
+                                    "error": True,
+                                },
+                            )
+                            yield message
+                        return  # Stop generation
 
-                        # Regular answer text
-                        elif getattr(part, "text", None):
-                            answer_chunks.append(part.text)
+                    if chunk.candidates[0].grounding_metadata:
+                        grounding_metadata_list.append(
+                            chunk.candidates[0].grounding_metadata
+                        )
+                    # Prefer fine-grained parts to split thoughts vs. normal text
+                    parts = []
+                    try:
+                        parts = chunk.candidates[0].content.parts or []
+                    except Exception as parts_error:
+                        # Fallback: use aggregated text if parts aren't accessible
+                        self.log.warning(f"Failed to access content parts: {parts_error}")
+                        if hasattr(chunk, "text") and chunk.text:
+                            answer_chunks.append(chunk.text)
                             await __event_emitter__(
                                 {
                                     "type": "chat:message:delta",
                                     "data": {
                                         "role": "assistant",
-                                        "content": part.text,
+                                        "content": chunk.text,
                                     },
                                 }
                             )
-                    except Exception as part_error:
-                        # Log part processing errors but continue with the stream
-                        self.log.warning(f"Error processing content part: {part_error}")
                         continue
+
+                    for part in parts:
+                        try:
+                            # Thought parts (internal reasoning)
+                            if getattr(part, "thought", False) and getattr(
+                                part, "text", None
+                            ):
+                                if thinking_started_at is None:
+                                    thinking_started_at = time.time()
+                                thought_chunks.append(part.text)
+                                # Emit a live preview of what is currently being thought
+                                preview = part.text.replace("\n", " ").strip()
+                                MAX_PREVIEW = 120
+                                if len(preview) > MAX_PREVIEW:
+                                    preview = preview[:MAX_PREVIEW].rstrip() + "…"
+                                await __event_emitter__(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "action": "thinking",
+                                            "description": f"Thinking… {preview}",
+                                            "done": False,
+                                            "hidden": False,
+                                        },
+                                    }
+                                )
+
+                            # Regular answer text
+                            elif getattr(part, "text", None):
+                                answer_chunks.append(part.text)
+                                await __event_emitter__(
+                                    {
+                                        "type": "chat:message:delta",
+                                        "data": {
+                                            "role": "assistant",
+                                            "content": part.text,
+                                        },
+                                    }
+                                )
+
+                            # Native function call from the model
+                            elif getattr(part, "function_call", None):
+                                function_call_parts_this_round.append(part)
+                                tool_name = part.function_call.name
+                                await emit_chat_event(
+                                    "status",
+                                    {
+                                        "action": "tool_calls",
+                                        "description": f"Calling: {tool_name}",
+                                        "done": False,
+                                    },
+                                )
+
+                        except Exception as part_error:
+                            # Log part processing errors but continue with the stream
+                            self.log.warning(f"Error processing content part: {part_error}")
+                            continue
+
+                # --- End of streaming for this round ---
+
+                # If no function calls were returned, or we can't execute them, exit the loop
+                can_execute = (
+                    function_call_parts_this_round
+                    and __tools__ is not None
+                    and client is not None
+                    and model_id is not None
+                )
+                if not can_execute:
+                    break
+
+                tool_call_iteration += 1
+                self.log.debug(
+                    f"Native tool call round {tool_call_iteration}: "
+                    f"{[p.function_call.name for p in function_call_parts_this_round]}"
+                )
+
+                # Execute each tool call and build function response parts
+                function_response_parts: list = []
+                for fc_part in function_call_parts_this_round:
+                    tool_name = fc_part.function_call.name
+                    tool_args = (
+                        dict(fc_part.function_call.args)
+                        if fc_part.function_call.args
+                        else {}
+                    )
+
+                    await emit_chat_event(
+                        "status",
+                        {
+                            "action": "tool_calls",
+                            "description": f"Running: {tool_name}",
+                            "done": False,
+                        },
+                    )
+
+                    if tool_name in __tools__:
+                        try:
+                            tool_callable = __tools__[tool_name]["callable"]
+                            if asyncio.iscoroutinefunction(tool_callable):
+                                tool_result = await tool_callable(**tool_args)
+                            else:
+                                tool_result = tool_callable(**tool_args)
+                            self.log.debug(
+                                f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
+                            )
+                        except Exception as tool_err:
+                            self.log.warning(
+                                f"Tool '{tool_name}' execution error: {tool_err}"
+                            )
+                            tool_result = f"Error executing tool: {tool_err}"
+                    else:
+                        self.log.warning(f"Tool '{tool_name}' not found in __tools__")
+                        tool_result = f"Error: tool '{tool_name}' not available"
+
+                    function_response_parts.append(
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=tool_name,
+                                response={"result": str(tool_result)},
+                            )
+                        )
+                    )
+
+                await emit_chat_event(
+                    "status",
+                    {
+                        "action": "tool_calls",
+                        "description": "Tools complete",
+                        "done": True,
+                    },
+                )
+
+                # Extend the conversation with the model's tool calls and our responses
+                current_contents = current_contents + [
+                    types.Content(
+                        role="model", parts=function_call_parts_this_round
+                    ),
+                    types.Content(role="user", parts=function_response_parts),
+                ]
+
+                # Get the next streaming response (model reads tool results)
+                _next_contents = current_contents
+
+                async def _get_next_stream() -> Any:
+                    return await client.aio.models.generate_content_stream(
+                        model=model_id,
+                        contents=_next_contents,
+                        config=generation_config,
+                    )
+
+                response_iterator = await self._retry_with_backoff(_get_next_stream)
 
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
@@ -3393,7 +3519,15 @@ class Pipe:
                         )
                         self.log.debug(f"Request {request_id}: Got streaming response")
                         return self._handle_streaming_response(
-                            response_iterator, __event_emitter__, __request__, __user__
+                            response_iterator,
+                            __event_emitter__,
+                            __request__,
+                            __user__,
+                            __tools__,
+                            client,
+                            model_id,
+                            contents,
+                            generation_config,
                         )
 
                     except Exception as e:
