@@ -3539,142 +3539,252 @@ class Pipe:
             # Non-streaming path (now also used for image generation)
             if not stream or supports_image_generation:
                 try:
-
-                    async def get_response():
-                        return await client.aio.models.generate_content(
-                            model=model_id,
-                            contents=contents,
-                            config=generation_config,
-                        )
-
-                    # Measure duration for non-streaming path (no status to avoid false indicators)
+                    # Measure duration for non-streaming path
                     start_ts = time.time()
 
-                    # Send processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing image request...",
-                                    "done": False,
-                                },
-                            }
-                        )
-
-                    response = await self._retry_with_backoff(get_response)
-                    self.log.debug(f"Request {request_id}: Got non-streaming response")
-
-                    # Clear processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing complete",
-                                    "done": True,
-                                },
-                            }
-                        )
-
-                    # Handle "Thinking" and produce final formatted content
-                    # Check for safety blocks first
-                    safety_message = self._get_safety_block_message(response)
-                    if safety_message:
-                        return safety_message
-
-                    # Get the first candidate (safety checks passed)
-                    candidate = response.candidates[0]
-
-                    # Process content parts - use new streamlined approach
-                    parts = getattr(getattr(candidate, "content", None), "parts", [])
-                    if not parts:
-                        return "[No content generated or unexpected response structure]"
+                    # Accumulate content across all tool-call rounds
+                    MAX_TOOL_ITERATIONS = 10
+                    tool_call_iteration = 0
+                    current_contents = list(contents)
 
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
                     generated_images: list[str] = []
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
+                    grounding_metadata_list = []
+                    response = None
 
-                    for part in parts:
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
-                            thought_segments.append(part.text)
-                        elif getattr(part, "text", None):
-                            answer_segments.append(part.text)
-                        elif (
-                            getattr(part, "inline_data", None)
-                            and __request__
-                            and __user__
-                        ):
-                            # Handle generated images with unified upload method
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
-
-                            self.log.debug(
-                                f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
+                    while tool_call_iteration <= MAX_TOOL_ITERATIONS:
+                        # Send processing status for image generation (first request only)
+                        if tool_call_iteration == 0 and supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing image request...",
+                                        "done": False,
+                                    },
+                                }
                             )
 
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
+                        _iter_contents = current_contents
+
+                        async def get_response():
+                            return await client.aio.models.generate_content(
+                                model=model_id,
+                                contents=_iter_contents,
+                                config=generation_config,
+                            )
+
+                        response = await self._retry_with_backoff(get_response)
+                        self.log.debug(f"Request {request_id}: Got non-streaming response")
+
+                        # Clear processing status for image generation (first request only)
+                        if tool_call_iteration == 0 and supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing complete",
+                                        "done": True,
+                                    },
+                                }
+                            )
+
+                        # Check for safety blocks first
+                        safety_message = self._get_safety_block_message(response)
+                        if safety_message:
+                            return safety_message
+
+                        # Get the first candidate (safety checks passed)
+                        candidate = response.candidates[0]
+
+                        # Collect grounding metadata across all rounds
+                        if getattr(candidate, "grounding_metadata", None):
+                            grounding_metadata_list.append(candidate.grounding_metadata)
+
+                        # Process content parts
+                        parts = getattr(getattr(candidate, "content", None), "parts", [])
+                        if not parts:
+                            return "[No content generated or unexpected response structure]"
+
+                        function_call_parts_this_round: list = []
+
+                        for part in parts:
+                            if getattr(part, "thought", False) and getattr(
+                                part, "text", None
+                            ):
+                                thought_segments.append(part.text)
+                            elif getattr(part, "text", None):
+                                answer_segments.append(part.text)
+                            elif getattr(part, "function_call", None):
+                                function_call_parts_this_round.append(part)
+                                tool_name = part.function_call.name
+                                if __event_emitter__:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "action": "tool_calls",
+                                                "description": f"Calling: {tool_name}",
+                                                "done": False,
+                                            },
+                                        }
+                                    )
+                            elif (
+                                getattr(part, "inline_data", None)
+                                and __request__
+                                and __user__
+                            ):
+                                # Handle generated images with unified upload method
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
+
                                 self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
+                                    f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
                                 )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
 
-                            image_url = await self._upload_image_with_status(
-                                image_data,
-                                mime_type,
-                                __request__,
-                                __user__,
-                                __event_emitter__,
-                            )
-                            if image_url.startswith("data:"):
-                                generated_images.append(
-                                    f"![Generated Image]({image_url})"
+                                image_hash = self._image_data_hash(image_data)
+                                if image_hash in seen_generated_image_hashes:
+                                    self.log.debug(
+                                        "Skipping duplicate generated image part from Gemini response"
+                                    )
+                                    continue
+                                seen_generated_image_hashes.add(image_hash)
+
+                                image_url = await self._upload_image_with_status(
+                                    image_data,
+                                    mime_type,
+                                    __request__,
+                                    __user__,
+                                    __event_emitter__,
                                 )
+                                if image_url.startswith("data:"):
+                                    generated_images.append(
+                                        f"![Generated Image]({image_url})"
+                                    )
+                                else:
+                                    generated_image_files.append(
+                                        self._build_generated_image_file(
+                                            content_url=image_url,
+                                            mime_type=mime_type,
+                                        )
+                                    )
+
+                            elif getattr(part, "inline_data", None):
+                                # Fallback: return as base64 data URL if no request/user context
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
+
+                                image_hash = self._image_data_hash(image_data)
+                                if image_hash in seen_generated_image_hashes:
+                                    self.log.debug(
+                                        "Skipping duplicate generated image part from Gemini response"
+                                    )
+                                    continue
+                                seen_generated_image_hashes.add(image_hash)
+
+                                if isinstance(image_data, bytes):
+                                    image_data_b64 = base64.b64encode(image_data).decode(
+                                        "utf-8"
+                                    )
+                                else:
+                                    image_data_b64 = str(image_data)
+
+                                data_url = f"data:{mime_type};base64,{image_data_b64}"
+                                generated_images.append(f"![Generated Image]({data_url})")
+
+                        # If no function calls (or unable to execute), we're done
+                        can_execute = (
+                            function_call_parts_this_round
+                            and __tools__ is not None
+                            and not supports_image_generation
+                        )
+                        if not can_execute:
+                            break
+
+                        tool_call_iteration += 1
+                        self.log.debug(
+                            f"Native tool call round {tool_call_iteration}: "
+                            f"{[p.function_call.name for p in function_call_parts_this_round]}"
+                        )
+
+                        # Execute each tool call and build function response parts
+                        function_response_parts: list = []
+                        for fc_part in function_call_parts_this_round:
+                            tool_name = fc_part.function_call.name
+                            tool_args = (
+                                dict(fc_part.function_call.args)
+                                if fc_part.function_call.args
+                                else {}
+                            )
+
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "action": "tool_calls",
+                                            "description": f"Running: {tool_name}",
+                                            "done": False,
+                                        },
+                                    }
+                                )
+
+                            if tool_name in __tools__:
+                                try:
+                                    tool_callable = __tools__[tool_name]["callable"]
+                                    if asyncio.iscoroutinefunction(tool_callable):
+                                        tool_result = await tool_callable(**tool_args)
+                                    else:
+                                        tool_result = tool_callable(**tool_args)
+                                    self.log.debug(
+                                        f"Tool '{tool_name}' returned: {str(tool_result)[:200]}"
+                                    )
+                                except Exception as tool_err:
+                                    self.log.warning(
+                                        f"Tool '{tool_name}' execution error: {tool_err}"
+                                    )
+                                    tool_result = f"Error executing tool: {tool_err}"
                             else:
-                                generated_image_files.append(
-                                    self._build_generated_image_file(
-                                        content_url=image_url,
-                                        mime_type=mime_type,
+                                self.log.warning(f"Tool '{tool_name}' not found in __tools__")
+                                tool_result = f"Error: tool '{tool_name}' not available"
+
+                            function_response_parts.append(
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=tool_name,
+                                        response={"result": str(tool_result)},
                                     )
                                 )
+                            )
 
-                        elif getattr(part, "inline_data", None):
-                            # Fallback: return as base64 data URL if no request/user context
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "tool_calls",
+                                        "description": "Tools complete",
+                                        "done": True,
+                                    },
+                                }
+                            )
 
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
-                                self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
-                                )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
-
-                            if isinstance(image_data, bytes):
-                                image_data_b64 = base64.b64encode(image_data).decode(
-                                    "utf-8"
-                                )
-                            else:
-                                image_data_b64 = str(image_data)
-
-                            data_url = f"data:{mime_type};base64,{image_data_b64}"
-                            generated_images.append(f"![Generated Image]({data_url})")
+                        # Extend conversation with tool calls and their responses
+                        current_contents = current_contents + [
+                            types.Content(
+                                role="model", parts=function_call_parts_this_round
+                            ),
+                            types.Content(role="user", parts=function_response_parts),
+                        ]
 
                     final_answer = "".join(answer_segments)
 
                     # Apply grounding (if available) and send sources/status as needed
-                    grounding_metadata_list = []
-                    if getattr(candidate, "grounding_metadata", None):
-                        grounding_metadata_list.append(candidate.grounding_metadata)
                     if grounding_metadata_list:
                         cited = await self._process_grounding_metadata(
                             grounding_metadata_list,
