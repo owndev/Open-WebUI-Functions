@@ -2754,6 +2754,8 @@ class Pipe:
         # Accumulate content separately for answer and thoughts (across all tool-call rounds)
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
+        # Tool call <details> blocks are kept separate so grounding only processes real text
+        tool_call_blocks: list[str] = []
         thinking_started_at: Optional[float] = None
         stream_usage_metadata = None
 
@@ -2911,15 +2913,6 @@ class Pipe:
                         else {}
                     )
 
-                    await emit_chat_event(
-                        "status",
-                        {
-                            "action": "tool_calls",
-                            "description": f"Running: {tool_name}",
-                            "done": False,
-                        },
-                    )
-
                     if tool_name in __tools__:
                         try:
                             tool_callable = __tools__[tool_name]["callable"]
@@ -2963,13 +2956,14 @@ class Pipe:
 
                 # Emit a <details type="tool_calls"> block so the chat history shows
                 # what tools ran — matching the shape OWUI itself emits for native calls.
+                # Kept separate from answer_chunks so grounding only processes real text.
                 if tool_call_details:
                     tool_calls_block = (
                         '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
                         + "\n\n".join(tool_call_details)
                         + "\n\n</details>"
                     )
-                    answer_chunks.append(tool_calls_block)
+                    tool_call_blocks.append(tool_calls_block)
                     await emit_chat_event(
                         "chat:message:delta",
                         {"role": "assistant", "content": tool_calls_block},
@@ -2995,7 +2989,9 @@ class Pipe:
 
                 response_iterator = await self._retry_with_backoff(_get_next_stream)
 
-            # After processing all chunks, handle grounding data
+            # After processing all chunks, handle grounding data.
+            # Grounding only processes real model text — tool call blocks are HTML and
+            # must be excluded to avoid malformed citation injection.
             final_answer_text = "".join(answer_chunks)
             if grounding_metadata_list and __event_emitter__:
                 cited = await self._process_grounding_metadata(
@@ -3005,7 +3001,15 @@ class Pipe:
                 )
                 final_answer_text = cited or final_answer_text
 
-            final_content = final_answer_text
+            # Combine tool call blocks (if any) with the grounded answer text
+            tool_calls_section = "\n\n".join(tool_call_blocks)
+            combined_answer = (
+                (tool_calls_section + "\n\n" + final_answer_text)
+                if (tool_calls_section and final_answer_text)
+                else (tool_calls_section or final_answer_text)
+            )
+
+            final_content = combined_answer
             details_block: Optional[str] = None
 
             if thought_chunks:
@@ -3025,7 +3029,7 @@ class Pipe:
 {quoted_content}
 
 </details>""".strip()
-                final_content = f"{details_block}{final_answer_text}"
+                final_content = f"{details_block}{combined_answer}"
 
             if not final_content:
                 final_content = ""
