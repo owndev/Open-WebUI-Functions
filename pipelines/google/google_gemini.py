@@ -53,6 +53,7 @@ import asyncio
 import inspect
 import base64
 import hashlib
+import json
 import logging
 import io
 import uuid
@@ -1209,6 +1210,94 @@ class Pipe:
     def _is_open_webui_image_tool(tool_name: str) -> bool:
         """Return True for Open WebUI's built-in image generation tools."""
         return tool_name in {"generate_image", "edit_image"}
+
+    async def _process_tool_result_for_owui(
+        self,
+        tool_result: Any,
+        event_emitter: Optional[Callable] = None,
+    ) -> str:
+        """Mirror OWUI middleware's tool-result handling for direct-call pipes.
+
+        When this pipe drives its own native function-calling loop it bypasses
+        OWUI's middleware, so the 'embeds' and 'files' events that would
+        normally be fired on the pipe's behalf never reach the chat — rich
+        media (HTMLResponse cards, base64 images) never persists. This helper
+        does that work locally: it detects HTMLResponse / image-data /
+        dict / list returns, emits the matching persisted events, and returns
+        the string the LLM should see.
+        """
+        try:
+            from fastapi.responses import HTMLResponse  # noqa: WPS433
+        except Exception:
+            HTMLResponse = None  # type: ignore
+
+        embeds: list = []
+        files: list = []
+        llm_text: Optional[str] = None
+        generic_embed_msg = "Embedded UI result is active and visible to the user."
+
+        # (HTMLResponse, context) tuple — OWUI's canonical rich-card pattern
+        if (
+            HTMLResponse is not None
+            and isinstance(tool_result, tuple)
+            and len(tool_result) == 2
+            and isinstance(tool_result[0], HTMLResponse)
+        ):
+            html_response, context = tool_result
+            if "inline" in html_response.headers.get("content-disposition", ""):
+                embeds.append(html_response.body.decode("utf-8", "replace"))
+            if context is None:
+                llm_text = generic_embed_msg
+            elif isinstance(context, (dict, list)):
+                llm_text = json.dumps(context, ensure_ascii=False)
+            else:
+                llm_text = str(context)
+
+        # Bare HTMLResponse — render embed, hand the LLM a generic ack
+        elif HTMLResponse is not None and isinstance(tool_result, HTMLResponse):
+            if "inline" in tool_result.headers.get("content-disposition", ""):
+                embeds.append(tool_result.body.decode("utf-8", "replace"))
+            llm_text = generic_embed_msg
+
+        # Base64 image data URL — files event
+        elif isinstance(tool_result, str) and tool_result.startswith("data:image/"):
+            files.append({"type": "image", "url": tool_result})
+            llm_text = "Image rendered for the user."
+
+        # Generic tuple without HTMLResponse — keep the first str if any
+        elif isinstance(tool_result, tuple):
+            llm_text = next(
+                (v for v in tool_result if isinstance(v, str)), None
+            )
+            if llm_text is None:
+                llm_text = json.dumps(
+                    list(tool_result), ensure_ascii=False, default=str
+                )
+
+        # Dict/list — JSON-serialise for the LLM
+        elif isinstance(tool_result, (dict, list)):
+            llm_text = json.dumps(tool_result, ensure_ascii=False)
+
+        # Plain str / None / other — coerce
+        else:
+            llm_text = "" if tool_result is None else str(tool_result)
+
+        if event_emitter is not None and embeds:
+            try:
+                await event_emitter(
+                    {"type": "embeds", "data": {"embeds": embeds}}
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit 'embeds' event: {e}")
+        if event_emitter is not None and files:
+            try:
+                await event_emitter(
+                    {"type": "files", "data": {"files": files}}
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit 'files' event: {e}")
+
+        return llm_text or ""
 
     @staticmethod
     def _image_data_hash(image_data: Any) -> str:
@@ -3002,16 +3091,14 @@ class Pipe:
                             # and other wrappers that fool iscoroutinefunction.
                             _raw = tool_callable(**tool_args)
                             tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                            # OpenWebUI tools can return (HTMLResponse, str) tuples where
-                            # the str is the model-visible text and HTMLResponse is for the
-                            # UI. Extract the str component so Gemini gets clean text.
-                            if isinstance(tool_result, tuple):
-                                tool_result = next(
-                                    (v for v in tool_result if isinstance(v, str)), None
-                                )
-                            if tool_result is None:
-                                tool_result = ""
-                            tool_result = str(tool_result)
+                            # Mirror OWUI middleware: emit 'embeds'/'files' for
+                            # rich returns (HTMLResponse cards, base64 images)
+                            # and hand back the LLM-visible text. Without this
+                            # the pipe's bypass of OWUI middleware would drop
+                            # the embed on the floor.
+                            tool_result = await self._process_tool_result_for_owui(
+                                tool_result, __event_emitter__
+                            )
                             self.log.info(
                                 f"[stream] tool {tool_name!r} returned {len(tool_result)} chars: "
                                 f"{tool_result[:200]!r}"
@@ -3916,15 +4003,9 @@ class Pipe:
                                     # and other wrappers that fool iscoroutinefunction.
                                     _raw = tool_callable(**tool_args)
                                     tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                                    # OpenWebUI tools may return (HTMLResponse, str) tuples;
-                                    # extract the str component for Gemini.
-                                    if isinstance(tool_result, tuple):
-                                        tool_result = next(
-                                            (v for v in tool_result if isinstance(v, str)), None
-                                        )
-                                    if tool_result is None:
-                                        tool_result = ""
-                                    tool_result = str(tool_result)
+                                    tool_result = await self._process_tool_result_for_owui(
+                                        tool_result, __event_emitter__
+                                    )
                                     self.log.info(
                                         f"[non-stream] tool {tool_name!r} returned {len(tool_result)} chars: "
                                         f"{tool_result[:200]!r}"
