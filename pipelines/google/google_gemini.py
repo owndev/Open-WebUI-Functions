@@ -3158,10 +3158,18 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
-            # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
-            await emit_chat_event(
-                "replace", {"role": "assistant", "content": final_content}
-            )
+            # Only emit `replace` when no tools were called. When tools ran, they
+            # already emitted rich HTML widgets to the UI via their bound
+            # __event_emitter__. Emitting `replace` here would overwrite the entire
+            # message — nuking those widgets. Without `replace`, the streamed deltas
+            # plus the final `yield` below produce the correct text output while the
+            # tool HTML persists alongside it.
+            # Exception: always emit `replace` when grounding modified the text, so
+            # citation markers are injected into the live message content.
+            if not tool_call_blocks or grounding_metadata_list:
+                await emit_chat_event(
+                    "replace", {"role": "assistant", "content": final_content}
+                )
             await emit_chat_event(
                 "chat:message",
                 {"role": "assistant", "content": final_content, "done": True},
