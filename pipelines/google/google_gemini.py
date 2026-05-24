@@ -3158,22 +3158,31 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
-            # Only emit `replace` when no tools were called. When tools ran, they
-            # already emitted rich HTML widgets to the UI via their bound
-            # __event_emitter__. Emitting `replace` here would overwrite the entire
-            # message — nuking those widgets. Without `replace`, the streamed deltas
-            # plus the final `yield` below produce the correct text output while the
-            # tool HTML persists alongside it.
-            # Exception: always emit `replace` when grounding modified the text, so
-            # citation markers are injected into the live message content.
-            if not tool_call_blocks or grounding_metadata_list:
+            # When tools are available this turn, the SDK's Automatic Function
+            # Calling (AFC) may execute them invisibly to our loop — and any tool
+            # that emits HTML via its bound __event_emitter__ will render a widget
+            # in the chat. Our `replace`/`chat:message`/`chat:finish` events with
+            # full content would overwrite that widget. So when __tools__ is
+            # available, emit completion signals without a content override and
+            # let the streamed deltas plus the final yield carry the text.
+            # Exception: when grounding modified the text, we MUST emit `replace`
+            # so citation markers reach the live message.
+            tools_were_available = bool(__tools__)
+            if grounding_metadata_list or not tools_were_available:
                 await emit_chat_event(
                     "replace", {"role": "assistant", "content": final_content}
                 )
-            await emit_chat_event(
-                "chat:message",
-                {"role": "assistant", "content": final_content, "done": True},
-            )
+                await emit_chat_event(
+                    "chat:message",
+                    {"role": "assistant", "content": final_content, "done": True},
+                )
+            else:
+                # Tools could have rendered HTML — signal completion without
+                # overriding the message body so the widget persists.
+                await emit_chat_event(
+                    "chat:message",
+                    {"role": "assistant", "done": True},
+                )
 
             if thought_chunks:
                 # Clear the thinking status without a summary in the status emitter
@@ -3189,14 +3198,26 @@ class Pipe:
             if usage:
                 yield {"usage": usage}
 
-            await emit_chat_event(
-                "chat:finish",
-                {"role": "assistant", "content": final_content, "done": True},
-            )
+            if grounding_metadata_list or not tools_were_available:
+                await emit_chat_event(
+                    "chat:finish",
+                    {"role": "assistant", "content": final_content, "done": True},
+                )
+            else:
+                # Same reasoning as the chat:message gating above — don't override
+                # the message body when tools may have rendered HTML widgets.
+                await emit_chat_event(
+                    "chat:finish",
+                    {"role": "assistant", "done": True},
+                )
 
-            # Yield final content to ensure the async iterator completes properly.
-            # This ensures the response is persisted even if the user navigates away.
-            yield final_content
+            # Yield final content to ensure the async iterator completes properly
+            # and the response is persisted. When tools were available, yield empty
+            # so we don't overwrite tool-emitted HTML widgets in the persisted message.
+            if grounding_metadata_list or not tools_were_available:
+                yield final_content
+            else:
+                yield ""
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
