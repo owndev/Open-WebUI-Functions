@@ -2578,7 +2578,26 @@ class Pipe:
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
 
-        if __tools__ is not None and params.get("function_calling") == "native":
+        # Determine native function calling mode. OpenWebUI stores this setting
+        # in either __metadata__["model"]["params"] (current) or __metadata__["params"]
+        # (older), and may not set it at all when the user toggles the model picker.
+        # When __tools__ is provided, OWUI is operating in native mode by definition
+        # (default mode injects tools into the system prompt and does not pass __tools__).
+        _model_params = (__metadata__ or {}).get("model", {}).get("params", {}) or {}
+        _fc_mode = (
+            _model_params.get("function_calling")
+            or params.get("function_calling")
+        )
+        self.log.info(
+            f"Native tool registration: __tools__={'present' if __tools__ else 'absent'} "
+            f"keys={list(__tools__.keys()) if __tools__ else []} "
+            f"function_calling={_fc_mode!r}"
+        )
+
+        # Register tools whenever __tools__ is provided unless the user explicitly
+        # opted into "default" mode. This handles the case where function_calling is
+        # not set anywhere in metadata (common when OWUI uses tool selection per chat).
+        if __tools__ and _fc_mode != "default":
             for name, tool_def in __tools__.items():
                 if enable_image_generation and self._is_open_webui_image_tool(name):
                     self.log.debug(
@@ -2587,8 +2606,9 @@ class Pipe:
                     continue
                 if not name.startswith("_"):
                     tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
+                    self.log.info(
+                        f"Registering native tool with Gemini: '{name}' "
+                        f"signature={getattr(tool, '__signature__', '<no signature>')}"
                     )
                     tools.append(tool)
 
@@ -2758,6 +2778,13 @@ class Pipe:
 
         await emit_chat_event("chat:start", {"role": "assistant"})
 
+        self.log.info(
+            f"[stream] _handle_streaming_response entered. "
+            f"__tools__ keys={list(__tools__.keys()) if __tools__ else None} "
+            f"client={'present' if client else 'missing'} "
+            f"model_id={model_id!r}"
+        )
+
         grounding_metadata_list = []
         # Accumulate content separately for answer and thoughts (across all tool-call rounds)
         answer_chunks: list[str] = []
@@ -2878,6 +2905,10 @@ class Pipe:
                             elif getattr(part, "function_call", None):
                                 function_call_parts_this_round.append(part)
                                 tool_name = part.function_call.name
+                                self.log.info(
+                                    f"[stream] function_call detected: name={tool_name!r} "
+                                    f"args={dict(part.function_call.args) if part.function_call.args else {}}"
+                                )
                                 await emit_chat_event(
                                     "status",
                                     {
@@ -2894,6 +2925,13 @@ class Pipe:
 
                 # --- End of streaming for this round ---
 
+                self.log.info(
+                    f"[stream] round={tool_call_iteration} complete. "
+                    f"function_calls={len(function_call_parts_this_round)} "
+                    f"answer_chars={sum(len(c) for c in answer_chunks)} "
+                    f"thought_chars={sum(len(c) for c in thought_chunks)}"
+                )
+
                 # If no function calls were returned, or we can't execute them, exit the loop
                 can_execute = (
                     function_call_parts_this_round
@@ -2902,6 +2940,12 @@ class Pipe:
                     and model_id is not None
                 )
                 if not can_execute:
+                    self.log.info(
+                        f"[stream] exiting tool loop. function_calls={bool(function_call_parts_this_round)} "
+                        f"tools_available={__tools__ is not None} "
+                        f"client_available={client is not None} "
+                        f"model_id_available={model_id is not None}"
+                    )
                     break
 
                 if tool_call_iteration >= MAX_TOOL_ITERATIONS:
@@ -2921,15 +2965,30 @@ class Pipe:
                 function_response_parts: list = []
                 tool_call_details: list[str] = []
                 for fc_part in function_call_parts_this_round:
-                    tool_name = fc_part.function_call.name
+                    raw_tool_name = fc_part.function_call.name
                     tool_args = (
                         dict(fc_part.function_call.args)
                         if fc_part.function_call.args
                         else {}
                     )
+                    # Gemini sometimes namespaces tool names as "default_api:foo" or
+                    # "default_api.foo" — strip that prefix so we can match the plain
+                    # name OpenWebUI uses as the __tools__ key.
+                    tool_name = raw_tool_name
+                    for prefix in ("default_api:", "default_api."):
+                        if tool_name.startswith(prefix):
+                            tool_name = tool_name[len(prefix):]
+                            break
+                    if tool_name != raw_tool_name:
+                        self.log.info(
+                            f"[stream] normalized tool name {raw_tool_name!r} -> {tool_name!r}"
+                        )
 
                     if tool_name in __tools__:
                         try:
+                            self.log.info(
+                                f"[stream] executing tool {tool_name!r} with args={tool_args}"
+                            )
                             tool_callable = __tools__[tool_name]["callable"]
                             # Call first, then check isawaitable — handles functools.partial
                             # and other wrappers that fool iscoroutinefunction.
@@ -2939,22 +2998,30 @@ class Pipe:
                             if tool_result is None:
                                 tool_result = ""
                             tool_result = str(tool_result)
-                            self.log.debug(
-                                f"Tool '{tool_name}' returned: {tool_result[:200]}"
+                            self.log.info(
+                                f"[stream] tool {tool_name!r} returned {len(tool_result)} chars: "
+                                f"{tool_result[:200]!r}"
                             )
                         except Exception as tool_err:
-                            self.log.warning(
-                                f"Tool '{tool_name}' execution error: {tool_err}"
+                            self.log.exception(
+                                f"[stream] tool {tool_name!r} raised: {tool_err}"
                             )
                             tool_result = f"Error executing tool: {tool_err}"
                     else:
-                        self.log.warning(f"Tool '{tool_name}' not found in __tools__")
+                        self.log.warning(
+                            f"[stream] tool {tool_name!r} (raw={raw_tool_name!r}) NOT FOUND in __tools__. "
+                            f"available keys={list(__tools__.keys())}"
+                        )
                         tool_result = f"Error: tool '{tool_name}' not available"
 
+                    # IMPORTANT: the FunctionResponse name must exactly match the name
+                    # the model emitted in its FunctionCall, otherwise Gemini cannot
+                    # pair the response with the call. Use the raw name here even when
+                    # we normalised it for the __tools__ lookup above.
                     function_response_parts.append(
                         types.Part(
                             function_response=types.FunctionResponse(
-                                name=tool_name,
+                                name=raw_tool_name,
                                 response={"result": tool_result},
                             )
                         )
@@ -3003,6 +3070,12 @@ class Pipe:
                     types.Content(role="user", parts=function_response_parts),
                 ]
 
+                self.log.info(
+                    f"[stream] requesting follow-up stream after tool execution. "
+                    f"contents_len={len(current_contents)} "
+                    f"function_responses={len(function_response_parts)}"
+                )
+
                 # Get the next streaming response (model reads tool results)
                 _next_contents = current_contents
 
@@ -3013,12 +3086,23 @@ class Pipe:
                         config=generation_config,
                     )
 
-                response_iterator = await self._retry_with_backoff(_get_next_stream)
+                try:
+                    response_iterator = await self._retry_with_backoff(_get_next_stream)
+                except Exception as next_stream_err:
+                    self.log.exception(
+                        f"[stream] follow-up stream request failed: {next_stream_err}"
+                    )
+                    break
 
             # After processing all chunks, handle grounding data.
             # Grounding only processes real model text — tool call blocks are HTML and
             # must be excluded to avoid malformed citation injection.
             final_answer_text = "".join(answer_chunks)
+            self.log.info(
+                f"[stream] all rounds done. answer_chars={len(final_answer_text)} "
+                f"thought_chars={sum(len(c) for c in thought_chunks)} "
+                f"tool_call_blocks={len(tool_call_blocks)}"
+            )
             if grounding_metadata_list and __event_emitter__:
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
@@ -3675,6 +3759,10 @@ class Pipe:
                             elif getattr(part, "function_call", None):
                                 function_call_parts_this_round.append(part)
                                 tool_name = part.function_call.name
+                                self.log.info(
+                                    f"[non-stream] function_call detected: name={tool_name!r} "
+                                    f"args={dict(part.function_call.args) if part.function_call.args else {}}"
+                                )
                                 if __event_emitter__:
                                     await __event_emitter__(
                                         {
@@ -3775,12 +3863,22 @@ class Pipe:
                         function_response_parts: list = []
                         tool_call_details: list[str] = []
                         for fc_part in function_call_parts_this_round:
-                            tool_name = fc_part.function_call.name
+                            raw_tool_name = fc_part.function_call.name
                             tool_args = (
                                 dict(fc_part.function_call.args)
                                 if fc_part.function_call.args
                                 else {}
                             )
+                            # Strip default_api:/default_api. prefix Gemini sometimes adds
+                            tool_name = raw_tool_name
+                            for prefix in ("default_api:", "default_api."):
+                                if tool_name.startswith(prefix):
+                                    tool_name = tool_name[len(prefix):]
+                                    break
+                            if tool_name != raw_tool_name:
+                                self.log.info(
+                                    f"[non-stream] normalized tool name {raw_tool_name!r} -> {tool_name!r}"
+                                )
 
                             if __event_emitter__:
                                 await __event_emitter__(
@@ -3796,6 +3894,9 @@ class Pipe:
 
                             if tool_name in __tools__:
                                 try:
+                                    self.log.info(
+                                        f"[non-stream] executing tool {tool_name!r} with args={tool_args}"
+                                    )
                                     tool_callable = __tools__[tool_name]["callable"]
                                     # Call first, then check isawaitable — handles functools.partial
                                     # and other wrappers that fool iscoroutinefunction.
@@ -3805,22 +3906,28 @@ class Pipe:
                                     if tool_result is None:
                                         tool_result = ""
                                     tool_result = str(tool_result)
-                                    self.log.debug(
-                                        f"Tool '{tool_name}' returned: {tool_result[:200]}"
+                                    self.log.info(
+                                        f"[non-stream] tool {tool_name!r} returned {len(tool_result)} chars: "
+                                        f"{tool_result[:200]!r}"
                                     )
                                 except Exception as tool_err:
-                                    self.log.warning(
-                                        f"Tool '{tool_name}' execution error: {tool_err}"
+                                    self.log.exception(
+                                        f"[non-stream] tool {tool_name!r} raised: {tool_err}"
                                     )
                                     tool_result = f"Error executing tool: {tool_err}"
                             else:
-                                self.log.warning(f"Tool '{tool_name}' not found in __tools__")
+                                self.log.warning(
+                                    f"[non-stream] tool {tool_name!r} (raw={raw_tool_name!r}) NOT FOUND. "
+                                    f"available keys={list(__tools__.keys())}"
+                                )
                                 tool_result = f"Error: tool '{tool_name}' not available"
 
+                            # Use raw name in FunctionResponse so Gemini can pair it with
+                            # the original FunctionCall it emitted.
                             function_response_parts.append(
                                 types.Part(
                                     function_response=types.FunctionResponse(
-                                        name=tool_name,
+                                        name=raw_tool_name,
                                         response={"result": tool_result},
                                     )
                                 )
