@@ -2614,6 +2614,14 @@ class Pipe:
 
         if tools:
             gen_config_params["tools"] = tools
+            # Disable the SDK's Automatic Function Calling (AFC) so our own tool
+            # execution loop in _handle_streaming_response / pipe handles the round-
+            # trips. AFC intercepts function_call parts before we see them and passes
+            # raw Python return values (including OWUI's (HTMLResponse, str) tuples)
+            # directly to Gemini, which Gemini cannot deserialise — causing blank output.
+            gen_config_params["automatic_function_calling"] = (
+                types.AutomaticFunctionCallingConfig(disable=True)
+            )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -2994,7 +3002,13 @@ class Pipe:
                             # and other wrappers that fool iscoroutinefunction.
                             _raw = tool_callable(**tool_args)
                             tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                            # Normalise: None → empty string so the model gets clean text
+                            # OpenWebUI tools can return (HTMLResponse, str) tuples where
+                            # the str is the model-visible text and HTMLResponse is for the
+                            # UI. Extract the str component so Gemini gets clean text.
+                            if isinstance(tool_result, tuple):
+                                tool_result = next(
+                                    (v for v in tool_result if isinstance(v, str)), None
+                                )
                             if tool_result is None:
                                 tool_result = ""
                             tool_result = str(tool_result)
@@ -3902,7 +3916,12 @@ class Pipe:
                                     # and other wrappers that fool iscoroutinefunction.
                                     _raw = tool_callable(**tool_args)
                                     tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                                    # Normalise: None → empty string so the model gets clean text
+                                    # OpenWebUI tools may return (HTMLResponse, str) tuples;
+                                    # extract the str component for Gemini.
+                                    if isinstance(tool_result, tuple):
+                                        tool_result = next(
+                                            (v for v in tool_result if isinstance(v, str)), None
+                                        )
                                     if tool_result is None:
                                         tool_result = ""
                                     tool_result = str(tool_result)
