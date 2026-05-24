@@ -2899,6 +2899,11 @@ class Pipe:
         try:
             while tool_call_iteration <= MAX_TOOL_ITERATIONS:
                 function_call_parts_this_round: list = []
+                # Gemini 3 (and 2.5 thinking) models embed a thought_signature
+                # on each thought Part. The whole model turn — thoughts AND
+                # function calls — must be echoed back together in history or
+                # the API will reject the follow-up request.
+                thought_parts_this_round: list = []
 
                 async for chunk in response_iterator:
                     # Capture usage metadata (final chunk has complete data)
@@ -2968,6 +2973,10 @@ class Pipe:
                                 if thinking_started_at is None:
                                     thinking_started_at = time.time()
                                 thought_chunks.append(part.text)
+                                # Preserve the raw Part (with thought_signature)
+                                # so it can be echoed back in history alongside
+                                # the function_call parts for Gemini 3 models.
+                                thought_parts_this_round.append(part)
                                 # Emit a live preview of what is currently being thought
                                 preview = part.text.replace("\n", " ").strip()
                                 MAX_PREVIEW = 120
@@ -3163,10 +3172,14 @@ class Pipe:
                         {"role": "assistant", "content": tool_calls_block},
                     )
 
-                # Extend the conversation with the model's tool calls and our responses
+                # Extend the conversation with the model's tool calls and our responses.
+                # Thought parts (with their thought_signature) must be included alongside
+                # the function_call parts in the model turn — omitting them causes Gemini
+                # 3 / 2.5 thinking models to reject the follow-up request.
+                model_parts_this_round = thought_parts_this_round + function_call_parts_this_round
                 current_contents = current_contents + [
                     types.Content(
-                        role="model", parts=function_call_parts_this_round
+                        role="model", parts=model_parts_this_round
                     ),
                     types.Content(role="user", parts=function_response_parts),
                 ]
@@ -3849,12 +3862,14 @@ class Pipe:
                             return "[No content generated or unexpected response structure]"
 
                         function_call_parts_this_round: list = []
+                        thought_parts_this_round: list = []
 
                         for part in parts:
                             if getattr(part, "thought", False) and getattr(
                                 part, "text", None
                             ):
                                 thought_segments.append(part.text)
+                                thought_parts_this_round.append(part)
                             elif getattr(part, "text", None):
                                 answer_segments.append(part.text)
                             elif getattr(part, "function_call", None):
@@ -4064,10 +4079,13 @@ class Pipe:
                             )
                             tool_call_blocks_ns.append(tool_calls_block)
 
-                        # Extend conversation with tool calls and their responses
+                        # Extend conversation with tool calls and their responses.
+                        # Include thought parts (with thought_signature) in the model
+                        # turn for Gemini 3 / 2.5 thinking model compatibility.
+                        model_parts_this_round = thought_parts_this_round + function_call_parts_this_round
                         current_contents = current_contents + [
                             types.Content(
-                                role="model", parts=function_call_parts_this_round
+                                role="model", parts=model_parts_this_round
                             ),
                             types.Content(role="user", parts=function_response_parts),
                         ]
