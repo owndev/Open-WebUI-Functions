@@ -3158,28 +3158,30 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
-            # When tools are available this turn, any tool that returns an
-            # HTMLResponse (or similar rich object) renders a widget via its bound
-            # __event_emitter__. That widget appears during streaming but is wiped
-            # when OWUI receives a "done: true" finalisation event for the assistant
-            # message — at that point OWUI re-renders the message from the
-            # persisted content, which contains only the streamed text deltas, not
-            # the HTML widget.
-            # So when tools were available, suppress the finalisation events that
-            # trigger that re-render. The async-generator completion below is
-            # sufficient for OWUI's middleware to know the stream ended.
-            # Exception: grounding requires `replace` to inject citation markers
-            # into the live text and must still fire.
+            # When tools are available this turn, the SDK's Automatic Function
+            # Calling (AFC) may execute them invisibly to our loop — and any tool
+            # that emits HTML via its bound __event_emitter__ will render a widget
+            # in the chat. Our `replace`/`chat:message`/`chat:finish` events with
+            # full content would overwrite that widget. So when __tools__ is
+            # available, emit completion signals without a content override and
+            # let the streamed deltas plus the final yield carry the text.
+            # Exception: when grounding modified the text, we MUST emit `replace`
+            # so citation markers reach the live message.
             tools_were_available = bool(__tools__)
-            emit_finalisation = (not tools_were_available) or bool(grounding_metadata_list)
-
-            if emit_finalisation:
+            if grounding_metadata_list or not tools_were_available:
                 await emit_chat_event(
                     "replace", {"role": "assistant", "content": final_content}
                 )
                 await emit_chat_event(
                     "chat:message",
                     {"role": "assistant", "content": final_content, "done": True},
+                )
+            else:
+                # Tools could have rendered HTML — signal completion without
+                # overriding the message body so the widget persists.
+                await emit_chat_event(
+                    "chat:message",
+                    {"role": "assistant", "done": True},
                 )
 
             if thought_chunks:
@@ -3196,17 +3198,26 @@ class Pipe:
             if usage:
                 yield {"usage": usage}
 
-            if emit_finalisation:
+            if grounding_metadata_list or not tools_were_available:
                 await emit_chat_event(
                     "chat:finish",
                     {"role": "assistant", "content": final_content, "done": True},
                 )
-                # Yield the full content as the persisted assistant message body.
+            else:
+                # Same reasoning as the chat:message gating above — don't override
+                # the message body when tools may have rendered HTML widgets.
+                await emit_chat_event(
+                    "chat:finish",
+                    {"role": "assistant", "done": True},
+                )
+
+            # Yield final content to ensure the async iterator completes properly
+            # and the response is persisted. When tools were available, yield empty
+            # so we don't overwrite tool-emitted HTML widgets in the persisted message.
+            if grounding_metadata_list or not tools_were_available:
                 yield final_content
-            # When tools were available we deliberately skip finalisation events
-            # and the final yield. The streamed deltas plus tool-emitted widgets
-            # are the canonical message; ending the generator here lets OWUI's
-            # middleware finalise based on what was streamed/emitted.
+            else:
+                yield ""
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
