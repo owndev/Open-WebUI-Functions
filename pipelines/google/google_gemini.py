@@ -1359,6 +1359,44 @@ class Pipe:
         except Exception:
             return None
 
+    @staticmethod
+    def _owui_spec_to_gemini_tool(name: str, spec: dict) -> Optional["types.Tool"]:
+        """Convert an OWUI OpenAI-format tool spec to a Gemini types.Tool.
+
+        OWUI builds a full JSON schema for each tool (including nested object
+        properties for complex parameters like List[Task]).  Using this spec
+        instead of re-introspecting the callable preserves that richness and
+        gives the model enough detail to send correctly-shaped arguments.
+        """
+
+        def _uppercase_types(schema: Any) -> Any:
+            if isinstance(schema, dict):
+                return {
+                    k: schema[k].upper() if k == "type" and isinstance(schema[k], str)
+                    else _uppercase_types(schema[k])
+                    for k in schema
+                }
+            if isinstance(schema, list):
+                return [_uppercase_types(item) for item in schema]
+            return schema
+
+        # OpenAI spec may be wrapped: {"type": "function", "function": {...}}
+        fn_spec = spec.get("function", spec)
+        description = fn_spec.get("description", "")
+        parameters = fn_spec.get("parameters", {})
+
+        params_schema = _uppercase_types(parameters)
+
+        try:
+            decl = types.FunctionDeclaration(
+                name=name,
+                description=description[:1000] if description else "",
+                parameters=params_schema,
+            )
+            return types.Tool(function_declarations=[decl])
+        except Exception:
+            return None
+
     async def _process_tool_result_for_owui(
         self,
         tool_result: Any,
@@ -2849,11 +2887,18 @@ class Pipe:
                     )
                     continue
                 if not name.startswith("_"):
-                    callable_fn = tool_def["callable"]
-                    gemini_tool = self._owui_callable_to_gemini_tool(name, callable_fn)
+                    spec = tool_def.get("spec")
+                    if spec:
+                        gemini_tool = self._owui_spec_to_gemini_tool(name, spec)
+                        source = "OWUI spec"
+                    else:
+                        gemini_tool = self._owui_callable_to_gemini_tool(
+                            name, tool_def["callable"]
+                        )
+                        source = "callable introspection"
                     if gemini_tool is not None:
                         self.log.info(
-                            f"Registering native tool with Gemini (clean declaration): '{name}'"
+                            f"Registering native tool with Gemini ({source}): '{name}'"
                         )
                         tools.append(gemini_tool)
                     else:
