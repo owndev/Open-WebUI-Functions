@@ -2853,23 +2853,6 @@ class Pipe:
 
         return replaced_text if replaced_text is not None else text
 
-    @staticmethod
-    def _truncate_tool_result_for_display(result: Any, max_chars: int = 2000) -> str:
-        """Trim a tool result for the user-facing <details> block.
-
-        Some tools (e.g. fetch_url) return hundreds of KB of HTML which OWUI
-        renders as a giant code block with Run/Save/Copy affordances. The full
-        result still goes to the model via function_response; this is only for
-        what gets displayed inline.
-        """
-        text = result if isinstance(result, str) else str(result)
-        if len(text) <= max_chars:
-            return text
-        return (
-            text[:max_chars].rstrip()
-            + f"\n\n... [truncated: {len(text) - max_chars} more chars]"
-        )
-
     async def _resolve_grounding_redirects(
         self,
         urls: List[str],
@@ -3412,9 +3395,8 @@ class Pipe:
                         )
                     )
                     args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                    display_result = self._truncate_tool_result_for_display(tool_result)
                     tool_call_details.append(
-                        f"**{tool_name}**({args_repr})\n```\n{display_result}\n```"
+                        f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
                     )
 
                 # If all tool calls failed (not found / errored), function_response_parts
@@ -4346,9 +4328,8 @@ class Pipe:
                                 )
                             )
                             args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                            display_result = self._truncate_tool_result_for_display(tool_result)
                             tool_call_details.append(
-                                f"**{tool_name}**({args_repr})\n```\n{display_result}\n```"
+                                f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
                             )
 
                         # Don't push empty Content to Gemini — would cause an API error
