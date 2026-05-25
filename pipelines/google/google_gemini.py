@@ -3104,10 +3104,18 @@ class Pipe:
         if not image_files:
             return json.dumps({"error": "No image was returned by Gemini"})
 
-        # Return plain text — not JSON. A plain string keeps the tool-call
-        # details block readable and prevents the model from echoing back a
-        # JSON blob as its follow-up reply.
-        return f"{len(image_files)} image(s) generated and displayed in the chat."
+        # Do NOT include image URLs in the function response — the images are
+        # already displayed via the chat:message:files event above. Returning
+        # URLs here causes the model to echo them as markdown images, producing
+        # a duplicate render in the chat.
+        return json.dumps({
+            "status": "success",
+            "images_generated": len(image_files),
+            "message": (
+                f"{len(image_files)} image(s) generated and already displayed to the user. "
+                "Do not include image URLs or markdown images in your reply."
+            ),
+        })
 
     async def _fetch_url_for_owui(
         self,
