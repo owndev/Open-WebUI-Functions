@@ -333,6 +333,15 @@ class Pipe:
             description="Whether to use Enterprise Web Search instead of standard Google search when grounding is enabled. "
             "Only available on Vertex AI.",
         )
+        REPLACE_SEARCH_WEB_WITH_GOOGLE: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_SEARCH_WEB", "false").lower() == "true",
+            description="Intercept OWUI's search_web tool calls and fulfill them with Google "
+            "Search via Vertex AI, preserving OWUI's native search UX (spinner, tool-call "
+            "detail, source cards) while using Google's actual results. Requires the "
+            "google_search_tool feature flag or the companion filter that converts "
+            "web_search → google_search_tool in metadata. When enabled, native grounding "
+            "is skipped in favour of this Python-tool approach.",
+        )
 
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
@@ -2629,7 +2638,14 @@ class Pipe:
         tools = []
 
         if features.get("google_search_tool", False):
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+            if self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE:
+                # search_web calls will be intercepted at execution time and routed to
+                # Google Search — no server-side grounding declaration needed here.
+                self.log.debug(
+                    "REPLACE_SEARCH_WEB_WITH_GOOGLE active: skipping native grounding, "
+                    "search_web tool calls will be fulfilled by Google Search at runtime"
+                )
+            elif self.valves.USE_ENTERPRISE_WEB_SEARCH:
                 self.log.debug("Enabling Enterprise Web Search grounding")
                 tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
@@ -2836,6 +2852,89 @@ class Pipe:
             replaced_text = "".join(cited_chunks)
 
         return replaced_text if replaced_text is not None else text
+
+    async def _google_search_for_owui(
+        self,
+        query: str,
+        model_id: str,
+        __event_emitter__: Optional[Callable] = None,
+    ) -> str:
+        """Fulfill a search_web call using Google Search via Vertex AI grounding.
+
+        Makes a lightweight Vertex AI call with google_search grounding enabled,
+        extracts the grounding chunks, and returns results in OWUI's search_web
+        format: [{"title": "...", "url": "...", "content": "..."}, ...].
+        """
+        self.log.info(f"[search] intercepting search_web — querying Google: {query!r}")
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": f"Searching Google for: {query}",
+                            "done": False,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+
+        client = self._get_client()
+        search_tool = (
+            types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+            if self.valves.USE_ENTERPRISE_WEB_SEARCH
+            else types.Tool(google_search=types.GoogleSearch())
+        )
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=f"Search: {query}",
+                config=types.GenerateContentConfig(
+                    tools=[search_tool],
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                ),
+            )
+            results = []
+            if response.candidates:
+                metadata = getattr(response.candidates[0], "grounding_metadata", None)
+                if metadata and metadata.grounding_chunks:
+                    for chunk in metadata.grounding_chunks:
+                        if getattr(chunk, "web", None) and chunk.web:
+                            results.append(
+                                {
+                                    "title": chunk.web.title or "",
+                                    "url": chunk.web.uri or "",
+                                    "content": "",
+                                }
+                            )
+            self.log.info(f"[search] Google returned {len(results)} results for {query!r}")
+
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Found {len(results)} results for: {query}",
+                                "done": True,
+                                "urls": [
+                                    f"https://www.google.com/search?q={query}"
+                                ],
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return json.dumps(results, ensure_ascii=False)
+        except Exception as e:
+            self.log.warning(f"[search] Google search failed for {query!r}: {e}")
+            return json.dumps([])
 
     async def _handle_streaming_response(
         self,
@@ -3117,11 +3216,28 @@ class Pipe:
                             self.log.info(
                                 f"[stream] executing tool {tool_name!r} with args={tool_args}"
                             )
-                            tool_callable = __tools__[tool_name]["callable"]
-                            # Call first, then check isawaitable — handles functools.partial
-                            # and other wrappers that fool iscoroutinefunction.
-                            _raw = tool_callable(**tool_args)
-                            tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                            # Intercept OWUI's web-search tools and fulfill them with
+                            # Google Search so OWUI shows its full native search UX
+                            # (spinner, tool-call detail, source cards) while using
+                            # Google's actual results instead of OWUI's search engine.
+                            _web_search_names = {
+                                "search_web", "web_search", "search_internet"
+                            }
+                            if (
+                                tool_name in _web_search_names
+                                and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
+                            ):
+                                tool_result = await self._google_search_for_owui(
+                                    query=tool_args.get("query", ""),
+                                    model_id=model_id,
+                                    __event_emitter__=__event_emitter__,
+                                )
+                            else:
+                                tool_callable = __tools__[tool_name]["callable"]
+                                # Call first, then check isawaitable — handles functools.partial
+                                # and other wrappers that fool iscoroutinefunction.
+                                _raw = tool_callable(**tool_args)
+                                tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                             # Mirror OWUI middleware: emit 'embeds'/'files' for
                             # rich returns (HTMLResponse cards, base64 images)
                             # and hand back the LLM-visible text. Without this
@@ -4044,11 +4160,24 @@ class Pipe:
                                     self.log.info(
                                         f"[non-stream] executing tool {tool_name!r} with args={tool_args}"
                                     )
-                                    tool_callable = __tools__[tool_name]["callable"]
-                                    # Call first, then check isawaitable — handles functools.partial
-                                    # and other wrappers that fool iscoroutinefunction.
-                                    _raw = tool_callable(**tool_args)
-                                    tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    _web_search_names = {
+                                        "search_web", "web_search", "search_internet"
+                                    }
+                                    if (
+                                        tool_name in _web_search_names
+                                        and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
+                                    ):
+                                        tool_result = await self._google_search_for_owui(
+                                            query=tool_args.get("query", ""),
+                                            model_id=model_id,
+                                            __event_emitter__=__event_emitter__,
+                                        )
+                                    else:
+                                        tool_callable = __tools__[tool_name]["callable"]
+                                        # Call first, then check isawaitable — handles functools.partial
+                                        # and other wrappers that fool iscoroutinefunction.
+                                        _raw = tool_callable(**tool_args)
+                                        tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                                     tool_result = await self._process_tool_result_for_owui(
                                         tool_result, __event_emitter__
                                     )
