@@ -3104,10 +3104,17 @@ class Pipe:
         if not image_files:
             return json.dumps({"error": "No image was returned by Gemini"})
 
+        # Do NOT include image URLs in the function response — the images are
+        # already displayed via the chat:message:files event above. Returning
+        # URLs here causes the model to echo them as markdown images, producing
+        # a duplicate render in the chat.
         return json.dumps({
             "status": "success",
-            "message": "The image has been generated and is visible in the chat.",
-            "images": [{"url": f.get("url", "")} for f in image_files],
+            "images_generated": len(image_files),
+            "message": (
+                f"{len(image_files)} image(s) generated and already displayed to the user. "
+                "Do not include image URLs or markdown images in your reply."
+            ),
         })
 
     async def _fetch_url_for_owui(
@@ -4468,6 +4475,7 @@ class Pipe:
                     seen_generated_image_hashes: set[str] = set()
                     grounding_metadata_list = []
                     response = None
+                    _image_gen_intercepted = False
 
                     while tool_call_iteration <= MAX_TOOL_ITERATIONS:
                         # Send processing status for image generation (first request only)
@@ -4558,6 +4566,7 @@ class Pipe:
                                 getattr(part, "inline_data", None)
                                 and __request__
                                 and __user__
+                                and not _image_gen_intercepted
                             ):
                                 # Handle generated images with unified upload method
                                 mime_type = part.inline_data.mime_type
@@ -4594,7 +4603,7 @@ class Pipe:
                                         )
                                     )
 
-                            elif getattr(part, "inline_data", None):
+                            elif getattr(part, "inline_data", None) and not _image_gen_intercepted:
                                 # Fallback: return as base64 data URL if no request/user context
                                 mime_type = part.inline_data.mime_type
                                 image_data = part.inline_data.data
@@ -4735,6 +4744,7 @@ class Pipe:
                                             __request__=__request__,
                                             __user__=__user__,
                                         )
+                                        _image_gen_intercepted = True
                                     else:
                                         tool_callable = __tools__[tool_name]["callable"]
                                         # Call first, then check isawaitable — handles functools.partial
