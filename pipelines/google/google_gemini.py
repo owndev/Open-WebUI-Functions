@@ -352,6 +352,20 @@ class Pipe:
             "Independent of REPLACE_FETCH_URL (which controls the implementation used "
             "when fetching is enabled).",
         )
+        REPLACE_IMAGE_GENERATION: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_IMAGE_GENERATION", "true").lower() == "true",
+            description="Intercept OWUI's generate_image and edit_image tool calls and "
+            "fulfill them with Gemini native image generation, bypassing the configured "
+            "image generation backend entirely. Enable OWUI image generation with any "
+            "credentials (real or dummy) to activate the tool injection; this valve "
+            "then routes the calls to Gemini instead.",
+        )
+        IMAGE_GEN_MODEL_ID: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GEN_MODEL_ID", "gemini-3.0-flash-preview-image-generation"),
+            description="Gemini model to use for generate_image / edit_image tool call "
+            "interception. Must be a model that supports response_modalities=[IMAGE]. "
+            "Used when REPLACE_IMAGE_GENERATION is true.",
+        )
         REPLACE_FETCH_URL: bool = Field(
             default=os.getenv("GOOGLE_REPLACE_FETCH_URL", "true").lower() == "true",
             description="Intercept OWUI's fetch_url tool calls and fulfill them with a "
@@ -2982,6 +2996,120 @@ class Pipe:
             self.log.warning(f"[search] redirect resolution failed: {e}")
             return {u: u for u in urls}
 
+    async def _generate_image_for_owui(
+        self,
+        prompt: str,
+        image_urls: Optional[List[str]] = None,
+        __event_emitter__: Optional[Callable] = None,
+        __request__: Optional[Request] = None,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """Fulfill generate_image / edit_image tool calls with Gemini native image generation.
+
+        Reads OWUI's image generation config for size hints, uses IMAGE_GEN_MODEL_ID
+        (valve) for the Gemini model, uploads the result via the pipe's existing image
+        upload infrastructure, emits chat:message:files so OWUI displays the image
+        inline, and returns the same JSON shape OWUI's own builtin returns.
+        """
+        action = "Editing image" if image_urls else "Generating image"
+        self.log.info(f"[image] intercepting {'edit_image' if image_urls else 'generate_image'}: {prompt[:80]!r}")
+        if __event_emitter__:
+            try:
+                await __event_emitter__({"type": "status", "data": {
+                    "action": "image_generation", "description": f"{action}: {prompt[:60]}…", "done": False,
+                }})
+            except Exception:
+                pass
+
+        aspect_ratio = self.valves.IMAGE_GENERATION_ASPECT_RATIO
+        resolution = self.valves.IMAGE_GENERATION_RESOLUTION
+
+        model_id = self.valves.IMAGE_GEN_MODEL_ID
+        client = self._get_client()
+
+        # Build contents — include reference images for edit_image
+        contents: Any = prompt
+        if image_urls:
+            parts: list = [{"text": prompt}]
+            for url in image_urls:
+                try:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _sess:
+                        async with _sess.get(url, timeout=_aiohttp.ClientTimeout(total=15)) as _r:
+                            img_bytes = await _r.read()
+                            mime = _r.headers.get("Content-Type", "image/png").split(";")[0]
+                    parts.append({"inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(img_bytes).decode(),
+                    }})
+                except Exception as e:
+                    self.log.warning(f"[image] failed to fetch reference image {url!r}: {e}")
+            contents = [{"role": "user", "parts": parts}]
+
+        try:
+            gen_config_params: Dict[str, Any] = {"response_modalities": ["IMAGE", "TEXT"]}
+            if self._check_image_config_support(model_id):
+                try:
+                    gen_config_params["image_config"] = types.ImageConfig(
+                        aspect_ratio=aspect_ratio if aspect_ratio != "default" else None,
+                        image_size=resolution if resolution != "default" else None,
+                    )
+                except Exception:
+                    pass
+
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=types.GenerateContentConfig(**gen_config_params),
+            )
+        except Exception as e:
+            self.log.exception(f"[image] Gemini image generation failed: {e}")
+            return json.dumps({"error": str(e)})
+
+        image_files: list = []
+        for candidate in getattr(response, "candidates", []) or []:
+            for part in getattr(getattr(candidate, "content", None), "parts", []) or []:
+                if getattr(part, "inline_data", None) and __request__ and __user__:
+                    try:
+                        image_url = await self._upload_image_with_status(
+                            part.inline_data.data,
+                            part.inline_data.mime_type,
+                            __request__,
+                            __user__,
+                            __event_emitter__,
+                        )
+                        image_files.append(self._build_generated_image_file(
+                            content_url=image_url,
+                            mime_type=part.inline_data.mime_type,
+                        ))
+                    except Exception as e:
+                        self.log.warning(f"[image] upload failed: {e}")
+
+        if image_files and __event_emitter__:
+            try:
+                await __event_emitter__({"type": "chat:message:files", "data": {"files": image_files}})
+            except Exception:
+                pass
+
+        if __event_emitter__:
+            try:
+                await __event_emitter__({"type": "status", "data": {
+                    "action": "image_generation",
+                    "description": f"Generated {len(image_files)} image(s)",
+                    "done": True,
+                }})
+            except Exception:
+                pass
+
+        if not image_files:
+            return json.dumps({"error": "No image was returned by Gemini"})
+
+        return json.dumps({
+            "status": "success",
+            "message": "The image has been generated and is visible in the chat.",
+            "images": [{"url": f.get("url", "")} for f in image_files],
+        })
+
     async def _fetch_url_for_owui(
         self,
         url: str,
@@ -3571,6 +3699,7 @@ class Pipe:
                                 "search_web", "web_search", "search_internet"
                             }
                             _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
+                            _image_gen_names = {"generate_image", "edit_image"}
                             if (
                                 tool_name in _web_search_names
                                 and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -3590,7 +3719,6 @@ class Pipe:
                                         "Do not attempt to fetch URLs."
                                     )
                                 elif self.valves.REPLACE_FETCH_URL:
-                                    # Extract the user's original question as the RAG query
                                     _fetch_query = ""
                                     for _c in current_contents:
                                         if getattr(_c, "role", "") == "user":
@@ -3610,6 +3738,17 @@ class Pipe:
                                     tool_callable = __tools__[tool_name]["callable"]
                                     _raw = tool_callable(**tool_args)
                                     tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                            elif (
+                                tool_name in _image_gen_names
+                                and self.valves.REPLACE_IMAGE_GENERATION
+                            ):
+                                tool_result = await self._generate_image_for_owui(
+                                    prompt=tool_args.get("prompt", ""),
+                                    image_urls=tool_args.get("image_urls"),
+                                    __event_emitter__=__event_emitter__,
+                                    __request__=__request__,
+                                    __user__=__user__,
+                                )
                             else:
                                 tool_callable = __tools__[tool_name]["callable"]
                                 # Call first, then check isawaitable — handles functools.partial
@@ -4542,6 +4681,7 @@ class Pipe:
                                         "search_web", "web_search", "search_internet"
                                     }
                                     _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
+                                    _image_gen_names = {"generate_image", "edit_image"}
                                     if (
                                         tool_name in _web_search_names
                                         and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -4561,7 +4701,6 @@ class Pipe:
                                                 "Do not attempt to fetch URLs."
                                             )
                                         elif self.valves.REPLACE_FETCH_URL:
-                                            # Extract the user's original question as the RAG query
                                             _fetch_query = ""
                                             for _m in messages:
                                                 if _m.get("role") == "user":
@@ -4585,6 +4724,17 @@ class Pipe:
                                             tool_callable = __tools__[tool_name]["callable"]
                                             _raw = tool_callable(**tool_args)
                                             tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    elif (
+                                        tool_name in _image_gen_names
+                                        and self.valves.REPLACE_IMAGE_GENERATION
+                                    ):
+                                        tool_result = await self._generate_image_for_owui(
+                                            prompt=tool_args.get("prompt", ""),
+                                            image_urls=tool_args.get("image_urls"),
+                                            __event_emitter__=__event_emitter__,
+                                            __request__=__request__,
+                                            __user__=__user__,
+                                        )
                                     else:
                                         tool_callable = __tools__[tool_name]["callable"]
                                         # Call first, then check isawaitable — handles functools.partial
