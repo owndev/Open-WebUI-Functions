@@ -2915,6 +2915,7 @@ class Pipe:
         self,
         url: str,
         __event_emitter__: Optional[Callable] = None,
+        __request__: Optional[Request] = None,
     ) -> str:
         """Fetch a URL and return clean plain text, bypassing OWUI's loader chain.
 
@@ -2922,8 +2923,21 @@ class Pipe:
         pipeline (experimentally ~1200 chars on Wikipedia) regardless of the
         WEB_FETCH_MAX_CONTENT_LENGTH setting. This implementation uses aiohttp
         directly and strips HTML with BeautifulSoup, returning the full page text.
+
+        Respects OWUI config when __request__ is provided:
+          WEB_FETCH_MAX_CONTENT_LENGTH  — max chars returned (None = no limit)
+          ENABLE_WEB_LOADER_SSL_VERIFICATION — SSL cert verification (default True)
+          WEB_LOADER_TIMEOUT            — request timeout in seconds (default 30)
         """
         self.log.info(f"[fetch] intercepting fetch_url: {url!r}")
+
+        # Read OWUI config values when available, fall back to safe defaults.
+        cfg = getattr(getattr(__request__, "app", None), "state", None)
+        cfg = getattr(cfg, "config", None) if cfg else None
+        max_content_length: Optional[int] = getattr(cfg, "WEB_FETCH_MAX_CONTENT_LENGTH", None)
+        verify_ssl: bool = bool(getattr(cfg, "ENABLE_WEB_LOADER_SSL_VERIFICATION", True))
+        loader_timeout: int = int(getattr(cfg, "WEB_LOADER_TIMEOUT", None) or 30)
+
         if __event_emitter__:
             try:
                 await __event_emitter__(
@@ -2953,10 +2967,13 @@ class Pipe:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=loader_timeout)
+        connector = aiohttp.TCPConnector(ssl=verify_ssl)
 
         try:
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            async with aiohttp.ClientSession(
+                headers=headers, timeout=timeout, connector=connector
+            ) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     resp.raise_for_status()
                     raw_bytes = await resp.read()
@@ -2976,7 +2993,14 @@ class Pipe:
             else:
                 text = raw_bytes.decode("utf-8", errors="replace")
 
-            self.log.info(f"[fetch] fetched {len(text)} chars from {url!r}")
+            # Apply WEB_FETCH_MAX_CONTENT_LENGTH if configured (mirrors OWUI behaviour)
+            if max_content_length and max_content_length > 0 and len(text) > max_content_length:
+                text = text[:max_content_length] + "\n\n[Content truncated]"
+
+            self.log.info(
+                f"[fetch] fetched {len(text)} chars from {url!r}"
+                + (f" (capped at {max_content_length})" if max_content_length else "")
+            )
 
             if __event_emitter__:
                 try:
@@ -3470,6 +3494,7 @@ class Pipe:
                                 tool_result = await self._fetch_url_for_owui(
                                     url=tool_args.get("url", ""),
                                     __event_emitter__=__event_emitter__,
+                                    __request__=__request__,
                                 )
                             else:
                                 tool_callable = __tools__[tool_name]["callable"]
@@ -4419,6 +4444,7 @@ class Pipe:
                                         tool_result = await self._fetch_url_for_owui(
                                             url=tool_args.get("url", ""),
                                             __event_emitter__=__event_emitter__,
+                                            __request__=__request__,
                                         )
                                     else:
                                         tool_callable = __tools__[tool_name]["callable"]
