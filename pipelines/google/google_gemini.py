@@ -2922,6 +2922,21 @@ class Pipe:
                                 }
                             )
 
+                    # Emit each grounding chunk as a persisted "source" event so
+                    # OWUI renders the citation chips/source panel under the
+                    # message, matching the native-grounding UX.
+                    if __event_emitter__:
+                        sources = self._format_grounding_chunks_as_sources(
+                            metadata.grounding_chunks
+                        )
+                        for source in sources:
+                            try:
+                                await __event_emitter__(
+                                    {"type": "source", "data": source}
+                                )
+                            except Exception:
+                                pass
+
                 if response_text:
                     # Lead with a summary entry carrying the full grounded text so
                     # the outer model has actual content to synthesize from.
