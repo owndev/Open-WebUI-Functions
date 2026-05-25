@@ -1296,30 +1296,41 @@ class Pipe:
                 continue
 
             ann = param.annotation
-            # Unwrap Optional[X] → X
             origin = getattr(ann, "__origin__", None)
+
+            # Unwrap Optional[X] / Union[X, None] → X
             if origin is Union:
                 args = [a for a in ann.__args__ if a is not type(None)]
                 ann = args[0] if args else str
-                # re-derive origin after unwrap
                 origin = getattr(ann, "__origin__", None)
-                if origin is not None:
-                    ann = origin
 
-            # Try to extract the element type for List[X] before collapsing to list
-            elem_ann = None
+            # Capture List[X] element type before collapsing generic → base type
             type_args = getattr(ann, "__args__", None)
-            if type_args and ann in (list,):
-                elem_ann = type_args[0]
-            elif origin is list and type_args:
-                elem_ann = type_args[0]
+            elem_ann = type_args[0] if (origin is list and type_args) else None
+
+            # Collapse generic to base type so the _TYPE_MAP lookup succeeds
+            # (e.g. List[Dict[str, Any]] → list → "array").  Without this the
+            # lookup defaults to "string" and the model sends JSON-encoded
+            # strings instead of real arrays/objects.
+            if origin is not None:
+                ann = origin
 
             json_type = _TYPE_MAP.get(ann, "string")
             prop: dict = {"type": json_type.upper()}
 
-            # Gemini requires array properties to include an items schema
+            # Gemini requires array properties to include an items schema.
+            # Also collapse the element annotation through its origin
+            # (Dict[str, Any] → dict → "object"; List[X] → list → "array").
             if json_type == "array":
-                elem_type = _TYPE_MAP.get(elem_ann, "string").upper() if elem_ann else "STRING"
+                e_ann = elem_ann
+                e_origin = getattr(e_ann, "__origin__", None) if e_ann else None
+                if e_origin is Union and getattr(e_ann, "__args__", None):
+                    inner = [a for a in e_ann.__args__ if a is not type(None)]
+                    e_ann = inner[0] if inner else str
+                    e_origin = getattr(e_ann, "__origin__", None)
+                if e_origin is not None:
+                    e_ann = e_origin
+                elem_type = _TYPE_MAP.get(e_ann, "string").upper() if e_ann else "STRING"
                 prop["items"] = {"type": elem_type}
 
             properties[param_name] = prop
