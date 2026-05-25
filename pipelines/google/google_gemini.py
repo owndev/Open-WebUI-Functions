@@ -2855,16 +2855,17 @@ class Pipe:
                             f"Could not build FunctionDeclaration for tool '{name}'; skipping"
                         )
 
+        # Always disable the SDK's Automatic Function Calling (AFC). When enabled,
+        # the SDK imposes a hard cap of 10 remote calls and intercepts function_call
+        # parts before our loop sees them. We drive all tool round-trips ourselves,
+        # so AFC must be off unconditionally — even on requests with no tools, where
+        # the SDK would otherwise silently default to AFC-enabled.
+        gen_config_params["automatic_function_calling"] = (
+            types.AutomaticFunctionCallingConfig(disable=True)
+        )
+
         if tools:
             gen_config_params["tools"] = tools
-            # Disable the SDK's Automatic Function Calling (AFC) so our own tool
-            # execution loop in _handle_streaming_response / pipe handles the round-
-            # trips. AFC intercepts function_call parts before we see them and passes
-            # raw Python return values (including OWUI's (HTMLResponse, str) tuples)
-            # directly to Gemini, which Gemini cannot deserialise — causing blank output.
-            gen_config_params["automatic_function_calling"] = (
-                types.AutomaticFunctionCallingConfig(disable=True)
-            )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
