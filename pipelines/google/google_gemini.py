@@ -2912,8 +2912,24 @@ class Pipe:
 
                     # Check for safety feedback or empty chunks
                     if not chunk.candidates:
-                        # Check prompt feedback
-                        if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                        # Trailing metadata chunks (common with Search grounding and Vertex AI)
+                        # arrive with an empty candidates list but carry usage_metadata or
+                        # grounding_metadata. Treating them as blocks is a false positive that
+                        # also abandons the socket, causing the asyncio "Unclosed connection"
+                        # warning. Skip them and let the loop finish naturally.
+                        if (
+                            getattr(chunk, "usage_metadata", None) is not None
+                            or getattr(chunk, "grounding_metadata", None) is not None
+                        ):
+                            if getattr(chunk, "usage_metadata", None):
+                                stream_usage_metadata = chunk.usage_metadata
+                            continue
+
+                        # Explicit prompt-level block with a stated reason
+                        if (
+                            getattr(chunk, "prompt_feedback", None)
+                            and chunk.prompt_feedback.block_reason
+                        ):
                             block_reason = chunk.prompt_feedback.block_reason.name
                             message = f"[Blocked due to Prompt Safety: {block_reason}]"
                             await emit_chat_event(
@@ -2926,19 +2942,25 @@ class Pipe:
                                 },
                             )
                             yield message
-                        else:
-                            message = "[Blocked by safety settings]"
-                            await emit_chat_event(
-                                "chat:finish",
-                                {
-                                    "role": "assistant",
-                                    "content": message,
-                                    "done": True,
-                                    "error": True,
-                                },
-                            )
-                            yield message
-                        return  # Stop generation
+                            if hasattr(response_iterator, "aclose"):
+                                await response_iterator.aclose()
+                            return
+
+                        # Genuine mid-stream safety block (empty candidates, no metadata)
+                        message = "[Blocked by safety settings]"
+                        await emit_chat_event(
+                            "chat:finish",
+                            {
+                                "role": "assistant",
+                                "content": message,
+                                "done": True,
+                                "error": True,
+                            },
+                        )
+                        yield message
+                        if hasattr(response_iterator, "aclose"):
+                            await response_iterator.aclose()
+                        return
 
                     if chunk.candidates[0].grounding_metadata:
                         grounding_metadata_list.append(
@@ -3310,6 +3332,15 @@ class Pipe:
                 },
             )
             yield message
+        finally:
+            # Guarantee the response iterator is closed on every exit path so the
+            # underlying httpx/aiohttp socket is released and asyncio does not log
+            # an "Unclosed connection" warning.
+            if hasattr(response_iterator, "aclose"):
+                try:
+                    await response_iterator.aclose()
+                except Exception:
+                    pass
 
     @staticmethod
     def _build_usage_dict(usage_metadata: Any) -> Optional[Dict[str, int]]:
