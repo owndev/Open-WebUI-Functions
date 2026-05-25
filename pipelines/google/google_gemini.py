@@ -2861,6 +2861,67 @@ class Pipe:
 
         return replaced_text if replaced_text is not None else text
 
+    @staticmethod
+    def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """Chunk text using LangChain's splitter, falling back to a manual implementation."""
+        try:
+            from langchain.text_splitter import RecursiveCharacterTextSplitter
+            return RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            ).split_text(text)
+        except Exception:
+            chunks: List[str] = []
+            start = 0
+            while start < len(text):
+                chunks.append(text[start : start + chunk_size])
+                start += chunk_size - chunk_overlap
+            return chunks
+
+    async def _rag_chunks(
+        self,
+        chunks: List[str],
+        query: str,
+        top_k: int,
+        __request__: Optional[Request] = None,
+    ) -> List[str]:
+        """Return the top_k most relevant chunks via cosine similarity over embeddings.
+
+        Uses OWUI's configured embedding function (request.app.state.EMBEDDING_FUNCTION)
+        and the query/content prefix settings from OWUI's RAG config. Falls back to
+        returning the first top_k chunks if embedding is unavailable or fails.
+        """
+        embedding_fn = getattr(
+            getattr(getattr(__request__, "app", None), "state", None),
+            "EMBEDDING_FUNCTION",
+            None,
+        )
+        if embedding_fn is None:
+            self.log.debug("[fetch] no EMBEDDING_FUNCTION available, using first-K chunks")
+            return chunks[:top_k]
+
+        cfg = getattr(getattr(getattr(__request__, "app", None), "state", None), "config", None)
+        query_prefix: str = str(getattr(cfg, "RAG_EMBEDDING_QUERY_PREFIX", "") or "")
+        content_prefix: str = str(getattr(cfg, "RAG_EMBEDDING_CONTENT_PREFIX", "") or "")
+
+        try:
+            import numpy as np
+
+            query_emb = np.array(await embedding_fn(query, prefix=query_prefix))
+            chunk_embs = np.array(
+                await embedding_fn(chunks, prefix=content_prefix)
+            )
+            norms = np.linalg.norm(chunk_embs, axis=1) * np.linalg.norm(query_emb) + 1e-10
+            sims = np.dot(chunk_embs, query_emb) / norms
+            top_idx = sorted(np.argsort(sims)[::-1][:top_k].tolist())
+            self.log.info(
+                f"[fetch] RAG: selected {len(top_idx)}/{len(chunks)} chunks "
+                f"(scores: {[round(float(sims[i]), 3) for i in top_idx]})"
+            )
+            return [chunks[i] for i in top_idx]
+        except Exception as e:
+            self.log.warning(f"[fetch] RAG embedding failed, using first-K chunks: {e}")
+            return chunks[:top_k]
+
     async def _resolve_grounding_redirects(
         self,
         urls: List[str],
@@ -2914,6 +2975,7 @@ class Pipe:
     async def _fetch_url_for_owui(
         self,
         url: str,
+        query: Optional[str] = None,
         __event_emitter__: Optional[Callable] = None,
         __request__: Optional[Request] = None,
     ) -> str:
@@ -2922,12 +2984,19 @@ class Pipe:
         OWUI's fetch_url built-in truncates content somewhere in its WebBaseLoader
         pipeline (experimentally ~1200 chars on Wikipedia) regardless of the
         WEB_FETCH_MAX_CONTENT_LENGTH setting. This implementation uses aiohttp
-        directly and strips HTML with BeautifulSoup, returning the full page text.
+        directly and strips HTML with BeautifulSoup.
+
+        When the fetched content exceeds CHUNK_SIZE * 2 chars and a query is
+        provided, the text is chunked and run through OWUI's embedding function
+        for in-memory cosine-similarity retrieval (RAG_TOP_K chunks returned).
+        This mirrors OWUI's RAG pipeline without requiring a vector DB.
 
         Respects OWUI config when __request__ is provided:
-          WEB_FETCH_MAX_CONTENT_LENGTH  — max chars returned (None = no limit)
+          WEB_FETCH_MAX_CONTENT_LENGTH       — hard cap on returned chars (None = no limit)
           ENABLE_WEB_LOADER_SSL_VERIFICATION — SSL cert verification (default True)
-          WEB_LOADER_TIMEOUT            — request timeout in seconds (default 30)
+          WEB_LOADER_TIMEOUT                 — request timeout in seconds (default 30)
+          CHUNK_SIZE / CHUNK_OVERLAP         — chunking parameters (defaults 1500 / 100)
+          RAG_TOP_K                          — chunks to return after retrieval (default 4)
         """
         self.log.info(f"[fetch] intercepting fetch_url: {url!r}")
 
@@ -2937,6 +3006,9 @@ class Pipe:
         max_content_length: Optional[int] = getattr(cfg, "WEB_FETCH_MAX_CONTENT_LENGTH", None)
         verify_ssl: bool = bool(getattr(cfg, "ENABLE_WEB_LOADER_SSL_VERIFICATION", True))
         loader_timeout: int = int(getattr(cfg, "WEB_LOADER_TIMEOUT", None) or 30)
+        chunk_size: int = max(int(getattr(cfg, "CHUNK_SIZE", 0) or 0), 1500)
+        chunk_overlap: int = max(int(getattr(cfg, "CHUNK_OVERLAP", 0) or 0), 100)
+        rag_top_k: int = max(int(getattr(cfg, "RAG_TOP_K", 0) or 0), 4)
 
         if __event_emitter__:
             try:
@@ -2992,6 +3064,17 @@ class Pipe:
                 text = _re.sub(r"\n{3,}", "\n\n", text)
             else:
                 text = raw_bytes.decode("utf-8", errors="replace")
+
+            # RAG: chunk and retrieve when content is large and a query is available.
+            # Threshold is 2x chunk_size — below that, the model can read it all.
+            if query and len(text) > chunk_size * 2:
+                chunks = self._split_text(text, chunk_size, chunk_overlap)
+                self.log.info(
+                    f"[fetch] RAG: {len(chunks)} chunks from {len(text)} chars, "
+                    f"retrieving top {rag_top_k} for query {query[:80]!r}"
+                )
+                selected = await self._rag_chunks(chunks, query, rag_top_k, __request__)
+                text = "\n\n---\n\n".join(selected)
 
             # Apply WEB_FETCH_MAX_CONTENT_LENGTH if configured (mirrors OWUI behaviour)
             if max_content_length and max_content_length > 0 and len(text) > max_content_length:
@@ -3491,8 +3574,19 @@ class Pipe:
                                 tool_name in _fetch_url_names
                                 and self.valves.REPLACE_FETCH_URL
                             ):
+                                # Extract the user's original question as the RAG query
+                                _fetch_query = ""
+                                for _c in current_contents:
+                                    if getattr(_c, "role", "") == "user":
+                                        for _p in getattr(_c, "parts", []) or []:
+                                            if getattr(_p, "text", None):
+                                                _fetch_query = _p.text[:500]
+                                                break
+                                    if _fetch_query:
+                                        break
                                 tool_result = await self._fetch_url_for_owui(
                                     url=tool_args.get("url", ""),
+                                    query=_fetch_query or None,
                                     __event_emitter__=__event_emitter__,
                                     __request__=__request__,
                                 )
@@ -4441,8 +4535,23 @@ class Pipe:
                                         tool_name in _fetch_url_names
                                         and self.valves.REPLACE_FETCH_URL
                                     ):
+                                        # Extract the user's original question as the RAG query
+                                        _fetch_query = ""
+                                        for _m in messages:
+                                            if _m.get("role") == "user":
+                                                _mc = _m.get("content", "")
+                                                if isinstance(_mc, str):
+                                                    _fetch_query = _mc[:500]
+                                                elif isinstance(_mc, list):
+                                                    for _item in _mc:
+                                                        if isinstance(_item, dict) and _item.get("type") == "text":
+                                                            _fetch_query = _item.get("text", "")[:500]
+                                                            break
+                                            if _fetch_query:
+                                                break
                                         tool_result = await self._fetch_url_for_owui(
                                             url=tool_args.get("url", ""),
+                                            query=_fetch_query or None,
                                             __event_emitter__=__event_emitter__,
                                             __request__=__request__,
                                         )
