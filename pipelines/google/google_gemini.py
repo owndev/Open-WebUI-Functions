@@ -342,6 +342,14 @@ class Pipe:
             "web_search → google_search_tool in metadata. When enabled, native grounding "
             "is skipped in favour of this Python-tool approach.",
         )
+        REPLACE_FETCH_URL: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_FETCH_URL", "true").lower() == "true",
+            description="Intercept OWUI's fetch_url tool calls and fulfill them with a "
+            "direct aiohttp fetch + BeautifulSoup text extraction, bypassing OWUI's "
+            "loader chain entirely. Eliminates the mysterious ~1200-char truncation that "
+            "occurs somewhere in OWUI's WebBaseLoader pipeline regardless of the "
+            "WEB_FETCH_MAX_CONTENT_LENGTH setting.",
+        )
 
         # Image Processing Configuration
         IMAGE_GENERATION_ASPECT_RATIO: str = Field(
@@ -2903,6 +2911,108 @@ class Pipe:
             self.log.warning(f"[search] redirect resolution failed: {e}")
             return {u: u for u in urls}
 
+    async def _fetch_url_for_owui(
+        self,
+        url: str,
+        __event_emitter__: Optional[Callable] = None,
+    ) -> str:
+        """Fetch a URL and return clean plain text, bypassing OWUI's loader chain.
+
+        OWUI's fetch_url built-in truncates content somewhere in its WebBaseLoader
+        pipeline (experimentally ~1200 chars on Wikipedia) regardless of the
+        WEB_FETCH_MAX_CONTENT_LENGTH setting. This implementation uses aiohttp
+        directly and strips HTML with BeautifulSoup, returning the full page text.
+        """
+        self.log.info(f"[fetch] intercepting fetch_url: {url!r}")
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": f"Fetching: {url}",
+                            "done": False,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+
+        try:
+            import aiohttp
+            from bs4 import BeautifulSoup
+        except ImportError as e:
+            return f"Error: missing dependency ({e})"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    raw_bytes = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "")
+
+            if "text/html" in content_type or not content_type:
+                encoding = resp.charset or "utf-8"
+                html = raw_bytes.decode(encoding, errors="replace")
+                soup = BeautifulSoup(html, "html.parser")
+                # Remove script, style, nav, footer — keep readable body text
+                for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+                # Collapse runs of blank lines to at most two
+                import re as _re
+                text = _re.sub(r"\n{3,}", "\n\n", text)
+            else:
+                text = raw_bytes.decode("utf-8", errors="replace")
+
+            self.log.info(f"[fetch] fetched {len(text)} chars from {url!r}")
+
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Fetched {len(text):,} chars from {url}",
+                                "done": True,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return text
+
+        except Exception as e:
+            self.log.warning(f"[fetch] failed to fetch {url!r}: {e}")
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Failed to fetch {url}: {e}",
+                                "done": True,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+            return f"Error fetching {url}: {e}"
+
     async def _google_search_for_owui(
         self,
         query: str,
@@ -3343,6 +3453,7 @@ class Pipe:
                             _web_search_names = {
                                 "search_web", "web_search", "search_internet"
                             }
+                            _fetch_url_names = {"fetch_url", "browse_url", "get_url"}
                             if (
                                 tool_name in _web_search_names
                                 and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -3350,6 +3461,14 @@ class Pipe:
                                 tool_result = await self._google_search_for_owui(
                                     query=tool_args.get("query", ""),
                                     model_id=model_id,
+                                    __event_emitter__=__event_emitter__,
+                                )
+                            elif (
+                                tool_name in _fetch_url_names
+                                and self.valves.REPLACE_FETCH_URL
+                            ):
+                                tool_result = await self._fetch_url_for_owui(
+                                    url=tool_args.get("url", ""),
                                     __event_emitter__=__event_emitter__,
                                 )
                             else:
@@ -4283,6 +4402,7 @@ class Pipe:
                                     _web_search_names = {
                                         "search_web", "web_search", "search_internet"
                                     }
+                                    _fetch_url_names = {"fetch_url", "browse_url", "get_url"}
                                     if (
                                         tool_name in _web_search_names
                                         and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -4290,6 +4410,14 @@ class Pipe:
                                         tool_result = await self._google_search_for_owui(
                                             query=tool_args.get("query", ""),
                                             model_id=model_id,
+                                            __event_emitter__=__event_emitter__,
+                                        )
+                                    elif (
+                                        tool_name in _fetch_url_names
+                                        and self.valves.REPLACE_FETCH_URL
+                                    ):
+                                        tool_result = await self._fetch_url_for_owui(
+                                            url=tool_args.get("url", ""),
                                             __event_emitter__=__event_emitter__,
                                         )
                                     else:
