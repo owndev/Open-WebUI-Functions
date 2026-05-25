@@ -2899,19 +2899,46 @@ class Pipe:
                 ),
             )
             results = []
+            source_chunks: list = []
             if response.candidates:
+                # Extract grounded response text — this is the synthesized answer
+                # the model produced using Google Search; include it so the outer
+                # model can quote/cite it rather than seeing empty content.
+                response_text = ""
+                for part in getattr(response.candidates[0].content, "parts", []) or []:
+                    if getattr(part, "text", None):
+                        response_text += part.text
+
                 metadata = getattr(response.candidates[0], "grounding_metadata", None)
+                source_chunks = []
                 if metadata and metadata.grounding_chunks:
                     for chunk in metadata.grounding_chunks:
                         if getattr(chunk, "web", None) and chunk.web:
-                            results.append(
+                            source_chunks.append(
                                 {
                                     "title": chunk.web.title or "",
                                     "url": chunk.web.uri or "",
                                     "content": "",
                                 }
                             )
-            self.log.info(f"[search] Google returned {len(results)} results for {query!r}")
+
+                if response_text:
+                    # Lead with a summary entry carrying the full grounded text so
+                    # the outer model has actual content to synthesize from.
+                    results.append(
+                        {
+                            "title": f"Google Search: {query}",
+                            "url": f"https://www.google.com/search?q={query.replace(' ', '+')}",
+                            "content": response_text,
+                        }
+                    )
+                # Append individual source chunks for OWUI's source-card display.
+                results.extend(source_chunks)
+
+            self.log.info(
+                f"[search] Google returned {len(results)} results for {query!r} "
+                f"(content_chars={sum(len(r['content']) for r in results)})"
+            )
 
             if __event_emitter__:
                 try:
@@ -2920,11 +2947,11 @@ class Pipe:
                             "type": "status",
                             "data": {
                                 "action": "web_search",
-                                "description": f"Found {len(results)} results for: {query}",
+                                "description": f"Found {len(source_chunks)} results for: {query}",
                                 "done": True,
                                 "urls": [
-                                    f"https://www.google.com/search?q={query}"
-                                ],
+                                    r["url"] for r in source_chunks if r["url"]
+                                ] or [f"https://www.google.com/search?q={query}"],
                             },
                         }
                     )
