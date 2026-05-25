@@ -1252,6 +1252,87 @@ class Pipe:
         """Return True for Open WebUI's built-in image generation tools."""
         return tool_name in {"generate_image", "edit_image"}
 
+    @staticmethod
+    def _owui_callable_to_gemini_tool(name: str, fn: Any) -> Optional["types.Tool"]:
+        """Convert an OWUI tool callable to a Gemini types.Tool with a clean FunctionDeclaration.
+
+        OWUI callables carry injected parameters (__user__, __request__,
+        __event_emitter__, __metadata__, …) that must NOT appear in the
+        function declaration sent to Gemini.  Passing the bare callable to the
+        SDK causes the SDK to introspect the full signature, insert those
+        params, and — even with AFC disabled — log AFC activity and make the
+        model call the function with empty stub objects, producing blank output.
+        """
+        import inspect as _inspect
+
+        # JSON-Schema type for common Python annotations
+        _TYPE_MAP = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            list: "array",
+            dict: "object",
+        }
+
+        try:
+            sig = _inspect.signature(fn)
+        except (ValueError, TypeError):
+            return None
+
+        properties: dict = {}
+        required: list = []
+
+        for param_name, param in sig.parameters.items():
+            # Skip OWUI injected params, self/cls, and *args/**kwargs
+            if (
+                param_name.startswith("__")
+                or param_name in ("self", "cls")
+                or param.kind in (
+                    _inspect.Parameter.VAR_POSITIONAL,
+                    _inspect.Parameter.VAR_KEYWORD,
+                )
+            ):
+                continue
+
+            ann = param.annotation
+            # Unwrap Optional[X] → X
+            origin = getattr(ann, "__origin__", None)
+            if origin is Union:
+                args = [a for a in ann.__args__ if a is not type(None)]
+                ann = args[0] if args else str
+            elif origin is not None:
+                ann = origin  # e.g. List → list
+
+            json_type = _TYPE_MAP.get(ann, "string")
+            prop: dict = {"type": json_type}
+
+            # Use docstring-derived description if available via __doc__ on the param
+            # (rare, but keep the slot for future enrichment)
+
+            properties[param_name] = prop
+
+            if param.default is _inspect.Parameter.empty:
+                required.append(param_name)
+
+        doc = _inspect.getdoc(fn) or ""
+        params_schema: dict = {"type": "OBJECT", "properties": {
+            k: {"type": v["type"].upper() if v["type"] not in ("array", "object") else v["type"].upper()}
+            for k, v in properties.items()
+        }}
+        if required:
+            params_schema["required"] = required
+
+        try:
+            decl = types.FunctionDeclaration(
+                name=name,
+                description=doc[:1000] if doc else "",
+                parameters=params_schema,
+            )
+            return types.Tool(function_declarations=[decl])
+        except Exception:
+            return None
+
     async def _process_tool_result_for_owui(
         self,
         tool_result: Any,
@@ -2742,12 +2823,17 @@ class Pipe:
                     )
                     continue
                 if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.info(
-                        f"Registering native tool with Gemini: '{name}' "
-                        f"signature={getattr(tool, '__signature__', '<no signature>')}"
-                    )
-                    tools.append(tool)
+                    callable_fn = tool_def["callable"]
+                    gemini_tool = self._owui_callable_to_gemini_tool(name, callable_fn)
+                    if gemini_tool is not None:
+                        self.log.info(
+                            f"Registering native tool with Gemini (clean declaration): '{name}'"
+                        )
+                        tools.append(gemini_tool)
+                    else:
+                        self.log.warning(
+                            f"Could not build FunctionDeclaration for tool '{name}'; skipping"
+                        )
 
         if tools:
             gen_config_params["tools"] = tools
