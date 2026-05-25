@@ -3573,22 +3573,24 @@ class Pipe:
                                 # so it can be echoed back in history alongside
                                 # the function_call parts for Gemini 3 models.
                                 thought_parts_this_round.append(part)
-                                # Emit a live preview of what is currently being thought
-                                preview = part.text.replace("\n", " ").strip()
-                                MAX_PREVIEW = 120
-                                if len(preview) > MAX_PREVIEW:
-                                    preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                                await __event_emitter__(
-                                    {
-                                        "type": "status",
-                                        "data": {
-                                            "action": "thinking",
-                                            "description": f"Thinking… {preview}",
-                                            "done": False,
-                                            "hidden": False,
-                                        },
-                                    }
-                                )
+                                # Emit a single "Thinking…" status on first thought
+                                # so OWUI shows a spinner. We do NOT include the
+                                # actual thought text here — doing so causes OWUI
+                                # to render its own collapsible thought block,
+                                # duplicating the <details> block we emit at the
+                                # end of the full response.
+                                if thinking_started_at is None:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "action": "thinking",
+                                                "description": "Thinking…",
+                                                "done": False,
+                                                "hidden": True,
+                                            },
+                                        }
+                                    )
 
                             # Regular answer text
                             elif getattr(part, "text", None):
@@ -4543,17 +4545,8 @@ class Pipe:
                                     f"[non-stream] function_call detected: name={tool_name!r} "
                                     f"args={dict(part.function_call.args) if part.function_call.args else {}}"
                                 )
-                                if __event_emitter__:
-                                    await __event_emitter__(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "action": "tool_calls",
-                                                "description": f"Calling: {tool_name}",
-                                                "done": False,
-                                            },
-                                        }
-                                    )
+                                # Status is emitted in the execution loop below;
+                                # emitting here too causes duplicate "Executing" entries.
                             elif (
                                 getattr(part, "inline_data", None)
                                 and __request__
