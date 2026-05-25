@@ -352,6 +352,12 @@ class Pipe:
             "Independent of REPLACE_FETCH_URL (which controls the implementation used "
             "when fetching is enabled).",
         )
+        MAX_TOOL_ITERATIONS: int = Field(
+            default=int(os.getenv("GOOGLE_MAX_TOOL_ITERATIONS", "10")),
+            description="Maximum number of tool-call round-trips the pipe will execute per "
+            "request before stopping. Prevents runaway agent loops. Set via the "
+            "GOOGLE_MAX_TOOL_ITERATIONS environment variable. Default: 10.",
+        )
         REPLACE_IMAGE_GENERATION: bool = Field(
             default=os.getenv("GOOGLE_REPLACE_IMAGE_GENERATION", "true").lower() == "true",
             description="Intercept OWUI's generate_image and edit_image tool calls and "
@@ -2855,17 +2861,16 @@ class Pipe:
                             f"Could not build FunctionDeclaration for tool '{name}'; skipping"
                         )
 
-        # Always disable the SDK's Automatic Function Calling (AFC). When enabled,
-        # the SDK imposes a hard cap of 10 remote calls and intercepts function_call
-        # parts before our loop sees them. We drive all tool round-trips ourselves,
-        # so AFC must be off unconditionally — even on requests with no tools, where
-        # the SDK would otherwise silently default to AFC-enabled.
-        gen_config_params["automatic_function_calling"] = (
-            types.AutomaticFunctionCallingConfig(disable=True)
-        )
-
         if tools:
             gen_config_params["tools"] = tools
+            # Disable the SDK's Automatic Function Calling (AFC) so our own tool
+            # execution loop in _handle_streaming_response / pipe handles the round-
+            # trips. AFC intercepts function_call parts before we see them and passes
+            # raw Python return values (including OWUI's (HTMLResponse, str) tuples)
+            # directly to Gemini, which Gemini cannot deserialise — causing blank output.
+            gen_config_params["automatic_function_calling"] = (
+                types.AutomaticFunctionCallingConfig(disable=True)
+            )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -3573,12 +3578,12 @@ class Pipe:
         stream_usage_metadata = None
 
         # Tool call loop: keep iterating as long as the model returns function calls
-        MAX_TOOL_ITERATIONS = 10
+        max_tool_iterations = self.valves.MAX_TOOL_ITERATIONS
         tool_call_iteration = 0
         current_contents = list(contents) if contents is not None else []
 
         try:
-            while tool_call_iteration <= MAX_TOOL_ITERATIONS:
+            while tool_call_iteration <= max_tool_iterations:
                 function_call_parts_this_round: list = []
                 # Gemini 3 (and 2.5 thinking) models embed a thought_signature
                 # on each thought Part. The whole model turn — thoughts AND
@@ -3759,9 +3764,9 @@ class Pipe:
                     )
                     break
 
-                if tool_call_iteration >= MAX_TOOL_ITERATIONS:
+                if tool_call_iteration >= max_tool_iterations:
                     self.log.warning(
-                        f"Native tool call loop reached MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}; "
+                        f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
                         "stopping to prevent runaway agent."
                     )
                     break
@@ -4564,7 +4569,7 @@ class Pipe:
                     start_ts = time.time()
 
                     # Accumulate content across all tool-call rounds
-                    MAX_TOOL_ITERATIONS = 10
+                    max_tool_iterations = self.valves.MAX_TOOL_ITERATIONS
                     tool_call_iteration = 0
                     current_contents = list(contents)
 
@@ -4578,7 +4583,7 @@ class Pipe:
                     grounding_metadata_list = []
                     response = None
 
-                    while tool_call_iteration <= MAX_TOOL_ITERATIONS:
+                    while tool_call_iteration <= max_tool_iterations:
                         # Send processing status for image generation (first request only)
                         if tool_call_iteration == 0 and supports_image_generation:
                             await __event_emitter__(
@@ -4726,9 +4731,9 @@ class Pipe:
                         if not can_execute:
                             break
 
-                        if tool_call_iteration >= MAX_TOOL_ITERATIONS:
+                        if tool_call_iteration >= max_tool_iterations:
                             self.log.warning(
-                                f"Native tool call loop reached MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}; "
+                                f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
                                 "stopping to prevent runaway agent."
                             )
                             break
