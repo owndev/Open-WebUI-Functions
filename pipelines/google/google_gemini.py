@@ -2853,6 +2853,56 @@ class Pipe:
 
         return replaced_text if replaced_text is not None else text
 
+    async def _resolve_grounding_redirects(
+        self,
+        urls: List[str],
+        timeout_sec: float = 3.0,
+    ) -> Dict[str, str]:
+        """Resolve Vertex grounding-api-redirect URLs to their final destinations.
+
+        These redirect URLs (vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+        are temporary proxies and reject direct fetches with 400. The model wastes a
+        round trying to crawl them. We pre-resolve via a single HEAD/GET and hand the
+        model the real publisher URLs. Returns {original: resolved}; failures map to
+        the original so callers can always look up a value.
+        """
+        if not urls:
+            return {}
+        try:
+            import aiohttp
+        except ImportError:
+            return {u: u for u in urls}
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            )
+        }
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+        async def resolve_one(session, url: str) -> Tuple[str, str]:
+            try:
+                async with session.get(url, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("Location")
+                        if loc:
+                            return url, loc
+            except Exception:
+                pass
+            return url, url
+
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                pairs = await asyncio.gather(
+                    *(resolve_one(session, u) for u in urls),
+                    return_exceptions=False,
+                )
+                return dict(pairs)
+        except Exception as e:
+            self.log.warning(f"[search] redirect resolution failed: {e}")
+            return {u: u for u in urls}
+
     async def _google_search_for_owui(
         self,
         query: str,
@@ -2912,30 +2962,58 @@ class Pipe:
                 metadata = getattr(response.candidates[0], "grounding_metadata", None)
                 source_chunks = []
                 if metadata and metadata.grounding_chunks:
+                    # Resolve Vertex grounding-api-redirect URLs to real publisher
+                    # URLs so the model can crawl them with fetch_url if needed.
+                    raw_uris = [
+                        chunk.web.uri
+                        for chunk in metadata.grounding_chunks
+                        if getattr(chunk, "web", None) and chunk.web and chunk.web.uri
+                    ]
+                    url_map = await self._resolve_grounding_redirects(raw_uris)
+                    resolved_count = sum(
+                        1 for orig, final in url_map.items() if final != orig
+                    )
+                    self.log.debug(
+                        f"[search] resolved {resolved_count}/{len(raw_uris)} redirect URLs"
+                    )
+
                     for chunk in metadata.grounding_chunks:
                         if getattr(chunk, "web", None) and chunk.web:
+                            resolved_url = url_map.get(chunk.web.uri, chunk.web.uri or "")
                             source_chunks.append(
                                 {
                                     "title": chunk.web.title or "",
-                                    "url": chunk.web.uri or "",
+                                    "url": resolved_url,
                                     "content": "",
                                 }
                             )
 
                     # Emit each grounding chunk as a persisted "source" event so
                     # OWUI renders the citation chips/source panel under the
-                    # message, matching the native-grounding UX.
+                    # message, matching the native-grounding UX. Use resolved
+                    # URLs so the chips link to real publisher pages.
                     if __event_emitter__:
-                        sources = self._format_grounding_chunks_as_sources(
-                            metadata.grounding_chunks
-                        )
-                        for source in sources:
-                            try:
-                                await __event_emitter__(
-                                    {"type": "source", "data": source}
+                        for chunk in metadata.grounding_chunks:
+                            if getattr(chunk, "web", None) and chunk.web:
+                                title = chunk.web.title or "Source"
+                                resolved_url = url_map.get(
+                                    chunk.web.uri, chunk.web.uri
                                 )
-                            except Exception:
-                                pass
+                                source_event = {
+                                    "source": {
+                                        "name": title,
+                                        "type": "web_search_results",
+                                        "url": resolved_url,
+                                    },
+                                    "document": ["Click the link to view the content."],
+                                    "metadata": [{"source": title}],
+                                }
+                                try:
+                                    await __event_emitter__(
+                                        {"type": "source", "data": source_event}
+                                    )
+                                except Exception:
+                                    pass
 
                 if response_text:
                     # Lead with a summary entry carrying the full grounded text so
