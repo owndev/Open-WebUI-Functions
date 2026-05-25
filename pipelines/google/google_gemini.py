@@ -1301,14 +1301,26 @@ class Pipe:
             if origin is Union:
                 args = [a for a in ann.__args__ if a is not type(None)]
                 ann = args[0] if args else str
-            elif origin is not None:
-                ann = origin  # e.g. List → list
+                # re-derive origin after unwrap
+                origin = getattr(ann, "__origin__", None)
+                if origin is not None:
+                    ann = origin
+
+            # Try to extract the element type for List[X] before collapsing to list
+            elem_ann = None
+            type_args = getattr(ann, "__args__", None)
+            if type_args and ann in (list,):
+                elem_ann = type_args[0]
+            elif origin is list and type_args:
+                elem_ann = type_args[0]
 
             json_type = _TYPE_MAP.get(ann, "string")
-            prop: dict = {"type": json_type}
+            prop: dict = {"type": json_type.upper()}
 
-            # Use docstring-derived description if available via __doc__ on the param
-            # (rare, but keep the slot for future enrichment)
+            # Gemini requires array properties to include an items schema
+            if json_type == "array":
+                elem_type = _TYPE_MAP.get(elem_ann, "string").upper() if elem_ann else "STRING"
+                prop["items"] = {"type": elem_type}
 
             properties[param_name] = prop
 
@@ -1316,10 +1328,7 @@ class Pipe:
                 required.append(param_name)
 
         doc = _inspect.getdoc(fn) or ""
-        params_schema: dict = {"type": "OBJECT", "properties": {
-            k: {"type": v["type"].upper() if v["type"] not in ("array", "object") else v["type"].upper()}
-            for k, v in properties.items()
-        }}
+        params_schema: dict = {"type": "OBJECT", "properties": properties}
         if required:
             params_schema["required"] = required
 
