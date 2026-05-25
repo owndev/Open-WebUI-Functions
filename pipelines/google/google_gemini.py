@@ -342,13 +342,23 @@ class Pipe:
             "web_search → google_search_tool in metadata. When enabled, native grounding "
             "is skipped in favour of this Python-tool approach.",
         )
+        ENABLE_FETCH_URL: bool = Field(
+            default=os.getenv("GOOGLE_ENABLE_FETCH_URL", "true").lower() == "true",
+            description="Allow the model to call fetch_url / browse_url at all. "
+            "Set to false to block all URL fetching by the model — the tool call "
+            "is intercepted and the model receives a 'disabled' message instead of "
+            "making any outbound request. Useful as a security measure against SSRF "
+            "or prompt-injection attacks that try to exfiltrate data via URL fetches. "
+            "Independent of REPLACE_FETCH_URL (which controls the implementation used "
+            "when fetching is enabled).",
+        )
         REPLACE_FETCH_URL: bool = Field(
             default=os.getenv("GOOGLE_REPLACE_FETCH_URL", "true").lower() == "true",
             description="Intercept OWUI's fetch_url tool calls and fulfill them with a "
             "direct aiohttp fetch + BeautifulSoup text extraction, bypassing OWUI's "
             "loader chain entirely. Eliminates the mysterious ~1200-char truncation that "
             "occurs somewhere in OWUI's WebBaseLoader pipeline regardless of the "
-            "WEB_FETCH_MAX_CONTENT_LENGTH setting.",
+            "WEB_FETCH_MAX_CONTENT_LENGTH setting. Only applies when ENABLE_FETCH_URL is true.",
         )
 
         # Image Processing Configuration
@@ -3560,7 +3570,7 @@ class Pipe:
                             _web_search_names = {
                                 "search_web", "web_search", "search_internet"
                             }
-                            _fetch_url_names = {"fetch_url", "browse_url", "get_url"}
+                            _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
                             if (
                                 tool_name in _web_search_names
                                 and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -3570,26 +3580,36 @@ class Pipe:
                                     model_id=model_id,
                                     __event_emitter__=__event_emitter__,
                                 )
-                            elif (
-                                tool_name in _fetch_url_names
-                                and self.valves.REPLACE_FETCH_URL
-                            ):
-                                # Extract the user's original question as the RAG query
-                                _fetch_query = ""
-                                for _c in current_contents:
-                                    if getattr(_c, "role", "") == "user":
-                                        for _p in getattr(_c, "parts", []) or []:
-                                            if getattr(_p, "text", None):
-                                                _fetch_query = _p.text[:500]
-                                                break
-                                    if _fetch_query:
-                                        break
-                                tool_result = await self._fetch_url_for_owui(
-                                    url=tool_args.get("url", ""),
-                                    query=_fetch_query or None,
-                                    __event_emitter__=__event_emitter__,
-                                    __request__=__request__,
-                                )
+                            elif tool_name in _fetch_url_names:
+                                if not self.valves.ENABLE_FETCH_URL:
+                                    self.log.warning(
+                                        f"[stream] fetch_url blocked by ENABLE_FETCH_URL=false: {tool_args.get('url', '')!r}"
+                                    )
+                                    tool_result = (
+                                        "fetch_url is disabled by the administrator. "
+                                        "Do not attempt to fetch URLs."
+                                    )
+                                elif self.valves.REPLACE_FETCH_URL:
+                                    # Extract the user's original question as the RAG query
+                                    _fetch_query = ""
+                                    for _c in current_contents:
+                                        if getattr(_c, "role", "") == "user":
+                                            for _p in getattr(_c, "parts", []) or []:
+                                                if getattr(_p, "text", None):
+                                                    _fetch_query = _p.text[:500]
+                                                    break
+                                        if _fetch_query:
+                                            break
+                                    tool_result = await self._fetch_url_for_owui(
+                                        url=tool_args.get("url", ""),
+                                        query=_fetch_query or None,
+                                        __event_emitter__=__event_emitter__,
+                                        __request__=__request__,
+                                    )
+                                else:
+                                    tool_callable = __tools__[tool_name]["callable"]
+                                    _raw = tool_callable(**tool_args)
+                                    tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                             else:
                                 tool_callable = __tools__[tool_name]["callable"]
                                 # Call first, then check isawaitable — handles functools.partial
@@ -4521,7 +4541,7 @@ class Pipe:
                                     _web_search_names = {
                                         "search_web", "web_search", "search_internet"
                                     }
-                                    _fetch_url_names = {"fetch_url", "browse_url", "get_url"}
+                                    _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
                                     if (
                                         tool_name in _web_search_names
                                         and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
@@ -4531,30 +4551,40 @@ class Pipe:
                                             model_id=model_id,
                                             __event_emitter__=__event_emitter__,
                                         )
-                                    elif (
-                                        tool_name in _fetch_url_names
-                                        and self.valves.REPLACE_FETCH_URL
-                                    ):
-                                        # Extract the user's original question as the RAG query
-                                        _fetch_query = ""
-                                        for _m in messages:
-                                            if _m.get("role") == "user":
-                                                _mc = _m.get("content", "")
-                                                if isinstance(_mc, str):
-                                                    _fetch_query = _mc[:500]
-                                                elif isinstance(_mc, list):
-                                                    for _item in _mc:
-                                                        if isinstance(_item, dict) and _item.get("type") == "text":
-                                                            _fetch_query = _item.get("text", "")[:500]
-                                                            break
-                                            if _fetch_query:
-                                                break
-                                        tool_result = await self._fetch_url_for_owui(
-                                            url=tool_args.get("url", ""),
-                                            query=_fetch_query or None,
-                                            __event_emitter__=__event_emitter__,
-                                            __request__=__request__,
-                                        )
+                                    elif tool_name in _fetch_url_names:
+                                        if not self.valves.ENABLE_FETCH_URL:
+                                            self.log.warning(
+                                                f"[non-stream] fetch_url blocked by ENABLE_FETCH_URL=false: {tool_args.get('url', '')!r}"
+                                            )
+                                            tool_result = (
+                                                "fetch_url is disabled by the administrator. "
+                                                "Do not attempt to fetch URLs."
+                                            )
+                                        elif self.valves.REPLACE_FETCH_URL:
+                                            # Extract the user's original question as the RAG query
+                                            _fetch_query = ""
+                                            for _m in messages:
+                                                if _m.get("role") == "user":
+                                                    _mc = _m.get("content", "")
+                                                    if isinstance(_mc, str):
+                                                        _fetch_query = _mc[:500]
+                                                    elif isinstance(_mc, list):
+                                                        for _item in _mc:
+                                                            if isinstance(_item, dict) and _item.get("type") == "text":
+                                                                _fetch_query = _item.get("text", "")[:500]
+                                                                break
+                                                if _fetch_query:
+                                                    break
+                                            tool_result = await self._fetch_url_for_owui(
+                                                url=tool_args.get("url", ""),
+                                                query=_fetch_query or None,
+                                                __event_emitter__=__event_emitter__,
+                                                __request__=__request__,
+                                            )
+                                        else:
+                                            tool_callable = __tools__[tool_name]["callable"]
+                                            _raw = tool_callable(**tool_args)
+                                            tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
                                     else:
                                         tool_callable = __tools__[tool_name]["callable"]
                                         # Call first, then check isawaitable — handles functools.partial
