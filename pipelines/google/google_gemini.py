@@ -1485,59 +1485,6 @@ class Pipe:
 
         return llm_text or ""
 
-    async def _emit_citation_sources_for_tool(
-        self,
-        tool_name: str,
-        raw_result: Any,
-        tool_def: dict,
-        __event_emitter__: Optional[Callable],
-    ) -> None:
-        """Emit one source event per document for tools flagged citation=True.
-
-        OWUI sets citation=True on knowledge-base tools. When we drive tool
-        calling ourselves we bypass OWUI's middleware citation tracker, so
-        source chips in the UI either don't appear or all point to the same
-        document (whichever OWUI's fallback logic picks). Emitting source
-        events ourselves gives OWUI the per-document attribution it needs.
-        """
-        if not tool_def.get("citation", False) or not __event_emitter__:
-            return
-
-        items = (
-            raw_result if isinstance(raw_result, list)
-            else ([raw_result] if isinstance(raw_result, dict) else [])
-        )
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            metadata = item.get("metadata") or {}
-            name = (
-                item.get("name")
-                or item.get("filename")
-                or item.get("title")
-                or (metadata.get("source") if isinstance(metadata, dict) else None)
-                or tool_name
-            )
-            content = item.get("content") or item.get("text") or ""
-            try:
-                await __event_emitter__(
-                    {
-                        "type": "source",
-                        "data": {
-                            "source": {
-                                "name": str(name),
-                                "type": "collection",
-                                "url": item.get("url") or item.get("id"),
-                            },
-                            "document": [content],
-                            "metadata": [{"source": str(name)}],
-                        },
-                    }
-                )
-            except Exception:
-                pass
-
     @staticmethod
     def _image_data_hash(image_data: Any) -> str:
         """Build a stable hash for generated image data across bytes/str inputs."""
@@ -3967,16 +3914,6 @@ class Pipe:
                                 # and other wrappers that fool iscoroutinefunction.
                                 _raw = tool_callable(**tool_args)
                                 tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                            # Emit per-document source events for citable tools
-                            # (citation=True in tool_def, e.g. knowledge-base tools).
-                            # Must happen before _process_tool_result_for_owui
-                            # converts the raw list/dict to a string.
-                            await self._emit_citation_sources_for_tool(
-                                tool_name,
-                                tool_result,
-                                __tools__.get(tool_name, {}),
-                                __event_emitter__,
-                            )
                             # Mirror OWUI middleware: emit 'embeds'/'files' for
                             # rich returns (HTMLResponse cards, base64 images)
                             # and hand back the LLM-visible text. Without this
@@ -4954,12 +4891,6 @@ class Pipe:
                                         # and other wrappers that fool iscoroutinefunction.
                                         _raw = tool_callable(**tool_args)
                                         tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
-                                    await self._emit_citation_sources_for_tool(
-                                        tool_name,
-                                        tool_result,
-                                        __tools__.get(tool_name, {}),
-                                        __event_emitter__,
-                                    )
                                     tool_result = await self._process_tool_result_for_owui(
                                         tool_result, __event_emitter__
                                     )
