@@ -50,8 +50,10 @@ import os
 import re
 import time
 import asyncio
+import inspect
 import base64
 import hashlib
+import json
 import logging
 import io
 import uuid
@@ -174,7 +176,10 @@ class EncryptedStr(str):
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
-        except (InvalidToken, Exception):
+        except (InvalidToken, ValueError, Exception) as e:
+            # Only swallow decryption errors; re-raise anything fatal
+            if isinstance(e, (KeyboardInterrupt, SystemExit, MemoryError)):
+                raise
             return value
 
     # Pydantic integration
@@ -327,6 +332,53 @@ class Pipe:
             == "true",
             description="Whether to use Enterprise Web Search instead of standard Google search when grounding is enabled. "
             "Only available on Vertex AI.",
+        )
+        REPLACE_SEARCH_WEB_WITH_GOOGLE: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_SEARCH_WEB", "false").lower() == "true",
+            description="Intercept OWUI's search_web tool calls and fulfill them with Google "
+            "Search via Vertex AI, preserving OWUI's native search UX (spinner, tool-call "
+            "detail, source cards) while using Google's actual results. Requires the "
+            "google_search_tool feature flag or the companion filter that converts "
+            "web_search → google_search_tool in metadata. When enabled, native grounding "
+            "is skipped in favour of this Python-tool approach.",
+        )
+        ENABLE_FETCH_URL: bool = Field(
+            default=os.getenv("GOOGLE_ENABLE_FETCH_URL", "true").lower() == "true",
+            description="Allow the model to call fetch_url / browse_url at all. "
+            "Set to false to block all URL fetching by the model — the tool call "
+            "is intercepted and the model receives a 'disabled' message instead of "
+            "making any outbound request. Useful as a security measure against SSRF "
+            "or prompt-injection attacks that try to exfiltrate data via URL fetches. "
+            "Independent of REPLACE_FETCH_URL (which controls the implementation used "
+            "when fetching is enabled).",
+        )
+        MAX_TOOL_ITERATIONS: int = Field(
+            default=int(os.getenv("GOOGLE_MAX_TOOL_ITERATIONS", "10")),
+            description="Maximum number of tool-call round-trips the pipe will execute per "
+            "request before stopping. Prevents runaway agent loops. Set via the "
+            "GOOGLE_MAX_TOOL_ITERATIONS environment variable. Default: 10.",
+        )
+        REPLACE_IMAGE_GENERATION: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_IMAGE_GENERATION", "true").lower() == "true",
+            description="Intercept OWUI's generate_image and edit_image tool calls and "
+            "fulfill them with Gemini native image generation, bypassing the configured "
+            "image generation backend entirely. Enable OWUI image generation with any "
+            "credentials (real or dummy) to activate the tool injection; this valve "
+            "then routes the calls to Gemini instead.",
+        )
+        IMAGE_GEN_MODEL_ID: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GEN_MODEL_ID", "gemini-3.0-flash-preview-image-generation"),
+            description="Gemini model to use for generate_image / edit_image tool call "
+            "interception. Must be a model that supports response_modalities=[IMAGE]. "
+            "Used when REPLACE_IMAGE_GENERATION is true.",
+        )
+        REPLACE_FETCH_URL: bool = Field(
+            default=os.getenv("GOOGLE_REPLACE_FETCH_URL", "true").lower() == "true",
+            description="Intercept OWUI's fetch_url tool calls and fulfill them with a "
+            "direct aiohttp fetch + BeautifulSoup text extraction, bypassing OWUI's "
+            "loader chain entirely. Eliminates the mysterious ~1200-char truncation that "
+            "occurs somewhere in OWUI's WebBaseLoader pipeline regardless of the "
+            "WEB_FETCH_MAX_CONTENT_LENGTH setting. Only applies when ENABLE_FETCH_URL is true.",
         )
 
         # Image Processing Configuration
@@ -741,8 +793,9 @@ class Pipe:
                 def sanitize_header_value(value: Any, max_length: int = 255) -> str:
                     if value is None:
                         return ""
-                    # Convert to string and remove all control characters
-                    sanitized = re.sub(r"[\x00-\x1F\x7F]", "", str(value))
+                    # Convert to string, strip all control characters including CR/LF
+                    # to prevent HTTP header injection via newline sequences.
+                    sanitized = re.sub(r"[\x00-\x1F\x7F\r\n]", "", str(value))
                     sanitized = sanitized.strip()
                     return (
                         sanitized[:max_length]
@@ -1204,6 +1257,233 @@ class Pipe:
     def _is_open_webui_image_tool(tool_name: str) -> bool:
         """Return True for Open WebUI's built-in image generation tools."""
         return tool_name in {"generate_image", "edit_image"}
+
+    @staticmethod
+    def _owui_callable_to_gemini_tool(name: str, fn: Any) -> Optional["types.Tool"]:
+        """Convert an OWUI tool callable to a Gemini types.Tool with a clean FunctionDeclaration.
+
+        OWUI callables carry injected parameters (__user__, __request__,
+        __event_emitter__, __metadata__, …) that must NOT appear in the
+        function declaration sent to Gemini.  Passing the bare callable to the
+        SDK causes the SDK to introspect the full signature, insert those
+        params, and — even with AFC disabled — log AFC activity and make the
+        model call the function with empty stub objects, producing blank output.
+        """
+        import inspect as _inspect
+
+        # JSON-Schema type for common Python annotations
+        _TYPE_MAP = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            list: "array",
+            dict: "object",
+        }
+
+        try:
+            sig = _inspect.signature(fn)
+        except (ValueError, TypeError):
+            return None
+
+        properties: dict = {}
+        required: list = []
+
+        for param_name, param in sig.parameters.items():
+            # Skip OWUI injected params, self/cls, and *args/**kwargs
+            if (
+                param_name.startswith("__")
+                or param_name in ("self", "cls")
+                or param.kind in (
+                    _inspect.Parameter.VAR_POSITIONAL,
+                    _inspect.Parameter.VAR_KEYWORD,
+                )
+            ):
+                continue
+
+            ann = param.annotation
+            origin = getattr(ann, "__origin__", None)
+
+            # Unwrap Optional[X] / Union[X, None] → X
+            if origin is Union:
+                args = [a for a in ann.__args__ if a is not type(None)]
+                ann = args[0] if args else str
+                origin = getattr(ann, "__origin__", None)
+
+            # Capture List[X] element type before collapsing generic → base type
+            type_args = getattr(ann, "__args__", None)
+            elem_ann = type_args[0] if (origin is list and type_args) else None
+
+            # Collapse generic to base type so the _TYPE_MAP lookup succeeds
+            # (e.g. List[Dict[str, Any]] → list → "array").  Without this the
+            # lookup defaults to "string" and the model sends JSON-encoded
+            # strings instead of real arrays/objects.
+            if origin is not None:
+                ann = origin
+
+            json_type = _TYPE_MAP.get(ann, "string")
+            prop: dict = {"type": json_type.upper()}
+
+            # Gemini requires array properties to include an items schema.
+            # Also collapse the element annotation through its origin
+            # (Dict[str, Any] → dict → "object"; List[X] → list → "array").
+            if json_type == "array":
+                e_ann = elem_ann
+                e_origin = getattr(e_ann, "__origin__", None) if e_ann else None
+                if e_origin is Union and getattr(e_ann, "__args__", None):
+                    inner = [a for a in e_ann.__args__ if a is not type(None)]
+                    e_ann = inner[0] if inner else str
+                    e_origin = getattr(e_ann, "__origin__", None)
+                if e_origin is not None:
+                    e_ann = e_origin
+                elem_type = _TYPE_MAP.get(e_ann, "string").upper() if e_ann else "STRING"
+                prop["items"] = {"type": elem_type}
+
+            properties[param_name] = prop
+
+            if param.default is _inspect.Parameter.empty:
+                required.append(param_name)
+
+        doc = _inspect.getdoc(fn) or ""
+        params_schema: dict = {"type": "OBJECT", "properties": properties}
+        if required:
+            params_schema["required"] = required
+
+        try:
+            decl = types.FunctionDeclaration(
+                name=name,
+                description=doc[:1000] if doc else "",
+                parameters=params_schema,
+            )
+            return types.Tool(function_declarations=[decl])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _owui_spec_to_gemini_tool(name: str, spec: dict) -> Optional["types.Tool"]:
+        """Convert an OWUI OpenAI-format tool spec to a Gemini types.Tool.
+
+        OWUI builds a full JSON schema for each tool (including nested object
+        properties for complex parameters like List[Task]).  Using this spec
+        instead of re-introspecting the callable preserves that richness and
+        gives the model enough detail to send correctly-shaped arguments.
+        """
+
+        def _uppercase_types(schema: Any) -> Any:
+            if isinstance(schema, dict):
+                return {
+                    k: schema[k].upper() if k == "type" and isinstance(schema[k], str)
+                    else _uppercase_types(schema[k])
+                    for k in schema
+                }
+            if isinstance(schema, list):
+                return [_uppercase_types(item) for item in schema]
+            return schema
+
+        # OpenAI spec may be wrapped: {"type": "function", "function": {...}}
+        fn_spec = spec.get("function", spec)
+        description = fn_spec.get("description", "")
+        parameters = fn_spec.get("parameters", {})
+
+        params_schema = _uppercase_types(parameters)
+
+        try:
+            decl = types.FunctionDeclaration(
+                name=name,
+                description=description[:1000] if description else "",
+                parameters=params_schema,
+            )
+            return types.Tool(function_declarations=[decl])
+        except Exception:
+            return None
+
+    async def _process_tool_result_for_owui(
+        self,
+        tool_result: Any,
+        event_emitter: Optional[Callable] = None,
+    ) -> str:
+        """Mirror OWUI middleware's tool-result handling for direct-call pipes.
+
+        When this pipe drives its own native function-calling loop it bypasses
+        OWUI's middleware, so the 'embeds' and 'files' events that would
+        normally be fired on the pipe's behalf never reach the chat — rich
+        media (HTMLResponse cards, base64 images) never persists. This helper
+        does that work locally: it detects HTMLResponse / image-data /
+        dict / list returns, emits the matching persisted events, and returns
+        the string the LLM should see.
+        """
+        try:
+            from fastapi.responses import HTMLResponse  # noqa: WPS433
+        except Exception:
+            HTMLResponse = None  # type: ignore
+
+        embeds: list = []
+        files: list = []
+        llm_text: Optional[str] = None
+        generic_embed_msg = "Embedded UI result is active and visible to the user."
+
+        # (HTMLResponse, context) tuple — OWUI's canonical rich-card pattern
+        if (
+            HTMLResponse is not None
+            and isinstance(tool_result, tuple)
+            and len(tool_result) == 2
+            and isinstance(tool_result[0], HTMLResponse)
+        ):
+            html_response, context = tool_result
+            if "inline" in html_response.headers.get("content-disposition", ""):
+                embeds.append(html_response.body.decode("utf-8", "replace"))
+            if context is None:
+                llm_text = generic_embed_msg
+            elif isinstance(context, (dict, list)):
+                llm_text = json.dumps(context, ensure_ascii=False)
+            else:
+                llm_text = str(context)
+
+        # Bare HTMLResponse — render embed, hand the LLM a generic ack
+        elif HTMLResponse is not None and isinstance(tool_result, HTMLResponse):
+            if "inline" in tool_result.headers.get("content-disposition", ""):
+                embeds.append(tool_result.body.decode("utf-8", "replace"))
+            llm_text = generic_embed_msg
+
+        # Base64 image data URL — files event
+        elif isinstance(tool_result, str) and tool_result.startswith("data:image/"):
+            files.append({"type": "image", "url": tool_result})
+            llm_text = "Image rendered for the user."
+
+        # Generic tuple without HTMLResponse — keep the first str if any
+        elif isinstance(tool_result, tuple):
+            llm_text = next(
+                (v for v in tool_result if isinstance(v, str)), None
+            )
+            if llm_text is None:
+                llm_text = json.dumps(
+                    list(tool_result), ensure_ascii=False, default=str
+                )
+
+        # Dict/list — JSON-serialise for the LLM
+        elif isinstance(tool_result, (dict, list)):
+            llm_text = json.dumps(tool_result, ensure_ascii=False)
+
+        # Plain str / None / other — coerce
+        else:
+            llm_text = "" if tool_result is None else str(tool_result)
+
+        if event_emitter is not None and embeds:
+            try:
+                await event_emitter(
+                    {"type": "embeds", "data": {"embeds": embeds}}
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit 'embeds' event: {e}")
+        if event_emitter is not None and files:
+            try:
+                await event_emitter(
+                    {"type": "files", "data": {"files": files}}
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to emit 'files' event: {e}")
+
+        return llm_text or ""
 
     @staticmethod
     def _image_data_hash(image_data: Any) -> str:
@@ -2535,7 +2815,14 @@ class Pipe:
         tools = []
 
         if features.get("google_search_tool", False):
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+            if self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE:
+                # search_web calls will be intercepted at execution time and routed to
+                # Google Search — no server-side grounding declaration needed here.
+                self.log.debug(
+                    "REPLACE_SEARCH_WEB_WITH_GOOGLE active: skipping native grounding, "
+                    "search_web tool calls will be fulfilled by Google Search at runtime"
+                )
+            elif self.valves.USE_ENTERPRISE_WEB_SEARCH:
                 self.log.debug("Enabling Enterprise Web Search grounding")
                 tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
@@ -2573,7 +2860,26 @@ class Pipe:
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
 
-        if __tools__ is not None and params.get("function_calling") == "native":
+        # Determine native function calling mode. OpenWebUI stores this setting
+        # in either __metadata__["model"]["params"] (current) or __metadata__["params"]
+        # (older), and may not set it at all when the user toggles the model picker.
+        # When __tools__ is provided, OWUI is operating in native mode by definition
+        # (default mode injects tools into the system prompt and does not pass __tools__).
+        _model_params = (__metadata__ or {}).get("model", {}).get("params", {}) or {}
+        _fc_mode = (
+            _model_params.get("function_calling")
+            or params.get("function_calling")
+        )
+        self.log.info(
+            f"Native tool registration: __tools__={'present' if __tools__ else 'absent'} "
+            f"keys={list(__tools__.keys()) if __tools__ else []} "
+            f"function_calling={_fc_mode!r}"
+        )
+
+        # Register tools whenever __tools__ is provided unless the user explicitly
+        # opted into "default" mode. This handles the case where function_calling is
+        # not set anywhere in metadata (common when OWUI uses tool selection per chat).
+        if __tools__ and _fc_mode != "default":
             for name, tool_def in __tools__.items():
                 if enable_image_generation and self._is_open_webui_image_tool(name):
                     self.log.debug(
@@ -2581,14 +2887,42 @@ class Pipe:
                     )
                     continue
                 if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
-                    )
-                    tools.append(tool)
+                    spec = tool_def.get("spec")
+                    if spec:
+                        gemini_tool = self._owui_spec_to_gemini_tool(name, spec)
+                        source = "OWUI spec"
+                    else:
+                        gemini_tool = self._owui_callable_to_gemini_tool(
+                            name, tool_def["callable"]
+                        )
+                        source = "callable introspection"
+                    if gemini_tool is not None:
+                        self.log.info(
+                            f"Registering native tool with Gemini ({source}): '{name}'"
+                        )
+                        tools.append(gemini_tool)
+                    else:
+                        self.log.warning(
+                            f"Could not build FunctionDeclaration for tool '{name}'; skipping"
+                        )
 
         if tools:
             gen_config_params["tools"] = tools
+
+        # Always disable the SDK's Automatic Function Calling (AFC).
+        # AFC is the SDK's own tool-execution loop; it has a hard cap of
+        # max_remote_calls=10 that is completely separate from our
+        # MAX_TOOL_ITERATIONS valve. Even when tools is empty, AFC stays
+        # "enabled" by default and starts counting any generate_content
+        # round-trips against that cap — dropping the session at 10
+        # regardless of what GOOGLE_MAX_TOOL_ITERATIONS is set to.
+        # We never pass Python callables to the SDK (only FunctionDeclarations
+        # and server-side built-ins), so AFC can't usefully execute anything
+        # on our behalf anyway. Disabling it unconditionally hands full control
+        # of the tool loop back to our own _handle_streaming_response / pipe code.
+        gen_config_params["automatic_function_calling"] = (
+            types.AutomaticFunctionCallingConfig(disable=True)
+        )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -2681,17 +3015,21 @@ class Pipe:
         # Add citations in the text body
         replaced_text: Optional[str] = None
         if grounding_supports:
-            # Citation indexes are in bytes
+            # Citation indexes are byte offsets into the UTF-8 encoded text
             ENCODING = "utf-8"
             text_bytes = text.encode(ENCODING)
+            text_len = len(text_bytes)
             last_byte_index = 0
             cited_chunks = []
 
             for support in grounding_supports:
+                end_index = getattr(support.segment, "end_index", None)
+                if end_index is None:
+                    continue
+                # Clamp to valid range to guard against out-of-bounds byte offsets
+                end_index = max(last_byte_index, min(end_index, text_len))
                 cited_chunks.append(
-                    text_bytes[last_byte_index : support.segment.end_index].decode(
-                        ENCODING
-                    )
+                    text_bytes[last_byte_index:end_index].decode(ENCODING, errors="replace")
                 )
 
                 # Generate and append citations (e.g., "[1][2]")
@@ -2701,15 +3039,541 @@ class Pipe:
                 cited_chunks.append(f" {footnotes}")
 
                 # Update index for the next segment
-                last_byte_index = support.segment.end_index
+                last_byte_index = end_index
 
             # Append any remaining text after the last citation
-            if last_byte_index < len(text_bytes):
-                cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING))
+            if last_byte_index < text_len:
+                cited_chunks.append(text_bytes[last_byte_index:].decode(ENCODING, errors="replace"))
 
             replaced_text = "".join(cited_chunks)
 
         return replaced_text if replaced_text is not None else text
+
+    @staticmethod
+    def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """Chunk text using LangChain's splitter, falling back to a manual implementation."""
+        try:
+            from langchain.text_splitter import RecursiveCharacterTextSplitter
+            return RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            ).split_text(text)
+        except Exception:
+            chunks: List[str] = []
+            start = 0
+            while start < len(text):
+                chunks.append(text[start : start + chunk_size])
+                start += chunk_size - chunk_overlap
+            return chunks
+
+    async def _rag_chunks(
+        self,
+        chunks: List[str],
+        query: str,
+        top_k: int,
+        __request__: Optional[Request] = None,
+    ) -> List[str]:
+        """Return the top_k most relevant chunks via cosine similarity over embeddings.
+
+        Uses OWUI's configured embedding function (request.app.state.EMBEDDING_FUNCTION)
+        and the query/content prefix settings from OWUI's RAG config. Falls back to
+        returning the first top_k chunks if embedding is unavailable or fails.
+        """
+        embedding_fn = getattr(
+            getattr(getattr(__request__, "app", None), "state", None),
+            "EMBEDDING_FUNCTION",
+            None,
+        )
+        if embedding_fn is None:
+            self.log.debug("[fetch] no EMBEDDING_FUNCTION available, using first-K chunks")
+            return chunks[:top_k]
+
+        cfg = getattr(getattr(getattr(__request__, "app", None), "state", None), "config", None)
+        query_prefix: str = str(getattr(cfg, "RAG_EMBEDDING_QUERY_PREFIX", "") or "")
+        content_prefix: str = str(getattr(cfg, "RAG_EMBEDDING_CONTENT_PREFIX", "") or "")
+
+        try:
+            import numpy as np
+
+            query_emb = np.array(await embedding_fn(query, prefix=query_prefix))
+            chunk_embs = np.array(
+                await embedding_fn(chunks, prefix=content_prefix)
+            )
+            norms = np.linalg.norm(chunk_embs, axis=1) * np.linalg.norm(query_emb) + 1e-10
+            sims = np.dot(chunk_embs, query_emb) / norms
+            top_idx = sorted(np.argsort(sims)[::-1][:top_k].tolist())
+            self.log.info(
+                f"[fetch] RAG: selected {len(top_idx)}/{len(chunks)} chunks "
+                f"(scores: {[round(float(sims[i]), 3) for i in top_idx]})"
+            )
+            return [chunks[i] for i in top_idx]
+        except Exception as e:
+            self.log.warning(f"[fetch] RAG embedding failed, using first-K chunks: {e}")
+            return chunks[:top_k]
+
+    async def _resolve_grounding_redirects(
+        self,
+        urls: List[str],
+        timeout_sec: float = 3.0,
+    ) -> Dict[str, str]:
+        """Resolve Vertex grounding-api-redirect URLs to their final destinations.
+
+        These redirect URLs (vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+        are temporary proxies and reject direct fetches with 400. The model wastes a
+        round trying to crawl them. We pre-resolve via a single HEAD/GET and hand the
+        model the real publisher URLs. Returns {original: resolved}; failures map to
+        the original so callers can always look up a value.
+        """
+        if not urls:
+            return {}
+        try:
+            import aiohttp
+        except ImportError:
+            return {u: u for u in urls}
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            )
+        }
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+        async def resolve_one(session, url: str) -> Tuple[str, str]:
+            try:
+                async with session.get(url, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("Location")
+                        if loc:
+                            return url, loc
+            except Exception:
+                pass
+            return url, url
+
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                pairs = await asyncio.gather(
+                    *(resolve_one(session, u) for u in urls),
+                    return_exceptions=False,
+                )
+                return dict(pairs)
+        except Exception as e:
+            self.log.warning(f"[search] redirect resolution failed: {e}")
+            return {u: u for u in urls}
+
+    async def _generate_image_for_owui(
+        self,
+        prompt: str,
+        image_urls: Optional[List[str]] = None,
+        __event_emitter__: Optional[Callable] = None,
+        __request__: Optional[Request] = None,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """Fulfill generate_image / edit_image tool calls with Gemini native image generation.
+
+        Reads OWUI's image generation config for size hints, uses IMAGE_GEN_MODEL_ID
+        (valve) for the Gemini model, uploads the result via the pipe's existing image
+        upload infrastructure, emits chat:message:files so OWUI displays the image
+        inline, and returns the same JSON shape OWUI's own builtin returns.
+        """
+        action = "Editing image" if image_urls else "Generating image"
+        self.log.info(f"[image] intercepting {'edit_image' if image_urls else 'generate_image'}: {prompt[:80]!r}")
+        if __event_emitter__:
+            try:
+                await __event_emitter__({"type": "status", "data": {
+                    "action": "image_generation", "description": f"{action}: {prompt[:60]}…", "done": False,
+                }})
+            except Exception:
+                pass
+
+        aspect_ratio = self.valves.IMAGE_GENERATION_ASPECT_RATIO
+        resolution = self.valves.IMAGE_GENERATION_RESOLUTION
+
+        model_id = self.valves.IMAGE_GEN_MODEL_ID
+        client = self._get_client()
+
+        # Build contents — include reference images for edit_image
+        contents: Any = prompt
+        if image_urls:
+            parts: list = [{"text": prompt}]
+            for url in image_urls:
+                try:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _sess:
+                        async with _sess.get(url, timeout=_aiohttp.ClientTimeout(total=15)) as _r:
+                            img_bytes = await _r.read()
+                            mime = _r.headers.get("Content-Type", "image/png").split(";")[0]
+                    parts.append({"inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(img_bytes).decode(),
+                    }})
+                except Exception as e:
+                    self.log.warning(f"[image] failed to fetch reference image {url!r}: {e}")
+            contents = [{"role": "user", "parts": parts}]
+
+        try:
+            gen_config_params: Dict[str, Any] = {"response_modalities": ["IMAGE", "TEXT"]}
+            if self._check_image_config_support(model_id):
+                try:
+                    gen_config_params["image_config"] = types.ImageConfig(
+                        aspect_ratio=aspect_ratio if aspect_ratio != "default" else None,
+                        image_size=resolution if resolution != "default" else None,
+                    )
+                except Exception:
+                    pass
+
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=types.GenerateContentConfig(**gen_config_params),
+            )
+        except Exception as e:
+            self.log.exception(f"[image] Gemini image generation failed: {e}")
+            return json.dumps({"error": str(e)})
+
+        image_files: list = []
+        for candidate in getattr(response, "candidates", []) or []:
+            for part in getattr(getattr(candidate, "content", None), "parts", []) or []:
+                if getattr(part, "inline_data", None) and __request__ and __user__:
+                    try:
+                        image_url = await self._upload_image_with_status(
+                            part.inline_data.data,
+                            part.inline_data.mime_type,
+                            __request__,
+                            __user__,
+                            __event_emitter__,
+                        )
+                        image_files.append(self._build_generated_image_file(
+                            content_url=image_url,
+                            mime_type=part.inline_data.mime_type,
+                        ))
+                    except Exception as e:
+                        self.log.warning(f"[image] upload failed: {e}")
+
+        if image_files and __event_emitter__:
+            try:
+                await __event_emitter__({"type": "chat:message:files", "data": {"files": image_files}})
+            except Exception:
+                pass
+
+        if __event_emitter__:
+            try:
+                await __event_emitter__({"type": "status", "data": {
+                    "action": "image_generation",
+                    "description": f"Generated {len(image_files)} image(s)",
+                    "done": True,
+                }})
+            except Exception:
+                pass
+
+        if not image_files:
+            return json.dumps({"error": "No image was returned by Gemini"})
+
+        return json.dumps({
+            "status": "success",
+            "message": "The image has been generated and is visible in the chat.",
+            "images": [{"url": f.get("url", "")} for f in image_files],
+        })
+
+    async def _fetch_url_for_owui(
+        self,
+        url: str,
+        query: Optional[str] = None,
+        __event_emitter__: Optional[Callable] = None,
+        __request__: Optional[Request] = None,
+    ) -> str:
+        """Fetch a URL and return clean plain text, bypassing OWUI's loader chain.
+
+        OWUI's fetch_url built-in truncates content somewhere in its WebBaseLoader
+        pipeline (experimentally ~1200 chars on Wikipedia) regardless of the
+        WEB_FETCH_MAX_CONTENT_LENGTH setting. This implementation uses aiohttp
+        directly and strips HTML with BeautifulSoup.
+
+        When the fetched content exceeds CHUNK_SIZE * 2 chars and a query is
+        provided, the text is chunked and run through OWUI's embedding function
+        for in-memory cosine-similarity retrieval (RAG_TOP_K chunks returned).
+        This mirrors OWUI's RAG pipeline without requiring a vector DB.
+
+        Respects OWUI config when __request__ is provided:
+          WEB_FETCH_MAX_CONTENT_LENGTH       — hard cap on returned chars (None = no limit)
+          ENABLE_WEB_LOADER_SSL_VERIFICATION — SSL cert verification (default True)
+          WEB_LOADER_TIMEOUT                 — request timeout in seconds (default 30)
+          CHUNK_SIZE / CHUNK_OVERLAP         — chunking parameters (defaults 1500 / 100)
+          RAG_TOP_K                          — chunks to return after retrieval (default 4)
+        """
+        self.log.info(f"[fetch] intercepting fetch_url: {url!r}")
+
+        # Read OWUI config values when available, fall back to safe defaults.
+        cfg = getattr(getattr(__request__, "app", None), "state", None)
+        cfg = getattr(cfg, "config", None) if cfg else None
+        max_content_length: Optional[int] = getattr(cfg, "WEB_FETCH_MAX_CONTENT_LENGTH", None)
+        verify_ssl: bool = bool(getattr(cfg, "ENABLE_WEB_LOADER_SSL_VERIFICATION", True))
+        loader_timeout: int = int(getattr(cfg, "WEB_LOADER_TIMEOUT", None) or 30)
+        chunk_size: int = max(int(getattr(cfg, "CHUNK_SIZE", 0) or 0), 1500)
+        chunk_overlap: int = max(int(getattr(cfg, "CHUNK_OVERLAP", 0) or 0), 100)
+        rag_top_k: int = max(int(getattr(cfg, "RAG_TOP_K", 0) or 0), 4)
+
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": f"Fetching: {url}",
+                            "done": False,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+
+        try:
+            import aiohttp
+            from bs4 import BeautifulSoup
+        except ImportError as e:
+            return f"Error: missing dependency ({e})"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        timeout = aiohttp.ClientTimeout(total=loader_timeout)
+        connector = aiohttp.TCPConnector(ssl=verify_ssl)
+
+        try:
+            async with aiohttp.ClientSession(
+                headers=headers, timeout=timeout, connector=connector
+            ) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    raw_bytes = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "")
+
+            if "text/html" in content_type or not content_type:
+                encoding = resp.charset or "utf-8"
+                html = raw_bytes.decode(encoding, errors="replace")
+                soup = BeautifulSoup(html, "html.parser")
+                # Remove script, style, nav, footer — keep readable body text
+                for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+                # Collapse runs of blank lines to at most two
+                import re as _re
+                text = _re.sub(r"\n{3,}", "\n\n", text)
+            else:
+                text = raw_bytes.decode("utf-8", errors="replace")
+
+            # RAG: chunk and retrieve when content is large and a query is available.
+            # Threshold is 2x chunk_size — below that, the model can read it all.
+            if query and len(text) > chunk_size * 2:
+                chunks = self._split_text(text, chunk_size, chunk_overlap)
+                self.log.info(
+                    f"[fetch] RAG: {len(chunks)} chunks from {len(text)} chars, "
+                    f"retrieving top {rag_top_k} for query {query[:80]!r}"
+                )
+                selected = await self._rag_chunks(chunks, query, rag_top_k, __request__)
+                text = "\n\n---\n\n".join(selected)
+
+            # Apply WEB_FETCH_MAX_CONTENT_LENGTH if configured (mirrors OWUI behaviour)
+            if max_content_length and max_content_length > 0 and len(text) > max_content_length:
+                text = text[:max_content_length] + "\n\n[Content truncated]"
+
+            self.log.info(
+                f"[fetch] fetched {len(text)} chars from {url!r}"
+                + (f" (capped at {max_content_length})" if max_content_length else "")
+            )
+
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Fetched {len(text):,} chars from {url}",
+                                "done": True,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return text
+
+        except Exception as e:
+            self.log.warning(f"[fetch] failed to fetch {url!r}: {e}")
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Failed to fetch {url}: {e}",
+                                "done": True,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+            return f"Error fetching {url}: {e}"
+
+    async def _google_search_for_owui(
+        self,
+        query: str,
+        model_id: str,
+        __event_emitter__: Optional[Callable] = None,
+    ) -> str:
+        """Fulfill a search_web call using Google Search via Vertex AI grounding.
+
+        Makes a lightweight Vertex AI call with google_search grounding enabled,
+        extracts the grounding chunks, and returns results in OWUI's search_web
+        format: [{"title": "...", "url": "...", "content": "..."}, ...].
+        """
+        self.log.info(f"[search] intercepting search_web — querying Google: {query!r}")
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": f"Searching Google for: {query}",
+                            "done": False,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+
+        client = self._get_client()
+        search_tool = (
+            types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+            if self.valves.USE_ENTERPRISE_WEB_SEARCH
+            else types.Tool(google_search=types.GoogleSearch())
+        )
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=f"Search: {query}",
+                config=types.GenerateContentConfig(
+                    tools=[search_tool],
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                ),
+            )
+            results = []
+            source_chunks: list = []
+            if response.candidates:
+                # Extract grounded response text — this is the synthesized answer
+                # the model produced using Google Search; include it so the outer
+                # model can quote/cite it rather than seeing empty content.
+                response_text = ""
+                for part in getattr(response.candidates[0].content, "parts", []) or []:
+                    if getattr(part, "text", None):
+                        response_text += part.text
+
+                metadata = getattr(response.candidates[0], "grounding_metadata", None)
+                source_chunks = []
+                if metadata and metadata.grounding_chunks:
+                    # Resolve Vertex grounding-api-redirect URLs to real publisher
+                    # URLs so the model can crawl them with fetch_url if needed.
+                    raw_uris = [
+                        chunk.web.uri
+                        for chunk in metadata.grounding_chunks
+                        if getattr(chunk, "web", None) and chunk.web and chunk.web.uri
+                    ]
+                    url_map = await self._resolve_grounding_redirects(raw_uris)
+                    resolved_count = sum(
+                        1 for orig, final in url_map.items() if final != orig
+                    )
+                    self.log.debug(
+                        f"[search] resolved {resolved_count}/{len(raw_uris)} redirect URLs"
+                    )
+
+                    for chunk in metadata.grounding_chunks:
+                        if getattr(chunk, "web", None) and chunk.web:
+                            resolved_url = url_map.get(chunk.web.uri, chunk.web.uri or "")
+                            source_chunks.append(
+                                {
+                                    "title": chunk.web.title or "",
+                                    "url": resolved_url,
+                                    "content": "",
+                                }
+                            )
+
+                    # Emit each grounding chunk as a persisted "source" event so
+                    # OWUI renders the citation chips/source panel under the
+                    # message, matching the native-grounding UX. Use resolved
+                    # URLs so the chips link to real publisher pages.
+                    if __event_emitter__:
+                        for chunk in metadata.grounding_chunks:
+                            if getattr(chunk, "web", None) and chunk.web:
+                                title = chunk.web.title or "Source"
+                                resolved_url = url_map.get(
+                                    chunk.web.uri, chunk.web.uri
+                                )
+                                source_event = {
+                                    "source": {
+                                        "name": title,
+                                        "type": "web_search_results",
+                                        "url": resolved_url,
+                                    },
+                                    "document": ["Click the link to view the content."],
+                                    "metadata": [{"source": title}],
+                                }
+                                try:
+                                    await __event_emitter__(
+                                        {"type": "source", "data": source_event}
+                                    )
+                                except Exception:
+                                    pass
+
+                if response_text:
+                    # Lead with a summary entry carrying the full grounded text so
+                    # the outer model has actual content to synthesize from.
+                    results.append(
+                        {
+                            "title": f"Google Search: {query}",
+                            "url": f"https://www.google.com/search?q={query.replace(' ', '+')}",
+                            "content": response_text,
+                        }
+                    )
+                # Append individual source chunks for OWUI's source-card display.
+                results.extend(source_chunks)
+
+            self.log.info(
+                f"[search] Google returned {len(results)} results for {query!r} "
+                f"(content_chars={sum(len(r['content']) for r in results)})"
+            )
+
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Found {len(source_chunks)} results for: {query}",
+                                "done": True,
+                                "urls": [
+                                    r["url"] for r in source_chunks if r["url"]
+                                ] or [f"https://www.google.com/search?q={query}"],
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return json.dumps(results, ensure_ascii=False)
+        except Exception as e:
+            self.log.warning(f"[search] Google search failed for {query!r}: {e}")
+            return json.dumps([])
 
     async def _handle_streaming_response(
         self,
@@ -2717,6 +3581,11 @@ class Pipe:
         __event_emitter__: Callable,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
+        __tools__: Optional[dict] = None,
+        client: Optional[Any] = None,
+        model_id: Optional[str] = None,
+        contents: Optional[list] = None,
+        generation_config: Optional[Any] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
@@ -2724,6 +3593,11 @@ class Pipe:
         Args:
             response_iterator: Iterator from generate_content
             __event_emitter__: Event emitter for status updates
+            __tools__: Available OpenWebUI tools for native tool calling
+            client: Gemini API client (needed for tool call follow-up requests)
+            model_id: Model ID (needed for tool call follow-up requests)
+            contents: Conversation contents list (extended per tool call round)
+            generation_config: Generation config (reused for follow-up requests)
 
         Returns:
             Generator yielding text chunks
@@ -2739,36 +3613,78 @@ class Pipe:
 
         await emit_chat_event("chat:start", {"role": "assistant"})
 
+        self.log.info(
+            f"[stream] _handle_streaming_response entered. "
+            f"__tools__ keys={list(__tools__.keys()) if __tools__ else None} "
+            f"client={'present' if client else 'missing'} "
+            f"model_id={model_id!r}"
+        )
+
         grounding_metadata_list = []
-        # Accumulate content separately for answer and thoughts
+        # Accumulate content separately for answer and thoughts (across all tool-call rounds)
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
+        # Tool call <details> blocks are kept separate so grounding only processes real text
+        tool_call_blocks: list[str] = []
         thinking_started_at: Optional[float] = None
         stream_usage_metadata = None
 
-        try:
-            async for chunk in response_iterator:
-                # Capture usage metadata (final chunk has complete data)
-                if getattr(chunk, "usage_metadata", None):
-                    stream_usage_metadata = chunk.usage_metadata
+        # Tool call loop: keep iterating as long as the model returns function calls
+        max_tool_iterations = self.valves.MAX_TOOL_ITERATIONS
+        tool_call_iteration = 0
+        current_contents = list(contents) if contents is not None else []
 
-                # Check for safety feedback or empty chunks
-                if not chunk.candidates:
-                    # Check prompt feedback
-                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
-                        block_reason = chunk.prompt_feedback.block_reason.name
-                        message = f"[Blocked due to Prompt Safety: {block_reason}]"
-                        await emit_chat_event(
-                            "chat:finish",
-                            {
-                                "role": "assistant",
-                                "content": message,
-                                "done": True,
-                                "error": True,
-                            },
-                        )
-                        yield message
-                    else:
+        try:
+            while tool_call_iteration <= max_tool_iterations:
+                function_call_parts_this_round: list = []
+                # Gemini 3 (and 2.5 thinking) models embed a thought_signature
+                # on each thought Part. The whole model turn — thoughts AND
+                # function calls — must be echoed back together in history or
+                # the API will reject the follow-up request.
+                thought_parts_this_round: list = []
+
+                async for chunk in response_iterator:
+                    # Capture usage metadata (final chunk has complete data)
+                    if getattr(chunk, "usage_metadata", None):
+                        stream_usage_metadata = chunk.usage_metadata
+
+                    # Check for safety feedback or empty chunks
+                    if not chunk.candidates:
+                        # Trailing metadata chunks (common with Search grounding and Vertex AI)
+                        # arrive with an empty candidates list but carry usage_metadata or
+                        # grounding_metadata. Treating them as blocks is a false positive that
+                        # also abandons the socket, causing the asyncio "Unclosed connection"
+                        # warning. Skip them and let the loop finish naturally.
+                        if (
+                            getattr(chunk, "usage_metadata", None) is not None
+                            or getattr(chunk, "grounding_metadata", None) is not None
+                        ):
+                            if getattr(chunk, "usage_metadata", None):
+                                stream_usage_metadata = chunk.usage_metadata
+                            continue
+
+                        # Explicit prompt-level block with a stated reason
+                        if (
+                            getattr(chunk, "prompt_feedback", None)
+                            and chunk.prompt_feedback.block_reason
+                        ):
+                            block_reason = chunk.prompt_feedback.block_reason.name
+                            message = f"[Blocked due to Prompt Safety: {block_reason}]"
+                            await emit_chat_event(
+                                "chat:finish",
+                                {
+                                    "role": "assistant",
+                                    "content": message,
+                                    "done": True,
+                                    "error": True,
+                                },
+                            )
+                            yield message
+                            if hasattr(response_iterator, "aclose"):
+                                await response_iterator.aclose()
+                            return
+
+                        # Genuine mid-stream safety block (empty candidates, no metadata)
                         message = "[Blocked by safety settings]"
                         await emit_chat_event(
                             "chat:finish",
@@ -2780,77 +3696,366 @@ class Pipe:
                             },
                         )
                         yield message
-                    return  # Stop generation
+                        if hasattr(response_iterator, "aclose"):
+                            await response_iterator.aclose()
+                        return
 
-                if chunk.candidates[0].grounding_metadata:
-                    grounding_metadata_list.append(
-                        chunk.candidates[0].grounding_metadata
-                    )
-                # Prefer fine-grained parts to split thoughts vs. normal text
-                parts = []
-                try:
-                    parts = chunk.candidates[0].content.parts or []
-                except Exception as parts_error:
-                    # Fallback: use aggregated text if parts aren't accessible
-                    self.log.warning(f"Failed to access content parts: {parts_error}")
-                    if hasattr(chunk, "text") and chunk.text:
-                        answer_chunks.append(chunk.text)
-                        await __event_emitter__(
-                            {
-                                "type": "chat:message:delta",
-                                "data": {
-                                    "role": "assistant",
-                                    "content": chunk.text,
-                                },
-                            }
+                    if chunk.candidates[0].grounding_metadata:
+                        grounding_metadata_list.append(
+                            chunk.candidates[0].grounding_metadata
                         )
-                    continue
-
-                for part in parts:
+                    # Prefer fine-grained parts to split thoughts vs. normal text
+                    parts = []
                     try:
-                        # Thought parts (internal reasoning)
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
-                            if thinking_started_at is None:
-                                thinking_started_at = time.time()
-                            thought_chunks.append(part.text)
-                            # Emit a live preview of what is currently being thought
-                            preview = part.text.replace("\n", " ").strip()
-                            MAX_PREVIEW = 120
-                            if len(preview) > MAX_PREVIEW:
-                                preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                            await __event_emitter__(
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "action": "thinking",
-                                        "description": f"Thinking… {preview}",
-                                        "done": False,
-                                        "hidden": False,
-                                    },
-                                }
-                            )
-
-                        # Regular answer text
-                        elif getattr(part, "text", None):
-                            answer_chunks.append(part.text)
+                        parts = chunk.candidates[0].content.parts or []
+                    except Exception as parts_error:
+                        # Fallback: use aggregated text if parts aren't accessible
+                        self.log.warning(f"Failed to access content parts: {parts_error}")
+                        if hasattr(chunk, "text") and chunk.text:
+                            answer_chunks.append(chunk.text)
                             await __event_emitter__(
                                 {
                                     "type": "chat:message:delta",
                                     "data": {
                                         "role": "assistant",
-                                        "content": part.text,
+                                        "content": chunk.text,
                                     },
                                 }
                             )
-                    except Exception as part_error:
-                        # Log part processing errors but continue with the stream
-                        self.log.warning(f"Error processing content part: {part_error}")
                         continue
 
-            # After processing all chunks, handle grounding data
+                    for part in parts:
+                        try:
+                            # Thought parts (internal reasoning)
+                            if getattr(part, "thought", False) and getattr(
+                                part, "text", None
+                            ):
+                                if thinking_started_at is None:
+                                    thinking_started_at = time.time()
+                                thought_chunks.append(part.text)
+                                # Preserve the raw Part (with thought_signature)
+                                # so it can be echoed back in history alongside
+                                # the function_call parts for Gemini 3 models.
+                                thought_parts_this_round.append(part)
+                                # Emit a single "Thinking…" status on first thought
+                                # so OWUI shows a spinner. We do NOT include the
+                                # actual thought text here — doing so causes OWUI
+                                # to render its own collapsible thought block,
+                                # duplicating the <details> block we emit at the
+                                # end of the full response.
+                                if thinking_started_at is None:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "action": "thinking",
+                                                "description": "Thinking…",
+                                                "done": False,
+                                                "hidden": True,
+                                            },
+                                        }
+                                    )
+
+                            # Regular answer text
+                            elif getattr(part, "text", None):
+                                answer_chunks.append(part.text)
+                                await __event_emitter__(
+                                    {
+                                        "type": "chat:message:delta",
+                                        "data": {
+                                            "role": "assistant",
+                                            "content": part.text,
+                                        },
+                                    }
+                                )
+
+                            # Native function call from the model
+                            elif getattr(part, "function_call", None):
+                                function_call_parts_this_round.append(part)
+                                tool_name = part.function_call.name
+                                self.log.info(
+                                    f"[stream] function_call detected: name={tool_name!r} "
+                                    f"args={dict(part.function_call.args) if part.function_call.args else {}}"
+                                )
+                                await emit_chat_event(
+                                    "status",
+                                    {
+                                        "action": "tool_calls",
+                                        "description": f"Calling: {tool_name}",
+                                        "done": False,
+                                    },
+                                )
+
+                        except Exception as part_error:
+                            # Log part processing errors but continue with the stream
+                            self.log.warning(f"Error processing content part: {part_error}")
+                            continue
+
+                # --- End of streaming for this round ---
+
+                self.log.info(
+                    f"[stream] round={tool_call_iteration} complete. "
+                    f"function_calls={len(function_call_parts_this_round)} "
+                    f"answer_chars={sum(len(c) for c in answer_chunks)} "
+                    f"thought_chars={sum(len(c) for c in thought_chunks)}"
+                )
+
+                # If no function calls were returned, or we can't execute them, exit the loop
+                can_execute = (
+                    function_call_parts_this_round
+                    and __tools__ is not None
+                    and client is not None
+                    and model_id is not None
+                )
+                if not can_execute:
+                    self.log.info(
+                        f"[stream] exiting tool loop. function_calls={bool(function_call_parts_this_round)} "
+                        f"tools_available={__tools__ is not None} "
+                        f"client_available={client is not None} "
+                        f"model_id_available={model_id is not None}"
+                    )
+                    break
+
+                if tool_call_iteration >= max_tool_iterations:
+                    self.log.warning(
+                        f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
+                        "stopping to prevent runaway agent."
+                    )
+                    limit_msg = (
+                        f"\n\n> ⚠️ Reached the tool call limit ({max_tool_iterations} rounds). "
+                        "The task may be incomplete. Raise **MAX_TOOL_ITERATIONS** in the pipe "
+                        "valve settings or via the `GOOGLE_MAX_TOOL_ITERATIONS` environment "
+                        "variable to allow longer agent sessions."
+                    )
+                    answer_chunks.append(limit_msg)
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "tool_calls_limit",
+                                    "description": f"Tool call limit reached ({max_tool_iterations}). Raise MAX_TOOL_ITERATIONS to continue.",
+                                    "done": True,
+                                },
+                            }
+                        )
+                    break
+
+                tool_call_iteration += 1
+                self.log.debug(
+                    f"Native tool call round {tool_call_iteration}: "
+                    f"{[p.function_call.name for p in function_call_parts_this_round]}"
+                )
+
+                # Execute each tool call and build function response parts
+                function_response_parts: list = []
+                tool_call_details: list[str] = []
+                for fc_part in function_call_parts_this_round:
+                    raw_tool_name = fc_part.function_call.name
+                    tool_args = (
+                        dict(fc_part.function_call.args)
+                        if fc_part.function_call.args
+                        else {}
+                    )
+                    # Gemini sometimes namespaces tool names as "default_api:foo" or
+                    # "default_api.foo" — strip that prefix so we can match the plain
+                    # name OpenWebUI uses as the __tools__ key.
+                    tool_name = raw_tool_name
+                    for prefix in ("default_api:", "default_api."):
+                        if tool_name.startswith(prefix):
+                            tool_name = tool_name[len(prefix):]
+                            break
+                    if tool_name != raw_tool_name:
+                        self.log.info(
+                            f"[stream] normalized tool name {raw_tool_name!r} -> {tool_name!r}"
+                        )
+
+                    if tool_name in __tools__:
+                        try:
+                            self.log.info(
+                                f"[stream] executing tool {tool_name!r} with args={tool_args}"
+                            )
+                            # Intercept OWUI's web-search tools and fulfill them with
+                            # Google Search so OWUI shows its full native search UX
+                            # (spinner, tool-call detail, source cards) while using
+                            # Google's actual results instead of OWUI's search engine.
+                            _web_search_names = {
+                                "search_web", "web_search", "search_internet"
+                            }
+                            _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
+                            _image_gen_names = {"generate_image", "edit_image"}
+                            if (
+                                tool_name in _web_search_names
+                                and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
+                            ):
+                                tool_result = await self._google_search_for_owui(
+                                    query=tool_args.get("query", ""),
+                                    model_id=model_id,
+                                    __event_emitter__=__event_emitter__,
+                                )
+                            elif tool_name in _fetch_url_names:
+                                if not self.valves.ENABLE_FETCH_URL:
+                                    self.log.warning(
+                                        f"[stream] fetch_url blocked by ENABLE_FETCH_URL=false: {tool_args.get('url', '')!r}"
+                                    )
+                                    tool_result = (
+                                        "fetch_url is disabled by the administrator. "
+                                        "Do not attempt to fetch URLs."
+                                    )
+                                elif self.valves.REPLACE_FETCH_URL:
+                                    _fetch_query = ""
+                                    for _c in current_contents:
+                                        if getattr(_c, "role", "") == "user":
+                                            for _p in getattr(_c, "parts", []) or []:
+                                                if getattr(_p, "text", None):
+                                                    _fetch_query = _p.text[:500]
+                                                    break
+                                        if _fetch_query:
+                                            break
+                                    tool_result = await self._fetch_url_for_owui(
+                                        url=tool_args.get("url", ""),
+                                        query=_fetch_query or None,
+                                        __event_emitter__=__event_emitter__,
+                                        __request__=__request__,
+                                    )
+                                else:
+                                    tool_callable = __tools__[tool_name]["callable"]
+                                    _raw = tool_callable(**tool_args)
+                                    tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                            elif (
+                                tool_name in _image_gen_names
+                                and self.valves.REPLACE_IMAGE_GENERATION
+                            ):
+                                tool_result = await self._generate_image_for_owui(
+                                    prompt=tool_args.get("prompt", ""),
+                                    image_urls=tool_args.get("image_urls"),
+                                    __event_emitter__=__event_emitter__,
+                                    __request__=__request__,
+                                    __user__=__user__,
+                                )
+                            else:
+                                tool_callable = __tools__[tool_name]["callable"]
+                                # Call first, then check isawaitable — handles functools.partial
+                                # and other wrappers that fool iscoroutinefunction.
+                                _raw = tool_callable(**tool_args)
+                                tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                            # Mirror OWUI middleware: emit 'embeds'/'files' for
+                            # rich returns (HTMLResponse cards, base64 images)
+                            # and hand back the LLM-visible text. Without this
+                            # the pipe's bypass of OWUI middleware would drop
+                            # the embed on the floor.
+                            tool_result = await self._process_tool_result_for_owui(
+                                tool_result, __event_emitter__
+                            )
+                            self.log.info(
+                                f"[stream] tool {tool_name!r} returned {len(tool_result)} chars: "
+                                f"{tool_result[:200]!r}"
+                            )
+                        except Exception as tool_err:
+                            self.log.exception(
+                                f"[stream] tool {tool_name!r} raised: {tool_err}"
+                            )
+                            tool_result = f"Error executing tool: {tool_err}"
+                    else:
+                        self.log.warning(
+                            f"[stream] tool {tool_name!r} (raw={raw_tool_name!r}) NOT FOUND in __tools__. "
+                            f"available keys={list(__tools__.keys())}"
+                        )
+                        tool_result = f"Error: tool '{tool_name}' not available"
+
+                    # IMPORTANT: the FunctionResponse name must exactly match the name
+                    # the model emitted in its FunctionCall, otherwise Gemini cannot
+                    # pair the response with the call. Use the raw name here even when
+                    # we normalised it for the __tools__ lookup above.
+                    function_response_parts.append(
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=raw_tool_name,
+                                response={"result": tool_result},
+                            )
+                        )
+                    )
+                    args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                    tool_call_details.append(
+                        f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                    )
+
+                # If all tool calls failed (not found / errored), function_response_parts
+                # will still be populated with error strings — but if it's empty for some
+                # reason, don't push empty Content to Gemini (would cause an API error).
+                if not function_response_parts:
+                    self.log.warning("No function response parts built; aborting tool loop.")
+                    break
+
+                await emit_chat_event(
+                    "status",
+                    {
+                        "action": "tool_calls",
+                        "description": "Tools complete",
+                        "done": True,
+                    },
+                )
+
+                # Emit a <details type="tool_calls"> block so the chat history shows
+                # what tools ran — matching the shape OWUI itself emits for native calls.
+                # Kept separate from answer_chunks so grounding only processes real text.
+                if tool_call_details:
+                    tool_calls_block = (
+                        '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
+                        + "\n\n".join(tool_call_details)
+                        + "\n\n</details>"
+                    )
+                    tool_call_blocks.append(tool_calls_block)
+                    await emit_chat_event(
+                        "chat:message:delta",
+                        {"role": "assistant", "content": tool_calls_block},
+                    )
+
+                # Extend the conversation with the model's tool calls and our responses.
+                # Thought parts (with their thought_signature) must be included alongside
+                # the function_call parts in the model turn — omitting them causes Gemini
+                # 3 / 2.5 thinking models to reject the follow-up request.
+                model_parts_this_round = thought_parts_this_round + function_call_parts_this_round
+                current_contents = current_contents + [
+                    types.Content(
+                        role="model", parts=model_parts_this_round
+                    ),
+                    types.Content(role="user", parts=function_response_parts),
+                ]
+
+                self.log.info(
+                    f"[stream] requesting follow-up stream after tool execution. "
+                    f"contents_len={len(current_contents)} "
+                    f"function_responses={len(function_response_parts)}"
+                )
+
+                # Get the next streaming response (model reads tool results)
+                _next_contents = current_contents
+
+                async def _get_next_stream() -> Any:
+                    return await client.aio.models.generate_content_stream(
+                        model=model_id,
+                        contents=_next_contents,
+                        config=generation_config,
+                    )
+
+                try:
+                    response_iterator = await self._retry_with_backoff(_get_next_stream)
+                except Exception as next_stream_err:
+                    self.log.exception(
+                        f"[stream] follow-up stream request failed: {next_stream_err}"
+                    )
+                    break
+
+            # After processing all chunks, handle grounding data.
+            # Grounding only processes real model text — tool call blocks are HTML and
+            # must be excluded to avoid malformed citation injection.
             final_answer_text = "".join(answer_chunks)
+            self.log.info(
+                f"[stream] all rounds done. answer_chars={len(final_answer_text)} "
+                f"thought_chars={sum(len(c) for c in thought_chunks)} "
+                f"tool_call_blocks={len(tool_call_blocks)}"
+            )
             if grounding_metadata_list and __event_emitter__:
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
@@ -2859,7 +4064,15 @@ class Pipe:
                 )
                 final_answer_text = cited or final_answer_text
 
-            final_content = final_answer_text
+            # Combine tool call blocks (if any) with the grounded answer text
+            tool_calls_section = "\n\n".join(tool_call_blocks)
+            combined_answer = (
+                (tool_calls_section + "\n\n" + final_answer_text)
+                if (tool_calls_section and final_answer_text)
+                else (tool_calls_section or final_answer_text)
+            )
+
+            final_content = combined_answer
             details_block: Optional[str] = None
 
             if thought_chunks:
@@ -2879,7 +4092,7 @@ class Pipe:
 {quoted_content}
 
 </details>""".strip()
-                final_content = f"{details_block}{final_answer_text}"
+                final_content = f"{details_block}\n\n{combined_answer}"
 
             if not final_content:
                 final_content = ""
@@ -2936,6 +4149,15 @@ class Pipe:
                 },
             )
             yield message
+        finally:
+            # Guarantee the response iterator is closed on every exit path so the
+            # underlying httpx/aiohttp socket is released and asyncio does not log
+            # an "Unclosed connection" warning.
+            if hasattr(response_iterator, "aclose"):
+                try:
+                    await response_iterator.aclose()
+                except Exception:
+                    pass
 
     @staticmethod
     def _build_usage_dict(usage_metadata: Any) -> Optional[Dict[str, int]]:
@@ -3393,7 +4615,15 @@ class Pipe:
                         )
                         self.log.debug(f"Request {request_id}: Got streaming response")
                         return self._handle_streaming_response(
-                            response_iterator, __event_emitter__, __request__, __user__
+                            response_iterator,
+                            __event_emitter__,
+                            __request__,
+                            __user__,
+                            __tools__,
+                            client,
+                            model_id,
+                            contents,
+                            generation_config,
                         )
 
                     except Exception as e:
@@ -3405,142 +4635,369 @@ class Pipe:
             # Non-streaming path (now also used for image generation)
             if not stream or supports_image_generation:
                 try:
-
-                    async def get_response():
-                        return await client.aio.models.generate_content(
-                            model=model_id,
-                            contents=contents,
-                            config=generation_config,
-                        )
-
-                    # Measure duration for non-streaming path (no status to avoid false indicators)
+                    # Measure duration for non-streaming path
                     start_ts = time.time()
 
-                    # Send processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing image request...",
-                                    "done": False,
-                                },
-                            }
-                        )
-
-                    response = await self._retry_with_backoff(get_response)
-                    self.log.debug(f"Request {request_id}: Got non-streaming response")
-
-                    # Clear processing status for image generation
-                    if supports_image_generation:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "action": "image_processing",
-                                    "description": "Processing complete",
-                                    "done": True,
-                                },
-                            }
-                        )
-
-                    # Handle "Thinking" and produce final formatted content
-                    # Check for safety blocks first
-                    safety_message = self._get_safety_block_message(response)
-                    if safety_message:
-                        return safety_message
-
-                    # Get the first candidate (safety checks passed)
-                    candidate = response.candidates[0]
-
-                    # Process content parts - use new streamlined approach
-                    parts = getattr(getattr(candidate, "content", None), "parts", [])
-                    if not parts:
-                        return "[No content generated or unexpected response structure]"
+                    # Accumulate content across all tool-call rounds
+                    max_tool_iterations = self.valves.MAX_TOOL_ITERATIONS
+                    tool_call_iteration = 0
+                    current_contents = list(contents)
 
                     answer_segments: list[str] = []
                     thought_segments: list[str] = []
+                    # Tool call <details> blocks kept separate so grounding only processes real text
+                    tool_call_blocks_ns: list[str] = []
                     generated_images: list[str] = []
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
+                    grounding_metadata_list = []
+                    response = None
 
-                    for part in parts:
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
-                            thought_segments.append(part.text)
-                        elif getattr(part, "text", None):
-                            answer_segments.append(part.text)
-                        elif (
-                            getattr(part, "inline_data", None)
-                            and __request__
-                            and __user__
-                        ):
-                            # Handle generated images with unified upload method
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
-
-                            self.log.debug(
-                                f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
+                    while tool_call_iteration <= max_tool_iterations:
+                        # Send processing status for image generation (first request only)
+                        if tool_call_iteration == 0 and supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing image request...",
+                                        "done": False,
+                                    },
+                                }
                             )
 
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
+                        _iter_contents = current_contents
+
+                        async def get_response():
+                            return await client.aio.models.generate_content(
+                                model=model_id,
+                                contents=_iter_contents,
+                                config=generation_config,
+                            )
+
+                        response = await self._retry_with_backoff(get_response)
+                        self.log.debug(f"Request {request_id}: Got non-streaming response")
+
+                        # Clear processing status for image generation (first request only)
+                        if tool_call_iteration == 0 and supports_image_generation:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "image_processing",
+                                        "description": "Processing complete",
+                                        "done": True,
+                                    },
+                                }
+                            )
+
+                        # Check for safety blocks first
+                        safety_message = self._get_safety_block_message(response)
+                        if safety_message:
+                            return safety_message
+
+                        # Get the first candidate (safety checks passed)
+                        candidate = response.candidates[0]
+
+                        # Collect grounding metadata across all rounds
+                        if getattr(candidate, "grounding_metadata", None):
+                            grounding_metadata_list.append(candidate.grounding_metadata)
+
+                        # Process content parts
+                        parts = getattr(getattr(candidate, "content", None), "parts", [])
+                        if not parts:
+                            return "[No content generated or unexpected response structure]"
+
+                        function_call_parts_this_round: list = []
+                        thought_parts_this_round: list = []
+
+                        for part in parts:
+                            if getattr(part, "thought", False) and getattr(
+                                part, "text", None
+                            ):
+                                thought_segments.append(part.text)
+                                thought_parts_this_round.append(part)
+                            elif getattr(part, "text", None):
+                                answer_segments.append(part.text)
+                            elif getattr(part, "function_call", None):
+                                function_call_parts_this_round.append(part)
+                                tool_name = part.function_call.name
+                                self.log.info(
+                                    f"[non-stream] function_call detected: name={tool_name!r} "
+                                    f"args={dict(part.function_call.args) if part.function_call.args else {}}"
+                                )
+                                # Status is emitted in the execution loop below;
+                                # emitting here too causes duplicate "Executing" entries.
+                            elif (
+                                getattr(part, "inline_data", None)
+                                and __request__
+                                and __user__
+                            ):
+                                # Handle generated images with unified upload method
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
+
                                 self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
+                                    f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
                                 )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
 
-                            image_url = await self._upload_image_with_status(
-                                image_data,
-                                mime_type,
-                                __request__,
-                                __user__,
-                                __event_emitter__,
-                            )
-                            if image_url.startswith("data:"):
-                                generated_images.append(
-                                    f"![Generated Image]({image_url})"
+                                image_hash = self._image_data_hash(image_data)
+                                if image_hash in seen_generated_image_hashes:
+                                    self.log.debug(
+                                        "Skipping duplicate generated image part from Gemini response"
+                                    )
+                                    continue
+                                seen_generated_image_hashes.add(image_hash)
+
+                                image_url = await self._upload_image_with_status(
+                                    image_data,
+                                    mime_type,
+                                    __request__,
+                                    __user__,
+                                    __event_emitter__,
                                 )
+                                if image_url.startswith("data:"):
+                                    generated_images.append(
+                                        f"![Generated Image]({image_url})"
+                                    )
+                                else:
+                                    generated_image_files.append(
+                                        self._build_generated_image_file(
+                                            content_url=image_url,
+                                            mime_type=mime_type,
+                                        )
+                                    )
+
+                            elif getattr(part, "inline_data", None):
+                                # Fallback: return as base64 data URL if no request/user context
+                                mime_type = part.inline_data.mime_type
+                                image_data = part.inline_data.data
+
+                                image_hash = self._image_data_hash(image_data)
+                                if image_hash in seen_generated_image_hashes:
+                                    self.log.debug(
+                                        "Skipping duplicate generated image part from Gemini response"
+                                    )
+                                    continue
+                                seen_generated_image_hashes.add(image_hash)
+
+                                if isinstance(image_data, bytes):
+                                    image_data_b64 = base64.b64encode(image_data).decode(
+                                        "utf-8"
+                                    )
+                                else:
+                                    image_data_b64 = str(image_data)
+
+                                data_url = f"data:{mime_type};base64,{image_data_b64}"
+                                generated_images.append(f"![Generated Image]({data_url})")
+
+                        # If no function calls (or unable to execute), we're done
+                        can_execute = (
+                            function_call_parts_this_round
+                            and __tools__ is not None
+                            and not supports_image_generation
+                        )
+                        if not can_execute:
+                            break
+
+                        if tool_call_iteration >= max_tool_iterations:
+                            self.log.warning(
+                                f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
+                                "stopping to prevent runaway agent."
+                            )
+                            answer_segments.append(
+                                f"\n\n> ⚠️ Reached the tool call limit ({max_tool_iterations} rounds). "
+                                "The task may be incomplete. Raise **MAX_TOOL_ITERATIONS** in the pipe "
+                                "valve settings or via the `GOOGLE_MAX_TOOL_ITERATIONS` environment "
+                                "variable to allow longer agent sessions."
+                            )
+                            break
+
+                        tool_call_iteration += 1
+                        self.log.debug(
+                            f"Native tool call round {tool_call_iteration}: "
+                            f"{[p.function_call.name for p in function_call_parts_this_round]}"
+                        )
+
+                        # Execute each tool call and build function response parts
+                        function_response_parts: list = []
+                        tool_call_details: list[str] = []
+                        for fc_part in function_call_parts_this_round:
+                            raw_tool_name = fc_part.function_call.name
+                            tool_args = (
+                                dict(fc_part.function_call.args)
+                                if fc_part.function_call.args
+                                else {}
+                            )
+                            # Strip default_api:/default_api. prefix Gemini sometimes adds
+                            tool_name = raw_tool_name
+                            for prefix in ("default_api:", "default_api."):
+                                if tool_name.startswith(prefix):
+                                    tool_name = tool_name[len(prefix):]
+                                    break
+                            if tool_name != raw_tool_name:
+                                self.log.info(
+                                    f"[non-stream] normalized tool name {raw_tool_name!r} -> {tool_name!r}"
+                                )
+
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "action": "tool_calls",
+                                            "description": f"Calling: {tool_name}",
+                                            "done": False,
+                                        },
+                                    }
+                                )
+
+                            if tool_name in __tools__:
+                                try:
+                                    self.log.info(
+                                        f"[non-stream] executing tool {tool_name!r} with args={tool_args}"
+                                    )
+                                    _web_search_names = {
+                                        "search_web", "web_search", "search_internet"
+                                    }
+                                    _fetch_url_names = {"fetch_url", "browse_url", "get_url", "browse"}
+                                    _image_gen_names = {"generate_image", "edit_image"}
+                                    if (
+                                        tool_name in _web_search_names
+                                        and self.valves.REPLACE_SEARCH_WEB_WITH_GOOGLE
+                                    ):
+                                        tool_result = await self._google_search_for_owui(
+                                            query=tool_args.get("query", ""),
+                                            model_id=model_id,
+                                            __event_emitter__=__event_emitter__,
+                                        )
+                                    elif tool_name in _fetch_url_names:
+                                        if not self.valves.ENABLE_FETCH_URL:
+                                            self.log.warning(
+                                                f"[non-stream] fetch_url blocked by ENABLE_FETCH_URL=false: {tool_args.get('url', '')!r}"
+                                            )
+                                            tool_result = (
+                                                "fetch_url is disabled by the administrator. "
+                                                "Do not attempt to fetch URLs."
+                                            )
+                                        elif self.valves.REPLACE_FETCH_URL:
+                                            _fetch_query = ""
+                                            for _m in messages:
+                                                if _m.get("role") == "user":
+                                                    _mc = _m.get("content", "")
+                                                    if isinstance(_mc, str):
+                                                        _fetch_query = _mc[:500]
+                                                    elif isinstance(_mc, list):
+                                                        for _item in _mc:
+                                                            if isinstance(_item, dict) and _item.get("type") == "text":
+                                                                _fetch_query = _item.get("text", "")[:500]
+                                                                break
+                                                if _fetch_query:
+                                                    break
+                                            tool_result = await self._fetch_url_for_owui(
+                                                url=tool_args.get("url", ""),
+                                                query=_fetch_query or None,
+                                                __event_emitter__=__event_emitter__,
+                                                __request__=__request__,
+                                            )
+                                        else:
+                                            tool_callable = __tools__[tool_name]["callable"]
+                                            _raw = tool_callable(**tool_args)
+                                            tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    elif (
+                                        tool_name in _image_gen_names
+                                        and self.valves.REPLACE_IMAGE_GENERATION
+                                    ):
+                                        tool_result = await self._generate_image_for_owui(
+                                            prompt=tool_args.get("prompt", ""),
+                                            image_urls=tool_args.get("image_urls"),
+                                            __event_emitter__=__event_emitter__,
+                                            __request__=__request__,
+                                            __user__=__user__,
+                                        )
+                                    else:
+                                        tool_callable = __tools__[tool_name]["callable"]
+                                        # Call first, then check isawaitable — handles functools.partial
+                                        # and other wrappers that fool iscoroutinefunction.
+                                        _raw = tool_callable(**tool_args)
+                                        tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    tool_result = await self._process_tool_result_for_owui(
+                                        tool_result, __event_emitter__
+                                    )
+                                    self.log.info(
+                                        f"[non-stream] tool {tool_name!r} returned {len(tool_result)} chars: "
+                                        f"{tool_result[:200]!r}"
+                                    )
+                                except Exception as tool_err:
+                                    self.log.exception(
+                                        f"[non-stream] tool {tool_name!r} raised: {tool_err}"
+                                    )
+                                    tool_result = f"Error executing tool: {tool_err}"
                             else:
-                                generated_image_files.append(
-                                    self._build_generated_image_file(
-                                        content_url=image_url,
-                                        mime_type=mime_type,
+                                self.log.warning(
+                                    f"[non-stream] tool {tool_name!r} (raw={raw_tool_name!r}) NOT FOUND. "
+                                    f"available keys={list(__tools__.keys())}"
+                                )
+                                tool_result = f"Error: tool '{tool_name}' not available"
+
+                            # Use raw name in FunctionResponse so Gemini can pair it with
+                            # the original FunctionCall it emitted.
+                            function_response_parts.append(
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=raw_tool_name,
+                                        response={"result": tool_result},
                                     )
                                 )
+                            )
+                            args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                            tool_call_details.append(
+                                f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                            )
 
-                        elif getattr(part, "inline_data", None):
-                            # Fallback: return as base64 data URL if no request/user context
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
+                        # Don't push empty Content to Gemini — would cause an API error
+                        if not function_response_parts:
+                            self.log.warning("No function response parts built; aborting tool loop.")
+                            break
 
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
-                                self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
-                                )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "tool_calls",
+                                        "description": "Tools complete",
+                                        "done": True,
+                                    },
+                                }
+                            )
 
-                            if isinstance(image_data, bytes):
-                                image_data_b64 = base64.b64encode(image_data).decode(
-                                    "utf-8"
-                                )
-                            else:
-                                image_data_b64 = str(image_data)
+                        # Accumulate <details type="tool_calls"> separately from answer text
+                        # so grounding citation processing only sees real model text.
+                        if tool_call_details:
+                            tool_calls_block = (
+                                '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
+                                + "\n\n".join(tool_call_details)
+                                + "\n\n</details>"
+                            )
+                            tool_call_blocks_ns.append(tool_calls_block)
 
-                            data_url = f"data:{mime_type};base64,{image_data_b64}"
-                            generated_images.append(f"![Generated Image]({data_url})")
+                        # Extend conversation with tool calls and their responses.
+                        # Include thought parts (with thought_signature) in the model
+                        # turn for Gemini 3 / 2.5 thinking model compatibility.
+                        model_parts_this_round = thought_parts_this_round + function_call_parts_this_round
+                        current_contents = current_contents + [
+                            types.Content(
+                                role="model", parts=model_parts_this_round
+                            ),
+                            types.Content(role="user", parts=function_response_parts),
+                        ]
 
+                    # Grounding only processes real model text — tool call blocks are HTML
+                    # and must be excluded to avoid malformed citation injection.
                     final_answer = "".join(answer_segments)
 
-                    # Apply grounding (if available) and send sources/status as needed
-                    grounding_metadata_list = []
-                    if getattr(candidate, "grounding_metadata", None):
-                        grounding_metadata_list.append(candidate.grounding_metadata)
                     if grounding_metadata_list:
                         cited = await self._process_grounding_metadata(
                             grounding_metadata_list,
@@ -3548,6 +5005,14 @@ class Pipe:
                             __event_emitter__,
                         )
                         final_answer = cited or final_answer
+
+                    # Combine tool call blocks with the grounded answer text
+                    tool_calls_section = "\n\n".join(tool_call_blocks_ns)
+                    combined_answer = (
+                        (tool_calls_section + "\n\n" + final_answer)
+                        if (tool_calls_section and final_answer)
+                        else (tool_calls_section or final_answer)
+                    )
 
                     # Combine all content
                     full_response = ""
@@ -3569,9 +5034,11 @@ class Pipe:
 
 </details>""".strip()
                         full_response += details_block
+                        if combined_answer:
+                            full_response += "\n\n"
 
-                    # Add the main answer
-                    full_response += final_answer
+                    # Add tool call blocks + grounded answer
+                    full_response += combined_answer
 
                     files_emitted = await self._emit_generated_image_files(
                         generated_image_files, __event_emitter__
@@ -3586,7 +5053,7 @@ class Pipe:
                     if (
                         generated_image_files
                         and files_emitted
-                        and not final_answer.strip()
+                        and not combined_answer.strip()
                     ):
                         if full_response:
                             full_response += "\n\n"
