@@ -3814,6 +3814,24 @@ class Pipe:
                         f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
                         "stopping to prevent runaway agent."
                     )
+                    limit_msg = (
+                        f"\n\n> ⚠️ Reached the tool call limit ({max_tool_iterations} rounds). "
+                        "The task may be incomplete. Raise **MAX_TOOL_ITERATIONS** in the pipe "
+                        "valve settings or via the `GOOGLE_MAX_TOOL_ITERATIONS` environment "
+                        "variable to allow longer agent sessions."
+                    )
+                    answer_chunks.append(limit_msg)
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "tool_calls_limit",
+                                    "description": f"Tool call limit reached ({max_tool_iterations}). Raise MAX_TOOL_ITERATIONS to continue.",
+                                    "done": True,
+                                },
+                            }
+                        )
                     break
 
                 tool_call_iteration += 1
@@ -4780,6 +4798,12 @@ class Pipe:
                             self.log.warning(
                                 f"Native tool call loop reached MAX_TOOL_ITERATIONS={max_tool_iterations}; "
                                 "stopping to prevent runaway agent."
+                            )
+                            answer_segments.append(
+                                f"\n\n> ⚠️ Reached the tool call limit ({max_tool_iterations} rounds). "
+                                "The task may be incomplete. Raise **MAX_TOOL_ITERATIONS** in the pipe "
+                                "valve settings or via the `GOOGLE_MAX_TOOL_ITERATIONS` environment "
+                                "variable to allow longer agent sessions."
                             )
                             break
 
