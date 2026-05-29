@@ -2908,14 +2908,21 @@ class Pipe:
 
         if tools:
             gen_config_params["tools"] = tools
-            # Disable the SDK's Automatic Function Calling (AFC) so our own tool
-            # execution loop in _handle_streaming_response / pipe handles the round-
-            # trips. AFC intercepts function_call parts before we see them and passes
-            # raw Python return values (including OWUI's (HTMLResponse, str) tuples)
-            # directly to Gemini, which Gemini cannot deserialise — causing blank output.
-            gen_config_params["automatic_function_calling"] = (
-                types.AutomaticFunctionCallingConfig(disable=True)
-            )
+
+        # Always disable the SDK's Automatic Function Calling (AFC).
+        # AFC is the SDK's own tool-execution loop; it has a hard cap of
+        # max_remote_calls=10 that is completely separate from our
+        # MAX_TOOL_ITERATIONS valve. Even when tools is empty, AFC stays
+        # "enabled" by default and starts counting any generate_content
+        # round-trips against that cap — dropping the session at 10
+        # regardless of what GOOGLE_MAX_TOOL_ITERATIONS is set to.
+        # We never pass Python callables to the SDK (only FunctionDeclarations
+        # and server-side built-ins), so AFC can't usefully execute anything
+        # on our behalf anyway. Disabling it unconditionally hands full control
+        # of the tool loop back to our own _handle_streaming_response / pipe code.
+        gen_config_params["automatic_function_calling"] = (
+            types.AutomaticFunctionCallingConfig(disable=True)
+        )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
