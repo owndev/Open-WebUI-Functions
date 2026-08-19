@@ -11,11 +11,14 @@
 #
 # AI RELEASE NOTES (optional):
 # 1. Set RELEASE_AI_ENABLED = "true" (GitHub Variable)
-# 2. Ensure the calling workflow has 'permissions: models: read' (GITHUB_TOKEN is used by default)
-#    Alternatively, create a RELEASE_AI_TOKEN secret with a PERSONAL PAT (models:read scope)
+# 2. The 'copilot-requests: write' permission below is what entitles the Copilot CLI.
+#    GITHUB_TOKEN is sufficient; a RELEASE_AI_TOKEN secret is optional and needs no scope.
 #    Note: Organization-scoped PATs do NOT work (403) — only personal PATs or GITHUB_TOKEN
+#    The organisation must also allow "use of Copilot CLI billed to the organization".
 # 3. Create "Release-Review" GitHub Environment with Required Reviewers
-# 4. Optionally configure: RELEASE_AI_MODEL, RELEASE_AI_LANGUAGE, RELEASE_AI_TEMPERATURE
+# 4. Optionally configure: RELEASE_AI_MODEL, RELEASE_AI_LANGUAGE
+#    Leave RELEASE_AI_MODEL unset to follow the Copilot account default (recommended) — a pinned
+#    model id stops working the day GitHub retires it from the Copilot CLI catalogue
 # See: https://github.com/owndev-public/workflows/blob/main/README.md
 #
 # FEATURES: GitVersion integration, Environment support, Automatic versioning,
@@ -27,7 +30,12 @@ permissions:
   contents: write
   actions: read
   discussions: write
-  models: read
+  # actions/ai-inference v3 reaches the model through the GitHub Copilot CLI, which is entitled by
+  # `copilot-requests: write`. The former `models: read` addressed GitHub Models, retired 2026-07-30.
+  # It has to be granted HERE: a called workflow can only downgrade the caller's GITHUB_TOKEN, never
+  # elevate it. Keeping `models: read` fails the run before the first step with
+  # "The workflow is requesting 'models: read', but is only allowed 'models: none'".
+  copilot-requests: write
 
 # Prevent concurrent runs on same ref
 concurrency:
@@ -67,8 +75,6 @@ jobs:
       release_ai_enabled: ${{ vars.RELEASE_AI_ENABLED }}
       release_ai_model: ${{ vars.RELEASE_AI_MODEL }}
       release_ai_language: ${{ vars.RELEASE_AI_LANGUAGE }}
-      release_ai_max_tokens: ${{ vars.RELEASE_AI_MAX_TOKENS }}
-      release_ai_temperature: ${{ vars.RELEASE_AI_TEMPERATURE }}
       release_ai_custom_prompt: ${{ vars.RELEASE_AI_CUSTOM_PROMPT }}
       release_ai_project_description: ${{ vars.RELEASE_AI_PROJECT_DESCRIPTION }}
       release_ai_max_commits: ${{ vars.RELEASE_AI_MAX_COMMITS }}

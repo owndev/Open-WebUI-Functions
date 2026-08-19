@@ -160,6 +160,11 @@ GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
 # Default: true
 GOOGLE_INCLUDE_THOUGHTS=true
 
+# Strip rendered thinking summaries from assistant messages before replaying
+# the conversation to the API (saves tokens, avoids stale reasoning)
+# Default: true
+GOOGLE_STRIP_THINKING_FROM_HISTORY=true
+
 # Thinking budget for Gemini 2.5 models (not used for Gemini 3 models)
 # -1 = dynamic (model decides), 0 = disabled, 1-32768 = fixed token limit
 # Default: -1 (dynamic)
@@ -806,6 +811,30 @@ No additional configuration is required. Token usage is tracked automatically fo
 
 > [!NOTE]
 > Thinking tokens consumed during internal reasoning are **not** included in `completion_tokens` — they are captured separately by the Gemini API in `thoughts_token_count` but are not forwarded to Open WebUI at this time.
+
+### Thinking Summaries in Conversation History
+
+When thoughts are enabled, the pipeline renders them as a collapsible
+`<details><summary>Thought (12s)</summary>...</details>` block in front of the answer.
+Open WebUI stores what the user sees, so that block comes back verbatim in the message
+history of every follow-up turn.
+
+By default the pipeline removes those blocks from assistant messages before they are
+sent to the API. This reduces prompt tokens on long thinking-heavy chats and keeps
+earlier reasoning from steering later answers. Only the API payload is affected — the
+thinking summary stays visible in the chat.
+
+```bash
+# Default: strip previous thinking summaries before sending
+GOOGLE_STRIP_THINKING_FROM_HISTORY=true
+
+# Send them along, as before
+GOOGLE_STRIP_THINKING_FROM_HISTORY=false
+```
+
+> [!NOTE]
+> Only the pipeline's own `Thought (…)` summaries are removed. Other `<details>` blocks
+> in a message, and anything written by the user, are left untouched.
 
 ### Thinking Compatibility
 

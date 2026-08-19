@@ -215,6 +215,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports encryption of sensitive information such as API keys.
 - Supports both streaming and non-streaming responses (streaming is automatically disabled for image generation models).
 - **Thinking & reasoning**: Configurable thinking levels (`low` / `high`) for Gemini 3 models and thinking budgets (0–32 768 tokens) for Gemini 2.5 models, with per-chat override support.
+- **Lean history**: Previously rendered thinking summaries are stripped from assistant messages before the conversation is replayed to the API (configurable).
 - Provides configurable error handling and timeouts.
 - **Advanced image processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
