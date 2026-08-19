@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.2
+version: 1.16.0
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -34,6 +34,7 @@ features:
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels for Gemini 3 models with model-specific validation
+  - Thinking summaries stripped from replayed history to save tokens (configurable)
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
   - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
   - Model whitelist for filtering available models
@@ -257,6 +258,13 @@ class Pipe:
         INCLUDE_THOUGHTS: bool = Field(
             default=os.getenv("GOOGLE_INCLUDE_THOUGHTS", "true").lower() == "true",
             description="Enable Gemini thoughts outputs (set false to disable).",
+        )
+        STRIP_THINKING_FROM_HISTORY: bool = Field(
+            default=os.getenv("GOOGLE_STRIP_THINKING_FROM_HISTORY", "true").lower()
+            == "true",
+            description="Remove previously rendered thinking summaries from assistant "
+            "messages before they are replayed to the API (saves tokens and avoids "
+            "distraction). Set false to send them as before.",
         )
         THINKING_BUDGET: int = Field(
             default=int(os.getenv("GOOGLE_THINKING_BUDGET", "-1")),
@@ -1556,6 +1564,47 @@ class Pipe:
 
         return model_id
 
+    # Matches the thinking summary this pipeline prepends to its own answers, i.e. a
+    # <details> block whose <summary> is exactly "Thought (12s)". The summary shape is
+    # kept strict so an answer that merely talks about <details> blocks survives.
+    # Non-greedy on purpose: a "</details>" inside the quoted thoughts ends the match
+    # early and leaves a harmless remainder rather than eating the real answer.
+    _THINKING_DETAILS_RE = re.compile(
+        r"<details[^>]*>\s*<summary>\s*Thought \(\d+s\)\s*</summary>"
+        r".*?</details>\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def _strip_thinking_from_content(self, content: Any) -> Any:
+        """Remove rendered thinking summaries from an assistant message.
+
+        Open WebUI stores what the user sees, so the "<details><summary>Thought
+        (Ns)</summary>" block emitted for the UI comes back verbatim in the message
+        history and would otherwise be replayed to the API (issue #176). Gemini has
+        no use for it: reasoning context is carried by the API itself, not by the
+        rendered markdown.
+
+        Args:
+            content: Message content, either a plain string or a multimodal list
+
+        Returns:
+            The content with thinking summaries removed (same shape as the input)
+        """
+        if isinstance(content, str):
+            return self._THINKING_DETAILS_RE.sub("", content)
+        if isinstance(content, list):
+            return [
+                (
+                    {**item, "text": self._THINKING_DETAILS_RE.sub("", item["text"])}
+                    if isinstance(item, dict)
+                    and item.get("type") == "text"
+                    and isinstance(item.get("text"), str)
+                    else item
+                )
+                for item in content
+            ]
+        return content
+
     def _prepare_content(
         self, messages: List[Dict[str, Any]]
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -1587,6 +1636,16 @@ class Pipe:
             content = message.get("content", "")
             parts = []
 
+            # Map roles: 'assistant' -> 'model', 'user' -> 'user'
+            api_role = "model" if role == "assistant" else "user"
+
+            # Never replay our own thinking summary back to the model (issue #176)
+            strip_thinking = (
+                api_role == "model" and self.valves.STRIP_THINKING_FROM_HISTORY
+            )
+            if strip_thinking:
+                content = self._strip_thinking_from_content(content)
+
             # Handle different content types
             if isinstance(content, list):  # Multimodal content
                 parts.extend(self._process_multimodal_content(content))
@@ -1596,8 +1655,14 @@ class Pipe:
                 self.log.warning(f"Unsupported message content type: {type(content)}")
                 continue  # Skip unsupported content
 
-            # Map roles: 'assistant' -> 'model', 'user' -> 'user'
-            api_role = "model" if role == "assistant" else "user"
+            # A turn that held nothing but a thinking summary is empty now
+            if strip_thinking:
+                parts = [
+                    p
+                    for p in parts
+                    if not isinstance(p.get("text"), str) or p["text"].strip()
+                ]
+
             if parts:  # Only add if there are parts
                 contents.append({"role": api_role, "parts": parts})
 
