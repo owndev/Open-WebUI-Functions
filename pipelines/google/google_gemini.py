@@ -3671,14 +3671,15 @@ class Pipe:
                     content = (
                         full_response if full_response else "[No content generated]"
                     )
-                    result = {
-                        "choices": [
-                            {"message": {"role": "assistant", "content": content}}
-                        ],
-                    }
+
+                    # Emit usage data so Open WebUI can capture it before we return the string
                     if usage:
-                        result["usage"] = usage
-                    return result
+                        await __event_emitter__({"type": "usage", "data": usage})
+
+                    # Return the content as a string for non-streaming calls.
+                    # This ensures Open WebUI captures the final content correctly
+                    # and propagates it to subsequent events (like outlet filters).
+                    return content
 
                 except Exception as e:
                     self.log.exception(
