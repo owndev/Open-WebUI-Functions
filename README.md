@@ -253,11 +253,29 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
 - Uses OpenAI's `tiktoken` library for token counting (accurate only for OpenAI models).
-- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview).
+- Falls back to an estimate (about 4 characters per token) when no `tiktoken` encoding can be loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through.
+- Also works for API requests. Since Open WebUI 0.10, the filter's outlet step runs for them too. There is no chat window to show a status message, but the metrics are still logged and sent to Log Analytics.
+- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`).
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 
 🔗 [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md)
+
+### 2. [Google Search Tool](./filters/google_search_tool.py)
+
+- Companion filter for the [Google Gemini pipeline](./pipelines/google/google_gemini.py). Requires Open WebUI 0.9.0 or newer.
+- When **Web Search** is switched on for a chat, it replaces Open WebUI's own web search with Google Search grounding and the URL context tool.
+- Requests without a `features` object (API clients, channel replies, automations) pass through unchanged.
+
+🔗 [Web search with Gemini](./docs/google-gemini-integration.md#web-search-and-access)
+
+### 3. [Vertex AI Search Tool](./filters/vertex_ai_search_tool.py)
+
+- Companion filter for the [Google Gemini pipeline](./pipelines/google/google_gemini.py) in Vertex AI mode. Requires Open WebUI 0.9.0 or newer.
+- Turns on Vertex AI Search grounding when a request asks for the `vertex_ai_search` feature.
+- Gets the data store from the request's `params.vertex_rag_store` or, if that is not set, from the `VERTEX_AI_RAG_STORE` environment variable.
+
+🔗 [Grounding with Vertex AI Search](./docs/google-gemini-integration.md#grounding-with-vertex-ai-search)
 
 ## 🤝 Integrations
 

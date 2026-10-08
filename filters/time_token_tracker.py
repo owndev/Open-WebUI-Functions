@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.1
+version: 2.6.2
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
@@ -14,13 +14,16 @@ features:
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
   - Sends metrics to Azure Log Analytics.
+  - Falls back to a len(text) // 4 token estimate when no tiktoken encoding can be loaded (e.g. offline).
 changelog:
+  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
 import time
 import json
 import uuid
+import asyncio
 import hmac
 import base64
 import hashlib
@@ -43,6 +46,12 @@ _request_data: dict[str, dict] = {}
 # Entries older than this (seconds) are pruned to prevent unbounded growth
 # when outlet() is never reached (e.g. cancelled requests, crashes).
 _STALE_ENTRY_TIMEOUT = 600
+
+# tiktoken downloads an encoding's BPE file on first use. When that fails
+# (offline, no TIKTOKEN_CACHE_DIR cache) token counts are estimated and the
+# load is retried at most once per this many seconds.
+_ENCODING_RETRY_INTERVAL = 300
+_encoding_failures: dict[str, float] = {}
 
 
 def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
@@ -211,7 +220,8 @@ class Filter:
             default=True, description="Show tokens per second for the response."
         )
         SEND_TO_LOG_ANALYTICS: bool = Field(
-            default=bool(os.getenv("SEND_TO_LOG_ANALYTICS", False)),
+            default=os.getenv("SEND_TO_LOG_ANALYTICS", "false").strip().lower()
+            in ("1", "true", "yes", "on"),
             description="Send logs to Azure Log Analytics workspace",
         )
         LOG_ANALYTICS_WORKSPACE_ID: str = Field(
@@ -372,6 +382,47 @@ class Filter:
         except:  # noqa: E722
             return ""
 
+    async def _get_encoding(self, model: str):
+        """
+        Return the tiktoken encoding for the model (cl100k_base for unknown
+        models), or None if it cannot be loaded. Exceptions raised in inlet()
+        abort the chat, so a missing encoding must not raise.
+        """
+        try:
+            name = tiktoken.encoding_name_for_model(model)
+        except Exception:  # KeyError: model unknown to tiktoken
+            name = "cl100k_base"
+
+        failed_at = _encoding_failures.get(name)
+        if failed_at and time.time() - failed_at < _ENCODING_RETRY_INTERVAL:
+            return None
+
+        try:
+            # The first load may download the BPE file: keep it off the loop.
+            encoding = await asyncio.to_thread(tiktoken.get_encoding, name)
+        except Exception as e:
+            _encoding_failures[name] = time.time()
+            self.log.warning(
+                f"tiktoken encoding '{name}' could not be loaded ({e}); "
+                f"estimating token counts as len(text) // 4, "
+                f"retrying in {_ENCODING_RETRY_INTERVAL}s"
+            )
+            return None
+
+        _encoding_failures.pop(name, None)
+        return encoding
+
+    def _count_tokens(self, encoding, text: str) -> int:
+        """Count tokens with tiktoken, or estimate them as len(text) // 4."""
+        if encoding is not None:
+            try:
+                # disallowed_special=(): text such as "<|endoftext|>" in a
+                # message is counted as plain text instead of raising.
+                return len(encoding.encode(text, disallowed_special=()))
+            except Exception as e:
+                self.log.warning(f"tiktoken could not encode text ({e}), estimating")
+        return len(text) // 4
+
     async def inlet(
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
@@ -389,14 +440,11 @@ class Filter:
             f"Request key={storage_key}, active_entries={len(_request_data)}"
         )
 
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-            self.log.debug(f"Using model-specific tiktoken encoding for '{model}'")
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-            self.log.debug(
-                f"Model '{model}' not found in tiktoken, using cl100k_base fallback"
-            )
+        encoding = await self._get_encoding(model)
+        self.log.debug(
+            f"tiktoken encoding for '{model}': "
+            f"{encoding.name if encoding else 'unavailable, estimating'}"
+        )
 
         # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
@@ -425,7 +473,7 @@ class Filter:
                 request_messages = [last_user_system] if last_user_system else []
 
         request_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
+            self._count_tokens(encoding, self._get_message_content(m))
             for m in request_messages
             if m
         )
@@ -473,10 +521,7 @@ class Filter:
         response_time = end_time - request_data.get("start_time", end_time)
         request_token_count = request_data.get("request_token_count", 0)
 
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
+        encoding = await self._get_encoding(model)
 
         reversed_messages = list(
             reversed(all_messages)
@@ -495,7 +540,7 @@ class Filter:
         # response_token_count is a local variable here; unlike the original
         # global, it does not need to persist beyond this method.
         response_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
+            self._count_tokens(encoding, self._get_message_content(m))
             for m in assistant_messages
             if m
         )  # Calculate tokens per second (only for the last assistant response)
@@ -505,7 +550,9 @@ class Filter:
                 (m for m in reversed_messages if m.get("role") == "assistant"), None
             )
             last_assistant_tokens = (
-                len(encoding.encode(self._get_message_content(last_assistant_msg)))
+                self._count_tokens(
+                    encoding, self._get_message_content(last_assistant_msg)
+                )
                 if last_assistant_msg
                 else 0
             )
@@ -549,19 +596,26 @@ class Filter:
         )
         self.log.debug(f"Status event: {description}")
 
-        # Send event with description
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {"description": description, "done": True},
-            }
-        )
+        # Send event with description. Since Open WebUI 0.10 outlet filters also
+        # run for API requests, where there is no event emitter (None).
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": description, "done": True},
+                    }
+                )
+            except Exception as e:
+                self.log.warning(f"Could not emit status event: {e}")
+        else:
+            self.log.debug("No event emitter (e.g. API request): status skipped")
 
         # If Log Analytics integration is enabled, send the data
         if self.valves.SEND_TO_LOG_ANALYTICS:
-            # Create chat and message IDs for tracking
-            chat_id = body.get("chat_id", str(uuid.uuid4()))
-            message_id = str(uuid.uuid4())
+            # Chat and message IDs for tracking; API requests have no chat id
+            chat_id = body.get("chat_id") or str(uuid.uuid4())
+            message_id = body.get("id") or str(uuid.uuid4())
             # User ID if available
             user_id = __user__.get("id", "unknown") if __user__ else "unknown"
 
@@ -595,7 +649,8 @@ class Filter:
                     )
                 else:
                     self.log.warning(
-                        f"Failed to send data to Log Analytics " f"(chat={chat_id})"
+                        f"Failed to send data to Log Analytics "
+                        f"(chat={chat_id}, message={message_id})"
                     )
             except Exception as e:
                 self.log.error(f"Error sending to Log Analytics: {e}")

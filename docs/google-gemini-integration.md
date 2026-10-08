@@ -597,6 +597,14 @@ For instance, the following [Filter (google_search_tool.py)](../filters/google_s
 
 When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
+To use the filter:
+
+1. Install [google_search_tool.py](../filters/google_search_tool.py) under **Admin Panel → Functions**. It requires Open WebUI 0.9.0 or newer.
+2. Attach it to your Gemini models (**Workspace → Models → Edit → Filters**) or make it global.
+3. Switch on **Web Search** in the chat. Open WebUI's own web search is then not used for that request, and Gemini grounds the answer with Google Search instead.
+
+API clients can request grounding by sending `"features": {"web_search": true}` with `/api/chat/completions`. Requests without a `features` object, such as plain API calls, channel replies or automations, pass through the filter unchanged.
+
 ### Enterprise Search
 
 The pipeline supports **Enterprise Web Search** for grounding, which provides organization-level management of search results.
@@ -635,7 +643,7 @@ The [vertex_ai_search_tool.py](../filters/vertex_ai_search_tool.py) filter enabl
 # ... (filter code) ...
 ```
 
-To use this filter, ensure it's enabled in your Open WebUI configuration. Then, in your chat settings or via metadata, you can enable the `vertex_ai_search` feature:
+To use this filter (Open WebUI 0.9.0 or newer), make sure it is enabled and attached to your Gemini models or set as global. Then enable the `vertex_ai_search` feature in the request and, optionally, choose the data store for that request with `params.vertex_rag_store`:
 
 ```json
 {
@@ -647,6 +655,11 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
   }
 }
 ```
+
+The data store is chosen in this order: the request's `params.vertex_rag_store`, then the `VERTEX_AI_RAG_STORE` environment variable (both passed on by the filter), then the pipeline's `VERTEX_AI_RAG_STORE` valve.
+
+> [!NOTE]
+> Open WebUI moves request `params` it does not know, such as `vertex_rag_store`, to the top level of the request before filters run. Filter version 1.0.1 and newer reads the value from there. Older versions never received it, so the environment variable or the valve was used instead.
 
 ## Native tool calling support
 
