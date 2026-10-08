@@ -186,7 +186,8 @@ async def api(t: Suite, mock) -> None:
         mark = t.mark()
         r = await t.owui.chat(model, "force-400 please", stream=stream)
         await t.log.settle(0.5)
-        t.expect_errors(mark)  # the pipe logs the provoked upstream 400
+        # the pipe logs the provoked upstream 400 (anything else still fails)
+        t.expect_errors(mark, ("function_azure:pipe", "Error in Azure AI request: 400"))
         t.check(
             f"api.error-400.{'stream' if stream else 'nonstream'}",
             f"upstream HTTP 400 -> readable error (stream={stream})",

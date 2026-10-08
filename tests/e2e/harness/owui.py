@@ -11,6 +11,8 @@ Gotchas encoded here (Open WebUI 0.11.x):
   ``upsert_model`` do that, so a later ``--reuse`` run never sees a stale list)
 - "API path" = ``POST /api/chat/completions`` without ``chat_id``; Open WebUI
   answers directly (JSON or SSE) and runs outlet filters, but nothing is saved
+- a streamed answer only counts ``choices[].delta.content``: Open WebUI's
+  middleware and OpenAI clients ignore ``choices[].message`` in stream chunks
 """
 
 import asyncio
@@ -24,6 +26,15 @@ import httpx
 
 from .config import ADMIN_EMAIL, ADMIN_NAME, ADMIN_PASSWORD, OWUI_URL
 from .results import short
+
+# Error recorded when a stream chunk carries a full chat.completion message.
+STREAM_MESSAGE_ERROR = (
+    "stream answered with chat.completion (choices[].message.content in a stream "
+    "chunk; Open WebUI and OpenAI clients ignore it)"
+)
+# Plaintext secrets shorter than this are not tracked (too likely to occur in
+# unrelated log text).
+MIN_SECRET_LENGTH = 6
 
 
 @dataclass
@@ -39,6 +50,9 @@ class ChatResult:
     chunks: int = 0
     raw: str = ""
     json: Any = None
+    # stream only: choices[].message.content of chat.completion chunks (not part
+    # of ``content``, see STREAM_MESSAGE_ERROR)
+    message_content: str = ""
 
     def brief(self) -> str:
         return (
@@ -48,8 +62,20 @@ class ChatResult:
 
 
 def parse_sse(text: str) -> dict:
-    """Parse an OpenAI-style SSE body into content / usage / errors / [DONE]."""
-    out = {"content": "", "usage": None, "errors": [], "done": False, "chunks": 0}
+    """Parse an OpenAI-style SSE body into content / usage / errors / [DONE].
+
+    Only ``choices[].delta.content`` counts as content. A chunk with a full
+    ``choices[].message`` (a chat.completion dict answered to a stream request)
+    goes to ``message_content`` and adds ``STREAM_MESSAGE_ERROR`` to ``errors``.
+    """
+    out = {
+        "content": "",
+        "usage": None,
+        "errors": [],
+        "done": False,
+        "chunks": 0,
+        "message_content": "",
+    }
     for line in text.splitlines():
         if not line.startswith("data:"):
             continue
@@ -67,8 +93,11 @@ def parse_sse(text: str) -> dict:
             out["errors"].append(data["error"])
         for choice in (data.get("choices") if isinstance(data, dict) else None) or []:
             out["content"] += (choice.get("delta") or {}).get("content") or ""
-            # some pipes answer stream requests with a full chat.completion dict
-            out["content"] += (choice.get("message") or {}).get("content") or ""
+            message = choice.get("message")
+            if isinstance(message, dict):
+                out["message_content"] += message.get("content") or ""
+                if STREAM_MESSAGE_ERROR not in out["errors"]:
+                    out["errors"].append(STREAM_MESSAGE_ERROR)
         if isinstance(data, dict) and data.get("usage"):
             out["usage"] = data["usage"]
     return out
@@ -89,6 +118,10 @@ class OWUI:
         )
         self.token: Optional[str] = None
         self.user: dict = {}
+        # Plaintext values written to password valves: value -> "<fid>.<valve>"
+        # (``Suite.scan_log`` fails when one of them shows up in the log).
+        self.secrets: dict = {}
+        self._password_valves: dict = {}
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -105,18 +138,52 @@ class OWUI:
             await asyncio.sleep(1)
         return False
 
-    async def login(self) -> dict:
-        """Sign in as the e2e admin, signing up first on a fresh volume."""
-        creds = {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    async def login(
+        self,
+        email: str = ADMIN_EMAIL,
+        password: str = ADMIN_PASSWORD,
+        name: str = ADMIN_NAME,
+    ) -> dict:
+        """Sign in (default: the e2e admin), signing up first on a fresh volume."""
+        creds = {"email": email, "password": password}
         r = await self.http.post("/api/v1/auths/signin", json=creds)
         if r.status_code != 200:
             r = await self.http.post(
-                "/api/v1/auths/signup", json={**creds, "name": ADMIN_NAME}
+                "/api/v1/auths/signup", json={**creds, "name": name}
             )
         r.raise_for_status()
         self.user = r.json()
         self.token = self.user["token"]
         return self.user
+
+    async def create_user(
+        self,
+        name: str = "E2E User",
+        email: str = "user@example.com",
+        password: str = ADMIN_PASSWORD,
+        role: str = "user",
+    ) -> "OWUI":
+        """Add a user (admin API; kept when it already exists) and return a
+        second client signed in as that user. Close it with ``close()``."""
+        status, data = await self.api(
+            "POST",
+            "/api/v1/auths/add",
+            {"name": name, "email": email, "password": password, "role": role},
+        )
+        other = OWUI(self.base)
+        r = await other.http.post(
+            "/api/v1/auths/signin", json={"email": email, "password": password}
+        )
+        if r.status_code != 200:  # add failed for another reason than "exists"
+            await other.close()
+            raise RuntimeError(
+                f"create_user {email}: auths/add HTTP {status} {short(data)}, "
+                f"signin HTTP {r.status_code}"
+            )
+        other.user = r.json()
+        other.token = other.user["token"]
+        other.secrets = self.secrets  # one registry for every client
+        return other
 
     @property
     def headers(self) -> dict:
@@ -162,6 +229,7 @@ class OWUI:
             "content": content,
             "meta": {"description": description},
         }
+        self._password_valves.pop(fid, None)  # the valves may have changed
         if await self.function(fid):
             return await self.api(
                 "POST", f"/api/v1/functions/id/{fid}/update", form, timeout=900
@@ -187,17 +255,43 @@ class OWUI:
         _, data = await self.api("GET", f"/api/v1/functions/id/{fid}/valves")
         return data if isinstance(data, dict) else {}
 
-    async def valves_spec(self, fid: str) -> dict:
-        _, data = await self.api("GET", f"/api/v1/functions/id/{fid}/valves/spec")
+    async def valves_spec(self, fid: str, user: bool = False) -> dict:
+        """JSON schema of the function's Valves (``user=True``: UserValves)."""
+        path = f"/api/v1/functions/id/{fid}/valves/{'user/' if user else ''}spec"
+        _, data = await self.api("GET", path)
         return data if isinstance(data, dict) else {}
+
+    async def valve_names(self, fid: str, user: bool = False) -> list:
+        """Sorted valve names (Valves, or UserValves with ``user=True``)."""
+        return sorted((await self.valves_spec(fid, user)).get("properties") or {})
+
+    async def _remember_secrets(self, fid: str, valves: dict) -> None:
+        """Track plaintext values written to password-typed valves."""
+        if fid not in self._password_valves:
+            props = (await self.valves_spec(fid)).get("properties") or {}
+            self._password_valves[fid] = {
+                name
+                for name, spec in props.items()
+                if ((spec or {}).get("input") or {}).get("type") == "password"
+            }
+        for name in self._password_valves[fid]:
+            value = valves.get(name)
+            if (
+                isinstance(value, str)
+                and len(value) >= MIN_SECRET_LENGTH
+                and not value.startswith("encrypted:")
+            ):
+                self.secrets[value] = f"{fid}.{name}"
 
     async def replace_valves(self, fid: str, valves: dict) -> dict:
         """Store exactly ``valves`` (every valve not sent reverts to its default).
 
         Valves can change what ``pipes()`` returns (e.g. ``AZURE_AI_MODEL``), so
         the cached model list is refreshed afterwards; otherwise chat requests
-        answer "Model not found" until something else refreshes it.
+        answer "Model not found" until something else refreshes it. Plaintext
+        values of password valves are remembered in ``secrets``.
         """
+        await self._remember_secrets(fid, valves)
         status, data = await self.api(
             "POST", f"/api/v1/functions/id/{fid}/valves/update", valves
         )
@@ -252,6 +346,17 @@ class OWUI:
         await self.models(refresh=True)
         return status
 
+    async def delete_model(self, model_id: str) -> bool:
+        """Delete a workspace model (override); False when there is none.
+
+        The pipe model it overrode shows up again (cache refreshed).
+        """
+        status, data = await self.api(
+            "POST", "/api/v1/models/model/delete", {"id": model_id}
+        )
+        await self.models(refresh=True)
+        return status == 200 and data is True
+
     async def model_filter_ids(self, model_id: str) -> Optional[list]:
         for model in await self.models(refresh=True):
             if model["id"] == model_id:
@@ -283,6 +388,7 @@ class OWUI:
             result.errors = parsed["errors"]
             result.done = parsed["done"]
             result.chunks = parsed["chunks"]
+            result.message_content = parsed["message_content"]
             return result
         try:
             result.json = r.json()
@@ -316,6 +422,10 @@ class OWUI:
     async def get_chat(self, chat_id: str) -> dict:
         _, data = await self.api("GET", f"/api/v1/chats/{chat_id}")
         return data if isinstance(data, dict) else {}
+
+    async def stop_task(self, task_id: str) -> tuple[int, Any]:
+        """Stop a running chat task (the web UI's Stop button)."""
+        return await self.api("POST", f"/api/tasks/stop/{quote(task_id)}")
 
     async def file_status(self, url: str) -> tuple[int, str]:
         """(HTTP status, content type) of an Open WebUI file URL."""

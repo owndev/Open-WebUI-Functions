@@ -1,6 +1,10 @@
 """
 Registry of known bugs that make scenarios fail on ``main`` today.
 
+The entries live in one module per area (``known_gemini.py``, ``known_azure.py``,
+``known_filters.py``, ``known_n8n.py`` for n8n + Infomaniak) and are re-exported
+here, so suites keep writing ``known.GEMINI_B1``.
+
 A failing scenario that carries a ``KnownIssue`` is reported as KNOWN and does
 not fail the run, but only when the failure looks like that bug:
 
@@ -16,20 +20,34 @@ not fail the run, but only when the failure looks like that bug:
   signatures (background tasks and later requests hit the same bug outside the
   check); every other error still fails it.
 
-When the fix is merged the scenario starts to PASS and the driver prints a
-reminder to drop the ``known=`` argument (and the entry here, once nothing
-references it).
+Version gating (``file`` + ``fixed_in``): a marker only applies while the staged
+copy of ``file`` (``FUNCTIONS_DIR/<file>``, the file under test) has a docstring
+``version:`` lower than ``fixed_in``. From that version on the bug counts as
+fixed: a failing tagged check is a FAIL ("regression of known <key>") and a
+passing one is listed as an obsolete marker ("drop marker"). Fix branches and
+mutants of fixed files are therefore protected, ``main`` stays green, and the
+markers switch off by themselves once the fix is merged. ``fixed_in=""`` (no fix
+yet) never gates.
 
-``fixed_by`` names the pull request (or branch) that carries the fix. Until it is
-merged the scenario stays KNOWN; the issue in ``ref`` (when there is one) is the
-stable pointer.
+Strict mode (``--strict-known`` / ``E2E_STRICT_KNOWN=1``): a tagged check that
+passes while its marker still applies (the bug was fixed without a version bump,
+or the evidence is wrong) is a FAIL.
+
+``fixed_by`` names the pull request (or branch) that carries the fix; the issue
+in ``ref`` (when there is one) is the stable pointer.
 """
 
+import os
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Union
+from functools import lru_cache
+from typing import Optional, Union
+
+from .config import FUNCTIONS_DIR
 
 Signature = Union[str, tuple]
+
+_VERSION_LINE = re.compile(r"^version:\s*([^\s#]+)", re.MULTILINE)
 
 
 def signature_matches(text: str, signature: Signature) -> bool:
@@ -37,6 +55,25 @@ def signature_matches(text: str, signature: Signature) -> bool:
     if isinstance(signature, str):
         return signature in text
     return all(part in text for part in signature)
+
+
+def version_tuple(version: str) -> tuple:
+    """``"2.8.0"`` -> ``(2, 8, 0)``; non-numeric parts are ignored."""
+    return tuple(int(part) for part in re.findall(r"\d+", version or ""))
+
+
+@lru_cache(maxsize=None)
+def staged_version(repo_path: str) -> str:
+    """``version:`` of the staged function file's docstring header ('' when the
+    file is not staged or has no version line)."""
+    try:
+        with open(os.path.join(FUNCTIONS_DIR, repo_path), encoding="utf-8") as fh:
+            head = fh.read(16384)
+    except OSError:
+        return ""
+    parts = head.split('"""', 2)
+    match = _VERSION_LINE.search(parts[1] if len(parts) == 3 else head)
+    return match.group(1) if match else ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +84,8 @@ class KnownIssue:
     ref: str = ""
     evidence: tuple = field(default=())
     log_patterns: tuple = field(default=())
+    file: str = ""  # repo path of the function file with the bug
+    fixed_in: str = ""  # docstring version of ``file`` that fixes it ("" = none)
 
     def label(self) -> str:
         ref = f" ({self.ref})" if self.ref else ""
@@ -55,7 +94,19 @@ class KnownIssue:
             if self.fixed_by
             else "no fix yet"
         )
+        if self.fixed_in:
+            fix += f", fixed in {self.file} {self.fixed_in}"
         return f"known {self.key}{ref}: {self.summary}; {fix}"
+
+    def fixed_version(self) -> Optional[str]:
+        """Staged version of ``file`` when it is >= ``fixed_in`` (the marker no
+        longer applies), else None."""
+        if not (self.file and self.fixed_in):
+            return None
+        staged = staged_version(self.file)
+        if staged and version_tuple(staged) >= version_tuple(self.fixed_in):
+            return staged
+        return None
 
     def detail_matches(self, detail: str) -> bool:
         """The failure detail shows this bug (always True without evidence)."""
@@ -78,123 +129,14 @@ N8N_INFOMANIAK_FIX = "PR #182"
 NO_ISSUE = "no issue filed"
 FOUND_BY_E2E = "found by tests/e2e, no issue filed"
 
-GEMINI_B1 = KnownIssue(
-    "B1",
-    "Gemini API stream without a websocket session ends with 'Error during "
-    "streaming' (the genai client is closed while the stream is consumed)",
-    GEMINI_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"Error during streaming",),
-    log_patterns=(
-        ("function_gemini:_handle_streaming_response", "Error during streaming"),
-    ),
-)
-GEMINI_B5 = KnownIssue(
-    "B5",
-    "Gemini's non-streaming path calls __event_emitter__ without a None check "
-    "(usage event, image status), so requests without an emitter (background "
-    "title/tags tasks) answer \"Error generating content: 'NoneType' object is "
-    'not callable"',
-    GEMINI_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"Error generating content: 'NoneType' object is not callable",),
-    log_patterns=(("function_gemini:pipe", "'NoneType' object is not callable"),),
-)
-GEMINI_172 = KnownIssue(
-    "#172",
-    "gemini-3.1-flash-image (non-preview) is not recognised as an image model, "
-    "the generated image is dropped",
-    GEMINI_FIX,
-    ref="https://github.com/owndev/Open-WebUI-Functions/issues/172",
-    # listed without the image marker / streamed instead of forced non-stream
-    evidence=(r"^name='[^'🎨]+'$", r"upstream=\['streamGenerateContent'\]"),
-)
-GEMINI_NONSTREAM_USAGE = KnownIssue(
-    "gemini-nonstream-usage",
-    "Gemini non-streaming answers are returned as a plain string and usage only "
-    "goes out as a 'usage' event, which Open WebUI 0.11 neither saves nor shows "
-    "(docs promise a usage dict); API clients get no usage either",
-    GEMINI_FIX,
-    ref=FOUND_BY_E2E,
-    evidence=(r"usage=None",),
-)
-AZURE_DOUBLE_STRIP = KnownIssue(
-    "azure-double-strip",
-    "Azure strips the function prefix twice for non-streaming / data_sources "
-    "requests, so dotted model names (gpt-4.1 -> '1') are mangled",
-    AZURE_FIX,
-    ref=NO_ISSUE,
-    # what is left of gpt-4.1 / Phi-3.5-mini-instruct after the second strip
-    evidence=(r"body\.model='(1|5-mini-instruct)'",),
-)
-AZURE_123 = KnownIssue(
-    "#123",
-    "Azure background tasks (title/tags/follow-ups) are sent with data_sources, "
-    "so task answers are grounded and return citations (the 'too many sources' "
-    "report)",
-    AZURE_FIX,
-    ref="https://github.com/owndev/Open-WebUI-Functions/issues/123",
-    evidence=(r"with data_sources=[1-9]",),
-)
-AZURE_STREAM_OPTIONS = KnownIssue(
-    "azure-stream-options",
-    "Azure forwards a client-supplied stream_options together with data_sources, "
-    "which Azure 'On Your Data' rejects (HTTP 400)",
-    AZURE_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"upstream stream_options=\{'include_usage': True\}",),
-    log_patterns=(
-        (
-            "function_azure:pipe",
-            "Error in Azure AI request: 400",
-            "/openai/deployments/",
-        ),
-    ),
-)
-FILTER_TRACKER_NO_EMITTER = KnownIssue(
-    "tracker-no-emitter",
-    "time_token_tracker outlet calls __event_emitter__ unconditionally; on the "
-    "API path Open WebUI passes None and the outlet raises",
-    FILTERS_FIX,
-    ref="https://github.com/owndev/Open-WebUI-Functions/issues/175",
-    evidence=(r"outlet filter time_token_tracker.*'NoneType' object is not callable",),
-    log_patterns=(
-        (
-            "Error in outlet filter time_token_tracker",
-            "'NoneType' object is not callable",
-        ),
-    ),
-)
-FILTER_SEARCH_KEYERROR = KnownIssue(
-    "search-tool-keyerror",
-    "google_search_tool inlet does features.pop('web_search') without a default; "
-    "requests without features.web_search fail with KeyError 'web_search'",
-    FILTERS_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"HTTP 400 .*'web_search'",),
-    log_patterns=("Error processing chat payload: 'web_search'",),
-)
-N8N_DICT_IN_STREAM = KnownIssue(
-    "n8n-dict-in-stream",
-    "n8n returns a chat.completion dict (usage) for stream=True; the streaming "
-    "middleware ignores choices[].message, the saved answer is empty",
-    N8N_INFOMANIAK_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"content= usage=\{",),  # empty answer, usage saved
-)
-N8N_SSE_CONTROL_LINES = KnownIssue(
-    "n8n-sse-control-lines",
-    "n8n parses SSE answers per network chunk: comment lines (': ...') and "
-    "'data: [DONE]' end up in the answer text",
-    N8N_INFOMANIAK_FIX,
-    ref=FOUND_BY_E2E,
-    evidence=(r"content=.*(: keep-alive|data: \[DONE\])",),
-)
-INFOMANIAK_CHUNKING = KnownIssue(
-    "infomaniak-chunking",
-    "Infomaniak forwards raw network chunks; coalesced or split SSE events are "
-    "dropped by the streaming middleware (empty answer / missing usage)",
-    N8N_INFOMANIAK_FIX,
-    ref=NO_ISSUE,
-    evidence=(r"content= usage=None", r"^usage=None$"),
-)
+# The entries, one module per area. They import the names above, so these
+# imports stay at the bottom; every KnownIssue they define is re-exported.
+from .known_azure import *  # noqa: E402, F403
+from .known_filters import *  # noqa: E402, F403
+from .known_gemini import *  # noqa: E402, F403
+from .known_n8n import *  # noqa: E402, F403
+
+
+def registry() -> list:
+    """Every registered ``KnownIssue`` (all area modules)."""
+    return [value for value in globals().values() if isinstance(value, KnownIssue)]

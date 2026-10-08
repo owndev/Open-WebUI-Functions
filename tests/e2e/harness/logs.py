@@ -5,7 +5,12 @@ run.sh starts the server with its output mirrored to ``SERVER_LOG`` (``docker
 logs`` keeps working), so scenarios can look at what the server logged while
 they ran: ``mark()`` remembers the current end of the log, ``since(mark)``
 returns what was appended afterwards, ``errors(mark, ...)`` finds unexpected
-ERROR / CRITICAL / Traceback blocks.
+ERROR / CRITICAL / Traceback / ResourceWarning blocks, ``warnings(mark, ...)``
+finds WARNING blocks and ``secrets(mark, ...)`` plaintext secrets at any level.
+
+run.sh starts the container with ``PYTHONWARNINGS=always::ResourceWarning``, so
+unclosed sockets / files show up as ``ResourceWarning:`` lines (counted as
+errors) instead of being dropped silently.
 """
 
 import asyncio
@@ -19,8 +24,11 @@ from .known import signature_matches
 _LOGURU = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \| (\w+)\s*\|")
 _ERROR_START = re.compile(
     r"\| (ERROR|CRITICAL)\s*\||^Traceback \(most recent call last\)|"
-    r"^ERROR:|Exception in ASGI application"
+    r"^ERROR:|Exception in ASGI application|ResourceWarning: "
 )
+# Loguru WARNING lines, "WARNING: ..." lines and Python warnings
+# ("file.py:12: UserWarning: ...").
+_WARNING_START = re.compile(r"\| WARNING\s*\||^WARNING:|\b\w*Warning: ")
 
 # Error blocks Open WebUI itself produces, not caused by the functions under test.
 # Each entry is a tuple of substrings that must ALL occur in the block.
@@ -30,6 +38,19 @@ GLOBAL_NOISE = (
     # after the title was already saved.
     ("Error generating initial chat title", "KeyError: 'model'"),
 )
+
+
+def _summary(block: list) -> str:
+    """First line ... last non-empty line of a block."""
+    tail = next((ln for ln in reversed(block) if ln.strip()), "")
+    summary = block[0].strip()[:220]
+    if tail is not block[0]:
+        summary += " ... " + tail.strip()[:160]
+    return summary
+
+
+def redact(text: str, secret: str) -> str:
+    return text.replace(secret, "***")
 
 
 class ServerLog:
@@ -70,11 +91,12 @@ class ServerLog:
             if any(n in line for n in needles)
         ]
 
-    def _blocks(self, mark: int) -> list:
-        """Error blocks since ``mark`` as (file offset, lines).
+    def _blocks(self, mark: int, start: re.Pattern = _ERROR_START) -> list:
+        """Blocks since ``mark`` as (file offset, lines).
 
-        A block starts at an ERROR/CRITICAL loguru line (or a traceback outside
-        any block) and runs until the next loguru line.
+        A block starts at a loguru line matching ``start`` (or a non-loguru line
+        matching it outside any block, e.g. a traceback) and runs until the next
+        loguru line.
         """
         try:
             with open(self.path, "rb") as fh:
@@ -86,7 +108,7 @@ class ServerLog:
         for raw in data.split(b"\n"):
             line = raw.decode("utf-8", "replace").rstrip("\r")
             is_loguru = bool(_LOGURU.match(line))
-            if _ERROR_START.search(line) and (is_loguru or current is None):
+            if start.search(line) and (is_loguru or current is None):
                 current = (offset, [line])
                 blocks.append(current)
             elif is_loguru:
@@ -105,22 +127,58 @@ class ServerLog:
 
         Dropped: blocks matching an ``ignore`` signature (a string, or a tuple
         of strings that must all occur in the block; see
-        ``harness.known.signature_matches``), blocks starting inside one of the
-        ``ranges`` (file offsets of scenarios that provoke errors on purpose),
-        and ``GLOBAL_NOISE``.
+        ``harness.known.signature_matches``), blocks that start inside one of
+        the ``ranges`` ``(start, end, signatures)`` AND match one of its
+        signatures (errors a scenario provoked on purpose), and
+        ``GLOBAL_NOISE``.
         """
         out = []
         for offset, block in self._blocks(mark):
             text = "\n".join(block)
             if any(signature_matches(text, sig) for sig in ignore):
                 continue
-            if any(start <= offset < end for start, end in ranges):
+            if any(
+                start <= offset < end
+                and any(signature_matches(text, sig) for sig in signatures)
+                for start, end, signatures in ranges
+            ):
                 continue
             if any(signature_matches(text, noise) for noise in GLOBAL_NOISE):
                 continue
-            tail = next((ln for ln in reversed(block) if ln.strip()), "")
-            summary = block[0].strip()[:220]
-            if tail is not block[0]:
-                summary += " ... " + tail.strip()[:160]
-            out.append(summary)
+            out.append(_summary(block))
+        return out
+
+    def warnings(self, mark: int, *patterns) -> list:
+        """WARNING blocks since ``mark`` (first line ... last line).
+
+        Loguru ``| WARNING |`` lines, ``WARNING:`` lines and Python warnings
+        (``file.py:12: UserWarning: ...``). With ``patterns`` (signatures: a
+        string, or a tuple of strings that must all occur in the block) only
+        the matching blocks are returned.
+        """
+        out = []
+        for _, block in self._blocks(mark, _WARNING_START):
+            text = "\n".join(block)
+            if patterns and not any(signature_matches(text, p) for p in patterns):
+                continue
+            out.append(_summary(block))
+        return out
+
+    def secrets(self, mark: int, secrets: dict) -> list:
+        """Plaintext secrets in the log since ``mark``, at any level.
+
+        ``secrets`` maps each secret value to a label (e.g. the valve name).
+        Returns one ``"<label> logged Nx: <first line, redacted>"`` per secret
+        found; the secret value itself is never part of the result.
+        """
+        text = self.since(mark)
+        out = []
+        for value, label in secrets.items():
+            count = text.count(value) if value else 0
+            if not count:
+                continue
+            line = next(ln for ln in text.splitlines() if value in ln)
+            for other in secrets:
+                line = redact(line, other) if other else line
+            out.append(f"{label} logged {count}x: {line.strip()[:200]}")
         return out

@@ -123,7 +123,11 @@ async def api(t: Suite, mock) -> None:
         mark = t.mark()
         r = await t.owui.chat(model("bad-model"), "Hello", stream=stream)
         await t.log.settle(0.5)
-        t.expect_errors(mark)
+        t.expect_errors(  # the provoked upstream 400 (main / PR #182 wording)
+            mark,
+            ("function_infomaniak:pipe", "Error in Infomaniak AI request: 400"),
+            ("function_infomaniak:pipe", "Infomaniak AI API error: HTTP 400"),
+        )
         t.check(
             f"api.error-400.{'stream' if stream else 'nonstream'}",
             f"upstream HTTP 400 -> readable error (stream={stream})",

@@ -9,7 +9,7 @@ from .known import KnownIssue
 from .logs import ServerLog
 from .mocks import Mock
 from .owui import OWUI, ChatResult, parse_sse
-from .results import FAIL, KNOWN, PASS, Results, short
+from .results import FAIL, KNOWN, PASS, Results, SetupError, short
 from .suite import Suite
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "PASS",
     "Results",
     "ServerLog",
+    "SetupError",
     "Suite",
     "parse_sse",
     "short",

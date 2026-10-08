@@ -48,13 +48,46 @@ PNG_B64 = (
 )
 
 
+def fault_status() -> Optional[int]:
+    """HTTP status every provider route answers with (``E2E_MOCK_FAULT``,
+    e.g. ``500``), or None for normal behaviour."""
+    value = os.environ.get("E2E_MOCK_FAULT", "").strip()
+    return int(value) if value.isdigit() and 400 <= int(value) <= 599 else None
+
+
+@web.middleware
+async def _fault_middleware(request: web.Request, handler) -> web.StreamResponse:
+    """Fault injection: every provider route (all but ``/__*`` control routes)
+    is recorded and answered with ``E2E_MOCK_FAULT``."""
+    status = fault_status()
+    if status is None or request.path.startswith("/__"):
+        return await handler(request)
+    await record(request, fault=status)
+    return web.json_response(
+        {
+            "error": {
+                "code": status,
+                "message": f"e2e mock fault injection (E2E_MOCK_FAULT={status})",
+                "status": "E2E_MOCK_FAULT",
+            }
+        },
+        status=status,
+    )
+
+
 def new_app() -> web.Application:
     """Create an application with the request recorder and control routes.
 
     Control routes: ``GET /__requests`` (record as JSON list), ``POST /__reset``
     (clear the record), ``POST /__shutdown`` (exit the mock process).
+
+    Fault injection: with ``E2E_MOCK_FAULT=<4xx|5xx>`` in the mock process's
+    environment every provider route answers with that HTTP status (used to
+    check that KNOWN results do not hide unrelated failures).
     """
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app = web.Application(
+        client_max_size=64 * 1024 * 1024, middlewares=[_fault_middleware]
+    )
     app[REQUESTS_KEY] = []
     app.router.add_get("/__requests", _list_requests)
     app.router.add_post("/__reset", _reset_requests)

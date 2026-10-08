@@ -21,6 +21,7 @@ import mock_azure
 import mock_gemini
 import mock_infomaniak
 import mock_n8n
+from common import fault_status
 
 HOST = "127.0.0.1"
 MOCKS = {
@@ -39,6 +40,8 @@ async def serve() -> None:
         await web.TCPSite(runner, HOST, port).start()
         runners.append(runner)
         print(f"mock {name} listening on http://{HOST}:{port}", flush=True)
+    if fault_status():
+        print(f"E2E_MOCK_FAULT: provider routes answer {fault_status()}", flush=True)
     await asyncio.Event().wait()
 
 

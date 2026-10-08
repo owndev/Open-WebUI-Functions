@@ -58,6 +58,8 @@ options:
       --reuse          reuse the running container NAME (implies --keep): skips
                        start-up, re-copies files, restarts the mocks
   -v, --verbose        print details of passing scenarios too
+      --strict-known   a check tagged with a known bug that passes while its
+                       marker still applies is a FAIL (default: $E2E_STRICT_KNOWN)
   -h, --help           this help
 
 exit code: 0 = only PASS/KNOWN, 1 = at least one FAIL, 2 = setup error
@@ -76,6 +78,7 @@ ONLY=""
 REF=""
 SRC_DIR=""
 VERBOSE=""
+STRICT=${E2E_STRICT_KNOWN:-}
 SUITES=""
 HEALTH_TIMEOUT=${E2E_HEALTH_TIMEOUT:-600}
 SECRET_KEY=${E2E_SECRET_KEY:-e2e-local-secret-key-0123456789abcdef}
@@ -112,6 +115,7 @@ while [ $# -gt 0 ]; do
     -k|--keep) KEEP=1; shift ;;
     --reuse) REUSE=1; KEEP=1; shift ;;
     -v|--verbose) VERBOSE=--verbose; shift ;;
+    --strict-known) STRICT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; die "unknown option $1" ;;
     *) add_suites "$1"; shift ;;
@@ -119,6 +123,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------- validate
+case "$STRICT" in 1 | true | yes | on) STRICT=1 ;; *) STRICT="" ;; esac
 case "$IMAGE" in */*) ;; *) IMAGE="ghcr.io/open-webui/open-webui:$IMAGE" ;; esac
 SUITES=${SUITES:-all}
 case ",$SUITES," in *,all,*) SUITES=all ;; esac
@@ -223,7 +228,8 @@ start_container() {
     -e WEBUI_SECRET_KEY="$SECRET_KEY" \
     -e ENABLE_OLLAMA_API=false -e ENABLE_OPENAI_API=false \
     -e VERTEX_AI_RAG_STORE="$VERTEX_RAG_STORE" \
-    -e PYTHONUNBUFFERED=1 \
+    -e PYTHONUNBUFFERED=1 -e SEND_TO_LOG_ANALYTICS=false \
+    -e RAG_EMBEDDING_ENGINE=openai -e PYTHONWARNINGS=always::ResourceWarning \
     "$IMAGE" bash -c 'mkdir -p /tmp/e2e; bash start.sh 2>&1 | tee -a /tmp/e2e/server.log' \
     >/dev/null || die "docker run failed (port ${PORT:-auto} busy? image $IMAGE missing?)"
 }
@@ -259,7 +265,8 @@ start_mocks() {
     dk exec "$NAME" python3 /e2e/mocks/serve_all.py --shutdown >/dev/null 2>&1 || true
     sleep 1
   fi
-  dk exec -d -w /e2e/mocks "$NAME" \
+  # E2E_MOCK_FAULT=500: every provider route of the mocks answers HTTP 500
+  dk exec -d -e E2E_MOCK_FAULT="${E2E_MOCK_FAULT:-}" -w /e2e/mocks "$NAME" \
     bash -c 'exec python3 -u serve_all.py >>/e2e/out/mocks.txt 2>&1'
 }
 
@@ -281,7 +288,7 @@ start_mocks || die "starting the mocks in $NAME failed"
 set +e
 dk exec -e E2E_IMAGE="$IMAGE" "$NAME" \
   python3 -u /e2e/e2e.py --suites "$SUITES" --out /e2e/out ${ONLY:+--only "$ONLY"} $VERBOSE \
-  2>&1 | tee "$OUT/driver.txt"
+  ${STRICT:+--strict-known} 2>&1 | tee "$OUT/driver.txt"
 RC=${PIPESTATUS[0]}
 set -e
 case "$RC" in

@@ -2,12 +2,14 @@
 "Browser path": chat the way the Open WebUI frontend does.
 
 The frontend keeps a socket.io connection open and sends ``session_id``,
-``chat_id``/``parent_id``, the assistant message ``id`` and the ``user_message``
-with every completion request. Open WebUI then runs the pipe as a background
-task, hands it a real ``__event_emitter__`` (status, source, files, ... events
+``chat_id``/``parent_id``, the assistant message ``id`` (or ``message_ids``, one
+per model, for a multi-model chat) and the ``user_message`` with every
+completion request. Open WebUI then runs the pipe as a background task per
+model, hands it a real ``__event_emitter__`` (status, source, files, ... events
 are pushed to the socket AND persisted into the chat), and returns only
 ``{status, task_ids, chat_id}``. The answer, usage, sources and statusHistory are
-read back from the saved chat.
+read back from the saved chat. The Stop button is ``POST /api/tasks/stop/<id>``
+for those task ids.
 
 Only this path exercises event emitters and persisted content; the API path
 (``OWUI.chat``) does not save anything.
@@ -43,6 +45,13 @@ class BrowserChat:
     message: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
     title: Optional[str] = None
+    model: Optional[str] = None
+    task_ids: list = field(default_factory=list)
+    # multi-model chat (``chat(models=...)``): one BrowserChat per model, in
+    # request order; the chat itself is answers[0]
+    answers: list = field(default_factory=list)
+    # responses of POST /api/tasks/stop/<id> (``stop_after_s`` / ``stop()``)
+    stopped: list = field(default_factory=list)
 
     @property
     def done(self) -> bool:
@@ -91,6 +100,10 @@ class BrowserChat:
     @property
     def event_types(self) -> list:
         return [e.get("type") for e in self.events]
+
+    def answer(self, model: str) -> Optional["BrowserChat"]:
+        """The (first) answer of ``model`` in a multi-model chat."""
+        return next((a for a in self.answers if a.model == model), None)
 
     def brief(self) -> str:
         return (
@@ -162,47 +175,82 @@ class BrowserSession:
         params: Optional[dict] = None,
         wait: float = 120,
         wait_title: bool = False,
+        models: Optional[list] = None,
+        stop_after_s: Optional[float] = None,
+        stop_wait: float = 15,
     ) -> BrowserChat:
         """Send one user message and wait until the saved answer is ``done``.
 
         ``background_tasks`` e.g. ``{"title_generation": True}`` lets Open WebUI
         run its background tasks after the answer (they call the pipe again with
         ``__task__`` set); ``wait_title`` waits for the generated chat title.
+
+        ``models``: answer with several models side by side (the web UI's
+        multi-model chat): the request carries ``message_ids`` with one
+        assistant message id per model (``model`` is put first when it is not
+        ``models[0]``). The result is the first model's answer; ``answers``
+        holds every model's answer and the call waits until all are done.
+
+        ``stop_after_s``: press Stop that many seconds after sending
+        (``POST /api/tasks/stop/<task id>`` for every task); then wait up to
+        ``stop_wait`` seconds for ``done`` (a stopped answer may never be done).
         """
-        assistant_id, user_id = str(uuid.uuid4()), str(uuid.uuid4())
+        if models:
+            ids = list(models) if models[0] == model else [model, *models]
+        else:
+            ids = [model]
+        assistant_ids = [str(uuid.uuid4()) for _ in ids]
+        user_id = str(uuid.uuid4())
         user_message = {
             "id": user_id,
             "parentId": parent_id,
-            "childrenIds": [assistant_id],
+            "childrenIds": assistant_ids,
             "role": "user",
             "content": text,
             "timestamp": int(time.time()),
-            "models": [model],
+            "models": ids,
         }
         body = {
-            "model": model,
+            "model": ids[0],
             "stream": stream,
             "messages": list(history or []) + [{"role": "user", "content": text}],
             "session_id": self.sid,
-            "id": assistant_id,
             "parent_id": parent_id,
             "user_message": user_message,
             "features": {**FRONTEND_FEATURES, **(features or {})},
             "params": params or {},
             "background_tasks": background_tasks or {},
         }
+        if models:
+            body["message_ids"] = [
+                {"model_id": m, "message_id": a, "modelIdx": i}
+                for i, (m, a) in enumerate(zip(ids, assistant_ids))
+            ]
+        else:
+            body["id"] = assistant_ids[0]
         if chat_id:
             body["chat_id"] = chat_id
         status, data = await self.owui.api("POST", "/api/chat/completions", body)
-        result = BrowserChat(status, data, message_id=assistant_id)
+        answers = [
+            BrowserChat(status, data, message_id=a, model=m)
+            for m, a in zip(ids, assistant_ids)
+        ]
+        result = answers[0]
+        result.answers = answers
         if status != 200 or not isinstance(data, dict) or not data.get("chat_id"):
             return result
-        result.chat_id = data["chat_id"]
+        for answer in answers:
+            answer.chat_id = data["chat_id"]
+            answer.task_ids = list(data.get("task_ids") or [])
 
+        if stop_after_s is not None:
+            await asyncio.sleep(stop_after_s)
+            await self.stop(result)
+            wait = min(wait, stop_wait)
         deadline = time.time() + wait
         while time.time() < deadline:
             await asyncio.sleep(0.5)
-            if (await self._load(result)).get("done"):
+            if all([(await self._load(a)).get("done") for a in answers]):
                 break
         # Outlet filters and late events are persisted right after "done".
         await asyncio.sleep(1.5)
@@ -214,7 +262,15 @@ class BrowserSession:
             ):
                 await asyncio.sleep(1)
                 await self._load(result)
+        for answer in answers[1:]:
+            await self.reload(answer)
         return await self.reload(result)
+
+    async def stop(self, result: BrowserChat) -> list:
+        """Press Stop: ``POST /api/tasks/stop/<id>`` for every task of the chat
+        request. Returns and records ``(HTTP status, body)`` per task."""
+        result.stopped = [await self.owui.stop_task(tid) for tid in result.task_ids]
+        return result.stopped
 
     async def reload(self, result: BrowserChat) -> BrowserChat:
         """Re-read the saved message and its socket events (e.g. after

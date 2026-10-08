@@ -97,6 +97,8 @@ async def api(t: Suite, mock, scenario) -> None:
             and r.content == "Hello with usage."
             and (r.usage or {}).get("total_tokens") == 8,
             r.brief(),
+            # the stream answer counts delta.content only (harness/owui.py)
+            known=known.N8N_DICT_IN_STREAM if stream else None,
         )
 
     for name, answer in (
@@ -163,7 +165,7 @@ async def api(t: Suite, mock, scenario) -> None:
     mark = t.mark()
     r = await t.owui.chat(MODEL, "fail please", stream=False)
     await t.log.settle(0.5)
-    t.expect_errors(mark)
+    t.expect_errors(mark, ("function_n8n:pipe", "N8N error: Status 500"))
     t.check(
         "api.error",
         "webhook HTTP 500 -> readable error with n8n's message and hint",
