@@ -13,9 +13,27 @@ A collection of **standalone Python functions for Open WebUI**. Each `.py` file 
 ```bash
 pixi run format   # ruff format
 pixi run lint     # ruff format + ruff check (line-length 88)
+# without pixi (e.g. Windows): uvx ruff@0.11.10 format <files>; uvx ruff@0.11.10 check <files>
 ```
 
-No test suite and no local runtime. The `pixi` env contains only Ruff — `open_webui.*`, `google.genai`, `aiohttp`, etc. are **not installed**, so imports will not resolve locally and nothing here is executable outside an Open WebUI instance.
+The `pixi` env contains only Ruff — `open_webui.*`, `google.genai`, `aiohttp`, etc. are **not installed** on the host, so the functions cannot be imported or run locally. They are tested inside a real Open WebUI container instead.
+
+## Testing
+
+Docker-based E2E tests live in `tests/e2e/` (human guide: `docs/testing.md`). Host needs only Docker + bash (Git Bash on Windows); mocks and driver run inside the Open WebUI container.
+
+```bash
+tests/e2e/run.sh <suite>                     # gemini | azure | n8n | infomaniak | filters | all
+tests/e2e/run.sh --image v0.11.3-slim gemini # A/B another Open WebUI release (default v0.11.4-slim)
+tests/e2e/run.sh --ref <branch> <suite>      # test files from a git ref; --src DIR / --file PATH=FILE
+tests/e2e/run.sh --keep --only 'azure.oyd' azure   # keep container; then --reuse --name <name>
+tests/e2e/check_owui_api.sh [TAG|latest]     # static check of open_webui imports/APIs vs a release
+```
+
+- **What to run:** changed `pipelines/google/*` → `gemini`; `pipelines/azure/*` → `azure`; `pipelines/n8n/*` → `n8n`; `pipelines/infomaniak/*` → `infomaniak`; `filters/*` → `filters` (+ `gemini` for `google_search_tool`); `tests/e2e/**` → `all`. New Open WebUI release → `check_owui_api.sh latest`, then `run.sh --image <new tag> all`.
+- **Results:** `PASS` / `FAIL` / `KNOWN`. Exit 1 only on FAIL. KNOWN = fails because of a bug registered in `tests/e2e/harness/known.py` with its fixing branch; it does not fail the run. When you fix such a bug, its scenarios print "no longer reproduces" — remove the `known=` marker (and the registry entry) in the same change. Output (git-ignored): `tests/e2e/out/<run>/` with `driver.txt`, `results.json`, `summary.md`, `server.log`, staged `functions/`.
+- **Add coverage** for every behaviour change: a `t.check(...)` in `tests/e2e/suites/<suite>.py` (API path `t.owui.chat`, browser path `t.browser().chat`, upstream request via `mock.last()`), mock behaviour in `tests/e2e/mocks/mock_<provider>.py`. Keep `tests/e2e` Ruff-clean.
+- **Gotchas:** `valves/update` REPLACES all valves (use `update_valves`, which merges); refresh `/api/models?refresh=true` after model/filterIds changes; settings in the data volume override env vars; only the browser path (socket.io + saved chat) exercises event emitters, saved content, usage and sources; background tasks (`/api/v1/tasks/*`) call pipes with `__task__` set and `__event_emitter__=None`; the first Gemini install pip-installs `google-genai` (~30-60 s); in Git Bash prefix your own `docker exec`/`docker cp` with `MSYS_NO_PATHCONV=1`; never remove Docker images, only your containers/volumes.
 
 Manual test path: paste the single file into Open WebUI → Functions, set the env vars from its `Valves`, invoke it from a chat. `WEBUI_SECRET_KEY` must be set in the Open WebUI environment or API-key encryption silently degrades to plaintext.
 

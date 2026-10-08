@@ -208,3 +208,6 @@ marimo/_lsp/
 __marimo__/
 
 .serena
+
+# Local E2E test output (tests/e2e/run.sh)
+tests/e2e/out/

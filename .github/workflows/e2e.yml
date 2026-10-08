@@ -1,0 +1,63 @@
+# 🧪 E2E Workflow
+#
+# Runs tests/e2e/run.sh (Docker-based end-to-end tests of the functions against a real
+# Open WebUI container with mock providers, see docs/testing.md).
+#
+# Informational only: the job is not a required check and does not block merging.
+# Known bugs are reported as KNOWN and do not fail the job; FAIL means a regression.
+
+name: 🧪 E2E
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    paths:
+      - "pipelines/**"
+      - "filters/**"
+      - "tests/**"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Open WebUI image tag (ghcr.io/open-webui/open-webui:<tag>)"
+        required: false
+        default: "v0.11.4-slim"
+      suites:
+        description: "Suites (gemini,azure,n8n,infomaniak,filters or all)"
+        required: false
+        default: "all"
+
+jobs:
+  e2e:
+    name: Open WebUI ${{ inputs.image_tag || 'v0.11.4-slim' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run E2E suites
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || 'v0.11.4-slim' }}
+          SUITES: ${{ inputs.suites || 'all' }}
+        run: |
+          bash tests/e2e/run.sh --image "$IMAGE_TAG" --name owui-e2e-ci \
+            --out "$RUNNER_TEMP/e2e-out" -s "$SUITES"
+
+      - name: Job summary
+        if: always()
+        run: cat "$RUNNER_TEMP/e2e-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-results-${{ inputs.image_tag || 'v0.11.4-slim' }}
+          path: ${{ runner.temp }}/e2e-out
+          if-no-files-found: warn
