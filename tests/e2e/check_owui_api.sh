@@ -9,11 +9,13 @@
 # with curl) and reports
 #   - every `from open_webui.X import a, b` symbol defined (or re-exported) in X;
 #     definitions marked "legacy"/"deprecated" are flagged as WARN
+#   - every module imported as `import open_webui.X [as y]`
 #   - every method called on an imported class object (Users.get_user_by_id(...))
 #   - every __dunder__ parameter the functions declare still injected by Open WebUI
 #   - frontmatter (version / required_open_webui_version / requirements) per file
 #   - event types Open WebUI persists from __event_emitter__, versions of shared deps
-# Exit code: 0 all ok (WARN allowed), 1 something missing, 2 fetch/usage error.
+# Exit code: 0 all ok (WARN allowed), 1 something missing, 2 fetch/usage error
+# (a fetch that fails for another reason than "404 not found" is tried 3 times).
 # Needs: bash, curl or gh, grep, sed, awk. Run it whenever Open WebUI publishes a
 # release (see docs/testing.md); the Docker E2E suites (run.sh) cover behaviour.
 set -euo pipefail
@@ -41,29 +43,36 @@ if [ "$TAG" = latest ]; then
 fi
 
 # fetch <path in the Open WebUI repo> -> local copy (empty file when missing).
-# A failure other than "404 not found" (network, rate limit, auth) is recorded in
-# $FETCH_ERRORS; the script then ends with exit 2 instead of reporting the module
+# A failure other than "404 not found" (network, rate limit, auth) is retried
+# (FETCH_TRIES attempts in all); when it persists it is recorded in
+# $FETCH_ERRORS and the script ends with exit 2 instead of reporting the module
 # as missing. fetch runs in $(...) subshells, hence the file.
 FETCH_ERRORS="$CACHE/.fetch_errors"
+FETCH_TRIES=3
 fetch() {
-  local path=$1 dest="$CACHE/$1" code
+  local path=$1 dest="$CACHE/$1" code err try
   if [ ! -e "$dest" ]; then
     mkdir -p "$(dirname "$dest")"
-    if [ "$USE_GH" = 1 ]; then
-      if ! gh api -H "Accept: application/vnd.github.raw" \
-        "repos/$GH_REPO/contents/$path?ref=$TAG" >"$dest" 2>"$dest.err"; then
-        grep -q "HTTP 404" "$dest.err" \
-          || echo "$path: $(tr '\n' ' ' <"$dest.err" | cut -c1-160)" >>"$FETCH_ERRORS"
-        : >"$dest"
+    for ((try = 1; try <= FETCH_TRIES; try++)); do
+      [ "$try" = 1 ] || sleep $((try * 2))
+      err=""
+      if [ "$USE_GH" = 1 ]; then
+        gh api -H "Accept: application/vnd.github.raw" \
+          "repos/$GH_REPO/contents/$path?ref=$TAG" >"$dest" 2>"$dest.err" && break
+        if grep -q "HTTP 404" "$dest.err"; then : >"$dest"; break; fi
+        err=$(tr '\n' ' ' <"$dest.err" | cut -c1-160)
+      else
+        code=$(curl -sSL -o "$dest" -w '%{http_code}' \
+          "https://raw.githubusercontent.com/$GH_REPO/$TAG/$path" 2>/dev/null || true)
+        [ "$code" != 200 ] || break
+        if [ "$code" = 404 ]; then : >"$dest"; break; fi
+        err="HTTP ${code:-error}"
       fi
-      rm -f "$dest.err"
-    else
-      code=$(curl -sSL -o "$dest" -w '%{http_code}' \
-        "https://raw.githubusercontent.com/$GH_REPO/$TAG/$path" 2>/dev/null || true)
-      if [ "$code" != 200 ]; then
-        [ "$code" = 404 ] || echo "$path: HTTP ${code:-error}" >>"$FETCH_ERRORS"
-        : >"$dest"
-      fi
+    done
+    rm -f "$dest.err"
+    if [ -n "$err" ]; then
+      echo "$path: $err ($FETCH_TRIES attempts)" >>"$FETCH_ERRORS"
+      : >"$dest"
     fi
   fi
   echo "$dest"
@@ -137,6 +146,30 @@ while IFS=$'\t' read -r mod name users; do
   fi
 done <<<"$SYMBOLS"
 
+# -- 1b. plain imports: "import open_webui.X [as y], ..." -> "module<TAB>files"
+MODULES=$(for f in $FILES; do
+  { grep -E '^[[:space:]]*import[[:space:]]' "$REPO/$f" || true; } | tr -d '\r' \
+    | sed -E 's/#.*//; s/^[[:space:]]*import[[:space:]]+//' | tr ',' '\n' \
+    | sed -E 's/[[:space:]]+as[[:space:]].*//; s/[[:space:]]//g' \
+    | { grep -E '^open_webui([.]|$)' || true; } | awk -v file="$f" '{ print $0 "\t" file }'
+done | sort -u | awk -F'\t' 'NF == 2 {
+    users[$1] = ($1 in users) ? users[$1] "," $2 : $2 }
+  END { for (m in users) print m "\t" users[m] }' | sort)
+
+echo
+echo "== open_webui modules imported with 'import'"
+[ -n "$MODULES" ] || echo "  (none)"
+while IFS=$'\t' read -r mod users; do
+  [ -n "$mod" ] || continue
+  if [ -s "$(module_file "$mod")" ]; then
+    ok "$mod (module)"
+  elif fetch_failed "backend/$(echo "$mod" | tr . /)"; then
+    printf '  ERROR %s could not be fetched (see the end of the output)\n' "$mod"
+  else
+    bad "$mod (module missing) <- $users"
+  fi
+done <<<"$MODULES"
+
 # -- 2. methods called on imported class objects, e.g. Users.get_user_by_id(
 echo
 echo "== methods called on imported objects"
@@ -144,6 +177,7 @@ while IFS=$'\t' read -r mod name users; do
   case "$name" in [A-Z][a-z]*) ;; *) continue ;; esac
   src=$(module_file "$mod")
   [ -s "$src" ] || continue
+  # shellcheck disable=SC2046 # the file list is split into words on purpose
   for method in $(cd "$REPO" && cat $(echo "$users" | tr , ' ') \
       | grep -oE "(^|[^A-Za-z0-9_.])$name\.[a-z_][a-z0-9_]*\(" \
       | sed -E "s/.*$name\.([a-z0-9_]+)\(/\1/" | sort -u); do

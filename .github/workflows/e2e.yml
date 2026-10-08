@@ -3,18 +3,31 @@
 # Runs tests/e2e/run.sh (Docker-based end-to-end tests of the functions against a real
 # Open WebUI container with mock providers, see docs/testing.md).
 #
-# Informational only: the job is not a required check and does not block merging.
+# Informational only: the jobs are not required checks and do not block merging.
 # Known bugs are reported as KNOWN and do not fail the job; FAIL means a regression.
+#
+# Jobs:
+# - images: the Open WebUI images to test. The default image is read from the
+#   DEFAULT_IMAGE= line of tests/e2e/run.sh (defined only there); the weekly run
+#   adds latest-slim, a manual run takes the image_tag input.
+# - e2e:    the suites per image in strict known mode (E2E_STRICT_KNOWN=1: a
+#           known-tagged check that passes while its marker applies is a FAIL).
+# - meta:   main's function files with every mock answering HTTP 500 must give
+#           no KNOWN. A KNOWN there means the evidence of a known bug also matches
+#           unrelated failures and would hide them. Exceptions: bugs that show in
+#           the request the pipe sends upstream (REQUEST_SIDE_KNOWN), and the
+#           filters suite, which uses no provider mock (its bugs reproduce for real).
+# - api:    tests/e2e/check_owui_api.sh latest (static open_webui API check).
 
 name: 🧪 E2E
 
 permissions:
   contents: read
 
-# One run per ref and image: a new push cancels the older run, while manual runs
-# with different image tags (A/B of Open WebUI releases) run side by side.
+# One run per event, ref and image: a new push cancels the older run, while manual
+# runs with different image tags (A/B of Open WebUI releases) run side by side.
 concurrency:
-  group: e2e-${{ github.ref }}-${{ inputs.image_tag || 'default' }}
+  group: e2e-${{ github.event_name }}-${{ github.ref }}-${{ inputs.image_tag || 'default' }}
   cancel-in-progress: true
 
 on:
@@ -24,53 +37,163 @@ on:
       - "filters/**"
       - "tests/**"
       - ".github/workflows/e2e.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "pipelines/**"
+      - "filters/**"
+      - "tests/**"
+      - ".github/workflows/e2e.yml"
+  # Weekly: catches new Open WebUI releases (latest-slim) and API removals.
+  schedule:
+    - cron: "23 4 * * 1"
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Open WebUI image tag (ghcr.io/open-webui/open-webui:<tag>) or a full image reference"
+        description: "Open WebUI image tag (ghcr.io/open-webui/open-webui:<tag>) or a full image reference; empty = the default of tests/e2e/run.sh"
         required: false
-        default: "v0.11.4-slim"
+        default: ""
       suites:
         description: "Comma-separated suites (modules in tests/e2e/suites/, e.g. gemini,azure,n8n,infomaniak,filters) or all"
         required: false
         default: "all"
 
 jobs:
-  e2e:
-    name: Open WebUI ${{ inputs.image_tag || 'v0.11.4-slim' }}
+  images:
+    name: Images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: List images
+        id: list
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_IMAGE: ${{ inputs.image_tag }}
+        run: |
+          default=$(sed -n 's/^DEFAULT_IMAGE=//p' tests/e2e/run.sh)
+          [ -n "$default" ] || { echo "::error::no DEFAULT_IMAGE= line in tests/e2e/run.sh"; exit 1; }
+          case "$EVENT" in
+            schedule) set -- "$default" ghcr.io/open-webui/open-webui:latest-slim ;;
+            workflow_dispatch) set -- "${INPUT_IMAGE:-$default}" ;;
+            *) set -- "$default" ;;
+          esac
+          # [{"image": "<as given>", "label": "<tag>"}, ...]
+          targets=$(jq -cn '$ARGS.positional | unique
+            | map({image: ., label: (split(":") | last | gsub("[^A-Za-z0-9._-]"; "-"))})' \
+            --args "$@")
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "images: $targets"
+
+  e2e:
+    name: Open WebUI ${{ matrix.target.label }}
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.images.outputs.targets) }}
+    env:
+      E2E_STRICT_KNOWN: "1"
+      # Time budget of the driver (25 min); with the start-up and the 60 s grace of
+      # run.sh it stays well below the step timeout.
+      E2E_TIMEOUT: "1500"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Run E2E suites
+        timeout-minutes: 35
         env:
-          IMAGE_TAG: ${{ inputs.image_tag || 'v0.11.4-slim' }}
+          IMAGE: ${{ matrix.target.image }}
           SUITES: ${{ inputs.suites || 'all' }}
         run: |
-          bash tests/e2e/run.sh --image "$IMAGE_TAG" --name owui-e2e-ci \
+          bash tests/e2e/run.sh --image "$IMAGE" --name owui-e2e-ci \
             --out "$RUNNER_TEMP/e2e-out" -s "$SUITES"
 
       - name: Job summary
         if: always()
         run: cat "$RUNNER_TEMP/e2e-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
 
-      # Artifact names must not contain / : and a few other characters, which a
-      # full image reference (ghcr.io/open-webui/open-webui:main) has.
-      - name: Artifact name
-        id: artifact
+      - name: Upload results
         if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-results-${{ matrix.target.label }}
+          path: ${{ runner.temp }}/e2e-out
+          if-no-files-found: warn
+
+  meta:
+    name: Meta-test (KNOWN does not hide failures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      E2E_TIMEOUT: "1200"
+      # Known bugs that show in the request the pipe sends upstream (checked via the
+      # mock's request record): they reproduce whatever the mock answers, so KNOWN
+      # is correct for them here. Space-separated KnownIssue keys.
+      REQUEST_SIDE_KNOWN: "azure-double-strip azure-stream-options #123"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Fetch main
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+
+      - name: Run the mock-backed suites on main's files with every mock failing
+        timeout-minutes: 30
         env:
-          IMAGE_TAG: ${{ inputs.image_tag || 'v0.11.4-slim' }}
+          E2E_MOCK_FAULT: "500"
+          OUT: ${{ runner.temp }}/e2e-meta
         run: |
-          safe=$(printf '%s' "$IMAGE_TAG" | tr -c 'A-Za-z0-9._-' '-')
-          echo "name=e2e-results-${safe}" >> "$GITHUB_OUTPUT"
+          rc=0
+          bash tests/e2e/run.sh --ref origin/main --name owui-e2e-meta --out "$OUT" \
+            gemini azure n8n infomaniak || rc=$?
+          # Exit 1 (FAIL) is expected here: every provider answers HTTP 500.
+          if [ "$rc" -gt 1 ]; then echo "::error::setup error (exit $rc)"; exit "$rc"; fi
+          failed=$(jq '.summary.FAIL' "$OUT/results.json")
+          if [ "$failed" -eq 0 ]; then
+            echo "::error::no FAIL with E2E_MOCK_FAULT=500: the fault injection did not work"
+            exit 1
+          fi
+          # KNOWN results except the request-side bugs, one line each
+          hidden=$(jq -r --arg ok "$REQUEST_SIDE_KNOWN" '($ok | split(" ")) as $ok
+            | .results[] | select(.status == "KNOWN" and (.known.key | IN($ok[]) | not))
+            | "\(.id)  known \(.known.key): \(.detail[0:240])"' "$OUT/results.json")
+          if [ -n "$hidden" ]; then
+            echo "::error::KNOWN with every mock answering HTTP 500: the evidence of these known bugs also matches unrelated failures"
+            printf '%s\n' "$hidden"
+            exit 1
+          fi
+          echo "$failed FAIL and no KNOWN except request-side bugs ($REQUEST_SIDE_KNOWN) with every mock answering HTTP 500"
+
+      - name: Job summary
+        if: always()
+        run: cat "$RUNNER_TEMP/e2e-meta/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.artifact.outputs.name }}
-          path: ${{ runner.temp }}/e2e-out
+          name: e2e-meta-results
+          path: ${{ runner.temp }}/e2e-meta
           if-no-files-found: warn
+
+  api:
+    name: Open WebUI API check (latest release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check the open_webui APIs used by the functions
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tests/e2e/check_owui_api.sh latest
