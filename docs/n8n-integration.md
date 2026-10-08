@@ -38,16 +38,16 @@ This integration allows Open WebUI to communicate with workflows created in **n8
   Automatic detection and handling of both streaming and non-streaming responses with consistent output formatting.
 
 - **Streaming Formats**  
-  Streamed replies are parsed line by line: n8n's native streaming (one JSON object per line), Server-Sent Events (`data:` lines; `[DONE]`, `:` comments and `event:`/`id:`/`retry:` fields are dropped) and plain text. JSON objects split across network chunks or written back to back are reassembled, so no SSE framing ends up in the answer (v2.3.1).
+  Streamed replies are parsed line by line: n8n's native streaming (one JSON object per line), Server-Sent Events (`data:` lines; `[DONE]`, `:` comments and `event:`/`id:`/`retry:` fields are dropped) and plain text. JSON objects split across network chunks or written back to back are reassembled, so no SSE framing ends up in the answer (v2.3.1). The parser keeps its state between chunks and reads every character once, so a large JSON object that arrives in many small chunks does not block Open WebUI.
 
 - **Token Usage**  
-  If the workflow's JSON reply contains an OpenAI-style `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`), it is passed to Open WebUI and saved with the message, for streaming and non-streaming chats (fixed in v2.3.1: the answer was saved empty when the chat was streaming).
+  If the workflow's non-streamed JSON reply contains an OpenAI-style `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`), it is passed to Open WebUI and saved with the message, for streaming and non-streaming chats (fixed in v2.3.1: the answer was saved empty when the chat was streaming). A `usage` object inside a streamed workflow reply is not forwarded.
 
 - **Chat Context**  
   The webhook payload includes `chat_id` and `message_id` of the current Open WebUI chat (empty for API calls that are not part of a chat). Open WebUI tasks that run on the n8n model as task model (title, tag and follow-up generation, search query generation, ...) are sent with empty `chat_id` and `message_id`, so workflows that key their memory on `chat_id` (like the template workflows) do not store the task prompts in the chat's memory.
 
 - **Status Updates**  
-  Shows the request progress in the chat and a final status on completion, on error or when the response is stopped (v2.3.1).
+  Shows the request progress in the chat and a final status on completion, on error or when the response is stopped (v2.3.1). An error chunk in an n8n stream (`{"type": "error", "content": "..."}`) is added to the answer as `N8N Error: ...` and becomes the final error status. A stream that breaks off keeps the text received so far (or shows the error if nothing arrived yet) and ends with the status `N8N streaming error: ...`.
 
 - **SystemPrompt Deduplication**  
   Intelligent removal of duplicate system prompts to prevent redundant instructions.
