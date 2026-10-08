@@ -140,28 +140,57 @@ WARNINGS = tuple(
         "Skipping image (parse failure)",
     )
 )
-# Valves and UserValves of google_gemini.py 1.16.1 (valve names are the public API)
-VALVES_1_16_1 = (
-    "BASE_URL GOOGLE_API_KEY API_VERSION STREAMING_ENABLED INCLUDE_THOUGHTS "
-    "STRIP_THINKING_FROM_HISTORY THINKING_BUDGET THINKING_LEVEL USE_VERTEX_AI "
-    "VERTEX_PROJECT VERTEX_LOCATION VERTEX_AI_RAG_STORE USE_PERMISSIVE_SAFETY "
-    "MODEL_CACHE_TTL RETRY_COUNT DEFAULT_SYSTEM_PROMPT "
-    "ENABLE_FORWARD_USER_INFO_HEADERS MODEL_ADDITIONAL MODEL_WHITELIST "
-    "USE_ENTERPRISE_WEB_SEARCH IMAGE_GENERATION_ASPECT_RATIO "
-    "IMAGE_GENERATION_RESOLUTION IMAGE_MAX_SIZE_MB IMAGE_MAX_DIMENSION "
-    "IMAGE_COMPRESSION_QUALITY IMAGE_ENABLE_OPTIMIZATION "
-    "IMAGE_PNG_COMPRESSION_THRESHOLD_MB IMAGE_HISTORY_MAX_REFERENCES "
-    "IMAGE_ADD_LABELS IMAGE_DEDUP_HISTORY IMAGE_HISTORY_FIRST "
-    "VIDEO_GENERATION_ASPECT_RATIO VIDEO_GENERATION_RESOLUTION "
-    "VIDEO_GENERATION_DURATION VIDEO_GENERATION_NEGATIVE_PROMPT "
-    "VIDEO_GENERATION_PERSON_GENERATION VIDEO_GENERATION_ENHANCE_PROMPT "
-    "VIDEO_POLL_INTERVAL VIDEO_POLL_TIMEOUT"
-).split()
-USER_VALVES_1_16_1 = (
-    "IMAGE_GENERATION_ASPECT_RATIO IMAGE_GENERATION_RESOLUTION "
-    "VIDEO_GENERATION_ASPECT_RATIO VIDEO_GENERATION_RESOLUTION "
-    "VIDEO_GENERATION_DURATION"
-).split()
+# Valves and UserValves of google_gemini.py 1.16.1 with their defaults (valve
+# names are the public API; the harness container sets no GOOGLE_* variables,
+# so the defaults are the os.getenv fallbacks)
+VALVES_1_16_1 = {
+    "BASE_URL": "https://generativelanguage.googleapis.com/",
+    "GOOGLE_API_KEY": "",
+    "API_VERSION": "v1alpha",
+    "STREAMING_ENABLED": True,
+    "INCLUDE_THOUGHTS": True,
+    "STRIP_THINKING_FROM_HISTORY": True,
+    "THINKING_BUDGET": -1,
+    "THINKING_LEVEL": "",
+    "USE_VERTEX_AI": False,
+    "VERTEX_PROJECT": None,
+    "VERTEX_LOCATION": "global",
+    "VERTEX_AI_RAG_STORE": None,
+    "USE_PERMISSIVE_SAFETY": False,
+    "MODEL_CACHE_TTL": 600,
+    "RETRY_COUNT": 2,
+    "DEFAULT_SYSTEM_PROMPT": "",
+    "ENABLE_FORWARD_USER_INFO_HEADERS": False,
+    "MODEL_ADDITIONAL": "",
+    "MODEL_WHITELIST": "",
+    "USE_ENTERPRISE_WEB_SEARCH": False,
+    "IMAGE_GENERATION_ASPECT_RATIO": "default",
+    "IMAGE_GENERATION_RESOLUTION": "default",
+    "IMAGE_MAX_SIZE_MB": 15.0,
+    "IMAGE_MAX_DIMENSION": 2048,
+    "IMAGE_COMPRESSION_QUALITY": 85,
+    "IMAGE_ENABLE_OPTIMIZATION": True,
+    "IMAGE_PNG_COMPRESSION_THRESHOLD_MB": 0.5,
+    "IMAGE_HISTORY_MAX_REFERENCES": 5,
+    "IMAGE_ADD_LABELS": True,
+    "IMAGE_DEDUP_HISTORY": True,
+    "IMAGE_HISTORY_FIRST": True,
+    "VIDEO_GENERATION_ASPECT_RATIO": "default",
+    "VIDEO_GENERATION_RESOLUTION": "default",
+    "VIDEO_GENERATION_DURATION": "default",
+    "VIDEO_GENERATION_NEGATIVE_PROMPT": "",
+    "VIDEO_GENERATION_PERSON_GENERATION": "default",
+    "VIDEO_GENERATION_ENHANCE_PROMPT": True,
+    "VIDEO_POLL_INTERVAL": 10,
+    "VIDEO_POLL_TIMEOUT": 600,
+}
+USER_VALVES_1_16_1 = {
+    "IMAGE_GENERATION_ASPECT_RATIO": "default",
+    "IMAGE_GENERATION_RESOLUTION": "default",
+    "VIDEO_GENERATION_ASPECT_RATIO": "default",
+    "VIDEO_GENERATION_RESOLUTION": "default",
+    "VIDEO_GENERATION_DURATION": "default",
+}
 
 
 # ----------------------------------------------------------------- helpers
@@ -1566,16 +1595,24 @@ async def valves(t: Suite, mock) -> None:
         f"generationConfig={short(gc, 300)}",
     )
 
-    names = set(await t.valve_names(FID))
-    user_names = set(await t.valve_names(FID, user=True))
-    missing = sorted(set(VALVES_1_16_1) - names)
-    missing_user = sorted(set(USER_VALVES_1_16_1) - user_names)
+    problems, counts = [], []
+    for user, snapshot in ((False, VALVES_1_16_1), (True, USER_VALVES_1_16_1)):
+        props = (await t.owui.valves_spec(FID, user)).get("properties") or {}
+        counts.append(len(props))
+        kind = "UserValves" if user else "Valves"
+        for name, default in snapshot.items():
+            if name not in props:
+                problems.append(f"{kind}.{name} missing")
+            elif (props[name] or {}).get("default") != default:
+                problems.append(
+                    f"{kind}.{name} default {props[name].get('default')!r} != {default!r}"
+                )
     t.check(
         "valves.names",
-        "every Valves / UserValves name of 1.16.1 still exists (public API)",
-        not missing and not missing_user,
-        f"valves={len(names)} user_valves={len(user_names)} missing={missing} "
-        f"missing_user={missing_user}",
+        "every Valves / UserValves name of 1.16.1 still exists with its default "
+        "(public API)",
+        not problems,
+        f"valves={counts[0]} user_valves={counts[1]} problems={problems}",
     )
 
 
