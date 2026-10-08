@@ -14,7 +14,14 @@ Models
   burst            the whole SSE stream in ONE write (coalesced events, what a
                    fast upstream or a buffering proxy produces)
   split            the SSE stream cut into 23-byte writes (events split mid-JSON)
-  bad-model        HTTP 400 with an OpenAI-style error body
+  noeol            the whole stream in one write, the last (usage) event without
+                   its trailing newline and no [DONE]
+  crlf             the whole stream in one write with CRLF line endings
+  midfail          one content event, then the connection is cut
+  slow             40 content events 0.5 s apart (Stop during the stream)
+  slowheaders      20 s before the response headers (Stop while waiting)
+  bad-model        HTTP 400 with an OpenAI-style error body (``error.message``)
+  bad-desc         HTTP 400 with an Infomaniak error body (``error.description``)
   whisper          type "stt", must not be listed by the pipe
 
 Open WebUI task prompts (title/tags/follow-ups) get the JSON they expect.
@@ -29,18 +36,36 @@ import time
 
 from aiohttp import web
 
-from common import last_user_text, new_app, record, task_answer
+from common import annotate, last_user_text, new_app, record, task_answer
 
 MODELS = [
     {"name": "mixtral", "type": "llm", "description": "Mixtral Mock"},
     {"name": "llama3", "type": "llm", "description": "Llama 3 Mock"},
     {"name": "whisper", "type": "stt", "description": "not an llm"},
     {"name": "bad-model", "type": "llm", "description": "Error trigger"},
+    {"name": "bad-desc", "type": "llm", "description": "Error with description"},
     {"name": "burst", "type": "llm", "description": "All SSE events in one write"},
     {"name": "split", "type": "llm", "description": "SSE events split mid-JSON"},
+    {"name": "noeol", "type": "llm", "description": "No newline at the end"},
+    {"name": "crlf", "type": "llm", "description": "CRLF line endings"},
+    {"name": "midfail", "type": "llm", "description": "Connection cut mid-stream"},
+    {"name": "slow", "type": "llm", "description": "Slow stream"},
+    {"name": "slowheaders", "type": "llm", "description": "Slow response headers"},
 ]
 USAGE_STREAM = {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
 USAGE = {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}
+ERRORS = {
+    "bad-model": {"code": "model_not_found", "message": "Mock: model not found"},
+    "bad-desc": {"code": "validation_failed", "description": "Mock description"},
+}
+PIECES = {
+    "noeol": ["No ", "EOL."],
+    "crlf": ["CR ", "LF."],
+    "midfail": ["partial "],
+    "slow": [f"t{i} " for i in range(40)],
+    "slowheaders": ["Late answer."],
+}
+SLOW_HEADERS_DELAY = 20
 
 
 async def list_models(request: web.Request) -> web.Response:
@@ -75,16 +100,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     body = await record(request)
     body = body if isinstance(body, dict) else {}
     model = body.get("model", "")
-    if model == "bad-model":
+    if model in ERRORS:
         return web.json_response(
-            {
-                "result": "error",
-                "error": {
-                    "code": "model_not_found",
-                    "message": "Mock: model not found",
-                },
-            },
-            status=400,
+            {"result": "error", "error": ERRORS[model]}, status=400
         )
     task = task_answer(last_user_text(body.get("messages")))
     if not body.get("stream"):
@@ -105,20 +123,59 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 "usage": USAGE,
             }
         )
+    # Task prompts are always answered the normal way (one event per write).
+    mode = "mixtral" if task else model
     label = model if model in ("burst", "split") else "stream"
-    pieces = [task] if task else ["Hello ", "from ", "Infomaniak ", f"({label})."]
+    pieces = (
+        [task]
+        if task
+        else PIECES.get(model, ["Hello ", "from ", "Infomaniak ", f"({label})."])
+    )
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
     events = _sse_events(model, pieces, include_usage)
 
+    if mode == "slowheaders":
+        await asyncio.sleep(SLOW_HEADERS_DELAY)
+        if request.transport is None or request.transport.is_closing():
+            annotate(request, client_gone=True)  # stopped while waiting
+            return web.Response(status=499)
     resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+    try:
+        await _stream_events(request, resp, mode, events, include_usage)
+    except ConnectionResetError:  # stopped: the pipe closed the connection
+        annotate(request, client_gone=True)
+    return resp
+
+
+async def _stream_events(
+    request: web.Request,
+    resp: web.StreamResponse,
+    mode: str,
+    events: list,
+    include_usage: bool,
+) -> None:
     await resp.prepare(request)
-    if model == "burst":
+    if mode == "burst":
         await resp.write("".join(events).encode())
-    elif model == "split":
+    elif mode == "split":
         raw = "".join(events).encode()
         for start in range(0, len(raw), 23):
             await resp.write(raw[start : start + 23])
             await asyncio.sleep(0.02)
+    elif mode == "noeol":
+        # no [DONE], and the last event (usage) ends without "\n\n"
+        await resp.write("".join(events[:-1]).rstrip("\n").encode())
+    elif mode == "crlf":
+        await resp.write("".join(events).replace("\n", "\r\n").encode())
+    elif mode == "midfail":
+        await resp.write(events[0].encode())
+        await asyncio.sleep(0.2)
+        request.transport.close()
+        return
+    elif mode == "slow":
+        for event in events:
+            await resp.write(event.encode())
+            await asyncio.sleep(0.5)
     else:
         # Content events one per write; the closing events (finish, usage,
         # [DONE]) in one write, as many OpenAI-compatible servers flush them.
@@ -128,7 +185,6 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             await asyncio.sleep(0.05)
         await resp.write("".join(events[-tail:]).encode())
     await resp.write_eof()
-    return resp
 
 
 async def fallback(request: web.Request) -> web.Response:
