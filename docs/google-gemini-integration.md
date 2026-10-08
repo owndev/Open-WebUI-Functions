@@ -666,8 +666,17 @@ To use this filter (Open WebUI 0.9.0 or newer), make sure it is enabled and atta
 
 The data store is chosen in this order: the request's `params.vertex_rag_store`, then the `VERTEX_AI_RAG_STORE` environment variable (both passed on by the filter), then the pipeline's `VERTEX_AI_RAG_STORE` valve.
 
+The filter passes the request's `params.vertex_rag_store` on only when the same request enables `vertex_ai_search`. Otherwise it ignores the value, and when the pipeline searches anyway (`USE_VERTEX_AI` plus the `VERTEX_AI_RAG_STORE` valve or environment variable), it uses its own data store.
+
+> [!WARNING]
+> The client chooses the data store. Any user who can use the model can enable `vertex_ai_search` and send any `params.vertex_rag_store`, for example through `/api/chat/completions`. Gemini then searches that data store with the pipeline's Google Cloud credentials. Give these credentials access only to data stores that every user of the model may search.
+
 > [!NOTE]
 > Open WebUI moves request `params` it does not know, such as `vertex_rag_store`, to the top level of the request before filters run. Filter version 1.0.1 and newer reads the value from there. Older versions never received it, so the environment variable or the valve was used instead.
+
+Limitations:
+
+- **Chats with several models:** the filter sets the `vertex_ai_search` flag and the data store in the request's metadata, which Open WebUI shares between all models of the chat. Other Gemini models in the same chat can therefore also use Vertex AI Search grounding with that data store, even without the filter. Other pipelines ignore the flag.
 
 ## Native tool calling support
 
