@@ -51,7 +51,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Handles token-by-token responses with built-in safety enforcement.
 
 > [!Note]
-> Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview` and `gemini-3.1-flash-image`); Imagen models (`imagen-*`) are not Gemini image models. If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
+> Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
   Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models.
@@ -63,7 +63,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Accepts both text and image data for more expressive interactions with configurable image optimization.
 
 - **Advanced Image Generation**  
-  Support for text-to-image and image-to-image generation with Gemini 2.5 Flash Image Preview models.
+  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message; the interim images that Gemini 3 image models create while thinking are not uploaded.
 
 - **Video Generation with Google Veo**  
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
@@ -180,9 +180,18 @@ GOOGLE_IMAGE_UPLOAD_FALLBACK=true
 GOOGLE_IMAGE_GENERATION_ASPECT_RATIO="1:1"
 
 # Default resolution for generated images
-# Valid values: "1K", "2K", "4K"
+# Valid values: "1K", "2K", "4K" (gemini-3.1-flash-lite-image only generates 1K;
+# other values are dropped for it and the model default is used)
 # Default: "2K"
 GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
+
+# Extra image generation models, for image models released after this pipeline version
+# Comma-separated list of model IDs (e.g., "gemini-nano-banana-3")
+# Listed models are called without streaming, their images are uploaded to the chat,
+# and they get the ImageConfig and thinking level settings of Gemini 3 image models.
+# Known Gemini and Nano Banana image models are detected automatically.
+# Default: "" (empty, no extra models)
+GOOGLE_IMAGE_GENERATION_MODELS=""
 
 # Enable Gemini thoughts outputs globally
 # Default: true
@@ -201,7 +210,8 @@ GOOGLE_THINKING_BUDGET=-1
 
 # Thinking level for Gemini 3 models only
 # Most Gemini 3 models accept "low" or "high"
-# gemini-3.1-flash-image(-preview) accepts "minimal" or "high"
+# gemini-3.1-flash-image(-preview) and gemini-3.1-flash-lite-image accept "minimal" or "high"
+# gemini-nano-banana-2.1 accepts "minimal", "medium" or "high"
 # The pipeline automatically maps unsupported values to the closest supported level
 # Default: "" (empty, uses model default)
 # Note: This setting is ignored for non-Gemini 3 models
@@ -253,6 +263,10 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 >
 > **Streaming Support**: Image generation models automatically disable streaming mode to prevent "chunk too big" errors. All image generation requests use non-streaming mode regardless of the streaming setting.
 >
+> **Thought Images**: Gemini 3 image models generate up to two interim images while thinking. With thoughts enabled (`GOOGLE_INCLUDE_THOUGHTS=true`), the API returns them as thought parts before the final image. The pipeline shows the thinking text but does not upload these interim images, so each generated image appears once in the chat and in your files.
+>
+> **Tools**: Gemini image models do not support function calling or the URL context tool. Native tools (which Open WebUI 0.10+ attaches to every chat in Native mode) and URL context are therefore not sent to image models; Google Search grounding still is.
+>
 > **Image Optimization Direction**: The current image processing configuration **only applies to input images** (Open WebUI → Google API), such as images uploaded to chat or used for image-to-image editing. Generated images from Google API are not yet subject to these optimization settings. This means:
 >
 > - ✅ **Input images**: Optimized using configuration settings
@@ -262,10 +276,10 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 
 ## Image Generation Configuration
 
-The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image`, `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
+The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image`, and the preview IDs `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`), the **Nano Banana** IDs (e.g., `gemini-nano-banana-2.1`) and the models listed in `GOOGLE_IMAGE_GENERATION_MODELS`.
 
 > [!IMPORTANT]
-> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3/3.1 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
+> **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3/3.1 and Nano Banana image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
 
 ### Aspect Ratio
 
@@ -298,6 +312,8 @@ Control the quality and size of generated images:
 - `1K` - Lower resolution, faster generation
 - `2K` - Balanced quality and speed (default)
 - `4K` - Highest quality, slower generation
+
+`gemini-3.1-flash-lite-image` only generates `1K` images. For this model, `2K` and `4K` are not sent and the model default (`1K`) is used.
 
 **Configuration:**
 
@@ -367,14 +383,28 @@ for part in response.parts:
 
 ### Model Compatibility
 
-| Model                       | ImageConfig Support (aspect_ratio, image_size) |
-| --------------------------- | ---------------------------------------------- |
-| gemini-3.1-flash-image-\*   | ✅ Supported                                   |
-| gemini-3-pro-image-\*       | ✅ Supported                                   |
-| gemini-3-flash-image-\*     | ✅ Supported                                   |
-| gemini-2.5-flash-image-\*   | ❌ Not supported (uses defaults)               |
-| Other gemini-3 / gemini-3.1 | ❌ Not image generation models                 |
-| Other models                | ❌ Not image generation models                 |
+| Model                                      | ImageConfig Support (aspect_ratio, image_size) |
+| ------------------------------------------ | ---------------------------------------------- |
+| gemini-nano-banana-\*                      | ✅ Supported                                   |
+| gemini-3.1-flash-image-\*                  | ✅ Supported                                   |
+| gemini-3.1-flash-lite-image                | ✅ Supported (`image_size` 1K only)            |
+| gemini-3-pro-image-\*                      | ✅ Supported                                   |
+| gemini-3-flash-image-\*                    | ✅ Supported                                   |
+| Models in `GOOGLE_IMAGE_GENERATION_MODELS` | ✅ Supported                                   |
+| gemini-2.5-flash-image-\*                  | ❌ Not supported (uses defaults)               |
+| Other gemini-3 / gemini-3.1                | ❌ Not image generation models                 |
+| Other models                               | ❌ Not image generation models                 |
+
+### Additional Image Generation Models
+
+Google releases new image models regularly. Gemini model IDs that contain `image` as their own segment (such as `gemini-3.1-flash-image`) or `nano-banana` (such as `gemini-nano-banana-2.1`) are detected automatically. If a new image model uses a different naming scheme, list it in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update:
+
+```bash
+# Comma-separated model IDs to treat as image generation models
+GOOGLE_IMAGE_GENERATION_MODELS="gemini-new-image-model,gemini-other-image-model"
+```
+
+Listed models are handled like Gemini 3 image models: requests are sent without streaming and with `response_modalities` `TEXT` and `IMAGE`, the aspect ratio and resolution settings are sent as ImageConfig, `GOOGLE_THINKING_LEVEL` / `reasoning_effort` are passed through as `thinking_level` without remapping, and generated images are uploaded to the chat. The model itself must still be available in the model list (returned by the API, or added via `GOOGLE_MODEL_ADDITIONAL`).
 
 ## Video Generation Configuration
 
@@ -597,6 +627,8 @@ For instance, the following [Filter (google_search_tool.py)](../filters/google_s
 
 When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
+Open WebUI's background tasks for the chat (title, tag and follow-up generation) inherit the `google_search_tool` flag from the chat request. The pipeline sends no grounding tools with these tasks, so they do not run extra Google searches. Image generation models get Google Search grounding but not the URL context tool, which they do not support.
+
 ### Enterprise Search
 
 The pipeline supports **Enterprise Web Search** for grounding, which provides organization-level management of search results.
@@ -622,7 +654,7 @@ To enable Vertex AI Search grounding, you need to:
    - Use the [Filter (vertex_ai_search_tool.py)](../filters/vertex_ai_search_tool.py) to enable the feature and optionally pass the store ID via chat metadata.
 3. **Enable Vertex AI**: Set `GOOGLE_GENAI_USE_VERTEXAI=true` to use Vertex AI (required for Vertex AI Search grounding).
 
-When `USE_VERTEX_AI` is `true` and `VERTEX_AI_RAG_STORE` is configured, Vertex AI Search grounding will be automatically enabled. You can also explicitly enable it via the `vertex_ai_search` feature flag.
+When `USE_VERTEX_AI` is `true` and `VERTEX_AI_RAG_STORE` is configured, Vertex AI Search grounding will be automatically enabled. You can also explicitly enable it via the `vertex_ai_search` feature flag. Background tasks (title, tag and follow-up generation) never use Vertex AI Search grounding.
 
 When enabled, Gemini will use the specified Vertex AI Search Data Store to retrieve relevant information and ground its responses, providing citations to the source documents.
 
@@ -654,10 +686,11 @@ Native tool calling is enabled/disabled via the standard 'Function calling' Open
 
 ### Known limitations on Open WebUI >= 0.10
 
-Open WebUI 0.10 made **Native** the default function calling mode, so attached tools are now passed to Gemini unless a model or chat opts out. In that mode the pipeline hands the tools to the `google-genai` SDK, which runs them through automatic function calling (AFC). This currently fails on Open WebUI 0.10 and later:
+Open WebUI 0.10 made **Native** the default function calling mode, so tools are passed to the pipeline unless a model or chat opts out. In that mode the pipeline hands them to the `google-genai` SDK as Python functions; the SDK declares them to Gemini and executes Gemini's function calls itself through automatic function calling (AFC). On Open WebUI 0.10 and later this has the following problems:
 
-- **Python tools from the Tools workspace** fail because Open WebUI 0.10+ loads them with `from __future__ import annotations`, so their type hints are plain strings that the SDK cannot turn into function declarations.
-- **MCP and OpenAPI tool server tools** are all exposed under the same callable name (`tool_function`), so Gemini cannot tell them apart.
+- **Built-in tools come with every chat.** In Native mode Open WebUI attaches its built-in tools (time, knowledge, chat and note search, tasks, automations, calendar, ...) to every chat, so every request declares them to Gemini, even if no tool was selected. Image generation models are the exception: the pipeline sends them no tools, because they do not support function calling.
+- **Python tools from the Tools workspace** are declared to Gemini, but executing them through AFC fails: Open WebUI 0.10+ compiles them with `from __future__ import annotations`, so their type hints are strings. The SDK's argument conversion then fails with an `isinstance()` error, which it returns to Gemini as the `functionResponse` instead of running the tool.
+- **MCP and OpenAPI tool server tools** all reach the SDK with the same function name, `tool_function`, so Gemini receives duplicate function declarations and rejects the request with `400 INVALID_ARGUMENT`.
 
 Workaround: set **Function Calling** to **Legacy** in the model's advanced parameters (**Admin Panel → Settings → Models → edit model → Advanced Params**), per chat in the chat controls, or globally in the default model parameters. Open WebUI then handles tool selection itself and the pipeline receives no native tools. A fix for native tool calling is tracked in [#169](https://github.com/owndev/Open-WebUI-Functions/issues/169).
 
@@ -717,7 +750,9 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
 - **Most Gemini 3 models**: support **`"low"`** and **`"high"`**.
-- **`gemini-3.1-flash-image`** and **`gemini-3.1-flash-image-preview`**: support **`"minimal"`** and **`"high"`**.
+- **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-preview`** and **`gemini-3.1-flash-lite-image`**: support **`"minimal"`** and **`"high"`** (model default: `"minimal"`).
+- **`gemini-nano-banana-2.1`**: supports **`"minimal"`**, **`"medium"`** and **`"high"`** (model default: `"medium"`).
+- **Other Nano Banana IDs and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: the configured level is sent unchanged, because the pipeline does not know their supported levels.
 
 > [!Note]
 > Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
@@ -733,7 +768,7 @@ GOOGLE_THINKING_LEVEL="low"
 # Use high thinking level for complex reasoning
 GOOGLE_THINKING_LEVEL="high"
 
-# Use minimal thinking level for gemini-3.1-flash-image-preview
+# Use minimal thinking level for the Gemini 3.1 / Nano Banana image models
 GOOGLE_THINKING_LEVEL="minimal"
 ```
 
@@ -841,13 +876,13 @@ The pipeline automatically extracts token usage metadata from every Gemini respo
 
 ### How it works
 
-- **Streaming mode**: Usage metadata is collected from the final chunk emitted by the Gemini API and yielded as a `{"choices": [], "usage": {...}}` chunk at the end of the stream.
+- **Streaming mode**: Usage metadata is collected from the final chunk emitted by the Gemini API and yielded as a `{"choices": [], "usage": {...}}` chunk once the stream completes.
 - **Non-streaming requests** (`stream: false`, for example API clients and Open WebUI background tasks such as title, tag and follow-up generation): `pipe()` returns an OpenAI `chat.completion` dict with the answer in `choices[0].message.content` and the token counts in `usage`.
 - **Streaming requests answered without streaming** (image generation models, or `GOOGLE_STREAMING_ENABLED=false`): `pipe()` yields the complete answer as one chunk, followed by the usage chunk, so Open WebUI shows and saves both.
 
 No additional configuration is required. Token usage is tracked automatically for all models that return `usage_metadata` (all current Gemini models).
 
-Open WebUI passes no event emitter to background tasks (title, tags, follow-ups, search queries). The pipeline then skips its status and source events, and it leaves the thinking summary out of task answers because Open WebUI reads JSON from them. A Gemini model can therefore also be used as the task model.
+Open WebUI passes no event emitter to background tasks (title, tags, follow-ups, search queries). The pipeline then skips its status and source events, leaves the thinking summary out of task answers because Open WebUI reads JSON from them, and sends no grounding tools (Google Search, URL context, Vertex AI Search) even though tasks inherit the chat's grounding flags. A Gemini model can therefore also be used as the task model.
 
 > [!NOTE]
 > Thinking tokens consumed during internal reasoning are **not** included in `completion_tokens` — they are captured separately by the Gemini API in `thoughts_token_count` but are not forwarded to Open WebUI at this time.
@@ -878,7 +913,9 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=false
 
 ### Thinking Compatibility
 
-- **`gemini-3.1-flash-image`** and **`gemini-3.1-flash-image-*`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
+- **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-*`** and **`gemini-3.1-flash-lite-image`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
+- **`gemini-nano-banana-2.1`**: `thinking_level` supports `"minimal"`, `"medium"` and `"high"`; `thinking_budget` is not used.
+- **Other `gemini-nano-banana-*` models and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: `thinking_level` is sent as configured, without remapping; `thinking_budget` is not used.
 - **Other `gemini-3-*` models**: `thinking_level` supports `"low"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-2.5-*` models**: `thinking_level` is not used; `thinking_budget` supports `0-32768`.
 - **`gemini-2.5-flash-image-*`**: neither `thinking_level` nor `thinking_budget` is supported.

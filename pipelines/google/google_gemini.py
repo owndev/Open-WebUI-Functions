@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.16.2
+version: 1.17.0
 required_open_webui_version: 0.9.0
 requirements: google-genai>=1.66.0, google-genai<3
 license: Apache License 2.0
@@ -16,6 +16,10 @@ features:
   - Smart streaming response handling with safety checks
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
+  - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
+  - Extra image generation model IDs configurable without a code change
+  - Interim thought images skipped, so each generated image is uploaded once
+  - Native tools and URL context left out for image models, which do not support them
   - Intelligent image optimization with size-aware compression algorithms
   - Automated image upload to Open WebUI with robust fallback support
   - Optimized text-to-image and image-to-image workflows
@@ -336,7 +340,8 @@ class Pipe:
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
             description="Thinking level for Gemini 3 models. Most Gemini 3 models support 'low'/'high', "
-            "while gemini-3.1-flash-image-preview supports 'minimal'/'high'. "
+            "while gemini-3.1-flash-image and gemini-3.1-flash-lite-image support 'minimal'/'high' "
+            "and gemini-nano-banana-2.1 supports 'minimal'/'medium'/'high'. "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -409,6 +414,15 @@ class Pipe:
             default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
             description="Default resolution for image generation.",
             json_schema_extra={"enum": RESOLUTION_OPTIONS},
+        )
+        IMAGE_GENERATION_MODELS: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_MODELS", ""),
+            description="A comma-separated list of extra model IDs to treat as image "
+            "generation models, for image models released after this pipeline version. "
+            "They are called without streaming, their images are uploaded to the chat, "
+            "and they get the aspect ratio/resolution (ImageConfig) and thinking level "
+            "settings of Gemini 3 image models. Known Gemini and Nano Banana image "
+            "models are detected automatically.",
         )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
@@ -992,6 +1006,25 @@ class Pipe:
     # A Gemini model ID with "image" as its own dash-separated segment.
     _GEMINI_IMAGE_MODEL_RE = re.compile(r"(?:^|/)gemini-[^/]*-image(?:-|$)")
 
+    def _is_configured_image_model(self, model_id: str) -> bool:
+        """Return True if the IMAGE_GENERATION_MODELS valve lists the model."""
+        configured = {
+            listed.rsplit("/", 1)[-1].lower()
+            for listed in re.findall(
+                r"[^,\s]+", self.valves.IMAGE_GENERATION_MODELS or ""
+            )
+        }
+        return model_id.rsplit("/", 1)[-1].lower() in configured
+
+    @staticmethod
+    def _is_nano_banana_model(model_id: str) -> bool:
+        """Return True for Nano Banana IDs such as "gemini-nano-banana-2.1".
+
+        Unlike the older image models, these IDs carry neither "image" nor a
+        Gemini version in their name.
+        """
+        return "nano-banana" in model_id.lower()
+
     def _check_image_generation_support(self, model_id: str) -> bool:
         """
         Check if a model supports image generation.
@@ -1003,6 +1036,10 @@ class Pipe:
             True if the model supports image generation, False otherwise
         """
         model_lower = model_id.lower()
+
+        # Models the admin declared as image models (IMAGE_GENERATION_MODELS)
+        if self._is_configured_image_model(model_id):
+            return True
 
         # Imagen models ("imagen-...") use the predict API, not generateContent.
         if model_lower.startswith("imagen-") or "/imagen-" in model_lower:
@@ -1016,6 +1053,7 @@ class Pipe:
             "gemini-3-flash-image-preview",
             "gemini-3.1-flash-image",
             "gemini-3.1-flash-image-preview",
+            "gemini-3.1-flash-lite-image",
             "gemini-3-pro-image",
             "gemini-3-pro-image-preview",
         ]
@@ -1024,6 +1062,10 @@ class Pipe:
         for pattern in image_generation_models:
             if model_lower == pattern or pattern in model_lower:
                 return True
+
+        # Nano Banana models, e.g. "gemini-nano-banana-2.1"
+        if self._is_nano_banana_model(model_id):
+            return True
 
         # Gemini image models carry "image" as a separate name segment, both as
         # preview and as released (GA) ID, e.g. "gemini-3.1-flash-image",
@@ -1047,16 +1089,26 @@ class Pipe:
         )
 
     def _is_gemini_3_image_model(self, model_id: str) -> bool:
-        """Return True for Gemini 3.x image generation models."""
-        return self._is_gemini_3_family_model(
-            model_id
-        ) and self._check_image_generation_support(model_id)
+        """Return True for image models with the features of Gemini 3 image models.
+
+        These take ImageConfig (aspect ratio, resolution) and thinking_level:
+        Gemini 3.x image IDs, Nano Banana IDs (gemini-nano-banana-*), whose names
+        carry no Gemini version, and the IDs listed in IMAGE_GENERATION_MODELS.
+        """
+        if not self._check_image_generation_support(model_id):
+            return False
+        return (
+            self._is_gemini_3_family_model(model_id)
+            or self._is_nano_banana_model(model_id)
+            or self._is_configured_image_model(model_id)
+        )
 
     def _check_image_config_support(self, model_id: str) -> bool:
         """
         Check if a model supports ImageConfig (aspect_ratio and image_size parameters).
 
-        ImageConfig is only supported by Gemini 3 image generation models.
+        ImageConfig is only supported by Gemini 3 image generation models,
+        including the Nano Banana IDs and the IDs in IMAGE_GENERATION_MODELS.
         Gemini 2.5 image models support image generation but not ImageConfig.
 
         Args:
@@ -1105,8 +1157,9 @@ class Pipe:
         """
         Check if a model supports the thinking_level parameter.
 
-        Gemini 3 models support thinking_level and should NOT use thinking_budget.
-        Other models (like Gemini 2.5) use thinking_budget instead.
+        Gemini 3 models (and image models with Gemini 3 image features, such as
+        the Nano Banana IDs) support thinking_level and should NOT use
+        thinking_budget. Other models (like Gemini 2.5) use thinking_budget instead.
 
         Args:
             model_id: The model ID to check
@@ -1114,19 +1167,39 @@ class Pipe:
         Returns:
             True if the model supports thinking_level, False otherwise
         """
-        return self._is_gemini_3_family_model(model_id)
+        return self._is_gemini_3_family_model(
+            model_id
+        ) or self._is_gemini_3_image_model(model_id)
 
     def _get_supported_thinking_levels(self, model_id: str) -> List[str]:
-        """Return the supported thinking levels for a specific Gemini 3 model."""
+        """Return the supported thinking levels for a specific Gemini 3 model.
+
+        An empty list means the levels are not known; the configured level is
+        then sent unchanged (e.g. other Nano Banana IDs, IMAGE_GENERATION_MODELS).
+        """
         model_lower = model_id.lower()
 
-        if model_lower.startswith("gemini-3.1-flash-image"):
+        # https://ai.google.dev/gemini-api/docs/generate-content/image-generation
+        if model_lower.startswith("gemini-nano-banana-2.1"):
+            return ["minimal", "medium", "high"]
+
+        if model_lower.startswith(
+            ("gemini-3.1-flash-image", "gemini-3.1-flash-lite-image")
+        ):
             return ["minimal", "high"]
 
         if self._is_gemini_3_family_model(model_id):
             return ["low", "high"]
 
         return []
+
+    @staticmethod
+    def _get_supported_image_sizes(model_id: str) -> Optional[List[str]]:
+        """Return the image_size values a model accepts, or None if not restricted."""
+        if model_id.lower().startswith("gemini-3.1-flash-lite-image"):
+            # Nano Banana 2 Lite only generates 1K images.
+            return ["1K"]
+        return None
 
     def _coerce_thinking_level(
         self, requested_level: str, supported_levels: List[str]
@@ -1288,11 +1361,6 @@ class Pipe:
         return model_lower.startswith("veo-") or (
             "veo" in model_lower and "generate" in model_lower
         )
-
-    @staticmethod
-    def _is_open_webui_image_tool(tool_name: str) -> bool:
-        """Return True for Open WebUI's built-in image generation tools."""
-        return tool_name in {"generate_image", "edit_image"}
 
     @staticmethod
     def _image_data_hash(image_data: Any) -> str:
@@ -2641,6 +2709,17 @@ class Pipe:
                 # Validate and normalize the values
                 validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
                 validated_resolution = self._validate_resolution(resolution)
+                supported_sizes = self._get_supported_image_sizes(model_id)
+                if (
+                    validated_resolution
+                    and supported_sizes is not None
+                    and validated_resolution not in supported_sizes
+                ):
+                    self.log.warning(
+                        f"Resolution '{validated_resolution}' is not supported by {model_id} "
+                        f"(supported: {', '.join(supported_sizes)}). Using the model default."
+                    )
+                    validated_resolution = None
 
                 # Create image config if we have at least one valid value
                 if validated_aspect_ratio or validated_resolution:
@@ -2801,7 +2880,19 @@ class Pipe:
         params = __metadata__.get("params", {})
         tools = []
 
-        if features.get("google_search_tool", False):
+        # Background tasks (title, tags, follow-ups, queries) inherit the chat's
+        # request metadata, including the grounding flags that the search filters
+        # set there. A task only works on the chat it is given, so it gets no
+        # grounding tools and does not run Google or Vertex AI searches.
+        is_task = bool(__metadata__.get("task"))
+        if is_task and (
+            features.get("google_search_tool") or features.get("vertex_ai_search")
+        ):
+            self.log.debug(
+                f"Grounding disabled for background task '{__metadata__.get('task')}'"
+            )
+
+        if features.get("google_search_tool", False) and not is_task:
             if self.valves.USE_ENTERPRISE_WEB_SEARCH:
                 self.log.debug("Enabling Enterprise Web Search grounding")
                 tools.append(
@@ -2810,12 +2901,21 @@ class Pipe:
             else:
                 self.log.debug("Enabling Google search grounding")
                 tools.append(types.Tool(google_search=types.GoogleSearch()))
-            self.log.debug("Enabling URL context grounding")
-            tools.append(types.Tool(url_context=types.UrlContext()))
+            # Gemini image models support Search grounding but not URL context.
+            if enable_image_generation:
+                self.log.debug("URL context is not supported by image models")
+            else:
+                self.log.debug("Enabling URL context grounding")
+                tools.append(types.Tool(url_context=types.UrlContext()))
 
-        if features.get("vertex_ai_search", False) or (
-            self.valves.USE_VERTEX_AI
-            and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
+        if not is_task and (
+            features.get("vertex_ai_search", False)
+            or (
+                self.valves.USE_VERTEX_AI
+                and (
+                    self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE")
+                )
+            )
         ):
             vertex_rag_store = (
                 params.get("vertex_rag_store")
@@ -2841,18 +2941,22 @@ class Pipe:
                 )
 
         if __tools__ is not None and params.get("function_calling") == "native":
-            for name, tool_def in __tools__.items():
-                if enable_image_generation and self._is_open_webui_image_tool(name):
-                    self.log.debug(
-                        f"Skipping Open WebUI built-in image tool '{name}' for native Gemini image generation"
-                    )
-                    continue
-                if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
-                    )
-                    tools.append(tool)
+            if enable_image_generation:
+                # Gemini image models do not support function calling. In Native
+                # mode Open WebUI 0.10+ attaches its built-in tools to every chat,
+                # so none are sent; this also keeps Open WebUI's own generate_image
+                # and edit_image tools away from native Gemini image generation.
+                self.log.debug(
+                    f"Not sending {len(__tools__)} native tool(s) to image model {model_id}"
+                )
+            else:
+                for name, tool_def in __tools__.items():
+                    if not name.startswith("_"):
+                        tool = tool_def["callable"]
+                        self.log.debug(
+                            f"Adding tool '{name}' with signature {tool.__signature__}"
+                        )
+                        tools.append(tool)
 
         if tools:
             gen_config_params["tools"] = tools
@@ -3094,10 +3198,9 @@ class Pipe:
 
                 for part in parts:
                     try:
+                        is_thought = bool(getattr(part, "thought", False))
                         # Thought parts (internal reasoning)
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
+                        if is_thought and getattr(part, "text", None):
                             if thinking_started_at is None:
                                 thinking_started_at = time.time()
                             thought_chunks.append(part.text)
@@ -3118,6 +3221,11 @@ class Pipe:
                                     },
                                 },
                             )
+
+                        # Interim image from the thinking process: the final image
+                        # follows as a regular part, so this one is not uploaded.
+                        elif is_thought and getattr(part, "inline_data", None):
+                            self.log.debug("Skipping interim thought image")
 
                         # Regular answer text
                         elif getattr(part, "text", None):
@@ -3867,10 +3975,15 @@ class Pipe:
                     seen_generated_image_hashes: set[str] = set()
 
                     for part in parts:
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
+                        is_thought = bool(getattr(part, "thought", False))
+                        if is_thought and getattr(part, "text", None):
                             thought_segments.append(part.text)
+                        elif is_thought and getattr(part, "inline_data", None):
+                            # Gemini 3 image models return up to two interim images
+                            # from their thinking process as thought parts when
+                            # thoughts are included. The final image follows as a
+                            # regular part, so interim images are not uploaded.
+                            self.log.debug("Skipping interim thought image")
                         elif getattr(part, "text", None):
                             answer_segments.append(part.text)
                         elif getattr(part, "inline_data", None):
