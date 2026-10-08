@@ -48,10 +48,11 @@ Open WebUI healthy after 67s (http://localhost:49213)
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [KNOWN] gemini.api.stream  API stream without websocket session: answer streamed
-          -> known B1: Gemini API stream without a websocket session ends with 'Error during
-             streaming' ...; fixed by branch hotfix/gemini-1.16.2
+          -> known B1 (no issue filed): Gemini API stream without a websocket session ends
+             with 'Error during streaming' ...; fix pending in branch hotfix/gemini-1.16.2
+             (not merged yet)
 ...
-SUMMARY: 98 PASS, 0 FAIL, 26 KNOWN in 258s
+SUMMARY: 98 PASS, 0 FAIL, 27 KNOWN in 258s
 total runtime: 368s
 output: tests/e2e/out/20261008-142233-owui-e2e-142233-1234
 ```
@@ -62,24 +63,38 @@ start-up, then 1.5-4 minutes of scenarios, most of it network downloads on first
 on the first `time_token_tracker` call). Without those the suites run in seconds.
 
 The exit code is `0` when there is no FAIL (KNOWN results are fine), `1` when at least
-one scenario FAILs and `2` for setup errors (Docker missing, container not healthy, ...).
+one scenario FAILs and `2` for setup errors: Docker missing, `docker run` failing (port
+busy, image missing), container not healthy, an option without its value, an unknown
+suite, `--file` path or git ref, an `--only` regex that selects no scenario group, a
+crashed driver.
 
 ## Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `[suite ...]`, `-s, --suites a,b` | `all` | `gemini`, `azure`, `n8n`, `infomaniak`, `filters`, `all` |
+| `[suite ...]`, `-s, --suites a,b` | `all` | `gemini`, `azure`, `n8n`, `infomaniak`, `filters` (the modules in `tests/e2e/suites/`), `all` |
 | `-i, --image IMAGE` | `$OWUI_IMAGE` or `ghcr.io/open-webui/open-webui:v0.11.4-slim` | image, or just a tag (`v0.11.3-slim`) |
-| `--only REGEX` | – | only scenario groups whose `<suite>.<group>` matches, e.g. `--only 'gemini.(api\|image)'` |
-| `--ref REF` | – | test the function files as of a git ref (`git show REF:path`), e.g. `--ref hotfix/gemini-1.16.2` |
-| `--src DIR` | – | test the function files from another checkout / worktree |
-| `--file PATH=FILE` | – | replace one function file, e.g. `--file pipelines/azure/azure_ai_foundry.py=/tmp/fix.py` (repeatable) |
+| `--only REGEX` | – | only scenario groups whose `<suite>.<group>` matches (Python regex), e.g. `--only gemini.api`; see below |
+| `--ref REF` | – | test the function files as of a git ref (`git show REF:path`): a branch, tag or commit |
+| `--src DIR` | – | test the function files from another checkout / worktree (not together with `--ref`) |
+| `--file PATH=FILE` | – | replace one function file, e.g. `--file pipelines/azure/azure_ai_foundry.py=/tmp/fix.py` (repeatable); `PATH` must be one of the function files the harness installs, anything else is an error |
 | `-n, --name NAME` | `$E2E_NAME` or `owui-e2e-<time>-<random>` | container name; the volume is `NAME-data` |
 | `-p, --port PORT` | `$E2E_PORT` or a free port picked by Docker | host port of the UI (bound to 127.0.0.1) |
 | `-o, --out DIR` | `tests/e2e/out/<timestamp>-<name>` | output directory (git-ignored) |
 | `-k, --keep` | off | keep container and volume after the run |
 | `--reuse` | off | reuse the running container `--name` (implies `--keep`), skips the start-up |
 | `-v, --verbose` | off | print details of passing scenarios too |
+
+`--only` takes a plain Python regex. Write alternatives with an unescaped pipe inside
+quotes:
+
+```bash
+tests/e2e/run.sh --only 'gemini.(api|image)' gemini
+```
+
+The groups of each suite are listed in the `GROUPS` constant (and docstring) of its
+module. A regex that matches no group stops the run with exit code 2 and prints the
+available groups.
 
 Unique container names, volumes and Docker-assigned ports make parallel runs (several
 worktrees, several agents) safe. The harness never removes images.
@@ -95,9 +110,9 @@ and that the **server log** has no unexpected `ERROR` / `Traceback` lines.
 | Suite | Function(s) | Mock | File-specific scenarios |
 | --- | --- | --- | --- |
 | `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | thinking wrapped in `<details>` and stripped from replayed history (#176), image models forced non-stream with IMAGE modality and the image saved to the chat (`gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`), Veo long-running operation with the video saved to the chat, Search grounding through the `google_search_tool` filter (googleSearch tool, sources, `[1]` citations) |
-| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` | `AZURE_AI_MODEL` lists, model header vs. body, dotted model names (`gpt-4.1`, `Phi-3.5-mini-instruct`), allow-listed body, upstream errors, Azure AI Search "On Your Data": `[docX]` → links, only referenced sources saved, no `data_sources` for background tasks, `stream_options` with `data_sources` |
+| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` | `AZURE_AI_MODEL` lists, model header vs. body, dotted model names (`gpt-4.1`, `Phi-3.5-mini-instruct`), allow-listed body (extra client keys such as `user` are dropped, `temperature` is kept), upstream errors, Azure AI Search "On Your Data": `[docX]` → links, only referenced sources saved, no `data_sources` for background tasks, `stream_options` with `data_sources` |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | bearer/Cloudflare headers, `usage`, `intermediateSteps` tool display (list and dict form), `<think>` blocks, n8n NDJSON streaming, SSE streams (separate and coalesced writes), webhook error |
-| `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | llm-only model list, product id / bearer key, SSE stream normal, coalesced into one write and split mid-JSON, upstream error |
+| `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | llm-only model list, product id / bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON, upstream error |
 | `filters` | `filters/*.py` + probe pipe | – | per-model (`meta.filterIds`) and global filters, `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path and its status in the browser path, background task sees `__task__` and no `__event_emitter__` |
 
 The **probe pipe** (`tests/e2e/probe/probe_pipe.py`) answers with a JSON report of what
@@ -123,14 +138,28 @@ Open WebUI handed it (`__metadata__` features/params, `__task__`, whether an
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known.py` (key, summary, issue reference, fixing branch). Printed
-  with the bug and the branch that fixes it, e.g.
-  `known B1 ...; fixed by branch hotfix/gemini-1.16.2`. KNOWN does not fail the run.
-  When a KNOWN scenario starts to pass (the fix was merged) the driver prints
-  `known B1 no longer reproduces: drop the known= marker`.
+  `tests/e2e/harness/known.py` (key, summary, issue reference, branch with the pending
+  fix, evidence). Printed with the bug, e.g.
+  `known B1 (no issue filed): ...; fix pending in branch hotfix/gemini-1.16.2 (not merged yet)`.
+  KNOWN does not fail the run. When a KNOWN scenario starts to pass (the fix was merged)
+  the driver prints `known B1 no longer reproduces: drop the known= marker`.
 
-Server-log errors caused by a KNOWN bug (or provoked on purpose, e.g. an upstream HTTP
-500) are excluded from the `server-log` check; anything else fails it.
+A tagged check only counts as KNOWN when the failure **looks like that bug**: one of the
+bug's `evidence` regexes matches the check's detail text, or (for checks that pass
+`since=mark`) the server log since `mark` contains the bug's log signature. A tagged
+check that fails in another way (an HTTP 500, a missing model, ...) is a FAIL and says
+`tagged known <key>, but the failure does not show it`.
+
+The fixing branch named in a KNOWN line may only exist as an open pull request (or not be
+published yet) until the fix is merged; the issue link, where there is one, is the
+stable reference.
+
+The `server-log` check fails on every ERROR / Traceback block logged while the suite ran,
+except blocks provoked on purpose (e.g. an upstream HTTP 400/500 test) and blocks that
+match the narrow log signature of a known bug that reproduced in this suite (function
+name plus error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is
+not callable`). A different error in the same function, or the same error in another
+function, still fails it.
 
 The output directory contains:
 
@@ -146,7 +175,8 @@ The output directory contains:
 ## Testing a fix, another branch or another Open WebUI version
 
 ```bash
-tests/e2e/run.sh --ref hotfix/azure-2.7.1 azure          # a branch, tag or commit
+tests/e2e/run.sh --ref my-fix-branch azure               # a branch, tag or commit
+tests/e2e/run.sh --ref origin/main azure                 # e.g. compare with main
 tests/e2e/run.sh --src ../other-worktree gemini          # files of another checkout
 tests/e2e/run.sh --file pipelines/n8n/n8n.py=/tmp/n8n_fix.py n8n
 tests/e2e/run.sh --image v0.11.3-slim gemini             # A/B against an older release
@@ -155,8 +185,9 @@ OWUI_IMAGE=ghcr.io/open-webui/open-webui:main tests/e2e/run.sh
 
 A fix is complete when its KNOWN scenarios turn into PASS (and the `known=` markers are
 removed in the same PR). To test fixes from several branches together, export each file
-(`git show hotfix/azure-2.7.1:pipelines/azure/azure_ai_foundry.py > /tmp/azure.py`) and
-pass one `--file` per file.
+(`git show my-fix-branch:pipelines/azure/azure_ai_foundry.py > /tmp/azure.py`) and pass
+one `--file` per file. `functions/SOURCES.txt` in the output directory records where each
+tested file came from.
 
 ## Debugging a failure
 
@@ -171,7 +202,7 @@ pass one `--file` per file.
    `Passw0rd!e2e`). The mocks keep running, so you can chat with the functions in the
    browser.
 3. Iterate without waiting for the start-up again: `tests/e2e/run.sh --reuse --name owui-dbg azure`
-   (copies the current files, restarts the mocks, reruns).
+   (copies the current files, restarts the mocks, reruns; `--only` works here too).
 4. Look at what reached a mock (Git Bash: prefix with `MSYS_NO_PATHCONV=1`):
 
    ```bash
@@ -192,7 +223,7 @@ e2e.py               in-container driver entry point
 harness/             driver library: owui.py (REST client, API-path chat, valves, models),
                      browser.py (socket.io + saved chats), logs.py (server log),
                      mocks.py, results.py, known.py (known bugs), suite.py, config.py
-suites/              one module per suite: async def run(t: Suite)
+suites/              one module per suite: GROUPS + async def run(t: Suite)
 mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 ```
@@ -217,17 +248,25 @@ async def api(t: Suite, mock) -> None:
   then assert on `c.content`, `c.usage`, `c.sources`, `c.files`, `c.status_history`,
   `c.events`, `c.title`.
 - Valves: use `t.owui.update_valves(fid, NAME=value)` (merges, see gotchas).
-- Server log: `mark = t.mark()` before, `t.log.errors(mark)` after; pass `since=mark` to
-  a KNOWN check so its errors are attributed to the bug; `t.expect_errors(mark)` for
-  errors you provoke on purpose.
-- Groups: wrap related scenarios in `if t.selected("group"):` so `--only` can select them.
+- Server log: `mark = t.mark()` before, `t.log.errors(mark)` after;
+  `t.expect_errors(mark)` for errors you provoke on purpose. Pass `since=mark` to a
+  check tagged `known=` when the bug shows in the server log rather than in the detail
+  text (e.g. a failing background task).
+- Groups: wrap related scenarios in `if t.selected("group"):` so `--only` can select
+  them, and list the group in the module's `GROUPS` (an unlisted group raises).
 - Mock behaviour: mocks pick behaviour from the request (model name, webhook path or a
   trigger word in the last user message, e.g. `force-400`). Add a branch in
   `tests/e2e/mocks/mock_<provider>.py`; requests are recorded automatically.
-- New known bug: add a `KnownIssue` to `harness/known.py` with the fixing branch (or
-  `""` plus a `ref` when no fix exists yet) and pass it as `known=`.
-- New suite: add `tests/e2e/suites/<name>.py` and its name to `SUITES` in
-  `harness/config.py`; for a new function file add it to `FUNCTION_FILES` in `run.sh`.
+- New known bug: add a `KnownIssue` to `harness/known.py` and pass it as `known=`. Give
+  it `evidence` (regexes that match the failing check's detail, so other failures stay
+  FAIL), `log_patterns` when it logs errors (a string or a tuple of strings that must
+  all occur in one error block; include the function, e.g. `function_gemini:pipe`), the
+  fixing branch (or `""` when no fix exists yet) and an issue `ref`.
+- New suite: add `tests/e2e/suites/<name>.py` (with `GROUPS` and `async def run(t)`)
+  and its name to `SUITES` in `harness/config.py`; `run.sh` accepts every module in
+  `tests/e2e/suites/`. For a new function file add it to `FUNCTION_FILES` in `run.sh`.
+  Mention the suite in this guide, in `CLAUDE.md` ("What to run") and, if it should
+  appear there, in the `suites` input description of `.github/workflows/e2e.yml`.
 
 Python under `tests/e2e/` follows the repo's Ruff settings:
 `uvx ruff@0.11.10 format tests/e2e && uvx ruff@0.11.10 check tests/e2e` (or `pixi run lint`).
@@ -280,8 +319,9 @@ check and does not block merging.
 - **Git Bash on Windows:** MSYS rewrites arguments that look like paths (`/e2e` →
   `C:/Program Files/Git/e2e`). `run.sh` runs every `docker` command with
   `MSYS_NO_PATHCONV=1` and streams host files with `tar` instead of passing host paths
-  to `docker.exe` (a global `MSYS_NO_PATHCONV=1` would in turn break `git -C /c/...`).
-  Do the same in your own commands: `MSYS_NO_PATHCONV=1 docker exec ...`. `*.sh` files
+  to `docker.exe`. A globally exported `MSYS_NO_PATHCONV` / `MSYS2_ARG_CONV_EXCL` would
+  break `git -C /c/...` (`--ref`), so `run.sh` unsets both for itself. Prefix your own
+  commands per call instead of exporting it: `MSYS_NO_PATHCONV=1 docker exec ...`. `*.sh` files
   are checked out with LF endings (`.gitattributes`), otherwise bash fails with `$'\r'`.
 - **Never remove images** to "clean up" – only the container and its volume are
   throw-away; the image is shared with other runs.

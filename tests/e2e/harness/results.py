@@ -3,9 +3,9 @@ Scenario results: PASS / FAIL / KNOWN bookkeeping, console lines and JSON.
 
 - PASS   the check held
 - FAIL   the check did not hold and no known bug explains it -> run fails
-- KNOWN  the check did not hold because of a registered known bug
-         (``harness.known``); reported with the bug and its fixing branch, does
-         not fail the run
+- KNOWN  the check did not hold and the failure shows a registered known bug
+         (``harness.known``); reported with the bug, its issue and the branch
+         with the pending fix, does not fail the run
 """
 
 import json
@@ -119,8 +119,9 @@ class Results:
                 note = item.detail
                 if item.known:
                     fixed_by = item.known["fixed_by"]
-                    note = f"known {item.known['key']}, " + (
-                        f"fixed by `{fixed_by}`" if fixed_by else "no fix yet"
+                    ref = f" ({item.known['ref']})" if item.known.get("ref") else ""
+                    note = f"known {item.known['key']}{ref}, " + (
+                        f"fix pending in `{fixed_by}`" if fixed_by else "no fix yet"
                     )
                     if item.known_fixed:
                         note += " (no longer reproduces)"

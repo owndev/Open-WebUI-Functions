@@ -7,7 +7,8 @@ Gotchas encoded here (Open WebUI 0.11.x):
   valves fall back to their defaults. ``update_valves`` therefore merges the
   current values with the changes and always sends the full set
 - ``/api/models`` is cached; pass ``refresh=true`` after creating models or
-  changing valves that influence the model list
+  changing valves that influence the model list (``replace_valves`` and
+  ``upsert_model`` do that, so a later ``--reuse`` run never sees a stale list)
 - "API path" = ``POST /api/chat/completions`` without ``chat_id``; Open WebUI
   answers directly (JSON or SSE) and runs outlet filters, but nothing is saved
 """
@@ -191,12 +192,18 @@ class OWUI:
         return data if isinstance(data, dict) else {}
 
     async def replace_valves(self, fid: str, valves: dict) -> dict:
-        """Store exactly ``valves`` (every valve not sent reverts to its default)."""
+        """Store exactly ``valves`` (every valve not sent reverts to its default).
+
+        Valves can change what ``pipes()`` returns (e.g. ``AZURE_AI_MODEL``), so
+        the cached model list is refreshed afterwards; otherwise chat requests
+        answer "Model not found" until something else refreshes it.
+        """
         status, data = await self.api(
             "POST", f"/api/v1/functions/id/{fid}/valves/update", valves
         )
         if status != 200:
             raise RuntimeError(f"valves/update {fid} failed: HTTP {status} {data}")
+        await self.models(refresh=True)
         return data
 
     async def update_valves(self, fid: str, **changes: Any) -> dict:

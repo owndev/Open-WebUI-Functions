@@ -17,10 +17,10 @@ class Suite:
     """Scenario helpers bound to one suite (ids are prefixed with its name).
 
     Server-log bookkeeping: the final ``scan_log()`` check reports ERROR /
-    Traceback blocks logged while the suite ran, except blocks that are
-    expected (``expect_errors``/``expect_log``) or attributed to a known bug (a
-    failing ``check(..., known=..., since=mark)`` covers the errors logged since
-    ``mark``; ``KnownIssue.log_patterns`` cover asynchronous ones).
+    Traceback blocks logged while the suite ran, except blocks that were
+    provoked on purpose (``expect_errors`` ranges, ``expect_log`` signatures) and
+    blocks matching the ``log_patterns`` signature of a known bug that
+    reproduced in this suite (see ``harness.known``).
     """
 
     def __init__(
@@ -30,12 +30,14 @@ class Suite:
         results: Results,
         log: ServerLog,
         only: Optional[str] = None,
+        groups: tuple = (),
     ):
         self.name = name
         self.owui = owui
         self.results = results
         self.log = log
         self.only = re.compile(only) if only else None
+        self.groups = tuple(groups)  # the suite module's GROUPS
         self.log_start = log.mark()
         self.ignored_log_patterns: list = []
         self.ignored_log_ranges: list = []
@@ -43,7 +45,15 @@ class Suite:
 
     # -------------------------------------------------------------- selection
     def selected(self, group: str) -> bool:
-        """True when ``--only`` is unset or matches ``<suite>.<group>``."""
+        """True when ``--only`` is unset or matches ``<suite>.<group>``.
+
+        ``group`` must be listed in the suite module's ``GROUPS`` (e2e.py
+        checks ``--only`` against those before anything runs).
+        """
+        if self.groups and group not in self.groups:
+            raise ValueError(
+                f"group {group!r} is missing from GROUPS in suites/{self.name}.py"
+            )
         return self.only is None or bool(self.only.search(f"{self.name}.{group}"))
 
     # ----------------------------------------------------------------- checks
@@ -58,13 +68,25 @@ class Suite:
     ) -> bool:
         """Record one scenario result (see ``harness.results``).
 
-        ``since``: log mark taken when the scenario started; when the check
-        fails with a ``known`` bug, errors logged since then belong to that bug.
+        A failing check tagged with ``known`` is KNOWN only when the failure
+        shows that bug: one of its ``evidence`` patterns matches ``detail``, or
+        (with ``since``, the log mark taken when the scenario started) an error
+        block logged since then matches its ``log_patterns``. Otherwise it is a
+        FAIL. Once the bug reproduced, its log signatures are ignored by the
+        suite's ``server-log`` check.
         """
         if not ok and known:
-            self.ignored_log_patterns.extend(known.log_patterns)
-            if since is not None:
-                self.ignored_log_ranges.append((since, self.log.mark()))
+            in_log = since is not None and any(
+                known.log_matches(block) for block in self.log.error_blocks(since)
+            )
+            if known.detail_matches(detail) or in_log:
+                self.ignored_log_patterns.extend(known.log_patterns)
+            else:
+                detail = (
+                    f"tagged known {known.key}, but the failure does not show it "
+                    f"(evidence {list(known.evidence)}): {detail}"
+                )
+                known = None
         return self.results.add(
             self.name, f"{self.name}.{sid}", title, ok, detail, known
         )
@@ -77,14 +99,16 @@ class Suite:
         """Errors logged since ``since`` were provoked on purpose."""
         self.ignored_log_ranges.append((since, self.log.mark()))
 
-    def expect_log(self, *patterns: str) -> None:
-        """Error blocks containing any of ``patterns`` are expected."""
-        self.ignored_log_patterns.extend(patterns)
+    def expect_log(self, *signatures) -> None:
+        """Error blocks matching any of ``signatures`` are expected (a string,
+        or a tuple of strings that must all occur in the block)."""
+        self.ignored_log_patterns.extend(signatures)
 
     def scan_log(self) -> bool:
         """Check: no unexpected ERROR/Traceback in the server log for this suite."""
         if not self.log.available:
             return self.check("server-log", "server log scan", True, "no server log")
+        total = len(self.log.error_blocks(self.log_start))
         errors = self.log.errors(
             self.log_start,
             tuple(self.ignored_log_patterns),
@@ -94,7 +118,8 @@ class Suite:
             "server-log",
             "no unexpected ERROR / Traceback lines in the server log",
             not errors,
-            f"{len(errors)} unexpected: " + " || ".join(errors[:5]),
+            f"{len(errors)} unexpected, {total - len(errors)} expected or known: "
+            + " || ".join(errors[:5]),
         )
 
     # -------------------------------------------------------------- resources

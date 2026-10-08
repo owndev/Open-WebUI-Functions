@@ -13,6 +13,7 @@ import os
 import re
 
 from .config import SERVER_LOG
+from .known import signature_matches
 
 # Loguru line: "2026-10-08 11:44:20.895 | ERROR    | module:function:line - msg"
 _LOGURU = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \| (\w+)\s*\|")
@@ -95,21 +96,27 @@ class ServerLog:
             offset += len(raw) + 1
         return blocks
 
+    def error_blocks(self, mark: int) -> list:
+        """Full text of every ERROR / Traceback block since ``mark``."""
+        return ["\n".join(block) for _, block in self._blocks(mark)]
+
     def errors(self, mark: int, ignore: tuple = (), ranges: tuple = ()) -> list:
         """Unexpected error blocks since ``mark`` (first line ... last line).
 
-        Dropped: blocks containing any ``ignore`` substring, blocks starting
-        inside one of the ``ranges`` (file offsets of scenarios whose errors are
-        expected or attributed to a known bug), and ``GLOBAL_NOISE``.
+        Dropped: blocks matching an ``ignore`` signature (a string, or a tuple
+        of strings that must all occur in the block; see
+        ``harness.known.signature_matches``), blocks starting inside one of the
+        ``ranges`` (file offsets of scenarios that provoke errors on purpose),
+        and ``GLOBAL_NOISE``.
         """
         out = []
         for offset, block in self._blocks(mark):
             text = "\n".join(block)
-            if any(p in text for p in ignore):
+            if any(signature_matches(text, sig) for sig in ignore):
                 continue
             if any(start <= offset < end for start, end in ranges):
                 continue
-            if any(all(p in text for p in noise) for noise in GLOBAL_NOISE):
+            if any(signature_matches(text, noise) for noise in GLOBAL_NOISE):
                 continue
             tail = next((ln for ln in reversed(block) if ln.strip()), "")
             summary = block[0].strip()[:220]

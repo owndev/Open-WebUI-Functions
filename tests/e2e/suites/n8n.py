@@ -13,6 +13,7 @@ Groups (``--only n8n.<group>``)
 
 from harness import Suite, known, short
 
+GROUPS = ("api", "browser", "tasks")
 FID = "n8n"
 MODEL = FID  # n8n.py is a single pipe: the model id is the function id
 PATH = "pipelines/n8n/n8n.py"

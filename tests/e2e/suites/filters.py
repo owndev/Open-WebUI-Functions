@@ -7,7 +7,8 @@ Groups (``--only filters.<group>``)
   model     filters attached per model (meta.filterIds): feature -> metadata
             mapping, API path without ``features``, tracker outlet on the API path,
             browser path tracker status, background task (no event emitter)
-  global    the same filters switched to global
+  global    the same filters switched to global (feature mapping, tracker outlet
+            on the API path)
 """
 
 import json
@@ -15,6 +16,7 @@ import json
 from harness import Suite, known, short
 from harness.config import VERTEX_RAG_STORE
 
+GROUPS = ("model", "global")
 PROBE_FID = "e2e_probe"
 PROBE_MODEL = f"{PROBE_FID}.echo"
 FILTERS = {
@@ -130,21 +132,7 @@ async def per_model(t: Suite) -> None:
     )
 
     for stream in (False, True):
-        mark = t.mark()
-        r = await t.owui.chat(
-            PROBE_MODEL, "tracker", stream=stream, features={"web_search": False}
-        )
-        await t.log.settle(1.5)
-        errors = t.log.errors(mark)
-        t.check(
-            f"model.tracker-api.{'stream' if stream else 'nonstream'}",
-            f"time_token_tracker outlet on the API path (stream={stream}) runs "
-            "without errors",
-            r.status == 200 and not errors,
-            f"{r.brief()} log_errors={errors[:2]}",
-            known=known.FILTER_TRACKER_NO_EMITTER,
-            since=mark,
-        )
+        await tracker_api(t, "model", stream)
 
     async with t.browser() as b:
         c = await b.chat(PROBE_MODEL, "tracker in the browser", stream=True)
@@ -190,3 +178,23 @@ async def global_mode(t: Suite) -> None:
         f"is_global={flags}",
     )
     await feature_mapping(t, "global")
+    await tracker_api(t, "global", stream=False)
+
+
+async def tracker_api(t: Suite, tag: str, stream: bool) -> None:
+    """time_token_tracker outlet on the API path (no chat, no event emitter)."""
+    mark = t.mark()
+    r = await t.owui.chat(
+        PROBE_MODEL, "tracker", stream=stream, features={"web_search": False}
+    )
+    await t.log.settle(1.5)
+    errors = t.log.errors(mark)
+    t.check(
+        f"{tag}.tracker-api.{'stream' if stream else 'nonstream'}",
+        f"time_token_tracker outlet on the API path (stream={stream}) runs "
+        "without errors",
+        r.status == 200 and not errors,
+        f"{r.brief()} log_errors={errors[:2]}",
+        known=known.FILTER_TRACKER_NO_EMITTER,
+        since=mark,
+    )

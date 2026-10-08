@@ -15,6 +15,16 @@ Groups (``--only gemini.<group>``)
 
 from harness import Suite, known, short
 
+GROUPS = (
+    "models",
+    "api",
+    "thinking",
+    "browser",
+    "tasks",
+    "image",
+    "video",
+    "grounding",
+)
 FID = "gemini"
 PATH = "pipelines/google/google_gemini.py"
 KEY = "mock-gemini-key"
@@ -151,6 +161,7 @@ async def api(t: Suite, mock) -> None:
         (r.usage or {}).get("prompt_tokens") == 9,
         f"usage={r.usage}",
         known=known.GEMINI_B1,
+        since=mark,
     )
 
 
@@ -220,6 +231,7 @@ async def tasks(t: Suite, mock) -> None:
         f"HTTP {status} answer={short(answer)} raw={short(raw, 200)}",
         known=known.GEMINI_B5,
     )
+    mark = t.mark()
     async with t.browser() as b:
         c = await b.chat(
             TEXT,
@@ -234,6 +246,7 @@ async def tasks(t: Suite, mock) -> None:
         c.done and c.title == "Mock Title",
         f"title={c.title!r} {c.brief()}",
         known=known.GEMINI_B5,
+        since=mark,  # the failing title task shows only in the server log
     )
 
 

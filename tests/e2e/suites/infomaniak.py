@@ -4,17 +4,21 @@ mocks/mock_infomaniak.py.
 
 Groups (``--only infomaniak.<group>``)
   models   /1/ai/models -> llm models only
-  api      API path non-stream / stream (normal, coalesced, split SSE), errors
+  api      API path non-stream / stream (normal, coalesced, split SSE), errors,
+           allow-listed body (extra client keys dropped)
   browser  browser path: saved answer and usage (normal, coalesced, split SSE)
   tasks    background title task
 """
 
 from harness import Suite, known, short
 
+GROUPS = ("models", "api", "browser", "tasks")
 FID = "infomaniak"
 PATH = "pipelines/infomaniak/infomaniak.py"
 KEY = "ik-secret"
 PRODUCT_ID = 12345
+# Client keys Open WebUI passes through to the pipe but the allow-list must drop.
+NOT_ALLOWED = {"user": "u-e2e", "foo_not_allowed": "x"}
 
 
 def model(name: str) -> str:
@@ -69,8 +73,11 @@ async def run(t: Suite) -> None:
 
 async def api(t: Suite, mock) -> None:
     await mock.reset()
-    r = await t.owui.chat(model("mixtral"), "Hello", stream=False)
+    r = await t.owui.chat(
+        model("mixtral"), "Hello", stream=False, seed=7, **NOT_ALLOWED
+    )
     req = await mock.last()
+    body = req.get("body") or {}
     t.check(
         "api.nonstream",
         "API non-stream: answer and usage",
@@ -81,12 +88,16 @@ async def api(t: Suite, mock) -> None:
     )
     t.check(
         "api.nonstream.request",
-        "upstream: product id in URL, decrypted bearer key, model id stripped",
+        "upstream: product id in URL, decrypted bearer key, model id stripped, "
+        "extra client keys dropped",
         f"/2/ai/{PRODUCT_ID}/" in req.get("path", "")
         and req.get("headers", {}).get("authorization") == f"Bearer {KEY}"
-        and (req.get("body") or {}).get("model") == "mixtral",
+        and body.get("model") == "mixtral"
+        and not set(NOT_ALLOWED) & set(body)
+        and body.get("seed") == 7,
         f"path={req.get('path')} auth={req.get('headers', {}).get('authorization')} "
-        f"model={(req.get('body') or {}).get('model')}",
+        f"model={body.get('model')} sent extra={sorted(NOT_ALLOWED)} "
+        f"upstream keys={sorted(body)}",
     )
     for name, answer in (
         ("mixtral", "Hello from Infomaniak (stream)."),

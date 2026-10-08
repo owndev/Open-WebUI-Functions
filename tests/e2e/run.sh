@@ -9,11 +9,33 @@
 # Docs: docs/testing.md
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-usage: tests/e2e/run.sh [options] [suite ...]
+# Git Bash on Windows rewrites arguments that look like POSIX paths
+# (/e2e -> C:/Program Files/Git/e2e). Every docker call goes through dk(), which
+# disables that rewriting so container paths stay untouched; host files are
+# streamed with tar, so docker.exe never gets a host path. Other tools (git, tar)
+# need the normal conversion for /c/... host paths, so a globally exported
+# MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL is dropped here.
+unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
+dk() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"; }
 
-suites: gemini azure n8n infomaniak filters all (default: all)
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$HERE/../.." && pwd)
+
+# Suites are the modules in tests/e2e/suites/ (e2e.py also checks harness/config.py).
+available_suites() {
+  local f
+  for f in "$HERE"/suites/*.py; do
+    f=${f##*/}
+    f=${f%.py}
+    [ "$f" = __init__ ] || printf '%s ' "$f"
+  done
+}
+
+usage() {
+  echo "usage: tests/e2e/run.sh [options] [suite ...]"
+  echo
+  echo "suites: $(available_suites)all (default: all)"
+  cat <<'EOF'
 
 options:
   -i, --image IMAGE    Open WebUI image or tag (default: $OWUI_IMAGE or
@@ -21,10 +43,12 @@ options:
                        like v0.11.3-slim means ghcr.io/open-webui/open-webui:TAG
   -s, --suites LIST    comma separated suites (same as positional suites)
       --only REGEX     run only scenario groups matching REGEX on "<suite>.<group>"
+                       (Python regex; alternatives as 'gemini.(api|image)')
       --ref REF        test the function files as of git REF (git show REF:path)
       --src DIR        test the function files from DIR (another checkout/worktree)
       --file PATH=FILE use FILE for repo path PATH (repeatable), e.g.
                        --file pipelines/azure/azure_ai_foundry.py=/tmp/fix.py
+                       (PATH must be one of the function files listed below)
   -n, --name NAME      container name (default: $E2E_NAME or owui-e2e-<random>);
                        the volume is NAME-data
   -p, --port PORT      host port for the UI on 127.0.0.1 (default: $E2E_PORT or
@@ -38,17 +62,9 @@ options:
 
 exit code: 0 = only PASS/KNOWN, 1 = at least one FAIL, 2 = setup error
 EOF
+  echo
+  echo "function files: ${FUNCTION_FILES[*]}"
 }
-
-# Git Bash on Windows rewrites arguments that look like POSIX paths
-# (/e2e -> C:/Program Files/Git/e2e). Every docker call goes through dk(), which
-# disables that rewriting so container paths stay untouched; host files are
-# streamed with tar, so docker.exe never gets a host path. Other tools (git, tar)
-# keep the normal conversion they need for /c/... host paths.
-dk() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"; }
-
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
 
 IMAGE=${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.4-slim}
 NAME=${E2E_NAME:-}
@@ -77,19 +93,22 @@ FUNCTION_FILES=(
 )
 
 die() { echo "error: $*" >&2; exit 2; }
+need() { [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; }
 add_suites() { SUITES="${SUITES:+$SUITES,}$1"; }
+# repo path as given to --file: backslashes -> slashes, no leading ./
+norm_path() { local p=${1//\\//}; echo "${p#./}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -i|--image) IMAGE=$2; shift 2 ;;
-    -s|--suites) add_suites "$2"; shift 2 ;;
-    --only) ONLY=$2; shift 2 ;;
-    --ref) REF=$2; shift 2 ;;
-    --src) SRC_DIR=$2; shift 2 ;;
-    --file) OVERRIDES+=("$2"); shift 2 ;;
-    -n|--name) NAME=$2; shift 2 ;;
-    -p|--port) PORT=$2; shift 2 ;;
-    -o|--out) OUT=$2; shift 2 ;;
+    -i|--image) need "$@"; IMAGE=$2; shift 2 ;;
+    -s|--suites) need "$@"; add_suites "$2"; shift 2 ;;
+    --only) need "$@"; ONLY=$2; shift 2 ;;
+    --ref) need "$@"; REF=$2; shift 2 ;;
+    --src) need "$@"; SRC_DIR=$2; shift 2 ;;
+    --file) need "$@"; OVERRIDES+=("$2"); shift 2 ;;
+    -n|--name) need "$@"; NAME=$2; shift 2 ;;
+    -p|--port) need "$@"; PORT=$2; shift 2 ;;
+    -o|--out) need "$@"; OUT=$2; shift 2 ;;
     -k|--keep) KEEP=1; shift ;;
     --reuse) REUSE=1; KEEP=1; shift ;;
     -v|--verbose) VERBOSE=--verbose; shift ;;
@@ -99,24 +118,41 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ---------------------------------------------------------------- validate
 case "$IMAGE" in */*) ;; *) IMAGE="ghcr.io/open-webui/open-webui:$IMAGE" ;; esac
 SUITES=${SUITES:-all}
 case ",$SUITES," in *,all,*) SUITES=all ;; esac
 for suite in ${SUITES//,/ }; do
   case "$suite" in
-    all | gemini | azure | n8n | infomaniak | filters) ;;
-    *) die "unknown suite '$suite' (gemini, azure, n8n, infomaniak, filters, all)" ;;
+    all) ;;
+    __init__ | *[!a-z0-9_]*) die "unknown suite '$suite' (choose from: $(available_suites)all)" ;;
+    *) [ -f "$HERE/suites/$suite.py" ] \
+         || die "unknown suite '$suite' (choose from: $(available_suites)all)" ;;
   esac
+done
+command -v docker >/dev/null || die "docker not found"
+[ -z "$REF" ] || [ -z "$SRC_DIR" ] || die "--ref and --src exclude each other"
+[ -z "$REF" ] || git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" >/dev/null \
+  || die "unknown git ref $REF"
+[ -z "$SRC_DIR" ] || [ -d "$SRC_DIR" ] || die "--src $SRC_DIR is not a directory"
+for override in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
+  case "$override" in
+    ?*=?*) ;;
+    *) die "--file needs PATH=FILE, got '$override'" ;;
+  esac
+  wanted=$(norm_path "${override%%=*}")
+  match=""
+  for path in "${FUNCTION_FILES[@]}"; do
+    [ "$wanted" != "$path" ] || match=$path
+  done
+  [ -n "$match" ] || die "--file: unknown path '${override%%=*}' (known: ${FUNCTION_FILES[*]})"
+  [ -f "${override#*=}" ] || die "--file $override: file not found"
 done
 NAME=${NAME:-owui-e2e-$(date +%H%M%S)-$RANDOM}
 VOLUME="$NAME-data"
 OUT=${OUT:-$HERE/out/$(date +%Y%m%d-%H%M%S)-$NAME}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
-command -v docker >/dev/null || die "docker not found"
-[ -z "$REF" ] || git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" >/dev/null \
-  || die "unknown git ref $REF"
-[ -z "$SRC_DIR" ] || [ -d "$SRC_DIR" ] || die "--src $SRC_DIR is not a directory"
 
 # ---------------------------------------------------------------- stage files
 # Function files are staged under $OUT/functions (also a record of what ran).
@@ -129,10 +165,9 @@ stage_functions() {
     mkdir -p "$staged/$(dirname "$path")"
     found=""
     for override in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
-      if [ "${override%%=*}" = "$path" ]; then found=${override#*=}; fi
+      if [ "$(norm_path "${override%%=*}")" = "$path" ]; then found=${override#*=}; fi
     done
     if [ -n "$found" ]; then
-      [ -f "$found" ] || die "--file $path=$found: file not found"
       cp "$found" "$staged/$path"
       src="file $found"
     elif [ -n "$REF" ]; then
@@ -157,7 +192,7 @@ cleanup() {
   set +e
   if dk container inspect "$NAME" >/dev/null 2>&1; then
     dk logs "$NAME" >"$OUT/server.log" 2>&1
-    if [ "$KEEP" = 1 ]; then
+    if [ "$KEEP" = 1 ] && [ "$(dk inspect -f '{{.State.Running}}' "$NAME")" = true ]; then
       echo "kept container $NAME (volume $VOLUME): http://localhost:$(host_port)" \
         " login admin@example.com / Passw0rd!e2e"
       echo "  rerun:   tests/e2e/run.sh --reuse --name $NAME ..."
@@ -190,7 +225,7 @@ start_container() {
     -e VERTEX_AI_RAG_STORE="$VERTEX_RAG_STORE" \
     -e PYTHONUNBUFFERED=1 \
     "$IMAGE" bash -c 'mkdir -p /tmp/e2e; bash start.sh 2>&1 | tee -a /tmp/e2e/server.log' \
-    >/dev/null
+    >/dev/null || die "docker run failed (port ${PORT:-auto} busy? image $IMAGE missing?)"
 }
 
 wait_healthy() {
@@ -210,11 +245,12 @@ wait_healthy() {
   done
 }
 
+# Called as `copy_into_container || die ...`, which turns set -e off inside.
 copy_into_container() {
-  dk exec "$NAME" bash -c 'rm -rf /e2e && mkdir -p /e2e/out'
+  dk exec "$NAME" bash -c 'rm -rf /e2e && mkdir -p /e2e/out' || return 1
   tar -C "$HERE" -cf - --exclude=out --exclude=__pycache__ \
       e2e.py harness suites mocks probe \
-    | dk exec -i "$NAME" tar -C /e2e -xf -
+    | dk exec -i "$NAME" tar -C /e2e -xf - || return 1
   tar -C "$OUT" -cf - functions | dk exec -i "$NAME" tar -C /e2e -xf -
 }
 
@@ -239,8 +275,8 @@ else
   start_container
 fi
 wait_healthy
-copy_into_container
-start_mocks
+copy_into_container || die "copying the test files into $NAME failed"
+start_mocks || die "starting the mocks in $NAME failed"
 
 set +e
 dk exec -e E2E_IMAGE="$IMAGE" "$NAME" \
@@ -248,6 +284,10 @@ dk exec -e E2E_IMAGE="$IMAGE" "$NAME" \
   2>&1 | tee "$OUT/driver.txt"
 RC=${PIPESTATUS[0]}
 set -e
+case "$RC" in
+  0 | 1 | 2) ;;
+  *) echo "error: the driver exited with $RC (docker exec failed?)" >&2; RC=2 ;;
+esac
 dk exec "$NAME" tar -C /e2e/out -cf - . | tar -C "$OUT" -xf - || true
 echo "total runtime: $(( $(date +%s) - T0 ))s"
 exit "$RC"

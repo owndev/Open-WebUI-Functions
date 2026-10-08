@@ -32,29 +32,43 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then USE_GH=
 
 if [ "$TAG" = latest ]; then
   if [ "$USE_GH" = 1 ]; then
-    TAG=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+    TAG=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name || true)
   else
-    TAG=$(curl -fsSL "https://api.github.com/repos/$GH_REPO/releases/latest" \
+    TAG=$({ curl -fsSL "https://api.github.com/repos/$GH_REPO/releases/latest" || true; } \
       | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
   fi
   [ -n "$TAG" ] || { echo "could not resolve the latest release" >&2; exit 2; }
 fi
 
-# fetch <path in the Open WebUI repo> -> local copy (empty file when missing)
+# fetch <path in the Open WebUI repo> -> local copy (empty file when missing).
+# A failure other than "404 not found" (network, rate limit, auth) is recorded in
+# $FETCH_ERRORS; the script then ends with exit 2 instead of reporting the module
+# as missing. fetch runs in $(...) subshells, hence the file.
+FETCH_ERRORS="$CACHE/.fetch_errors"
 fetch() {
-  local path=$1 dest="$CACHE/$1"
+  local path=$1 dest="$CACHE/$1" code
   if [ ! -e "$dest" ]; then
     mkdir -p "$(dirname "$dest")"
     if [ "$USE_GH" = 1 ]; then
-      gh api -H "Accept: application/vnd.github.raw" \
-        "repos/$GH_REPO/contents/$path?ref=$TAG" >"$dest" 2>/dev/null || : >"$dest"
+      if ! gh api -H "Accept: application/vnd.github.raw" \
+        "repos/$GH_REPO/contents/$path?ref=$TAG" >"$dest" 2>"$dest.err"; then
+        grep -q "HTTP 404" "$dest.err" \
+          || echo "$path: $(tr '\n' ' ' <"$dest.err" | cut -c1-160)" >>"$FETCH_ERRORS"
+        : >"$dest"
+      fi
+      rm -f "$dest.err"
     else
-      curl -fsSL "https://raw.githubusercontent.com/$GH_REPO/$TAG/$path" \
-        >"$dest" 2>/dev/null || : >"$dest"
+      code=$(curl -sSL -o "$dest" -w '%{http_code}' \
+        "https://raw.githubusercontent.com/$GH_REPO/$TAG/$path" 2>/dev/null || true)
+      if [ "$code" != 200 ]; then
+        [ "$code" = 404 ] || echo "$path: HTTP ${code:-error}" >>"$FETCH_ERRORS"
+        : >"$dest"
+      fi
     fi
   fi
   echo "$dest"
 }
+fetch_failed() { [ -s "$FETCH_ERRORS" ] && grep -q "^$1" "$FETCH_ERRORS"; }
 
 # module_file open_webui.models.users -> local copy of models/users.py (or __init__.py)
 module_file() {
@@ -105,8 +119,15 @@ B='([^A-Za-z0-9_]|$)'
 while IFS=$'\t' read -r mod name users; do
   [ -n "$name" ] || continue
   src=$(module_file "$mod")
-  if [ ! -s "$src" ]; then bad "$mod (module missing) <- $users"; continue; fi
-  def=$(grep -Em1 "^(async[[:space:]]+)?def[[:space:]]+$name[[:space:]]*\(|^class[[:space:]]+$name$B|^[[:space:]]*$name[[:space:]]*(:[^=]*)?=([^=]|$)|^[[:space:]]*(from[[:space:]].*)?import[[:space:]].*[[:space:],(]$name$B|^[[:space:]]+$name,?[[:space:]]*$" "$src" || true)
+  if [ ! -s "$src" ]; then
+    if fetch_failed "backend/$(echo "$mod" | tr . /)"; then
+      printf '  ERROR %s could not be fetched (see the end of the output)\n' "$mod"
+    else
+      bad "$mod (module missing) <- $users"
+    fi
+    continue
+  fi
+  def=$(grep -Em1 "^(async[[:space:]]+)?def[[:space:]]+${name}[[:space:]]*\(|^class[[:space:]]+$name$B|^[[:space:]]*${name}[[:space:]]*(:[^=]*)?=([^=]|$)|^[[:space:]]*(from[[:space:]].*)?import[[:space:]].*[[:space:],(]$name$B|^[[:space:]]+$name,?[[:space:]]*$" "$src" || true)
   if [ -z "$def" ]; then
     bad "$mod.$name <- $users"
   elif echo "$def" | grep -qiE "legacy|deprecated"; then
@@ -126,7 +147,7 @@ while IFS=$'\t' read -r mod name users; do
   for method in $(cd "$REPO" && cat $(echo "$users" | tr , ' ') \
       | grep -oE "(^|[^A-Za-z0-9_.])$name\.[a-z_][a-z0-9_]*\(" \
       | sed -E "s/.*$name\.([a-z0-9_]+)\(/\1/" | sort -u); do
-    if grep -Eq "^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+$method[[:space:]]*\(" "$src"; then
+    if grep -Eq "^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+${method}[[:space:]]*\(" "$src"; then
       ok "$name.$method() ($mod)"
     else
       bad "$name.$method() not found in $mod <- $users"
@@ -137,14 +158,15 @@ done <<<"$SYMBOLS"
 # -- 3. injected __params__ declared by pipe()/inlet()/outlet()/stream()
 echo
 echo "== injected __params__"
+# (grep finding nothing must not end the script under set -e / pipefail)
 PROVIDED=$(cat "$(fetch backend/open_webui/functions.py)" \
   "$(fetch backend/open_webui/utils/filter.py)" \
   "$(fetch backend/open_webui/utils/middleware.py)" \
-  | grep -oE "['\"]__[a-z][a-z_]*__['\"]" | tr -d "'\"" | sort -u)
+  | { grep -oE "['\"]__[a-z][a-z_]*__['\"]" || true; } | tr -d "'\"" | sort -u)
 for param in $(cd "$REPO" && cat $FILES \
     | grep -oE "^[[:space:]]*(self, )?__[a-z][a-z_]*__[[:space:]]*(:|=|,|\))" \
     | grep -oE "__[a-z][a-z_]*__" | sort -u); do
-  users=$(cd "$REPO" && grep -lE "^[[:space:]]*(self, )?$param[[:space:]]*(:|=|,|\))" $FILES | tr '\n' ' ')
+  users=$(cd "$REPO" && grep -lE "^[[:space:]]*(self, )?${param}[[:space:]]*(:|=|,|\))" $FILES | tr '\n' ' ')
   if echo "$PROVIDED" | grep -qx "$param"; then ok "$param"; else bad "$param not injected any more <- $users"; fi
 done
 
@@ -160,21 +182,29 @@ for f in $FILES; do
 done
 
 # -- 5. informational: persisted emitter events, shared dependency versions
+#       (never fail the check; "none found" just means the code moved)
 echo
 echo "== event types persisted by __event_emitter__ at $TAG"
-grep -oE "event_type (==|in) (\([^)]*\)|'[^']*')" "$(fetch backend/open_webui/socket/main.py)" \
+events=$({ grep -oE "event_type (==|in) (\([^)]*\)|'[^']*')" \
+  "$(fetch backend/open_webui/socket/main.py)" || true; } \
   | sed -E "s/event_type (==|in) //" | tr -d "()'" | tr ',' '\n' | sed 's/^ *//' \
-  | sort -u | tr '\n' ' ' | sed 's/^/  /'
-echo
+  | sort -u | tr '\n' ' ')
+echo "  ${events:-(none found in backend/open_webui/socket/main.py)}"
 echo
 echo "== shared dependencies at $TAG"
 deps=$(cat "$(fetch pyproject.toml)" "$(fetch backend/requirements.txt)" \
   "$(fetch backend/requirements-slim.txt)" 2>/dev/null \
-  | grep -ioE "^[[:space:]]*\"?(aiohttp|aiofiles|cryptography|pydantic|fastapi|pillow|google-genai|httpx|python-socketio)[=<>~!][^\",#[:space:]]*" \
+  | { grep -ioE "^[[:space:]]*\"?(aiohttp|aiofiles|cryptography|pydantic|fastapi|pillow|google-genai|httpx|python-socketio)[=<>~!][^\",#[:space:]]*" || true; } \
   | tr -d ' "' | sort -u | tr '\n' ' ')
 echo "  ${deps:-(none found)}"
 
 echo
+if [ -s "$FETCH_ERRORS" ]; then
+  echo "could not fetch from Open WebUI $TAG (network, rate limit or auth?):"
+  sed 's/^/  /' "$FETCH_ERRORS"
+  echo "RESULT: incomplete, $FAILS missing API(s) among the files that could be fetched"
+  exit 2
+fi
 if [ "$FAILS" -gt 0 ]; then
   echo "RESULT: $FAILS missing API(s), $WARNS warning(s) at Open WebUI $TAG"
   exit 1

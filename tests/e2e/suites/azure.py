@@ -3,7 +3,8 @@ Azure suite: pipelines/azure/azure_ai_foundry.py against mocks/mock_azure.py.
 
 Groups (``--only azure.<group>``)
   models   AZURE_AI_MODEL list (; , space separated) -> manifold models
-  api      API path non-stream / stream, headers, allow-listed body, errors
+  api      API path non-stream / stream, headers, allow-listed body (extra
+           client keys dropped), errors
   dotted   model names containing dots reach upstream intact
   browser  browser path: saved answer, usage, terminal status
   tasks    background title task
@@ -15,10 +16,13 @@ import json
 
 from harness import Suite, known, short
 
+GROUPS = ("models", "api", "dotted", "browser", "tasks", "oyd")
 FID = "azure"
 PATH = "pipelines/azure/azure_ai_foundry.py"
 KEY = "mock-key-123"
 MODELS = ("gpt-4o", "gpt-4.1", "Phi-3.5-mini-instruct")
+# Client keys Open WebUI passes through to the pipe but the allow-list must drop.
+NOT_ALLOWED = {"user": "u-e2e", "logit_bias": {"50256": -100}, "foo_not_allowed": "x"}
 ALLOWED = {
     "model",
     "messages",
@@ -119,10 +123,20 @@ async def run(t: Suite) -> None:
     t.scan_log()
 
 
+def _allow_listed(body: dict) -> bool:
+    """Only allow-listed keys went upstream, the extra client keys were dropped
+    and an allow-listed optional parameter (temperature) was kept."""
+    return (
+        set(body) <= ALLOWED
+        and not set(NOT_ALLOWED) & set(body)
+        and body.get("temperature") == 0.3
+    )
+
+
 async def api(t: Suite, mock) -> None:
     model = f"{FID}.gpt-4o"
     await mock.reset()
-    r = await t.owui.chat(model, "hello", stream=False)
+    r = await t.owui.chat(model, "hello", stream=False, temperature=0.3, **NOT_ALLOWED)
     req = await mock.last()
     t.check(
         "api.nonstream",
@@ -135,18 +149,20 @@ async def api(t: Suite, mock) -> None:
     body = req.get("body") or {}
     t.check(
         "api.nonstream.request",
-        "upstream: decrypted api-key, model header, only allow-listed body keys",
+        "upstream: decrypted api-key, model header, only allow-listed body keys "
+        "(extra client keys dropped)",
         req.get("auth_mode") == "api-key"
         and req.get("model_header") == "gpt-4o"
-        and set(body) <= ALLOWED
+        and _allow_listed(body)
         and "stream_options" not in body,
         f"auth={req.get('auth_mode')} header={req.get('model_header')} "
-        f"keys={sorted(body)}",
+        f"sent extra={sorted(NOT_ALLOWED)} upstream keys={sorted(body)}",
     )
 
     await mock.reset()
-    r = await t.owui.chat(model, "hello", stream=True)
+    r = await t.owui.chat(model, "hello", stream=True, temperature=0.3, **NOT_ALLOWED)
     req = await mock.last()
+    body = req.get("body") or {}
     t.check(
         "api.stream",
         "API stream: answer, usage chunk and [DONE]",
@@ -158,10 +174,12 @@ async def api(t: Suite, mock) -> None:
     )
     t.check(
         "api.stream.request",
-        "upstream: stream_options.include_usage requested",
-        ((req.get("body") or {}).get("stream_options") or {}).get("include_usage")
-        is True,
-        f"stream_options={(req.get('body') or {}).get('stream_options')}",
+        "upstream: stream_options.include_usage requested, only allow-listed body "
+        "keys (extra client keys dropped)",
+        (body.get("stream_options") or {}).get("include_usage") is True
+        and _allow_listed(body),
+        f"stream_options={body.get('stream_options')} "
+        f"sent extra={sorted(NOT_ALLOWED)} upstream keys={sorted(body)}",
     )
 
     for stream in (False, True):

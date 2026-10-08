@@ -8,8 +8,9 @@ started from tests/e2e/mocks/serve_all.py.
 usage: python3 /e2e/e2e.py [--suites gemini,azure,...|all] [--only REGEX]
                            [--out DIR] [--verbose]
 
-Writes <out>/results.json and <out>/summary.md; exit code 1 when any scenario
-FAILs (KNOWN results do not fail the run).
+Writes <out>/results.json and <out>/summary.md. Exit code: 0 = only PASS /
+KNOWN, 1 = at least one FAIL, 2 = setup error (bad arguments, --only matches no
+scenario group, Open WebUI or a mock unreachable, driver crash).
 """
 
 import argparse
@@ -17,6 +18,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -38,7 +40,37 @@ def parse_args() -> argparse.Namespace:
     if unknown:
         parser.error(f"unknown suite(s) {unknown}; choose from {', '.join(SUITES)}")
     args.suite_names = list(names)
+    if args.only:
+        try:
+            re.compile(args.only)
+        except re.error as exc:
+            parser.error(f"--only {args.only!r} is not a valid regex: {exc}")
     return args
+
+
+def suite_groups(name: str) -> tuple:
+    """``GROUPS`` of a suite module (empty when it cannot be imported; the
+    import error is reported as that suite's crash later)."""
+    try:
+        return tuple(getattr(importlib.import_module(f"suites.{name}"), "GROUPS"))
+    except Exception:
+        return ()
+
+
+def only_error(args: argparse.Namespace) -> str:
+    """Message when ``--only`` selects no scenario group at all, else ''."""
+    if not args.only:
+        return ""
+    groups = [f"{n}.{g}" for n in args.suite_names for g in suite_groups(n)]
+    if not groups or any(re.search(args.only, g) for g in groups):
+        return ""
+    hint = ""
+    if "\\|" in args.only:
+        hint = " ('\\|' matches a literal '|'; write alternatives as (a|b))"
+    return (
+        f"--only {args.only!r} matches no scenario group{hint}; "
+        f"groups: {' '.join(groups)}"
+    )
 
 
 def read_sources() -> dict:
@@ -56,6 +88,10 @@ def read_sources() -> dict:
 
 async def main() -> int:
     args = parse_args()
+    error = only_error(args)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     started = time.time()
     results = Results(verbose=args.verbose)
     log = ServerLog()
@@ -76,7 +112,7 @@ async def main() -> int:
     print(f"Open WebUI {version}, suites: {', '.join(args.suite_names)}", flush=True)
 
     for name in args.suite_names:
-        suite = Suite(name, owui, results, log, args.only)
+        suite = Suite(name, owui, results, log, args.only, suite_groups(name))
         print(f"\n=== {name} ===", flush=True)
         t0 = time.time()
         try:
@@ -115,4 +151,8 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    try:
+        sys.exit(asyncio.run(main()))
+    except Exception:  # driver bug or Open WebUI gone: setup error, not a FAIL
+        traceback.print_exc()
+        sys.exit(2)

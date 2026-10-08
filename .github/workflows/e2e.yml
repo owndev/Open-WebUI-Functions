@@ -11,8 +11,10 @@ name: 🧪 E2E
 permissions:
   contents: read
 
+# One run per ref and image: a new push cancels the older run, while manual runs
+# with different image tags (A/B of Open WebUI releases) run side by side.
 concurrency:
-  group: e2e-${{ github.ref }}
+  group: e2e-${{ github.ref }}-${{ inputs.image_tag || 'default' }}
   cancel-in-progress: true
 
 on:
@@ -25,11 +27,11 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Open WebUI image tag (ghcr.io/open-webui/open-webui:<tag>)"
+        description: "Open WebUI image tag (ghcr.io/open-webui/open-webui:<tag>) or a full image reference"
         required: false
         default: "v0.11.4-slim"
       suites:
-        description: "Suites (gemini,azure,n8n,infomaniak,filters or all)"
+        description: "Comma-separated suites (modules in tests/e2e/suites/, e.g. gemini,azure,n8n,infomaniak,filters) or all"
         required: false
         default: "all"
 
@@ -54,10 +56,21 @@ jobs:
         if: always()
         run: cat "$RUNNER_TEMP/e2e-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
 
+      # Artifact names must not contain / : and a few other characters, which a
+      # full image reference (ghcr.io/open-webui/open-webui:main) has.
+      - name: Artifact name
+        id: artifact
+        if: always()
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || 'v0.11.4-slim' }}
+        run: |
+          safe=$(printf '%s' "$IMAGE_TAG" | tr -c 'A-Za-z0-9._-' '-')
+          echo "name=e2e-results-${safe}" >> "$GITHUB_OUTPUT"
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-results-${{ inputs.image_tag || 'v0.11.4-slim' }}
+          name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-out
           if-no-files-found: warn
