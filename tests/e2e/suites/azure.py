@@ -781,7 +781,7 @@ async def oyd_big(t: Suite, mock, model: str) -> None:
     t.expect_errors(mark, STREAM_ERROR)
     t.check(
         "oyd.huge-context.api",
-        "a ~5 MiB context event ends the stream with an 'Error: ...' delta and "
+        "a context event over 4 MiB ends the stream with an 'Error: ...' delta and "
         "[DONE], without document text in the answer or the log",
         r.status == 200
         and r.content.startswith("Error:")
@@ -920,7 +920,7 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
     description = str(last.get("description", ""))
     t.check(
         "oyd.huge-context.browser",
-        "browser: a ~5 MiB context event -> 'Error: ...' saved and final "
+        "browser: a context event over 4 MiB -> 'Error: ...' saved and final "
         "'Error: ...' status done, without document text",
         c.done
         and c.content.startswith("Error:")

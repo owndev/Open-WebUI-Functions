@@ -39,7 +39,7 @@ Behaviour
       ``no-refs``        (On Your Data) answer without any [docX] reference
       ``paren-url``      (On Your Data) doc1's URL contains "(v2)"
       ``big-context``    (On Your Data) context event of ~300 KB (one SSE line)
-      ``huge-context``   (On Your Data) context event of ~5 MiB (one SSE line)
+      ``huge-context``   (On Your Data) context event of ~9 MB (one SSE line)
       ``content-null``   (On Your Data, non-stream) ``content: null`` with
                          finish_reason content_filter and the citations context
 
@@ -132,11 +132,14 @@ OYD_TOKENS_NO_REFS = [
 ]
 PAREN_URL = "https://docs.example.com/x100/manual_(v2).pdf"
 # Filler of the big/huge context documents. Each of the 3 citations carries it
-# once in "citations" and once in "all_retrieved_documents" (the suites request
-# that via include_contexts), so the context event is ~6x its size.
+# in "citations" and, when include_contexts asks for them, again in
+# "all_retrieved_documents". The citations alone already exceed the limits, so
+# the scenarios do not depend on AZURE_AI_INCLUDE_SEARCH_SCORES.
 FILLER_WORD = "bigdoc "
-BIG_DOC_CHARS = 50_000  # ~300 KB context event (> aiohttp's 128 KiB default)
-HUGE_DOC_CHARS = 900_000  # ~5.4 MB context event (> the 4 MiB the pipe reads)
+# 150 KB of citations (> aiohttp's default 128 KiB line), ~300 KB event
+BIG_DOC_CHARS = 50_000
+# 4.5 MB of citations (> the 4 MiB the 2.8.0 pipe reads), ~9 MB event
+HUGE_DOC_CHARS = 1_500_000
 VALID_ROLES = {"system", "developer", "user", "assistant", "tool"}
 VALID_PART_TYPES = {"text", "image_url", "input_audio", "refusal", "file"}
 
