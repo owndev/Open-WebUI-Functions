@@ -37,6 +37,15 @@ This integration allows Open WebUI to communicate with workflows created in **n8
 - **Streaming & Non-Streaming Support**  
   Automatic detection and handling of both streaming and non-streaming responses with consistent output formatting.
 
+- **Streaming Formats**  
+  Streamed replies are parsed line by line: n8n's native streaming (one JSON object per line), Server-Sent Events (`data:` lines; `[DONE]`, `:` comments and `event:`/`id:`/`retry:` fields are dropped) and plain text. JSON objects split across network chunks or written back to back are reassembled, so no SSE framing ends up in the answer (v2.3.1).
+
+- **Token Usage**  
+  If the workflow's JSON reply contains an OpenAI-style `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`), it is passed to Open WebUI and saved with the message, for streaming and non-streaming chats (fixed in v2.3.1: the answer was saved empty when the chat was streaming).
+
+- **Chat Context**  
+  The webhook payload includes `chat_id` and `message_id` of the current Open WebUI chat (empty for API calls that are not part of a chat).
+
 - **SystemPrompt Deduplication**  
   Intelligent removal of duplicate system prompts to prevent redundant instructions.
 

@@ -183,6 +183,8 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Integrates **Open WebUI** with **N8N**, an automation and workflow platform.
 - **AI agent tool usage display (v2.2.0)** 🛠️: Shows tool calls from N8N AI Agent workflows with three verbosity levels (minimal, compact, detailed) and customizable length limits (non-streaming mode only).
 - Streaming and non-streaming support for real-time and batch data processing.
+- Parses n8n native streaming (NDJSON), Server-Sent Events and plain-text streams without leaking SSE framing into the answer.
+- Forwards token usage returned by the workflow to Open WebUI.
 - Sends messages from Open WebUI to an **N8N webhook**.
 - Supports real-time message processing with dynamic field handling.
 - Enables automation of AI-generated responses inside an **N8N workflow**.
@@ -202,6 +204,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 - Integrates **Open WebUI** with **Infomaniak**, a Swiss web hosting and cloud services provider.
 - Sends messages from Open WebUI to an **Infomaniak AI Tool**.
+- Streaming and non-streaming support with token usage tracking and status updates.
 - Supports encryption of sensitive information such as API keys.
 
 🔗 [Infomaniak Pipeline in Open WebUI](https://openwebui.com/f/owndev/infomaniak_ai_tools)

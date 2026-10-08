@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
-version: 2.2.0
+version: 2.2.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
@@ -14,6 +14,8 @@ features:
   - Lists available models for easy access
   - Robust error handling and logging
   - Handles streaming and non-streaming responses
+  - Streams complete SSE lines so every event and the final token usage reach Open WebUI
+  - Status updates while sending, streaming, on completion and on error
   - Encrypted storage of sensitive API keys
 """
 
@@ -23,6 +25,7 @@ from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
+import asyncio
 import json
 import os
 import logging
@@ -199,6 +202,55 @@ class Pipe:
         """
         return f"{self.valves.INFOMANIAK_BASE_URL}/2/ai/{self.valves.INFOMANIAK_PRODUCT_ID}/openai/{endpoint}"
 
+    async def emit_status(
+        self,
+        __event_emitter__: Optional[Callable],
+        description: str,
+        done: bool,
+    ) -> None:
+        """
+        Emits a status event if an event emitter is available (Open WebUI may
+        pass None, e.g. for background tasks).
+        """
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": description, "done": done},
+                }
+            )
+
+    @staticmethod
+    def extract_error_detail(error_text: str) -> str:
+        """
+        Extracts a readable message from an Infomaniak / OpenAI-style error body.
+
+        Args:
+            error_text: Raw response body of the failed request
+
+        Returns:
+            The error message, or the (truncated) raw body if it is not JSON
+        """
+        try:
+            data = json.loads(error_text)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = (
+                    error.get("message")
+                    or error.get("description")
+                    or error.get("code")
+                )
+                return str(message or error)
+            if error:
+                return str(error)
+            if data.get("message"):
+                return str(data["message"])
+        text = (error_text or "").strip()
+        return text[:500] + "..." if len(text) > 500 else text
+
     def validate_body(self, body: Dict[str, Any]) -> None:
         """
         Validates the request body to ensure required fields are present.
@@ -297,7 +349,7 @@ class Pipe:
 
         Args:
             body: The request body containing messages and other parameters
-            __event_emitter__: Event emitter for status updates (optional, for interface consistency)
+            __event_emitter__: Optional event emitter for status updates
 
         Returns:
             Response from Infomaniak AI API, which could be a string, dictionary or streaming response
@@ -348,10 +400,13 @@ class Pipe:
         # Convert the modified body back to JSON
         payload = json.dumps(filtered_body)
 
+        await self.emit_status(
+            __event_emitter__, "Sending request to Infomaniak AI...", False
+        )
+
         request = None
         session = None
         streaming = False
-        response = None
 
         try:
             session = aiohttp.ClientSession(
@@ -367,6 +422,18 @@ class Pipe:
                 headers=headers,
             )
 
+            # Upstream HTTP error: log status and body, show the provider's message
+            if request.status >= 400:
+                error_text = await request.text()
+                log.error(
+                    f"Infomaniak AI API error: HTTP {request.status} - {error_text[:2000]}"
+                )
+                detail = self.extract_error_detail(error_text) or (
+                    f"HTTP {request.status}"
+                )
+                await self.emit_status(__event_emitter__, f"Error: {detail}", True)
+                return f"Error: {detail}"
+
             # Check if response is SSE
             if "text/event-stream" in request.headers.get("Content-Type", ""):
                 streaming = True
@@ -374,12 +441,32 @@ class Pipe:
                 streaming_resp = request
                 streaming_session = session
 
+                await self.emit_status(
+                    __event_emitter__, "Streaming response from Infomaniak AI...", False
+                )
+
                 async def stream_response(
                     resp: aiohttp.ClientResponse, client: aiohttp.ClientSession
                 ):
+                    # Open WebUI handles every item of the body iterator as exactly one
+                    # SSE line, but a network chunk can hold several events or end in
+                    # the middle of one. Re-split the byte stream into complete lines.
+                    buffer = b""
                     try:
                         async for chunk in resp.content.iter_any():
-                            yield chunk
+                            buffer += chunk
+                            while b"\n" in buffer:
+                                line, buffer = buffer.split(b"\n", 1)
+                                yield line + b"\n"
+                        if buffer:
+                            yield buffer
+                        await self.emit_status(
+                            __event_emitter__, "Streaming completed", True
+                        )
+                    except Exception as e:
+                        log.error(f"Error while streaming Infomaniak AI response: {e}")
+                        await self.emit_status(__event_emitter__, f"Error: {e}", True)
+                        raise
                     finally:
                         try:
                             await cleanup_response(resp, client)
@@ -402,20 +489,18 @@ class Pipe:
                     log.error(f"Error parsing JSON response: {e}")
                     response = await request.text()
 
-                request.raise_for_status()
-
+                await self.emit_status(__event_emitter__, "Request completed", True)
                 return response
 
         except Exception as e:
-            log.exception(f"Error in Infomaniak AI request: {e}")
+            if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError)):
+                # Network / upstream failure: the message is enough, no stack trace
+                log.error(f"Infomaniak AI request failed: {type(e).__name__}: {e}")
+            else:
+                log.exception(f"Error in Infomaniak AI request: {e}")
 
-            detail = f"Exception: {str(e)}"
-            if isinstance(response, dict):
-                if "error" in response:
-                    detail = f"{response['error']['message'] if 'message' in response['error'] else response['error']}"
-            elif isinstance(response, str):
-                detail = response
-
+            detail = f"Exception: {str(e) or type(e).__name__}"
+            await self.emit_status(__event_emitter__, f"Error: {detail}", True)
             return f"Error: {detail}"
         finally:
             if not streaming:
