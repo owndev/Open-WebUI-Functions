@@ -15,7 +15,7 @@ features:
   - Robust error handling and logging
   - Handles streaming and non-streaming responses
   - Streams complete SSE lines so every event and the final token usage reach Open WebUI
-  - Status updates while sending, streaming, on completion and on error
+  - Status updates while sending, streaming, on completion, on error and when stopped
   - Encrypted storage of sensitive API keys
 """
 
@@ -218,6 +218,19 @@ class Pipe:
                     "type": "status",
                     "data": {"description": description, "done": done},
                 }
+            )
+
+    async def emit_stopped_status(self, __event_emitter__: Optional[Callable]) -> None:
+        """
+        Emits the terminal status for a request that was stopped by the user or
+        whose client went away. Errors are only logged, so they cannot replace
+        the cancellation that is being handled.
+        """
+        try:
+            await self.emit_status(__event_emitter__, "Stopped", True)
+        except Exception as e:
+            logging.getLogger("infomaniak_ai_tools.pipe").debug(
+                f"Could not emit stopped status: {e}"
             )
 
     @staticmethod
@@ -463,6 +476,12 @@ class Pipe:
                         await self.emit_status(
                             __event_emitter__, "Streaming completed", True
                         )
+                    except (GeneratorExit, asyncio.CancelledError):
+                        # Stopped by the user or the client went away: end the
+                        # status so the message keeps no in-progress indicator
+                        log.info("Infomaniak AI stream stopped before completion")
+                        await self.emit_stopped_status(__event_emitter__)
+                        raise
                     except Exception as e:
                         log.error(f"Error while streaming Infomaniak AI response: {e}")
                         await self.emit_status(__event_emitter__, f"Error: {e}", True)
@@ -502,6 +521,11 @@ class Pipe:
             detail = f"Exception: {str(e) or type(e).__name__}"
             await self.emit_status(__event_emitter__, f"Error: {detail}", True)
             return f"Error: {detail}"
+        except asyncio.CancelledError:
+            # Stopped while waiting for the upstream response
+            log.info("Infomaniak AI request stopped before completion")
+            await self.emit_stopped_status(__event_emitter__)
+            raise
         finally:
             if not streaming:
                 await cleanup_response(request, session)

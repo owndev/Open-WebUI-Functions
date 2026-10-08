@@ -24,6 +24,8 @@ features:
   - Shows tool calls, inputs, and results from intermediateSteps in non-streaming mode (N8N limitation - streaming responses do not include intermediateSteps).
   - Parses n8n native streaming (NDJSON), Server-Sent Events (data lines, [DONE], comments) and plain-text streams line by line without leaking SSE framing.
   - Forwards token usage returned by the workflow to Open WebUI, for streaming and non-streaming chats.
+  - Sends Open WebUI tasks (title, tags, follow-ups, ...) without chat_id/message_id, so they stay out of the workflow's chat memory.
+  - Final status on completion, on error or when the response is stopped.
 """
 
 from typing import (
@@ -47,6 +49,7 @@ import codecs
 import hashlib
 import logging
 import json
+import asyncio
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from pydantic_core import core_schema
 import time
@@ -746,12 +749,17 @@ class Pipe:
                 }
             )
 
-    async def _stream_with_usage(
+    def _stream_with_usage(
         self, model: str, content: str, usage: Any
-    ) -> AsyncIterator[dict]:
+    ) -> Generator[dict, None, None]:
         """
         Yield a complete answer and its token usage as OpenAI chat.completion.chunk
         objects, for streaming requests answered by a non-streaming n8n reply.
+
+        This is a plain (sync) generator on purpose: Open WebUI appends the
+        finish_reason "stop" chunk and "data: [DONE]" to a Generator result in
+        every supported version, but in older versions (e.g. 0.8.0) not to an
+        async generator.
         """
         base = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -941,9 +949,8 @@ class Pipe:
         __event_call__: Callable[[dict], Awaitable[dict]] = None,
         __chat_id__: Optional[str] = None,
         __message_id__: Optional[str] = None,
-    ) -> Union[
-        str, Generator, Iterator, AsyncIterator, Dict[str, Any], StreamingResponse
-    ]:
+        __task__: Optional[str] = None,
+    ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the N8N endpoint.
 
@@ -952,11 +959,12 @@ class Pipe:
             __event_emitter__: Optional event emitter function for status updates
             __chat_id__: Chat ID passed by Open WebUI (empty for API calls without a chat)
             __message_id__: Assistant message ID passed by Open WebUI
+            __task__: Open WebUI task type (title, tags, follow-ups, ...), None for chat turns
 
         Returns:
             Response from N8N API: a string, an OpenAI-style dict (non-streaming
-            request with usage) or an async generator of OpenAI chunks (streaming
-            request with usage)
+            request with usage) or a generator of OpenAI chunks (streaming request
+            with usage)
         """
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
@@ -974,15 +982,25 @@ class Pipe:
             if "Prompt: " in question:
                 question = question.split("Prompt: ")[-1]
             try:
-                # chat_id / message_id are passed by Open WebUI; fall back to the
-                # event emitter closure for older versions that do not pass them
-                chat_id, message_id = __chat_id__, __message_id__
-                if not chat_id or not message_id:
-                    fallback_chat_id, fallback_message_id = self.extract_event_info(
-                        __event_emitter__
-                    )
-                    chat_id = chat_id or fallback_chat_id
-                    message_id = message_id or fallback_message_id
+                if __task__:
+                    # Open WebUI tasks (title, tag, follow-up, search query
+                    # generation, ...) are not chat turns. Send them without
+                    # chat_id / message_id (title, tag and follow-up tasks were
+                    # already sent that way), so workflows that key their memory on
+                    # chat_id (like the templates) do not store task prompts in the
+                    # chat's memory.
+                    chat_id, message_id = None, None
+                    self.log.debug(f"Open WebUI task '{__task__}': no chat context")
+                else:
+                    # chat_id / message_id are passed by Open WebUI; fall back to
+                    # the event emitter closure if they are missing
+                    chat_id, message_id = __chat_id__, __message_id__
+                    if not chat_id or not message_id:
+                        fallback_chat_id, fallback_message_id = self.extract_event_info(
+                            __event_emitter__
+                        )
+                        chat_id = chat_id or fallback_chat_id
+                        message_id = message_id or fallback_message_id
 
                 self.log.info(f"Starting N8N workflow request for chat ID: {chat_id}")
 
@@ -1501,7 +1519,8 @@ class Pipe:
                                 # request as a single SSE event without choices[].delta,
                                 # so the answer would be saved empty. Stream the answer
                                 # and the usage as chat.completion.chunk events instead
-                                # (Open WebUI appends the finish chunk and [DONE]).
+                                # (sync generator: Open WebUI appends the finish chunk
+                                # and [DONE], see _stream_with_usage).
                                 return self._stream_with_usage(
                                     body.get("model", ""), n8n_response, usage
                                 )
@@ -1565,6 +1584,19 @@ class Pipe:
                     True,
                 )
                 return error_msg
+            except asyncio.CancelledError:
+                # Stopped by the user (or the client went away): close the request
+                # and end the status, so the message keeps no in-progress indicator
+                self.log.info("N8N request stopped before completion")
+                if session:
+                    await session.close()
+                try:
+                    await self.emit_simple_status(
+                        __event_emitter__, "cancelled", "Stopped", True
+                    )
+                except Exception as emit_error:
+                    self.log.debug(f"Could not emit stopped status: {emit_error}")
+                raise
 
         # If no message is available alert user
         else:

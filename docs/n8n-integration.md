@@ -44,7 +44,10 @@ This integration allows Open WebUI to communicate with workflows created in **n8
   If the workflow's JSON reply contains an OpenAI-style `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`), it is passed to Open WebUI and saved with the message, for streaming and non-streaming chats (fixed in v2.3.1: the answer was saved empty when the chat was streaming).
 
 - **Chat Context**  
-  The webhook payload includes `chat_id` and `message_id` of the current Open WebUI chat (empty for API calls that are not part of a chat).
+  The webhook payload includes `chat_id` and `message_id` of the current Open WebUI chat (empty for API calls that are not part of a chat). Open WebUI tasks that run on the n8n model as task model (title, tag and follow-up generation, search query generation, ...) are sent with empty `chat_id` and `message_id`, so workflows that key their memory on `chat_id` (like the template workflows) do not store the task prompts in the chat's memory.
+
+- **Status Updates**  
+  Shows the request progress in the chat and a final status on completion, on error or when the response is stopped (v2.3.1).
 
 - **SystemPrompt Deduplication**  
   Intelligent removal of duplicate system prompts to prevent redundant instructions.

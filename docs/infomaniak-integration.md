@@ -26,7 +26,7 @@ This integration enables Open WebUI to interact with **Infomaniak AI Tools**, us
   Streaming responses are forwarded line by line, so every chunk and the final token usage reach Open WebUI, even when several events arrive in one network packet or one event is split across packets (fixed in v2.2.1).
 
 - **Status Updates**  
-  Shows the request progress in the chat (sending, streaming) and a final status on completion or error.
+  Shows the request progress in the chat (sending, streaming) and a final status on completion, on error or when the response is stopped.
 
 - **Error Handling**  
   Upstream HTTP errors are logged with status code and response body, and the provider's error message is shown in the chat.
