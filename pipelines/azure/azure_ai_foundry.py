@@ -22,6 +22,7 @@ features:
   - Answers with [docX] references show only the referenced documents; answers without any show all retrieved documents (default) or none (AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false)
   - Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no citations
   - Requests with Azure AI Search omit tools and stream_options, which On Your Data ignores or rejects
+  - Streamed events of up to 4 MiB (large Azure AI Search contexts); a stream that fails ends with an "Error: ..." message instead of an empty or cut off answer
 """
 
 from typing import (
@@ -43,6 +44,7 @@ from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
+from aiohttp.http_exceptions import LineTooLong
 import json
 import os
 import logging
@@ -157,13 +159,21 @@ class Pipe:
     # [docX] references to convert into links. Already linked references
     # ("[[docX]](url)" or "[docX](url)") are matched as a whole without a
     # group, so they are kept as they are instead of being wrapped again.
+    # "[[docX]]" without a link (group 1) is one reference, like "[docX]"
+    # (group 2).
     DOC_LINK_PATTERN = re.compile(
-        r"\[\[doc\d+\]\]\([^)\n]*\)|\[doc\d+\]\([^)\n]*\)|\[doc(\d+)\]"
+        r"\[\[doc\d+\]\]\([^)\n]*\)|\[doc\d+\]\([^)\n]*\)"
+        r"|\[\[doc(\d+)\]\]|\[doc(\d+)\]"
     )
 
     # Links this pipeline added to earlier answers ("[[docX]](url)"). They are
     # sent back to the model as plain "[docX]", so it does not copy the syntax.
-    LINKED_DOC_REF_PATTERN = re.compile(r"\[\[doc(\d+)\]\]\([^)\n]*\)")
+    # Before v2.8.0 parentheses in the URL were not percent-encoded, so a URL
+    # may contain balanced "(...)" pairs; otherwise the link ends at its
+    # first ")".
+    LINKED_DOC_REF_PATTERN = re.compile(
+        r"\[\[doc(\d+)\]\]\((?:(?:[^()\n]|\([^()\n]*\))*|[^)\n]*)\)"
+    )
 
     # End of a streamed piece of text that may still become a [docX] reference
     # or a link around one: "[", "[[", "[d" ... "[doc1", "[doc1]", "[[doc1]]",
@@ -172,6 +182,13 @@ class Pipe:
     PARTIAL_DOC_REF_PATTERN = re.compile(
         r"\[\[?(?:d(?:o(?:c\d*)?)?)?\Z|\[\[?doc\d+\]\]?(?:\([^)\n]*)?\Z"
     )
+
+    # Read buffer of the HTTP session. aiohttp reads a streamed response line
+    # by line and fails (LineTooLong) on a line longer than twice this size;
+    # its default of 64 KiB allows only 128 KiB. One SSE event is one line,
+    # and the context event of an Azure AI Search answer (citations plus
+    # all_retrieved_documents) can be larger, so lines up to 4 MiB are read.
+    STREAM_READ_BUFSIZE = 2 * 1024 * 1024
 
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
@@ -895,7 +912,9 @@ class Pipe:
 
         # Count conversions for logging
         original_count = sum(
-            1 for m in self.DOC_LINK_PATTERN.finditer(content) if m.group(1)
+            1
+            for m in self.DOC_LINK_PATTERN.finditer(content)
+            if m.group(1) or m.group(2)
         )
         linked_count = sum(
             1 for i in range(1, len(citations) + 1) if citation_urls.get(i)
@@ -913,7 +932,8 @@ class Pipe:
 
         References that are already links ("[[docX]](url)" or "[docX](url)"),
         for example because the model copied them, are left unchanged so they
-        are not wrapped a second time.
+        are not wrapped a second time. "[[docX]]" without a link is converted
+        like "[docX]".
 
         Args:
             text: Text that may contain [docX] references
@@ -926,10 +946,11 @@ class Pipe:
             return text
 
         def replace_doc_ref(match):
-            if match.group(1) is None:
+            number = match.group(1) or match.group(2)
+            if number is None:
                 # Already a markdown link
                 return match.group(0)
-            doc_num = int(match.group(1))
+            doc_num = int(number)
             return self._format_citation_link(doc_num, citation_urls.get(doc_num))
 
         return self.DOC_LINK_PATTERN.sub(replace_doc_ref, text)
@@ -1129,8 +1150,10 @@ class Pipe:
         all sources appear in the UI.
 
         Only emits citations that are actually referenced in the content (e.g., [doc1], [doc2]).
-        If the content references none, all citations are emitted, or none
-        when AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES is off.
+        If the content references none of them (references to documents that
+        do not exist, such as [doc9] with 3 citations, do not count), all
+        citations are emitted, or none when
+        AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES is off.
 
         Args:
             citations: List of Azure citation objects
@@ -1148,7 +1171,11 @@ class Pipe:
             return
 
         # Extract which citations are actually referenced in the content
-        referenced_indices = self._extract_referenced_citations(content)
+        referenced_indices = {
+            index
+            for index in self._extract_referenced_citations(content)
+            if 1 <= index <= len(citations)
+        }
 
         # If we couldn't find any references, include all citations (backward
         # compatibility), unless this fallback is switched off
@@ -1239,7 +1266,10 @@ class Pipe:
             message = choice["message"]
             context = message["context"]
             citations = context["citations"]
-            content = message["content"]
+            content = message.get("content")
+            if not isinstance(content, str):
+                # e.g. "content": null of a filtered answer
+                return response
 
             # Convert [docX] references to markdown links
             enhanced_content = self._convert_doc_refs_to_links(content, citations)
@@ -1434,15 +1464,18 @@ class Pipe:
         """
         log = logging.getLogger("azure_ai.stream_processor_with_citations")
 
+        response_content = ""  # Track the actual response content
+        citation_urls = {}  # Pre-allocate citation URLs map
+        # Unfinished [docX] references held back per choice index
+        pending_refs: Dict[int, str] = {}
+        # id/object/created/model of the stream, used for a flush or error event
+        stream_meta: Dict[str, Any] = {}
+        # Whether "data: [DONE]" was passed on
+        done_sent = False
+
         try:
             full_response_buffer = ""
-            response_content = ""  # Track the actual response content
             citations_data = None
-            citation_urls = {}  # Pre-allocate citation URLs map
-            # Unfinished [docX] references held back per choice index
-            pending_refs: Dict[int, str] = {}
-            # id/object/created/model of the stream, used for a flush event
-            stream_meta: Dict[str, Any] = {}
 
             async for chunk in content:
                 chunk_str = chunk.decode("utf-8", errors="ignore")
@@ -1452,29 +1485,7 @@ class Pipe:
                 # log.debug(f"Processing chunk: {chunk_str[:200]}...")
 
                 # Extract content from delta messages to build the full response content
-                try:
-                    lines = chunk_str.split("\n")
-                    for line in lines:
-                        if line.startswith("data: ") and line.strip() != "data: [DONE]":
-                            json_str = line[6:].strip()
-                            if json_str and json_str != "[DONE]":
-                                try:
-                                    response_data = json.loads(json_str)
-                                    if isinstance(response_data, dict):
-                                        if "choices" in response_data:
-                                            for choice in response_data["choices"]:
-                                                if (
-                                                    "delta" in choice
-                                                    and "content" in choice["delta"]
-                                                ):
-                                                    response_content += (
-                                                        choice["delta"]["content"] or ""
-                                                    )
-                                except json.JSONDecodeError:
-                                    # Malformed or incomplete JSON is expected in streamed chunks; safely skip.
-                                    pass
-                except Exception as e:
-                    log.debug(f"Exception while processing chunk: {e}")
+                response_content += self._read_sse_chunk(chunk_str, stream_meta)
 
                 # Look for citations or all_retrieved_documents in any part of the response
                 if (
@@ -1615,6 +1626,7 @@ class Pipe:
                 # Check if this is the end of the stream
                 if "data: [DONE]" in chunk_str:
                     log.debug("End of stream detected")
+                    done_sent = True
                     break
 
             # Stream ended without [DONE]: send text that is still held back
@@ -1642,16 +1654,28 @@ class Pipe:
                 )
 
         except Exception as e:
-            log.error(f"Error processing stream: {e}")
+            message = self._stream_error_message(e)
+            log.error(f"Error processing stream: {message}")
 
             # Send error status update
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"description": f"Error: {str(e)}", "done": True},
-                    }
-                )
+            await self._emit_stream_error_status(__event_emitter__, message, log)
+
+            if not done_sent:
+                # Text held back so far, then the error and [DONE], so API
+                # clients do not get an empty or silently cut off answer
+                try:
+                    flush_event = self._flush_pending_doc_refs(
+                        citation_urls, pending_refs, stream_meta
+                    )
+                except Exception as flush_err:
+                    log.debug(f"Error sending held back text: {flush_err}")
+                    flush_event = None
+                if flush_event:
+                    yield f"{flush_event}\n\n".encode("utf-8")
+                for item in self._stream_error_events(
+                    message, stream_meta, bool(response_content.strip())
+                ):
+                    yield item
         finally:
             # Always attempt to close response and session to avoid resource leaks
             try:
@@ -1666,6 +1690,118 @@ class Pipe:
                 # Suppress close-time errors (e.g., SSL shutdown timeouts)
                 pass
 
+    def _read_sse_chunk(self, chunk_str: str, stream_meta: Dict[str, Any]) -> str:
+        """
+        Read the SSE data lines of a streamed chunk.
+
+        Args:
+            chunk_str: Decoded SSE chunk (one or more lines)
+            stream_meta: id/object/created/model of the stream (updated in place)
+
+        Returns:
+            The text of the content deltas in the chunk
+        """
+        text = ""
+        for line in chunk_str.split("\n"):
+            if not line.startswith("data:"):
+                continue
+            try:
+                data = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                # "[DONE]", or malformed / incomplete JSON
+                continue
+            if not isinstance(data, dict):
+                continue
+            for key in ("id", "object", "created", "model"):
+                if key in data:
+                    stream_meta[key] = data[key]
+            choices = data.get("choices")
+            for choice in choices if isinstance(choices, list) else []:
+                if isinstance(choice, dict) and isinstance(choice.get("delta"), dict):
+                    content = choice["delta"].get("content")
+                    if isinstance(content, str):
+                        text += content
+        return text
+
+    def _stream_error_message(self, error: Exception) -> str:
+        """
+        Describe an error that ended a stream.
+
+        The message of aiohttp's LineTooLong contains the start of the line,
+        which can be document content, so it is replaced by the limit.
+
+        Args:
+            error: The exception raised while the stream was processed
+
+        Returns:
+            Error text for the status, the log and the answer
+        """
+        if isinstance(error, LineTooLong):
+            limit_mib = 2 * self.STREAM_READ_BUFSIZE // (1024 * 1024)
+            return (
+                f"Azure AI sent a stream event larger than {limit_mib} MiB, which "
+                "cannot be read. With Azure AI Search, retrieve fewer or shorter "
+                "documents (for example a lower top_n_documents) or set "
+                "AZURE_AI_INCLUDE_SEARCH_SCORES=false."
+            )
+        return str(error) or type(error).__name__
+
+    async def _emit_stream_error_status(
+        self,
+        __event_emitter__: Optional[Callable[..., Any]],
+        message: str,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Emit the final "Error: ..." status of a failed stream. A failing
+        emitter is only logged, so the stream can still be ended.
+        """
+        if not __event_emitter__:
+            return
+        try:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": f"Error: {message}", "done": True},
+                }
+            )
+        except Exception as emit_err:
+            log.debug(f"Could not emit error status: {emit_err}")
+
+    def _stream_error_events(
+        self, message: str, stream_meta: Dict[str, Any], after_text: bool
+    ) -> List[bytes]:
+        """
+        SSE events that end a stream which failed before "data: [DONE]": a
+        content delta "Error: <message>" and "data: [DONE]". If answer text
+        was sent before, a delta with a blank line separates the error from it.
+
+        Open WebUI parses every item of a streamed response as one SSE event,
+        so each event is a separate item.
+
+        Args:
+            message: Error text
+            stream_meta: id/object/created/model of the stream
+            after_text: Whether answer text was already sent
+
+        Returns:
+            The items to send
+        """
+        texts = ["\n\n"] if after_text else []
+        texts.append(f"Error: {message}")
+        items = []
+        for text in texts:
+            event = {
+                "object": "chat.completion.chunk",
+                **stream_meta,
+                "choices": [
+                    {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                ],
+            }
+            items.append(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+        items.append(b"data: [DONE]\n\n")
+        return items
+
     def _extract_referenced_citations(self, content: str) -> Set[int]:
         """
         Extract citation references (e.g., [doc1], [doc2]) from the content.
@@ -1676,6 +1812,10 @@ class Pipe:
         Returns:
             Set of citation indices that are referenced (e.g., {1, 2, 7, 8, 9})
         """
+        if not isinstance(content, str):
+            # e.g. "content": null of a filtered answer
+            return set()
+
         # Find all [docN] references in the content using class constant
         matches = re.findall(self.DOC_REF_PATTERN, content)
 
@@ -1699,9 +1839,24 @@ class Pipe:
         Yields:
             Bytes from the streaming content
         """
+        log = logging.getLogger("azure_ai.stream_processor")
+        # id/object/created/model of the stream, used for an error event
+        stream_meta: Dict[str, Any] = {}
+        # Whether answer text / "data: [DONE]" was passed on
+        text_sent = False
+        done_sent = False
+
         try:
             async for chunk in content:
+                if not text_sent:
+                    text_sent = bool(
+                        self._read_sse_chunk(
+                            chunk.decode("utf-8", errors="ignore"), stream_meta
+                        ).strip()
+                    )
                 yield chunk
+                if chunk.startswith(b"data:") and chunk[5:].strip() == b"[DONE]":
+                    done_sent = True
 
             # Send completion status update when streaming is done
             if __event_emitter__:
@@ -1712,17 +1867,17 @@ class Pipe:
                     }
                 )
         except Exception as e:
-            log = logging.getLogger("azure_ai.stream_processor")
-            log.error(f"Error processing stream: {e}")
+            message = self._stream_error_message(e)
+            log.error(f"Error processing stream: {message}")
 
             # Send error status update
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"description": f"Error: {str(e)}", "done": True},
-                    }
-                )
+            await self._emit_stream_error_status(__event_emitter__, message, log)
+
+            if not done_sent:
+                # The error and [DONE], so API clients do not get an empty or
+                # silently cut off answer
+                for item in self._stream_error_events(message, stream_meta, text_sent):
+                    yield item
         finally:
             # Always attempt to close response and session to avoid resource leaks
             try:
@@ -1893,6 +2048,7 @@ class Pipe:
             session = aiohttp.ClientSession(
                 trust_env=True,
                 timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+                read_bufsize=self.STREAM_READ_BUFSIZE,
             )
 
             request = await session.request(
@@ -1990,8 +2146,9 @@ class Pipe:
                                 and "choices" in response
                                 and response["choices"]
                             ):
-                                message = response["choices"][0].get("message", {})
-                                response_content = message.get("content", "")
+                                message = response["choices"][0].get("message") or {}
+                                # "content" is null e.g. for a filtered answer
+                                response_content = message.get("content") or ""
                             await self._emit_openwebui_citation_events(
                                 citations, __event_emitter__, response_content
                             )

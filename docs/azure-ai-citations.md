@@ -44,6 +44,8 @@ When Azure AI Search returns citations in a streaming response:
 3. After the stream ends, citation events are emitted via `__event_emitter__`
 4. Citations are filtered to only include documents referenced in the response
 
+Azure sends the citations (and, with `AZURE_AI_INCLUDE_SEARCH_SCORES=true`, `all_retrieved_documents`) in one SSE event, which grows with the number and length of the retrieved documents. The pipeline reads events of up to 4 MiB. If the stream fails anyway (a larger event, a dropped connection, a timeout), the text received so far is kept, an `Error: …` message is added to the answer and the stream is ended with `data: [DONE]`, so API clients do not get an empty or silently cut off answer; the chat UI also shows the error as the final status. See [Streamed Answer Ends With an Error](#streamed-answer-ends-with-an-error).
+
 #### Non-Streaming Responses
 
 When Azure AI Search returns citations in a non-streaming response:
@@ -125,7 +127,7 @@ The answer can be found in [[doc1]](https://example.com/doc1.pdf) and [[doc2]](h
 
 This works for both streaming and non-streaming responses.
 
-References that are already links (`[[doc1]](url)` or `[doc1](url)`) are left as they are, so they are never wrapped twice, also when such a link is streamed in pieces. Parentheses in document URLs are percent-encoded (`(` → `%28`, `)` → `%29`) so that a link always ends at its own `)`. The links that the pipeline added to earlier answers are sent back to Azure as plain `[docX]` in the chat history, so the model does not copy the link syntax into its next answer.
+References that are already links (`[[doc1]](url)` or `[doc1](url)`) are left as they are, so they are never wrapped twice, also when such a link is streamed in pieces. A reference the model writes as `[[doc1]]` (without a link) is converted like `[doc1]`. Parentheses in document URLs are percent-encoded (`(` → `%28`, `)` → `%29`) so that a link always ends at its own `)`. The links that the pipeline added to earlier answers are sent back to Azure as plain `[docX]` in the chat history, so the model does not copy the link syntax into its next answer; this also works for links that versions before v2.8.0 saved with unencoded parentheses in the URL (for example `[[doc1]](https://example.com/manual_(v2).pdf)`).
 
 ### Background Tasks (Titles, Tags, Follow-ups)
 
@@ -179,7 +181,7 @@ This ensures every citation has a meaningful display name.
 
 ### Citation Filtering
 
-Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI. If a chat answer contains no `[docX]` reference at all (for example "The requested information is not available in the retrieved data."), all citations are shown by default. Set `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false` to show no sources for such answers.
+Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI. If a chat answer contains no `[docX]` reference at all (for example "The requested information is not available in the retrieved data."), all citations are shown by default. Set `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false` to show no sources for such answers. References to documents that Azure did not return (for example `[doc9]` with 3 citations) do not count, so an answer that references only such documents is treated like an answer without references. A non-streamed answer whose `content` is `null` (for example a filtered answer) is returned as Azure sent it and also counts as an answer without references.
 
 ### Logging
 
@@ -415,6 +417,12 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 **Solution**: Update to v2.8.0 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources.
 
+### Streamed Answer Ends With an Error
+
+**Problem**: A streamed answer with Azure AI Search ends with `Error: Azure AI sent a stream event larger than 4 MiB, which cannot be read. …`, or (before v2.8.0) stays empty while the server log shows `Got more than 131072 bytes when reading`
+
+**Solution**: The citations of an answer arrive in one SSE event. Up to v2.7.0 the pipeline could only read events of up to 128 KiB, which many or long retrieved documents exceed; since v2.8.0 it reads events of up to 4 MiB. If an event is even larger, retrieve fewer or shorter documents (for example a lower `top_n_documents` in `AZURE_AI_DATA_SOURCES`, or shorter chunks in the index), or set `AZURE_AI_INCLUDE_SEARCH_SCORES=false`, so that `all_retrieved_documents` (which repeats the documents together with their scores) is no longer requested; citation cards then show no relevance percentage.
+
 ## References
 
 - [OpenWebUI Pipelines Citation Feature Discussion](https://github.com/open-webui/pipelines/issues/229)
@@ -427,6 +435,6 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 ## Version History
 
-- **v2.8.0**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, parentheses in document URLs are percent-encoded and links in the chat history are sent back as plain `[docX]`; document content is only logged at `DEBUG` level
+- **v2.8.0**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, `[[docX]]` without a link counts as one reference, parentheses in document URLs are percent-encoded and links in the chat history (also older links with parentheses in the URL) are sent back as plain `[docX]`; references to documents that do not exist do not count as references; streamed events of up to 4 MiB (was 128 KiB) are read and a failed stream ends with an `Error: …` message and `data: [DONE]` instead of an empty answer; a non-streamed answer with `content: null` no longer fails with `Error: expected string or bytes-like object`; document content is only logged at `DEBUG` level
 - **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
 - **v2.5.x**: Dual citation modes (OpenWebUI events + markdown/HTML)

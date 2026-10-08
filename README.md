@@ -154,7 +154,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 > This pipeline provides seamless integration with Azure OpenAI and other Azure AI models, with advanced features such as Azure Search integration and multiple model support.
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
-- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only).
+- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only). It uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026; see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect) for the recommended migration.
 - **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only). Answers with `[docX]` references show only the referenced documents; answers without any show all retrieved documents (default) or none with `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false`.
 - **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; `tools`/`tool_choice` (including Open WebUI's built-in tools) and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject, so function calling is not available in chats that use Azure AI Search.
 - **Relevance scores**: BM25 keyword and semantic rerank scores from Azure AI Search are displayed as a relevance percentage on citation cards, with independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
@@ -165,7 +165,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Token usage tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database (not available for streaming with Azure AI Search, which does not support it).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
-- Provides configurable error handling and timeouts.
+- Provides configurable error handling and timeouts; a stream that fails ends with an `Error: …` message instead of an empty or cut-off answer, and streamed events of up to 4 MiB (large Azure AI Search contexts) are read.
 - Supports encryption of sensitive information such as API keys.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai)

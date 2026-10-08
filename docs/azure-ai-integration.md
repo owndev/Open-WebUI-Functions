@@ -85,7 +85,8 @@ When a request uses Azure AI Search, the pipeline adapts it to what Azure OpenAI
 - **No tools** (behavior change in v2.8.0): `tools` and `tool_choice` are **always dropped** from requests that use `data_sources`, including tools you selected yourself. With tools in the request, Azure [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`, and Open WebUI 0.10+ adds its built-in tools to chats in the web UI. Up to v2.7.0 the pipeline forwarded them together with `data_sources`. Tools (function calling) are therefore not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` if you need them.
 - **No `stream_options`**: On Your Data rejects it (`Extra inputs are not permitted`), so streaming answers with Azure AI Search contain no token usage.
 - **Background tasks without search**: title, tag and follow-up generation are sent without `data_sources` and add no citations or status messages to the chat.
-- **Clean history**: `[[docX]](url)` links added to earlier answers are sent back to Azure as plain `[docX]`.
+- **Clean history**: `[[docX]](url)` links added to earlier answers are sent back to Azure as plain `[docX]`, also links with parentheses in the URL that versions before v2.8.0 saved.
+- **Large search contexts**: Azure sends the retrieved documents of a streamed answer in one SSE event. The pipeline reads events of up to 4 MiB (up to v2.7.0: 128 KiB, larger contexts gave an empty answer). If a stream fails, the answer ends with an `Error: …` message and `data: [DONE]`, and the chat UI shows the error as the final status; see [Streamed Answer Ends With an Error](azure-ai-citations.md#streamed-answer-ends-with-an-error).
 
 #### 📖 Official Documentation
 
@@ -96,7 +97,7 @@ For detailed information about Azure AI Search configuration, please refer to:
 - 🔍 [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/azure-search?tabs=rest)
 
 > [!WARNING]
-> Microsoft has deprecated Azure OpenAI On Your Data (the `data_sources` API used here) and announced its retirement for **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft recommends migrating to Foundry Agent Service with Foundry IQ.
+> Microsoft has deprecated Azure OpenAI On Your Data (the `data_sources` API used here) and announced its retirement for **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft recommends migrating to Foundry Agent Service with Foundry IQ; to get started, see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect).
 
 #### ⚙️ Configuration
 
