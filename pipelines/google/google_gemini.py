@@ -4,8 +4,9 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.16.0
+version: 1.16.1
 required_open_webui_version: 0.9.0
+requirements: google-genai>=1.66.0, google-genai<3
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -49,18 +50,18 @@ features:
 
 import os
 import re
+import sys
 import time
 import asyncio
 import base64
 import hashlib
+import importlib
+import importlib.metadata
 import logging
 import io
 import uuid
 import aiofiles
 from PIL import Image
-from google import genai
-from google.genai import types
-from google.genai.errors import ClientError, ServerError, APIError
 from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -72,6 +73,65 @@ from open_webui.routers.files import upload_file
 from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
+
+
+def _unload_stale_modules() -> None:
+    """
+    Drop already imported modules whose installed version changed on disk.
+
+    Open WebUI >= 0.11.4 no longer bundles google-genai, so it is installed at
+    runtime from the `requirements` header. google-genai requires websockets<17
+    (https://github.com/googleapis/python-genai/issues/2835), so pip downgrades the
+    websockets 17.x that uvicorn has already imported. Importing google.genai would
+    then mix in-memory 17.x modules with 16.x files and fail with
+    "cannot import name 'OP_BINARY' from 'websockets.frames'" until Open WebUI is
+    restarted. Unloading the stale modules makes the next import load them from disk.
+    """
+    unloaded = False
+    for distribution, package, version_module in (
+        ("websockets", "websockets", "websockets"),
+        ("google-genai", "google.genai", "google.genai.version"),
+    ):
+        loaded = sys.modules.get(version_module)
+        if loaded is None:
+            continue
+        try:
+            installed_version = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        loaded_version = getattr(loaded, "__version__", None)
+        if loaded_version == installed_version:
+            continue
+        logging.getLogger("google_ai.pipe").info(
+            f"Reloading stale {package} {loaded_version} as {installed_version}"
+        )
+        for name in [
+            n for n in list(sys.modules) if n == package or n.startswith(f"{package}.")
+        ]:
+            sys.modules.pop(name, None)
+        parent_name, _, child = package.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and hasattr(parent, child):
+            delattr(parent, child)
+        unloaded = True
+    if unloaded:
+        importlib.invalidate_caches()
+
+
+_unload_stale_modules()
+
+try:
+    importlib.metadata.version("google-genai")
+except importlib.metadata.PackageNotFoundError:
+    raise ImportError(
+        "google-genai is not installed. Open WebUI 0.11.4+ no longer bundles it: "
+        "keep ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS enabled or install "
+        "'google-genai>=1.66.0,<3' into the Open WebUI environment."
+    ) from None
+
+from google import genai  # noqa: E402
+from google.genai import types  # noqa: E402
+from google.genai.errors import ClientError, ServerError, APIError  # noqa: E402
 
 ASPECT_RATIO_OPTIONS: List[str] = [
     "default",

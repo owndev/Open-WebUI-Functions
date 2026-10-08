@@ -8,6 +8,34 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 
 - 🧩 [Google Gemini Pipeline](../pipelines/google/google_gemini.py)
 
+## Requirements
+
+The pipeline uses the official [`google-genai`](https://pypi.org/project/google-genai/) Python SDK. Open WebUI bundled it up to version 0.11.3, but **Open WebUI 0.11.4 no longer ships it** (see "Undeclared package imports" under **Changed** in the [Open WebUI 0.11.4 release notes](https://github.com/open-webui/open-webui/releases/tag/v0.11.4)). The pipeline therefore declares it in its header:
+
+```text
+requirements: google-genai>=1.66.0, google-genai<3
+```
+
+Open WebUI runs `pip` for this requirement when the function is saved and again at every startup for active functions. Once the package is installed this is a no-op, but after the container is recreated (for example on an image upgrade) it is downloaded again, so Open WebUI needs access to PyPI or to a mirror configured via `PIP_OPTIONS` / `PIP_PACKAGE_INDEX_OPTIONS`. On Open WebUI 0.9.0 to 0.11.3, the bundled `google-genai` 1.66.0 already satisfies the requirement, so pip has nothing to install.
+
+> [!NOTE]
+> `google-genai` currently requires `websockets<17` ([googleapis/python-genai#2835](https://github.com/googleapis/python-genai/issues/2835)), so pip downgrades the `websockets` 17.1 shipped with Open WebUI 0.11.4 to the newest 16.x (16.1.1, the version Open WebUI 0.11.3 shipped with the same uvicorn). The downgrade applies to the whole Open WebUI environment. The pipeline reloads the affected modules itself, so Open WebUI does not need a restart after the install. Other tools or functions that imported `websockets` before the downgrade only see a consistent version again after a restart.
+
+### Manual Installation
+
+Open WebUI skips the automatic install when `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` or `OFFLINE_MODE=true` is set. In that case, and generally for production, multi-worker or multi-replica deployments, install the SDK yourself. For Docker, bake it into your image, which also avoids the in-process `websockets` downgrade:
+
+```dockerfile
+# Use the same tag you deploy, e.g. v0.11.4, v0.11.4-slim or main
+FROM ghcr.io/open-webui/open-webui:v0.11.4
+RUN pip install --no-cache-dir "google-genai>=1.66.0,<3"
+```
+
+For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66.0,<3"` (or `uv pip install ...`) in Open WebUI's virtual environment and restart Open WebUI. Environments created without pip (for example by uv) cannot use the automatic install at all: saving the function fails with `No module named pip`, so set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` and install the SDK manually.
+
+> [!TIP]
+> Pipeline versions before 1.16.1 cannot import `google.genai` on Open WebUI 0.11.4, and Open WebUI switches off a function that fails to load. Paste version 1.16.1 or later, save it, and switch it back on under **Admin Panel → Functions**.
+
 ## Features
 
 - **Asynchronous API Calls**  
