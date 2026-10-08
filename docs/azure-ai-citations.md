@@ -23,6 +23,8 @@ When Azure AI Search is configured, the pipeline automatically:
 3. Filters citations to only show documents actually referenced in the response
 4. Extracts relevance scores from Azure Search when available
 
+Azure AI Search is only used for chat answers. Open WebUI background tasks (title, tags and follow-up generation) are sent **without** `data_sources` and never emit citation or status events, so they cannot add sources to a chat message (see [Background Tasks](#background-tasks-titles-tags-follow-ups)).
+
 ### Configuration Options
 
 | Environment Variable | Default | Description |
@@ -37,7 +39,7 @@ When Azure AI Search is configured, the pipeline automatically:
 When Azure AI Search returns citations in a streaming response:
 
 1. The pipeline detects citations in the SSE (Server-Sent Events) stream
-2. `[docX]` references in each chunk are converted to markdown links with document URLs
+2. `[docX]` references in each chunk are converted to markdown links with document URLs. Models usually stream a reference in pieces (`[`, `doc`, `1`, `]`), so an unfinished reference at the end of a chunk (`[`, `[d`, `[do`, `[doc`, `[doc1`) is held back and sent together with the next chunk; nothing is lost if the stream ends in the middle of one
 3. After the stream ends, citation events are emitted via `__event_emitter__`
 4. Citations are filtered to only include documents referenced in the response
 
@@ -122,6 +124,24 @@ The answer can be found in [[doc1]](https://example.com/doc1.pdf) and [[doc2]](h
 
 This works for both streaming and non-streaming responses.
 
+References that are already links (`[[doc1]](url)` or `[doc1](url)`) are left as they are, so they are never wrapped twice. The links that the pipeline added to earlier answers are sent back to Azure as plain `[docX]` in the chat history, so the model does not copy the link syntax into its next answer.
+
+### Background Tasks (Titles, Tags, Follow-ups)
+
+Open WebUI uses the chat model for background tasks such as title, tag and follow-up generation. For these requests (`__task__` is set) the pipeline:
+
+- does **not** send `data_sources` (no Azure AI Search query, no citations in the result)
+- does **not** emit citation or status events, so nothing is added to the chat message the task belongs to
+
+This addresses the "too many sources" problem ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)): a task answer such as a title contains no `[docX]` reference, so the "no references → show all citations" fallback emitted every retrieved document. On Open WebUI versions that pass the chat message's event emitter to background tasks, these citations were added to the message shortly after the answer was finished. (Open WebUI 0.11.4 passes no event emitter to background tasks; there the change saves one Azure AI Search query per task.)
+
+### Tools and `stream_options` with Azure AI Search
+
+When `data_sources` is used for a request, the pipeline does not forward:
+
+- **`tools` / `tool_choice`**: with tools in the request, Azure OpenAI On Your Data [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`. Open WebUI 0.10+ adds its built-in tools to chats in the web UI (native function calling), which would silently turn off the search.
+- **`stream_options`**: On Your Data rejects it (`Validation error at #/stream_options: Extra inputs are not permitted`). Open WebUI 0.11.1+ adds `stream_options.include_usage` to streaming requests of models with the usage capability. Streaming answers with Azure AI Search therefore contain no token usage.
+
 ### Relevance Scores
 
 When `AZURE_AI_INCLUDE_SEARCH_SCORES=true` (default), the pipeline:
@@ -158,7 +178,11 @@ This ensures every citation has a meaningful display name.
 
 ### Citation Filtering
 
-Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI.
+Citations are filtered to only show documents that are actually referenced in the response content. For example, if Azure returns 5 citations but the response only references `[doc1]` and `[doc3]`, only those 2 citations will appear in the UI. If a chat answer contains no `[docX]` reference at all, all citations are shown.
+
+### Logging
+
+Citation helpers log only counts at `INFO` level. Document content, titles and URLs are logged at `DEBUG` level only.
 
 ## Index Schema Requirements for Citations
 
@@ -378,6 +402,18 @@ The pipeline maps these fields to the OpenWebUI citation event:
 2. Check that the document URL is accessible
 3. Verify the markdown link format is being generated correctly
 
+### More Sources Appear After the Answer
+
+**Problem**: The referenced sources appear, and shortly after the answer is finished more (unreferenced) sources are added
+
+**Solution**: Update to v2.7.1 or later. Background tasks (title, tags, follow-ups) no longer use Azure AI Search and no longer emit citation events. Note that an answer without any `[docX]` reference still shows all citations returned by Azure.
+
+### Answers Ignore the Search Index / No Citations in the Chat UI
+
+**Problem**: With `AZURE_AI_DATA_SOURCES` configured, answers in the chat UI are not grounded and show no citations, or streaming fails with `Extra inputs are not permitted`
+
+**Solution**: Update to v2.7.1 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources.
+
 ## References
 
 - [OpenWebUI Pipelines Citation Feature Discussion](https://github.com/open-webui/pipelines/issues/229)
@@ -390,5 +426,6 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 ## Version History
 
+- **v2.7.1**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); `tools`, `tool_choice` and `stream_options` are not forwarded together with `data_sources`; `[docX]` references split across streamed chunks are linked; already linked references are not wrapped again and links in the chat history are sent back as plain `[docX]`; document content is only logged at `DEBUG` level
 - **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
 - **v2.5.x**: Dual citation modes (OpenWebUI events + markdown/HTML)

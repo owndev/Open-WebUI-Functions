@@ -155,13 +155,14 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
 - Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only).
-- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion (Azure OpenAI only).
+- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only).
+- **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; Open WebUI's built-in tools and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject.
 - **Relevance scores**: BM25 keyword and semantic rerank scores from Azure AI Search are displayed as a relevance percentage on citation cards, with independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
 - Supports multiple models via `AZURE_AI_MODEL` (semicolon- or comma-separated, for example `gpt-4o;gpt-4o-mini`) or automatic model extraction from the Azure OpenAI URL.
 - **Large predefined model catalogue** (GPT-4o, GPT-5, o3, o4-mini, Phi-4, DeepSeek-R1/V3, Mistral, Llama 3.x, Cohere, Grok, and more) via `USE_PREDEFINED_AZURE_AI_MODELS`.
 - Customizable pipeline display prefix via `AZURE_AI_PIPELINE_PREFIX`.
 - **Flexible authentication**: `api-key` header (default) or `Authorization: Bearer` token via `AZURE_AI_USE_AUTHORIZATION_HEADER`.
-- **Token usage tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database.
+- **Token usage tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database (not available for streaming with Azure AI Search, which does not support it).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
 - Provides configurable error handling and timeouts.

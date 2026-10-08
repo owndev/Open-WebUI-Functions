@@ -73,6 +73,15 @@ The pipeline supports **Azure AI Search** integration for **Retrieval-Augmented 
 > **Azure AI Search integration only works with Azure OpenAI endpoints** in this specific format:
 > `https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview`
 
+#### Behavior with `data_sources`
+
+When a request uses Azure AI Search, the pipeline adapts it to what Azure OpenAI On Your Data supports:
+
+- **No tools**: `tools` and `tool_choice` are not forwarded. With tools in the request, Azure [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`, and Open WebUI 0.10+ adds its built-in tools to chats in the web UI. Tools are therefore not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` if you need them.
+- **No `stream_options`**: On Your Data rejects it (`Extra inputs are not permitted`), so streaming answers with Azure AI Search contain no token usage.
+- **Background tasks without search**: title, tag and follow-up generation are sent without `data_sources` and add no citations or status messages to the chat.
+- **Clean history**: `[[docX]](url)` links added to earlier answers are sent back to Azure as plain `[docX]`.
+
 #### 📖 Official Documentation
 
 For detailed information about Azure AI Search configuration, please refer to:
@@ -80,6 +89,9 @@ For detailed information about Azure AI Search configuration, please refer to:
 - 📚 [Azure AI Search with Azure OpenAI - Official Guide](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/use-your-data-quickstart?tabs=api-key%2Ctypescript-keyless%2Cpython-new&pivots=rest-api)
 - 🔧 [Data Sources API Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data?tabs=rest#data-source)
 - 🔍 [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/azure-search?tabs=rest)
+
+> [!WARNING]
+> Microsoft has deprecated Azure OpenAI On Your Data (the `data_sources` API used here) and announced its retirement for **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft recommends migrating to Foundry Agent Service with Foundry IQ.
 
 #### ⚙️ Configuration
 
@@ -471,7 +483,8 @@ The pipeline automatically provides native OpenWebUI citation support for Azure 
 - **Relevance percentage** displayed on citation cards (requires `AZURE_AI_INCLUDE_SEARCH_SCORES=true`)
 - **Document preview** with content snippets
 - **Clickable links** to source documents when URLs are available
-- **Streaming support** with links converted inline as content streams
+- **Streaming support** with links converted inline as content streams, also when a `[docX]` reference arrives in several pieces
+- **No double links**: references that are already markdown links are not wrapped again
 
 **Relevance Score Selection:**
 
@@ -507,10 +520,17 @@ The pipeline automatically requests token usage metadata and returns it to Open 
 
 ### How it works
 
-- **Streaming mode**: `stream_options: {"include_usage": true}` is automatically added to every streaming request. The final SSE chunk contains the usage object which the Open WebUI middleware extracts.
+- **Streaming mode**: `stream_options: {"include_usage": true}` is automatically added to every streaming request without Azure AI Search data sources. The final SSE chunk contains the usage object which the Open WebUI middleware extracts.
 - **Non-streaming mode**: The response body already contains the standard `usage` field returned by the Azure / OpenAI API.
+- **Azure AI Search (`data_sources`)**: Azure OpenAI On Your Data does not support `stream_options`, so it is removed from these requests (also when Open WebUI adds it). Streaming answers with data sources have no token usage.
 
 No additional configuration is required.
+
+## Function Calling (Tools)
+
+Since Open WebUI 0.10, **Native** function calling is the default: in chats in the web UI, Open WebUI adds its built-in tools (27 in Open WebUI 0.11.4, for example `get_current_timestamp`, memory and notes tools) and any selected tools to the request as `tools`. The pipeline forwards them to Azure, except for requests with Azure AI Search data sources (see [Behavior with `data_sources`](#behavior-with-data_sources)).
+
+If a deployment does not support tool calling, Azure returns an error for these requests. Switch the model to **Legacy** function calling: per chat in the chat controls, per model in the model's advanced parameters (Workspace → Models), or for all models in the default model parameters of the admin settings. In Legacy mode Open WebUI selects tools with a separate prompt and does not send `tools` to the model. Alternatively, disable the built-in tools for that model in its settings.
 
 ## Model Selection
 
@@ -524,6 +544,8 @@ The pipeline resolves which model(s) to expose in Open WebUI in the following pr
 ### Model in Body vs Header
 
 By default the model name is sent via the `x-ms-model-mesh-model-name` HTTP header (used by the Azure AI Models-as-a-Service endpoint). Set `AZURE_AI_MODEL_IN_BODY=true` to place the model name in the JSON request body instead — required for Azure OpenAI deployments.
+
+Model names that contain dots, such as `gpt-4.1` or `Phi-3.5-mini-instruct`, are sent unchanged in both modes (v2.7.0 shortened them to `1` / `5-mini-instruct` for non-streaming requests and requests with Azure AI Search).
 
 ```bash
 # Include model name in request body (required for Azure OpenAI)
