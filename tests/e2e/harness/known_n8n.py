@@ -112,37 +112,41 @@ INFOMANIAK_CHUNKING = _infomaniak(
     "infomaniak-chunking",
     "Infomaniak forwards raw network chunks; coalesced or split SSE events are "
     "dropped by the streaming middleware (empty answer / missing usage)",
-    r"content= usage=None",  # nothing of the coalesced / split events saved
-    # usage requested from the upstream (include_usage) but not saved
-    r"^usage=None include_usage_sent=True$",
+    # nothing of the coalesced / split events saved (the request itself worked)
+    r"^HTTP 200 done=True content= usage=None ",
+    # usage requested from the upstream (include_usage) but not saved, while
+    # the answer is the expected one (or lost the same way)
+    r"^usage=None include_usage_sent=True answer_ok=True$",
+    r"^usage=None include_usage_sent=True content=$",
     ref=NO_ISSUE,
 )
 INFOMANIAK_STATUS = _infomaniak(
     "infomaniak-status",
     "Infomaniak emits no status events: no 'Sending' / 'Streaming' / "
     "'completed' / error status in the chat",
-    r"status=\[\]",
+    r"^status=\[\] answer_ok=True$",  # no status, the answer itself is right
 )
 INFOMANIAK_REMAINDER = _infomaniak(
     "infomaniak-remainder",
     "Infomaniak drops a final SSE line without a trailing newline (and coalesced "
     "events): the answer / usage of such a stream is lost",
-    r"content= usage=None",
+    r"^HTTP 200 done=True content= usage=None ",
 )
 INFOMANIAK_CRLF = _infomaniak(
     "infomaniak-crlf",
     "Infomaniak forwards CRLF-terminated SSE events in one chunk: the answer is lost",
-    r"content= usage=None",
+    r"^HTTP 200 done=True content= usage=None ",
 )
 INFOMANIAK_MIDFAIL = _infomaniak(
     "infomaniak-midfail",
     "an Infomaniak stream that breaks off mid-way ends without an error status",
-    r"status=\[\]",
+    r"^status=\[\] HTTP 200 done=True content=partial ",
 )
 INFOMANIAK_STOP = _infomaniak(
     "infomaniak-stop",
     "Stop leaves an Infomaniak answer without a final status",
-    r"status=\[\]",
+    # no status; the answer is what arrived before Stop (or nothing)
+    r"^status=\[\] stopped=\[\[200, .* content=(t0 [^|]*)? usage=None ",
 )
 INFOMANIAK_ERROR_DETAIL = _infomaniak(
     "infomaniak-error-detail",

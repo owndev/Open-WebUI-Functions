@@ -23,6 +23,7 @@ PRODUCT_ID = 12345
 PREFIX = "Infomaniak: "  # NAME_PREFIX default
 # Client keys Open WebUI passes through to the pipe but the allow-list must drop.
 NOT_ALLOWED = {"user": "u-e2e", "foo_not_allowed": "x"}
+NONSTREAM_ANSWER = "Hello from Infomaniak (non-stream)."
 SENDING = "Sending request to Infomaniak AI..."
 STREAMING = "Streaming response from Infomaniak AI..."
 ERROR_400 = "Error: Mock: model not found"
@@ -225,7 +226,7 @@ async def browser(t: Suite, mock) -> None:
             "browser.nonstream",
             "browser path non-stream: answer and usage saved",
             c.done
-            and c.content == "Hello from Infomaniak (non-stream)."
+            and c.content == NONSTREAM_ANSWER
             and (c.usage or {}).get("total_tokens") == 14,
             c.brief(),
         )
@@ -234,7 +235,7 @@ async def browser(t: Suite, mock) -> None:
             "browser path non-stream: status 'Sending ...' -> 'Request completed' "
             "(done)",
             statuses(c) == [(SENDING, False), ("Request completed", True)],
-            status_brief(c),
+            f"{status_brief(c)} answer_ok={c.content == NONSTREAM_ANSWER}",
             known=known.INFOMANIAK_STATUS,
         )
         for name, answer in (
@@ -258,7 +259,8 @@ async def browser(t: Suite, mock) -> None:
                 f"browser.stream.{name}.usage",
                 f"browser path stream ({name}): usage saved",
                 (c.usage or {}).get("total_tokens") == 13,
-                f"usage={c.usage} include_usage_sent={sent.get('include_usage')}",
+                f"usage={c.usage} include_usage_sent={sent.get('include_usage')} "
+                + (f"answer_ok={c.content == answer}" if c.content else "content="),
                 known=known.INFOMANIAK_CHUNKING,
             )
             if name == "mixtral":
@@ -272,7 +274,7 @@ async def browser(t: Suite, mock) -> None:
                         (STREAMING, False),
                         ("Streaming completed", True),
                     ],
-                    status_brief(c),
+                    f"{status_brief(c)} answer_ok={c.content == answer}",
                     known=known.INFOMANIAK_STATUS,
                 )
 
@@ -286,7 +288,7 @@ async def browser(t: Suite, mock) -> None:
             "error saved as the answer",
             statuses(c) == [(SENDING, False), (ERROR_400, True)]
             and c.content == ERROR_400,
-            f"{status_brief(c)} {c.brief()}",
+            f"{status_brief(c)} answer_ok={c.content == ERROR_400}",
             known=known.INFOMANIAK_STATUS,
         )
 
