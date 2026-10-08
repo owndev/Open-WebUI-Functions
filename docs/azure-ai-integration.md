@@ -82,7 +82,7 @@ The pipeline supports **Azure AI Search** integration for **Retrieval-Augmented 
 
 When a request uses Azure AI Search, the pipeline adapts it to what Azure OpenAI On Your Data supports:
 
-- **No tools** (behavior change in v2.7.1): `tools` and `tool_choice` are **always dropped** from requests that use `data_sources`, including tools you selected yourself. With tools in the request, Azure [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`, and Open WebUI 0.10+ adds its built-in tools to chats in the web UI. Up to v2.7.0 the pipeline forwarded them together with `data_sources`. Tools (function calling) are therefore not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` if you need them.
+- **No tools** (behavior change in v2.8.0): `tools` and `tool_choice` are **always dropped** from requests that use `data_sources`, including tools you selected yourself. With tools in the request, Azure [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`, and Open WebUI 0.10+ adds its built-in tools to chats in the web UI. Up to v2.7.0 the pipeline forwarded them together with `data_sources`. Tools (function calling) are therefore not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` if you need them.
 - **No `stream_options`**: On Your Data rejects it (`Extra inputs are not permitted`), so streaming answers with Azure AI Search contain no token usage.
 - **Background tasks without search**: title, tag and follow-up generation are sent without `data_sources` and add no citations or status messages to the chat.
 - **Clean history**: `[[docX]](url)` links added to earlier answers are sent back to Azure as plain `[docX]`.
@@ -533,7 +533,7 @@ No additional configuration is required.
 
 ## Function Calling (Tools)
 
-Since Open WebUI 0.10, **Native** function calling is the default: in chats in the web UI, Open WebUI adds its built-in tools (27 in Open WebUI 0.11.4, for example `get_current_timestamp`, memory and notes tools) and any selected tools to the request as `tools`. The pipeline forwards them to Azure, except for requests with Azure AI Search data sources: since v2.7.1 `tools` and `tool_choice` are dropped from those (see [Behavior with `data_sources`](#behavior-with-data_sources)).
+Since Open WebUI 0.10, **Native** function calling is the default: in chats in the web UI, Open WebUI adds its built-in tools (27 in Open WebUI 0.11.4, for example `get_current_timestamp`, memory and notes tools) and any selected tools to the request as `tools`. The pipeline forwards them to Azure, except for requests with Azure AI Search data sources: since v2.8.0 `tools` and `tool_choice` are dropped from those (see [Behavior with `data_sources`](#behavior-with-data_sources)).
 
 If a deployment does not support tool calling, Azure returns an error for these requests. Switch the model to **Legacy** function calling: per chat in the chat controls, per model in the model's advanced parameters (Workspace → Models), or for all models in the default model parameters of the admin settings. In Legacy mode Open WebUI selects tools with a separate prompt and does not send `tools` to the model. Alternatively, disable the built-in tools for that model in its settings.
 

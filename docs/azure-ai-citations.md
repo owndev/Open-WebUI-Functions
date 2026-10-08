@@ -140,7 +140,7 @@ This fixes the "too many sources" problem ([#123](https://github.com/owndev/Open
 
 When `data_sources` is used for a request, the pipeline does not forward:
 
-- **`tools` / `tool_choice`** (behavior change in v2.7.1, up to v2.7.0 they were forwarded): with tools in the request, Azure OpenAI On Your Data [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`. Open WebUI 0.10+ adds its built-in tools to chats in the web UI (native function calling), which would silently turn off the search. The tools are always dropped, also tools you selected yourself, so function calling is not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` for tools.
+- **`tools` / `tool_choice`** (behavior change in v2.8.0, up to v2.7.0 they were forwarded): with tools in the request, Azure OpenAI On Your Data [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`. Open WebUI 0.10+ adds its built-in tools to chats in the web UI (native function calling), which would silently turn off the search. The tools are always dropped, also tools you selected yourself, so function calling is not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` for tools.
 - **`stream_options`**: On Your Data rejects it (`Validation error at #/stream_options: Extra inputs are not permitted`). Open WebUI 0.11.1+ adds `stream_options.include_usage` to streaming requests of models with the usage capability. Streaming answers with Azure AI Search therefore contain no token usage.
 
 ### Relevance Scores
@@ -407,13 +407,13 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 **Problem**: The referenced sources appear, and shortly after the answer is finished more (unreferenced) sources are added
 
-**Solution**: Update to v2.7.1 or later. Background tasks (title, tags, follow-ups) no longer use Azure AI Search and no longer emit citation events. An answer without any `[docX]` reference still shows all citations returned by Azure; set `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false` to show no sources for such answers.
+**Solution**: Update to v2.8.0 or later. Background tasks (title, tags, follow-ups) no longer use Azure AI Search and no longer emit citation events. An answer without any `[docX]` reference still shows all citations returned by Azure; set `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false` to show no sources for such answers.
 
 ### Answers Ignore the Search Index / No Citations in the Chat UI
 
 **Problem**: With `AZURE_AI_DATA_SOURCES` configured, answers in the chat UI are not grounded and show no citations, or streaming fails with `Extra inputs are not permitted`
 
-**Solution**: Update to v2.7.1 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources.
+**Solution**: Update to v2.8.0 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources.
 
 ## References
 
@@ -427,6 +427,6 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 ## Version History
 
-- **v2.7.1**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, parentheses in document URLs are percent-encoded and links in the chat history are sent back as plain `[docX]`; document content is only logged at `DEBUG` level
+- **v2.8.0**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, parentheses in document URLs are percent-encoded and links in the chat history are sent back as plain `[docX]`; document content is only logged at `DEBUG` level
 - **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
 - **v2.5.x**: Dual citation modes (OpenWebUI events + markdown/HTML)

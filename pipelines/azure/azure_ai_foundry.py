@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.7.1
+version: 2.8.0
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
@@ -19,7 +19,7 @@ features:
   - Azure AI Search / RAG integration with native OpenWebUI citations (Azure OpenAI only)
   - Automatic [docX] to markdown link conversion for clickable citations (also when streamed in pieces)
   - Relevance scores from Azure AI Search displayed in citation cards
-  - Only referenced documents as sources; optionally none for answers without [docX] references
+  - Answers with [docX] references show only the referenced documents; answers without any show all retrieved documents (default) or none (AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false)
   - Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no citations
   - Requests with Azure AI Search omit tools and stream_options, which On Your Data ignores or rejects
 """
