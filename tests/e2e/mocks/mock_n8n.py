@@ -34,7 +34,7 @@ n8n sends), SSE streams ``text/event-stream``; every piece is its own write.
                         usage chunk, [DONE]) in one write
   stream-error-chunk    NDJSON begin / {"type": "error", ...} / end
   stream-midfail        NDJSON begin + one item, then the connection is cut
-  stream-large-flat     one flat 200 KB JSON object ({"output": "x" * 200000})
+  stream-large-flat     one flat 400 KB JSON object ({"output": "x" * 400000})
                         in 1 KiB writes, 30 ms apart (a slow upstream: every
                         write reaches the pipe as its own network chunk)
   slow-ndjson           40 NDJSON items 0.5 s apart (Stop during the stream)
@@ -96,7 +96,7 @@ JSON_ANSWERS = {
 UTF8_ITEMS = ["Größe ", "naïve ", "日本 ", "🙂"]
 BRACE_ITEMS = ["a } b ", "{ c } ", '"q" {']
 ERROR_CHUNK = "Tool node failed: quota exceeded"
-LARGE_FLAT_SIZE = 200_000
+LARGE_FLAT_SIZE = 400_000
 SLOW_JSON_DELAY = 20
 STREAM_DELAY = 0.05
 

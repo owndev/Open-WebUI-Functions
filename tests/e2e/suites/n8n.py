@@ -40,11 +40,15 @@ UTF8_ANSWER = "Größe naïve 日本 🙂"
 BRACES_ANSWER = 'a } b { c } "q" {'
 ERROR_CHUNK = "N8N Error: Tool node failed: quota exceeded"
 WEBHOOK_ERROR = "N8N Error: Workflow could not be started!\n\nHint: Activate it."
-LARGE_SIZE = 200_000  # mock_n8n.LARGE_FLAT_SIZE
-# Server CPU seconds for the whole large-flat request: ~0.3 s with a linear
-# parser, ~3-4 s with one that rescans its buffer on every chunk.
+LARGE_SIZE = 400_000  # mock_n8n.LARGE_FLAT_SIZE
+# Server CPU seconds for the whole large-flat request (observed on v0.11.4-slim):
+# ~0.4 s with a linear parser, ~5 s with one that rescans its buffer on every
+# chunk (#182 as first pushed). CPU time grows with the load on the host (up to
+# ~3x on a busy one), so the object is large enough that the quadratic cost stays
+# well above the limit on an idle host and the linear one well below it on a busy
+# one; with 200 KB the quadratic parser needed only 1.4 s on an idle host.
 LARGE_MAX_CPU_S = 1.5
-LARGE_MAX_S = 20.0  # the mock alone needs ~6 s
+LARGE_MAX_S = 30.0  # the mock alone needs ~12 s
 HEALTH_MAX_S = 1.0
 STOP_AFTER_S = 3
 STOP_WAIT_S = 5
@@ -408,7 +412,7 @@ async def streams(t: Suite, scenario) -> None:
 
 
 async def large_flat(t: Suite, scenario) -> None:
-    """A flat 200 KB object trickling in as 1 KiB writes (30 ms apart): the
+    """A flat 400 KB object trickling in as 1 KiB writes (30 ms apart): the
     answer is complete, and parsing it does not keep Open WebUI's event loop
     busy (a parser that rescans its buffer on every chunk burns several CPU
     seconds here; real TCP coalescing hides that from the wall time) and
@@ -446,7 +450,7 @@ async def large_flat(t: Suite, scenario) -> None:
     worst = max(latencies, default=0.0)
     t.check(
         "api.stream-large-flat",
-        "flat 200 KB object in 1 KiB writes: answer complete, Open WebUI spends "
+        "flat 400 KB object in 1 KiB writes: answer complete, Open WebUI spends "
         f"< {LARGE_MAX_CPU_S:g} CPU s on it, /health answers in < "
         f"{HEALTH_MAX_S:g} s meanwhile",
         r.status == 200
