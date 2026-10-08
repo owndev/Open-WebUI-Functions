@@ -253,8 +253,9 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
 - Uses OpenAI's `tiktoken` library for token counting (accurate only for OpenAI models).
-- Falls back to an estimate (about 4 characters per token) when no `tiktoken` encoding can be loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through.
+- Falls back to an estimate (about 4 characters per token) while no `tiktoken` encoding is loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through. The encoding is downloaded in the background; requests do not wait for it (the very first one at most 5 seconds).
 - Also works for API requests. Since Open WebUI 0.10, the filter's outlet step runs for them too. There is no chat window to show a status message, but the metrics are still logged and sent to Log Analytics.
+- On Open WebUI 0.11, response time and request tokens stay correct when Open WebUI adds RAG context or a code interpreter prompt to the user message after the filter's inlet step.
 - Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`).
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
@@ -265,7 +266,9 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 - Companion filter for the [Google Gemini pipeline](./pipelines/google/google_gemini.py). Requires Open WebUI 0.9.0 or newer.
 - When **Web Search** is switched on for a chat, it replaces Open WebUI's own web search with Google Search grounding and the URL context tool.
+- Attach it to your Gemini models only. As a global filter it would switch off Open WebUI's web search for all other models too.
 - Requests without a `features` object (API clients, channel replies, automations) pass through unchanged.
+- Does not check Open WebUI's per-user web search permission, see the [limitations](./docs/google-gemini-integration.md#web-search-and-access).
 
 🔗 [Web search with Gemini](./docs/google-gemini-integration.md#web-search-and-access)
 

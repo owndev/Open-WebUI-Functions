@@ -600,10 +600,18 @@ When enabled, sources and google queries from the search used by Gemini will be 
 To use the filter:
 
 1. Install [google_search_tool.py](../filters/google_search_tool.py) under **Admin Panel → Functions**. It requires Open WebUI 0.9.0 or newer.
-2. Attach it to your Gemini models (**Workspace → Models → Edit → Filters**) or make it global.
+2. Attach it to your Gemini models only (**Workspace → Models → Edit → Filters**).
 3. Switch on **Web Search** in the chat. Open WebUI's own web search is then not used for that request, and Gemini grounds the answer with Google Search instead.
 
+> [!WARNING]
+> Do not make this filter global. A global filter runs for every model, so **Web Search** would switch off Open WebUI's own web search for non-Gemini models as well, and they would get no web search at all.
+
 API clients can request grounding by sending `"features": {"web_search": true}` with `/api/chat/completions`. Requests without a `features` object, such as plain API calls, channel replies or automations, pass through the filter unchanged.
+
+Limitations:
+
+- **Chats with several models:** the filter sets the `google_search_tool` flag in the request's metadata, which Open WebUI shares between all models of the chat. Other Gemini models in the same chat can therefore also use Google Search grounding, even without the filter. Other pipelines ignore the flag.
+- **Web search permission:** the filter does not check Open WebUI's per-user **Web Search** permission (group permissions, **Features → Web Search**). Open WebUI checks that permission only for its own web search, and the `features` of a request come from the client. A user without the permission can still get Google Search grounding, for example by sending `"features": {"web_search": true}` to the API. To limit grounding to certain users, attach the filter only to Gemini models that only those users can access.
 
 ### Enterprise Search
 

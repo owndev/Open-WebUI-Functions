@@ -10,6 +10,11 @@ license: Apache License 2.0
 requirements:
   - https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/google/google_gemini.py
 description: Enable Vertex AI Search grounding for RAG
+features:
+  - Turns on Vertex AI Search grounding when features.vertex_ai_search is on (sets vertex_ai_search in the request metadata features).
+  - Data store from the request's params.vertex_rag_store, else from the VERTEX_AI_RAG_STORE environment variable.
+changelog:
+  - 1.0.1 - Open WebUI >= 0.10 compatibility. Open WebUI moves unknown request params to the top level of the body before the inlet filters run, so the per-request params.vertex_rag_store never reached the pipe; it is now read from there. vertex_ai_search is no longer popped from body["features"]. The flag and the data store are set in place in the request-level metadata, which UI chats pass to the pipe. Requires Open WebUI 0.9.0.
 """
 
 import logging

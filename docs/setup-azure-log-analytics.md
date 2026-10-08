@@ -26,6 +26,12 @@ When sending is on, each response creates one record with `chatId`, `messageId`,
 > [!NOTE]
 > Since Open WebUI 0.10, outlet filters also run for requests sent directly to the API (`/api/chat/completions` without a chat). Since version 2.6.2 the filter records these requests as well. They do not belong to a chat, so their `chatId` is a generated UUID.
 
+How the values are measured:
+
+- `requestTokens` counts the messages as the filter's inlet step sees them, before Open WebUI adds RAG context, web search results or a code interpreter prompt.
+- While no `tiktoken` encoding is loaded (for example offline, without a `tiktoken` cache), token counts are estimates (about 4 characters per token).
+- The filter matches each response to its request through the request metadata that Open WebUI 0.11 passes to both filter steps. If the outlet step gets other metadata (for example through the legacy `/api/chat/completed` endpoint), it matches by user, model and last user message instead. If no request matches, the record has `responseTime` and `requestTokens` 0 and a warning is logged.
+
 ## Show Logs
 
 To view these logs, go to `Logs` > `Custom Logs`. All logs will be listed there.

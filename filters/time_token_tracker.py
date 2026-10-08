@@ -14,9 +14,9 @@ features:
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
   - Sends metrics to Azure Log Analytics.
-  - Falls back to a len(text) // 4 token estimate when no tiktoken encoding can be loaded (e.g. offline).
+  - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests.
 changelog:
-  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate.
+  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
@@ -47,10 +47,27 @@ _request_data: dict[str, dict] = {}
 # when outlet() is never reached (e.g. cancelled requests, crashes).
 _STALE_ENTRY_TIMEOUT = 600
 
-# tiktoken downloads an encoding's BPE file on first use. When that fails
-# (offline, no TIKTOKEN_CACHE_DIR cache) token counts are estimated and the
-# load is retried at most once per this many seconds.
+# inlet() also puts its entry into __metadata__ under this key. Open WebUI
+# 0.11 passes the same metadata dict to inlet() and outlet() of a request (API
+# and UI chats), so outlet() finds the entry even when Open WebUI changed the
+# last user message after the inlet (RAG context, legacy code interpreter
+# prompt) and the fingerprint no longer matches. The fingerprint stays the
+# fallback, e.g. for the legacy /api/chat/completed endpoint, which builds a
+# new metadata dict.
+_METADATA_KEY = "time_token_tracker"
+
+# tiktoken downloads an encoding's BPE file on first use, without a timeout
+# and while holding a global lock. The load runs in a worker thread, at most
+# one per encoding at a time. Requests that arrive while it runs estimate
+# token counts as len(text) // 4 instead of queueing behind it. A failed load
+# (offline, no TIKTOKEN_CACHE_DIR cache) is retried in the background at most
+# once per _ENCODING_RETRY_INTERVAL seconds. Only the request that starts the
+# first load of an encoding waits for it, for at most _ENCODING_FIRST_LOAD_WAIT
+# seconds.
 _ENCODING_RETRY_INTERVAL = 300
+_ENCODING_FIRST_LOAD_WAIT = 5
+_encodings: dict[str, Any] = {}
+_encoding_loads: dict[str, asyncio.Task] = {}
 _encoding_failures: dict[str, float] = {}
 
 
@@ -62,7 +79,9 @@ def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
     Open WebUI reconstructs the body dict between inlet and outlet and only
     exposes chat_id in outlet, so we cannot rely on a single ID field.
     Instead we hash (user_id, model, number_of_user_messages,
-    last_user_message_content) — all of which are identical in both stages.
+    last_user_message_content). Open WebUI can change the last user message
+    after the inlet (RAG context, legacy code interpreter prompt), so outlet()
+    uses this key only when it finds no inlet entry in __metadata__.
 
     Collisions are only possible if the same user sends the exact same
     message at the exact same conversation depth to the same model
@@ -85,6 +104,11 @@ def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
 
     raw = f"{user_id}:{model}:{num_user_messages}:{last_user_content}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _metadata_key(filter_id: Optional[str]) -> str:
+    """Key of the inlet entry in __metadata__, per installed copy of the filter."""
+    return f"{_METADATA_KEY}:{filter_id}" if filter_id else _METADATA_KEY
 
 
 def _prune_stale_entries(self) -> None:
@@ -146,10 +170,10 @@ class EncryptedStr(str):
 
         key = cls._get_encryption_key()
         if not key:  # No decryption if no key
-            return value[len("encrypted:"):]  # Return without prefix
+            return value[len("encrypted:") :]  # Return without prefix
 
         try:
-            encrypted_part = value[len("encrypted:"):]
+            encrypted_part = value[len("encrypted:") :]
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
@@ -382,23 +406,9 @@ class Filter:
         except:  # noqa: E722
             return ""
 
-    async def _get_encoding(self, model: str):
-        """
-        Return the tiktoken encoding for the model (cl100k_base for unknown
-        models), or None if it cannot be loaded. Exceptions raised in inlet()
-        abort the chat, so a missing encoding must not raise.
-        """
+    async def _load_encoding(self, name: str):
+        """Load a tiktoken encoding in a worker thread (it may download it)."""
         try:
-            name = tiktoken.encoding_name_for_model(model)
-        except Exception:  # KeyError: model unknown to tiktoken
-            name = "cl100k_base"
-
-        failed_at = _encoding_failures.get(name)
-        if failed_at and time.time() - failed_at < _ENCODING_RETRY_INTERVAL:
-            return None
-
-        try:
-            # The first load may download the BPE file: keep it off the loop.
             encoding = await asyncio.to_thread(tiktoken.get_encoding, name)
         except Exception as e:
             _encoding_failures[name] = time.time()
@@ -408,9 +418,54 @@ class Filter:
                 f"retrying in {_ENCODING_RETRY_INTERVAL}s"
             )
             return None
-
         _encoding_failures.pop(name, None)
+        _encodings[name] = encoding
+        self.log.debug(f"tiktoken encoding '{name}' loaded")
         return encoding
+
+    async def _get_encoding(self, model: str):
+        """
+        Return the tiktoken encoding for the model (cl100k_base for unknown
+        models), or None while it is not loaded. Exceptions raised in inlet()
+        abort the chat, so a missing encoding must not raise, and a slow or
+        hanging download must not hold up the request.
+        """
+        try:
+            name = tiktoken.encoding_name_for_model(model)
+        except Exception:  # KeyError: model unknown to tiktoken
+            name = "cl100k_base"
+
+        encoding = _encodings.get(name)
+        if encoding is not None:
+            return encoding
+
+        load = _encoding_loads.get(name)
+        if load is not None and not load.done():
+            self.log.debug(f"tiktoken encoding '{name}' is still loading, estimating")
+            return None
+
+        failed_at = _encoding_failures.get(name)
+        if failed_at and time.time() - failed_at < _ENCODING_RETRY_INTERVAL:
+            return None
+
+        load = asyncio.create_task(self._load_encoding(name))
+        _encoding_loads[name] = load
+        if failed_at:
+            # Retry in the background; this request estimates.
+            return None
+
+        try:
+            # shield(): the load keeps running if the wait times out or the
+            # request is cancelled; later requests pick up the result.
+            return await asyncio.wait_for(
+                asyncio.shield(load), timeout=_ENCODING_FIRST_LOAD_WAIT
+            )
+        except asyncio.TimeoutError:
+            self.log.info(
+                f"tiktoken encoding '{name}' not loaded within "
+                f"{_ENCODING_FIRST_LOAD_WAIT}s, estimating while it loads"
+            )
+            return None
 
     def _count_tokens(self, encoding, text: str) -> int:
         """Count tokens with tiktoken, or estimate them as len(text) // 4."""
@@ -424,7 +479,12 @@ class Filter:
         return len(text) // 4
 
     async def inlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
     ) -> dict:
         user_id = __user__.get("id", "unknown") if __user__ else "unknown"
         model = body.get("model", "default-model")
@@ -478,10 +538,14 @@ class Filter:
             if m
         )
 
-        _request_data[storage_key] = {
+        entry = {
+            "key": storage_key,
             "start_time": time.time(),
             "request_token_count": request_token_count,
         }
+        _request_data[storage_key] = entry
+        if isinstance(__metadata__, dict):
+            __metadata__[_metadata_key(__id__)] = entry
 
         self.log.info(
             f"Inlet complete: key={storage_key}, model={model}, "
@@ -492,7 +556,12 @@ class Filter:
         return body
 
     async def outlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
     ) -> dict:
         model = body.get("model", "default-model")
         all_messages = body.get("messages", [])
@@ -502,8 +571,22 @@ class Filter:
             f"messages={len(all_messages)}, body_keys={list(body.keys())}"
         )
 
-        storage_key = _build_request_key(body, __user__)
-        request_data = _request_data.pop(storage_key, {})
+        # Prefer the entry inlet() left in this request's metadata; fall back
+        # to the fingerprint when outlet() gets another metadata dict.
+        request_data = None
+        if isinstance(__metadata__, dict):
+            request_data = __metadata__.pop(_metadata_key(__id__), None)
+        if isinstance(request_data, dict):
+            storage_key = request_data.get("key", "")
+            matched_by = "metadata"
+            # A concurrent identical request may have replaced the entry
+            # under the same fingerprint: only drop our own.
+            if _request_data.get(storage_key) is request_data:
+                _request_data.pop(storage_key, None)
+        else:
+            storage_key = _build_request_key(body, __user__)
+            matched_by = "fingerprint"
+            request_data = _request_data.pop(storage_key, {})
 
         if not request_data:
             self.log.warning(
@@ -513,7 +596,7 @@ class Filter:
             )
         else:
             self.log.debug(
-                f"Matched inlet data for key={storage_key}, "
+                f"Matched inlet data for key={storage_key} by {matched_by}, "
                 f"remaining_entries={len(_request_data)}"
             )
 
