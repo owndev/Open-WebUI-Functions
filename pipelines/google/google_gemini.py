@@ -18,8 +18,9 @@ features:
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
   - Extra image generation model IDs configurable without a code change
-  - Interim thought images skipped, so each generated image is uploaded once
+  - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
   - Native tools and URL context left out for image models, which do not support them
+  - Search grounding left out for image models without Search support (gemini-2.5-flash-image, gemini-3.1-flash-lite-image)
   - Intelligent image optimization with size-aware compression algorithms
   - Automated image upload to Open WebUI with robust fallback support
   - Optimized text-to-image and image-to-image workflows
@@ -417,12 +418,14 @@ class Pipe:
         )
         IMAGE_GENERATION_MODELS: str = Field(
             default=os.getenv("GOOGLE_IMAGE_GENERATION_MODELS", ""),
-            description="A comma-separated list of extra model IDs to treat as image "
-            "generation models, for image models released after this pipeline version. "
-            "They are called without streaming, their images are uploaded to the chat, "
-            "and they get the aspect ratio/resolution (ImageConfig) and thinking level "
-            "settings of Gemini 3 image models. Known Gemini and Nano Banana image "
-            "models are detected automatically.",
+            description="A comma-separated list of extra model IDs to treat as Gemini 3 "
+            "image models: called without streaming, images uploaded to the chat, and "
+            "given the aspect ratio/resolution (ImageConfig) and thinking level settings. "
+            "List image models released after this pipeline version whose IDs use "
+            "neither Gemini 3 nor Nano Banana naming (e.g. a future gemini-4-flash-image); "
+            "without an entry they get no ImageConfig and no thinking_level. Known "
+            "Gemini 3 and Nano Banana image models need not be listed. Imagen IDs "
+            "(imagen-*) are ignored.",
         )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
@@ -1006,6 +1009,22 @@ class Pipe:
     # A Gemini model ID with "image" as its own dash-separated segment.
     _GEMINI_IMAGE_MODEL_RE = re.compile(r"(?:^|/)gemini-[^/]*-image(?:-|$)")
 
+    # gemini-nano-banana-2.1 and its variants ("-preview", "@001"), but not
+    # e.g. gemini-nano-banana-2.10.
+    _NANO_BANANA_2_1_RE = re.compile(r"gemini-nano-banana-2\.1(?:[-@]|$)")
+
+    # Image models whose model pages list Search grounding as "Not supported"
+    # (https://ai.google.dev/gemini-api/docs/models), incl. their preview IDs.
+    _NO_SEARCH_GROUNDING_MODELS = (
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-lite-image",
+    )
+
+    def _supports_search_grounding(self, model_id: str) -> bool:
+        """Return False for models that do not support Google Search grounding."""
+        model_lower = model_id.rsplit("/", 1)[-1].lower()
+        return not model_lower.startswith(self._NO_SEARCH_GROUNDING_MODELS)
+
     def _is_configured_image_model(self, model_id: str) -> bool:
         """Return True if the IMAGE_GENERATION_MODELS valve lists the model."""
         configured = {
@@ -1037,13 +1056,15 @@ class Pipe:
         """
         model_lower = model_id.lower()
 
+        # Imagen models ("imagen-...") use the predict API, not generateContent,
+        # so they are never Gemini image models, even if IMAGE_GENERATION_MODELS
+        # lists them.
+        if model_lower.startswith("imagen-") or "/imagen-" in model_lower:
+            return False
+
         # Models the admin declared as image models (IMAGE_GENERATION_MODELS)
         if self._is_configured_image_model(model_id):
             return True
-
-        # Imagen models ("imagen-...") use the predict API, not generateContent.
-        if model_lower.startswith("imagen-") or "/imagen-" in model_lower:
-            return False
 
         # Known image generation models (both Gemini 2.5 and Gemini 3)
         image_generation_models = [
@@ -1180,7 +1201,7 @@ class Pipe:
         model_lower = model_id.lower()
 
         # https://ai.google.dev/gemini-api/docs/generate-content/image-generation
-        if model_lower.startswith("gemini-nano-banana-2.1"):
+        if self._NANO_BANANA_2_1_RE.match(model_lower):
             return ["minimal", "medium", "high"]
 
         if model_lower.startswith(
@@ -2893,7 +2914,12 @@ class Pipe:
             )
 
         if features.get("google_search_tool", False) and not is_task:
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+            if not self._supports_search_grounding(model_id):
+                self.log.debug(
+                    f"Search grounding is not supported by {model_id}; "
+                    "not sending the search tool"
+                )
+            elif self.valves.USE_ENTERPRISE_WEB_SEARCH:
                 self.log.debug("Enabling Enterprise Web Search grounding")
                 tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
@@ -2901,7 +2927,8 @@ class Pipe:
             else:
                 self.log.debug("Enabling Google search grounding")
                 tools.append(types.Tool(google_search=types.GoogleSearch()))
-            # Gemini image models support Search grounding but not URL context.
+            # Gemini image models do not support URL context (most of them
+            # support Search grounding, see _supports_search_grounding).
             if enable_image_generation:
                 self.log.debug("URL context is not supported by image models")
             else:
@@ -3134,6 +3161,7 @@ class Pipe:
         generated_images: list[str] = []
         generated_image_files: List[Dict[str, Any]] = []
         seen_generated_image_hashes: set[str] = set()
+        last_thought_image: Any = None
 
         try:
             async for chunk in response_iterator:
@@ -3223,9 +3251,11 @@ class Pipe:
                             )
 
                         # Interim image from the thinking process: the final image
-                        # follows as a regular part, so this one is not uploaded.
+                        # follows as a regular part, so this one is not uploaded
+                        # (only kept as fallback if no final image arrives).
                         elif is_thought and getattr(part, "inline_data", None):
                             self.log.debug("Skipping interim thought image")
+                            last_thought_image = part.inline_data
 
                         # Regular answer text
                         elif getattr(part, "text", None):
@@ -3262,6 +3292,23 @@ class Pipe:
                         # Log part processing errors but continue with the stream
                         self.log.warning(f"Error processing content part: {part_error}")
                         continue
+
+            # seen_generated_image_hashes records every final (non-thought) image
+            # part. If the response had thought images only, attach the last one.
+            if last_thought_image is not None and not seen_generated_image_hashes:
+                self.log.warning(
+                    "Gemini returned thought images but no final image; "
+                    "attaching the last thought image instead"
+                )
+                await self._collect_generated_image(
+                    last_thought_image,
+                    seen_generated_image_hashes,
+                    generated_images,
+                    generated_image_files,
+                    __request__,
+                    __user__,
+                    __event_emitter__,
+                )
 
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
@@ -3973,6 +4020,7 @@ class Pipe:
                     generated_images: list[str] = []
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
+                    last_thought_image: Any = None
 
                     for part in parts:
                         is_thought = bool(getattr(part, "thought", False))
@@ -3982,8 +4030,10 @@ class Pipe:
                             # Gemini 3 image models return up to two interim images
                             # from their thinking process as thought parts when
                             # thoughts are included. The final image follows as a
-                            # regular part, so interim images are not uploaded.
+                            # regular part, so interim images are not uploaded
+                            # (only kept as fallback if no final image arrives).
                             self.log.debug("Skipping interim thought image")
+                            last_thought_image = part.inline_data
                         elif getattr(part, "text", None):
                             answer_segments.append(part.text)
                         elif getattr(part, "inline_data", None):
@@ -3996,6 +4046,27 @@ class Pipe:
                                 __user__,
                                 __event_emitter__,
                             )
+
+                    # seen_generated_image_hashes records every final (non-thought)
+                    # image part. If the response had thought images only, attach
+                    # the last one.
+                    if (
+                        last_thought_image is not None
+                        and not seen_generated_image_hashes
+                    ):
+                        self.log.warning(
+                            "Gemini returned thought images but no final image; "
+                            "attaching the last thought image instead"
+                        )
+                        await self._collect_generated_image(
+                            last_thought_image,
+                            seen_generated_image_hashes,
+                            generated_images,
+                            generated_image_files,
+                            __request__,
+                            __user__,
+                            __event_emitter__,
+                        )
 
                     final_answer = "".join(answer_segments)
 

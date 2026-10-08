@@ -63,7 +63,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Accepts both text and image data for more expressive interactions with configurable image optimization.
 
 - **Advanced Image Generation**  
-  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message; the interim images that Gemini 3 image models create while thinking are not uploaded.
+  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message; the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached).
 
 - **Video Generation with Google Veo**  
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
@@ -186,10 +186,12 @@ GOOGLE_IMAGE_GENERATION_ASPECT_RATIO="1:1"
 GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
 
 # Extra image generation models, for image models released after this pipeline version
-# Comma-separated list of model IDs (e.g., "gemini-nano-banana-3")
+# Comma-separated list of model IDs (e.g., a future "gemini-4-flash-image")
 # Listed models are called without streaming, their images are uploaded to the chat,
 # and they get the ImageConfig and thinking level settings of Gemini 3 image models.
-# Known Gemini and Nano Banana image models are detected automatically.
+# List new image models whose IDs use neither Gemini 3 nor Nano Banana naming: without
+# an entry they get no ImageConfig and no thinking_level. Known Gemini 3 and Nano Banana
+# image models need not be listed. Imagen IDs (imagen-*) are ignored.
 # Default: "" (empty, no extra models)
 GOOGLE_IMAGE_GENERATION_MODELS=""
 
@@ -263,9 +265,9 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 >
 > **Streaming Support**: Image generation models automatically disable streaming mode to prevent "chunk too big" errors. All image generation requests use non-streaming mode regardless of the streaming setting.
 >
-> **Thought Images**: Gemini 3 image models generate up to two interim images while thinking. With thoughts enabled (`GOOGLE_INCLUDE_THOUGHTS=true`), the API returns them as thought parts before the final image. The pipeline shows the thinking text but does not upload these interim images, so each generated image appears once in the chat and in your files.
+> **Thought Images**: Gemini 3 image models generate up to two interim images while thinking. With thoughts enabled (`GOOGLE_INCLUDE_THOUGHTS=true`), the API returns them as thought parts before the final image. The pipeline shows the thinking text but does not upload these interim images, so each generated image appears once in the chat and in your files. If a response contains interim images but no final image, the last interim image is uploaded instead (and a warning is logged).
 >
-> **Tools**: Gemini image models do not support function calling or the URL context tool. Native tools (which Open WebUI 0.10+ attaches to every chat in Native mode) and URL context are therefore not sent to image models; Google Search grounding still is.
+> **Tools**: Gemini image models do not support function calling or the URL context tool. Native tools (which Open WebUI 0.10+ attaches to every chat in Native mode) and URL context are therefore not sent to image models. Google Search grounding still is, except for `gemini-2.5-flash-image` and `gemini-3.1-flash-lite-image` (and their preview IDs), which do not support it and get no search tool.
 >
 > **Image Optimization Direction**: The current image processing configuration **only applies to input images** (Open WebUI → Google API), such as images uploaded to chat or used for image-to-image editing. Generated images from Google API are not yet subject to these optimization settings. This means:
 >
@@ -397,11 +399,13 @@ for part in response.parts:
 
 ### Additional Image Generation Models
 
-Google releases new image models regularly. Gemini model IDs that contain `image` as their own segment (such as `gemini-3.1-flash-image`) or `nano-banana` (such as `gemini-nano-banana-2.1`) are detected automatically. If a new image model uses a different naming scheme, list it in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update:
+Google releases new image models regularly. Gemini model IDs that contain `image` as their own segment (such as `gemini-3.1-flash-image`) or `nano-banana` (such as `gemini-nano-banana-2.1`) are detected as image models automatically: they are called without streaming and their images are uploaded. ImageConfig (aspect ratio, resolution) and `thinking_level` are only sent to Gemini 3/3.1 image models (such as `gemini-3-pro-image` or `gemini-3.1-flash-image`), Nano Banana models (`gemini-nano-banana-*`) and the listed models.
+
+List a new image model in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update when its ID uses neither Gemini 3 nor Nano Banana naming, for example a future `gemini-4-flash-image` (detected as an image model, but without an entry it gets no ImageConfig and `thinking_budget` instead of `thinking_level`), or when it is not detected at all. The known models in the table above need not be listed. Imagen IDs (`imagen-*`) use another API and are ignored even if listed.
 
 ```bash
-# Comma-separated model IDs to treat as image generation models
-GOOGLE_IMAGE_GENERATION_MODELS="gemini-new-image-model,gemini-other-image-model"
+# Comma-separated model IDs to treat as Gemini 3 image models
+GOOGLE_IMAGE_GENERATION_MODELS="gemini-4-flash-image"
 ```
 
 Listed models are handled like Gemini 3 image models: requests are sent without streaming and with `response_modalities` `TEXT` and `IMAGE`, the aspect ratio and resolution settings are sent as ImageConfig, `GOOGLE_THINKING_LEVEL` / `reasoning_effort` are passed through as `thinking_level` without remapping, and generated images are uploaded to the chat. The model itself must still be available in the model list (returned by the API, or added via `GOOGLE_MODEL_ADDITIONAL`).
@@ -627,7 +631,7 @@ For instance, the following [Filter (google_search_tool.py)](../filters/google_s
 
 When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
 
-Open WebUI's background tasks for the chat (title, tag and follow-up generation) inherit the `google_search_tool` flag from the chat request. The pipeline sends no grounding tools with these tasks, so they do not run extra Google searches. Image generation models get Google Search grounding but not the URL context tool, which they do not support.
+Open WebUI's background tasks for the chat (title, tag and follow-up generation) inherit the `google_search_tool` flag from the chat request. The pipeline sends no grounding tools with these tasks, so they do not run extra Google searches. Image generation models get Google Search grounding but not the URL context tool, which they do not support. The exceptions are `gemini-2.5-flash-image` and `gemini-3.1-flash-lite-image` (and their preview IDs): they support neither, so they get no search tool (Google Search or Enterprise Web Search) and no URL context.
 
 ### Enterprise Search
 
