@@ -155,8 +155,8 @@ The functions include a built-in encryption mechanism for sensitive information:
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
 - Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only).
-- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only).
-- **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; Open WebUI's built-in tools and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject.
+- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only). Only referenced documents are shown as sources; `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false` shows none for answers without `[docX]` references.
+- **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; `tools`/`tool_choice` (including Open WebUI's built-in tools) and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject, so function calling is not available in chats that use Azure AI Search.
 - **Relevance scores**: BM25 keyword and semantic rerank scores from Azure AI Search are displayed as a relevance percentage on citation cards, with independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
 - Supports multiple models via `AZURE_AI_MODEL` (semicolon- or comma-separated, for example `gpt-4o;gpt-4o-mini`) or automatic model extraction from the Azure OpenAI URL.
 - **Large predefined model catalogue** (GPT-4o, GPT-5, o3, o4-mini, Phi-4, DeepSeek-R1/V3, Mistral, Llama 3.x, Cohere, Grok, and more) via `USE_PREDEFINED_AZURE_AI_MODELS`.

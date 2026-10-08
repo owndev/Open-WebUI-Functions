@@ -19,6 +19,7 @@ features:
   - Azure AI Search / RAG integration with native OpenWebUI citations (Azure OpenAI only)
   - Automatic [docX] to markdown link conversion for clickable citations (also when streamed in pieces)
   - Relevance scores from Azure AI Search displayed in citation cards
+  - Only referenced documents as sources; optionally none for answers without [docX] references
   - Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no citations
   - Requests with Azure AI Search omit tools and stream_options, which On Your Data ignores or rejects
 """
@@ -164,9 +165,13 @@ class Pipe:
     # sent back to the model as plain "[docX]", so it does not copy the syntax.
     LINKED_DOC_REF_PATTERN = re.compile(r"\[\[doc(\d+)\]\]\([^)\n]*\)")
 
-    # Unfinished [docX] reference at the end of a streamed piece of text
-    # ("[", "[d", "[do", "[doc", "[doc1"): held back until the next delta.
-    PARTIAL_DOC_REF_PATTERN = re.compile(r"\[(?:d(?:o(?:c\d*)?)?)?\Z")
+    # End of a streamed piece of text that may still become a [docX] reference
+    # or a link around one: "[", "[[", "[d" ... "[doc1", "[doc1]", "[[doc1]]",
+    # "[[doc1]](https://..." (until ")" or a line break). It is held back until
+    # the next delta shows what it is, so references and links are never cut.
+    PARTIAL_DOC_REF_PATTERN = re.compile(
+        r"\[\[?(?:d(?:o(?:c\d*)?)?)?\Z|\[\[?doc\d+\]\]?(?:\([^)\n]*)?\Z"
+    )
 
     # Environment variables for API key, endpoint, and optional model
     class Valves(BaseModel):
@@ -238,6 +243,17 @@ class Pipe:
                 os.getenv("AZURE_AI_INCLUDE_SEARCH_SCORES", "true").lower() == "true"
             ),
             description="If True, automatically add 'include_contexts' with 'all_retrieved_documents' to Azure AI Search requests to get relevance scores (original_search_score and rerank_score). This enables relevance percentage display in citation cards.",
+        )
+
+        # Citations for answers that reference no [docX] at all
+        AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES: bool = Field(
+            default=bool(
+                os.getenv(
+                    "AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES", "true"
+                ).lower()
+                == "true"
+            ),
+            description="If True (default), an Azure AI Search answer that contains no [docX] reference shows all documents returned by Azure as sources. If False, such an answer shows no sources. Answers with [docX] references always show only the referenced documents.",
         )
 
         # BM25 score normalization factor for relevance percentage display
@@ -831,6 +847,10 @@ class Pipe:
         If a URL is available, creates a clickable markdown link.
         Otherwise, returns the original [docX] reference.
 
+        Parentheses in the URL are percent-encoded, so the link ends at its
+        own ")" and is recognized as a whole when it comes back (history,
+        already linked references).
+
         Args:
             doc_num: The document number (1-based)
             url: Optional URL for the document
@@ -840,6 +860,7 @@ class Pipe:
         """
         if url:
             # Create markdown link: [[doc1]](url)
+            url = url.replace("(", "%28").replace(")", "%29")
             return f"[[doc{doc_num}]]({url})"
         else:
             # No URL available, keep original reference
@@ -915,9 +936,10 @@ class Pipe:
 
     def _split_partial_doc_ref(self, text: str) -> Tuple[str, str]:
         """
-        Split streamed text into a part that can be sent now and an unfinished
-        [docX] reference at its end ("[", "[d", "[do", "[doc", "[doc1"), which
-        is held back until the next delta completes it.
+        Split streamed text into a part that can be sent now and an end that
+        may still become a [docX] reference or a link around one ("[doc",
+        "[doc1]", "[[doc1]](https://..."), which is held back until the next
+        delta shows what it is.
 
         Args:
             text: Streamed text (held back text from before plus the new delta)
@@ -969,7 +991,7 @@ class Pipe:
         citation_urls: Dict[int, Optional[str]],
         pending: Dict[int, str],
         stream_meta: Dict[str, Any],
-    ) -> Optional[str]:
+    ) -> Optional[List[str]]:
         """
         Convert [docX] references in the content deltas of an SSE chunk into
         markdown links.
@@ -978,6 +1000,9 @@ class Pipe:
         delta and stored in `pending`; it is put in front of the next delta of
         the same choice, or sent before "data: [DONE]" / with the final delta.
 
+        Open WebUI parses every item of a streamed response as one SSE event,
+        so text sent before "data: [DONE]" is returned as a separate item.
+
         Args:
             chunk_str: Decoded SSE chunk (one or more lines)
             citation_urls: Mapping of 1-based citation index to URL (or None)
@@ -985,8 +1010,10 @@ class Pipe:
             stream_meta: id/object/created/model of the stream (updated in place)
 
         Returns:
-            The modified chunk, or None if nothing was changed
+            The items to send instead of the chunk, or None if nothing was
+            changed
         """
+        items: List[str] = []
         out_lines = []
         changed = False
 
@@ -1001,7 +1028,10 @@ class Pipe:
                     citation_urls, pending, stream_meta
                 )
                 if flush_event:
-                    out_lines.extend([flush_event, ""])
+                    if out_lines:
+                        items.append("\n".join(out_lines + [""]))
+                        out_lines = []
+                    items.append(f"{flush_event}\n\n")
                     changed = True
                 out_lines.append(line)
                 continue
@@ -1052,7 +1082,11 @@ class Pipe:
             else:
                 out_lines.append(line)
 
-        return "\n".join(out_lines) if changed else None
+        if not changed:
+            return None
+        if out_lines:
+            items.append("\n".join(out_lines))
+        return items
 
     def _flush_pending_doc_refs(
         self,
@@ -1095,6 +1129,8 @@ class Pipe:
         all sources appear in the UI.
 
         Only emits citations that are actually referenced in the content (e.g., [doc1], [doc2]).
+        If the content references none, all citations are emitted, or none
+        when AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES is off.
 
         Args:
             citations: List of Azure citation objects
@@ -1114,8 +1150,15 @@ class Pipe:
         # Extract which citations are actually referenced in the content
         referenced_indices = self._extract_referenced_citations(content)
 
-        # If we couldn't find any references, include all citations (backward compatibility)
+        # If we couldn't find any references, include all citations (backward
+        # compatibility), unless this fallback is switched off
         if not referenced_indices:
+            if not self.valves.AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES:
+                log.info(
+                    "No [docX] references found in content, no citation events emitted "
+                    "(AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES is off)"
+                )
+                return
             referenced_indices = set(range(1, len(citations) + 1))
             log.debug(
                 f"No [docX] references found in content, including all {len(citations)} citations"
@@ -1548,21 +1591,26 @@ class Pipe:
                 # Models often stream a reference in pieces ("[doc", "1", "]"), so an
                 # unfinished reference at the end of a delta is held back until the
                 # next delta or the end of the stream completes it.
+                out_items = [chunk]
                 if citation_urls:
                     try:
-                        modified_chunk_str = self._link_doc_refs_in_sse_chunk(
+                        modified_items = self._link_doc_refs_in_sse_chunk(
                             chunk_str, citation_urls, pending_refs, stream_meta
                         )
-                        if modified_chunk_str is not None:
-                            chunk = modified_chunk_str.encode("utf-8")
+                        if modified_items is not None:
+                            out_items = [
+                                item.encode("utf-8") for item in modified_items
+                            ]
                     except Exception as convert_err:
                         log.debug(
                             f"Error converting [docX] to markdown links: {convert_err}"
                         )
                         # Fall through to yield original chunk
 
-                # Yield the (possibly modified) chunk
-                yield chunk
+                # Yield the (possibly modified) chunk; held back text sent
+                # before [DONE] is a separate item (one SSE event per item)
+                for out_item in out_items:
+                    yield out_item
 
                 # Check if this is the end of the stream
                 if "data: [DONE]" in chunk_str:
