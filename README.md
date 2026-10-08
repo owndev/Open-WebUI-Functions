@@ -88,6 +88,7 @@ This repository focuses on reusable Python functions for Open WebUI. It includes
 > 1. **An active Open WebUI instance**: You must have [Open WebUI](https://github.com/open-webui/open-webui) installed and running.
 > 2. **Required AI services (if applicable)**: Some pipelines depend on external AI services, such as [Azure AI](https://ai.azure.com/).
 > 3. **Admin access**: You must have administrator privileges in Open WebUI to install functions.
+> 4. **Python packages**: Some functions list extra Python packages in the `requirements:` line of their header (for example, the Google Gemini pipeline needs `google-genai`, which Open WebUI no longer bundles as of 0.11.4). Open WebUI installs them automatically unless `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` or `OFFLINE_MODE=true` is set; in that case, install them into your Open WebUI image yourself (see [Gemini requirements](./docs/google-gemini-integration.md#requirements)).
 
 ## 🚀 Installation
 
