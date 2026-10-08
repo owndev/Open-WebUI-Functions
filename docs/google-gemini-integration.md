@@ -51,7 +51,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Handles token-by-token responses with built-in safety enforcement.
 
 > [!Note]
-> Streaming is automatically disabled for image generation models to prevent chunk size issues.
+> Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview` and `gemini-3.1-flash-image`); Imagen models (`imagen-*`) are not Gemini image models. If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
   Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models.
@@ -201,7 +201,7 @@ GOOGLE_THINKING_BUDGET=-1
 
 # Thinking level for Gemini 3 models only
 # Most Gemini 3 models accept "low" or "high"
-# gemini-3.1-flash-image-preview accepts "minimal" or "high"
+# gemini-3.1-flash-image(-preview) accepts "minimal" or "high"
 # The pipeline automatically maps unsupported values to the closest supported level
 # Default: "" (empty, uses model default)
 # Note: This setting is ignored for non-Gemini 3 models
@@ -262,7 +262,7 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 
 ## Image Generation Configuration
 
-The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
+The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image`, `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`).
 
 > [!IMPORTANT]
 > **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3/3.1 image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
@@ -469,7 +469,7 @@ Users can override the following settings per-user via Open WebUI valve override
 
 ### Image-to-Video
 
-Attach an image to your message when using any Veo model to use it as the starting frame for video generation. The pipeline automatically detects attached images and passes the first one to the Veo API via the `image` parameter.
+Attach an image to your message when using any Veo model to use it as the starting frame for video generation. The pipeline automatically detects attached images and passes the first one to the Veo API as the `image` of the request's `GenerateVideosSource`.
 
 > [!NOTE]
 > All Veo models support single-image image-to-video. **Multi-reference images** (up to 3 style/content guides, Veo 3.1 only) and **last-frame interpolation** are Veo API capabilities not yet exposed by the pipeline.
@@ -652,6 +652,15 @@ To use this filter, ensure it's enabled in your Open WebUI configuration. Then, 
 
 Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
 
+### Known limitations on Open WebUI >= 0.10
+
+Open WebUI 0.10 made **Native** the default function calling mode, so attached tools are now passed to Gemini unless a model or chat opts out. In that mode the pipeline hands the tools to the `google-genai` SDK, which runs them through automatic function calling (AFC). This currently fails on Open WebUI 0.10 and later:
+
+- **Python tools from the Tools workspace** fail because Open WebUI 0.10+ loads them with `from __future__ import annotations`, so their type hints are plain strings that the SDK cannot turn into function declarations.
+- **MCP and OpenAPI tool server tools** are all exposed under the same callable name (`tool_function`), so Gemini cannot tell them apart.
+
+Workaround: set **Function Calling** to **Legacy** in the model's advanced parameters (**Admin Panel → Settings → Models → edit model → Advanced Params**), per chat in the chat controls, or globally in the default model parameters. Open WebUI then handles tool selection itself and the pipeline receives no native tools. A fix for native tool calling is tracked in [#169](https://github.com/owndev/Open-WebUI-Functions/issues/169).
+
 ## Default System Prompt
 
 The Google Gemini pipeline supports a configurable default system prompt that is applied to all chats. This is useful when you want to consistently apply certain behaviors or instructions to all Gemini models without having to configure each model individually.
@@ -708,7 +717,7 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
 - **Most Gemini 3 models**: support **`"low"`** and **`"high"`**.
-- **`gemini-3.1-flash-image-preview`**: supports **`"minimal"`** and **`"high"`**.
+- **`gemini-3.1-flash-image`** and **`gemini-3.1-flash-image-preview`**: support **`"minimal"`** and **`"high"`**.
 
 > [!Note]
 > Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
@@ -832,10 +841,13 @@ The pipeline automatically extracts token usage metadata from every Gemini respo
 
 ### How it works
 
-- **Streaming mode**: Usage metadata is collected from the final chunk emitted by the Gemini API and yielded as a `{"usage": {...}}` dict at the end of the stream.
-- **Non-streaming mode**: Usage metadata is included in the `usage` key of the response dict returned by `pipe()`.
+- **Streaming mode**: Usage metadata is collected from the final chunk emitted by the Gemini API and yielded as a `{"choices": [], "usage": {...}}` chunk at the end of the stream.
+- **Non-streaming requests** (`stream: false`, for example API clients and Open WebUI background tasks such as title, tag and follow-up generation): `pipe()` returns an OpenAI `chat.completion` dict with the answer in `choices[0].message.content` and the token counts in `usage`.
+- **Streaming requests answered without streaming** (image generation models, or `GOOGLE_STREAMING_ENABLED=false`): `pipe()` yields the complete answer as one chunk, followed by the usage chunk, so Open WebUI shows and saves both.
 
 No additional configuration is required. Token usage is tracked automatically for all models that return `usage_metadata` (all current Gemini models).
+
+Open WebUI passes no event emitter to background tasks (title, tags, follow-ups, search queries). The pipeline then skips its status and source events, and it leaves the thinking summary out of task answers because Open WebUI reads JSON from them. A Gemini model can therefore also be used as the task model.
 
 > [!NOTE]
 > Thinking tokens consumed during internal reasoning are **not** included in `completion_tokens` — they are captured separately by the Gemini API in `thoughts_token_count` but are not forwarded to Open WebUI at this time.
@@ -866,7 +878,7 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=false
 
 ### Thinking Compatibility
 
-- **`gemini-3.1-flash-image-*`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
+- **`gemini-3.1-flash-image`** and **`gemini-3.1-flash-image-*`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
 - **Other `gemini-3-*` models**: `thinking_level` supports `"low"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-2.5-*` models**: `thinking_level` is not used; `thinking_budget` supports `0-32768`.
 - **`gemini-2.5-flash-image-*`**: neither `thinking_level` nor `thinking_budget` is supported.

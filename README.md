@@ -214,7 +214,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports integration with the Google Generative AI API or Vertex AI API for content generation.
 - Sends messages from Open WebUI to **Google Gemini**.
 - Supports encryption of sensitive information such as API keys.
-- Supports both streaming and non-streaming responses (streaming is automatically disabled for image generation models).
+- Supports both streaming and non-streaming responses (streaming is automatically disabled for image generation models, including released IDs such as `gemini-3.1-flash-image`).
 - **Thinking & reasoning**: Configurable thinking levels (`low` / `high`) for Gemini 3 models and thinking budgets (0–32 768 tokens) for Gemini 2.5 models, with per-chat override support.
 - **Lean history**: Previously rendered thinking summaries are stripped from assistant messages before the conversation is replayed to the API (configurable).
 - Provides configurable error handling and timeouts.
@@ -223,11 +223,12 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Multi-image history**: Configurable history image limit, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
 - **Image generation (Gemini 3)**: Configurable aspect ratio (for example `16:9` or `1:1`) and resolution (`1K`, `2K`, or `4K`) for Gemini 3 image models, with per-user valve overrides.
 - **Video generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video for all supported Veo models. Videos are automatically uploaded and embedded with playback controls.
-- **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database.
+- **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database, for streaming and non-streaming responses.
+- **Background tasks**: Works as the Open WebUI task model for title, tag and follow-up generation.
 - **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`.
 - Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
-- Native tool calling support
+- Native tool calling support (on Open WebUI 0.10+ set Function Calling to **Legacy** for now, see [known limitations](./docs/google-gemini-integration.md#known-limitations-on-open-webui--010))
 - Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)
