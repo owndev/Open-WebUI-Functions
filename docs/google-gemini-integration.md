@@ -42,13 +42,13 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Improves performance and scalability with non-blocking requests.
 
 - **Model Caching**  
-  Caches available model lists for faster subsequent access.
+  Caches available model lists for faster subsequent access. A change to a valve that shapes the list (`MODEL_WHITELIST`, `MODEL_ADDITIONAL`, `IMAGE_GENERATION_MODELS`, base URL, API version or Vertex AI settings) shows on the next model list refresh, without waiting for `GOOGLE_MODEL_CACHE_TTL`.
 
 - **Dynamic Model Handling**  
   Automatically strips provider prefixes for seamless integration.
 
 - **Streaming Response Support**  
-  Handles token-by-token responses with built-in safety enforcement.
+  Handles token-by-token responses with built-in safety enforcement. The final answer and error messages are sent as OpenAI `chat.completion.chunk` objects, so an answer that starts with `data:` reaches API clients intact.
 
 > [!Note]
 > Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
@@ -63,13 +63,13 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Accepts both text and image data for more expressive interactions with configurable image optimization.
 
 - **Advanced Image Generation**  
-  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message; the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached).
+  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message (API clients, which have no chat message, get it as a markdown link `![Generated Image](/api/v1/files/<id>/content)` in the answer); the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached).
 
 - **Video Generation with Google Veo**  
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
 
 - **Flexible Error Handling**  
-  Retries failed requests and logs errors for transparency.
+  Retries temporary errors (server errors such as HTTP 500/503, `GOOGLE_RETRY_COUNT` times with exponential backoff) and logs errors for transparency. Streaming requests are retried until their first chunk arrives; an error after that ends the answer with an error message. Every status the pipeline started (thinking, image processing, video generation, uploads) gets a final status when a request fails or is stopped, so no spinner is left behind.
 
 - **Integration with Google Generative AI or Vertex AI API**  
   Connect using either the Google Generative AI API or Google Cloud Vertex AI for content generation.
@@ -87,7 +87,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Improve the accuracy and recency of Gemini responses with Google search grounding.
 
 - **Ability to forward User Headers and change gemini base url**  
-  Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. Also, change the base URL for the Google Generative AI API if needed.
+  Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. The headers always belong to the user of the request, also with concurrent requests of several users. Also, change the base URL for the Google Generative AI API if needed.
 
 - **Native tool calling support**  
   Leverage Google genai native function calling to orchestrate the use of tools
@@ -104,10 +104,13 @@ Set the following environment variables to configure the Google Gemini integrati
 USE_PERMISSIVE_SAFETY=false
 
 # Model list cache duration (in seconds)
+# Valve changes that shape the model list (whitelist, additional and image
+# generation models, base URL, API version, Vertex AI settings) refresh it at once
 # Default: 600
 GOOGLE_MODEL_CACHE_TTL=600
 
-# Number of retry attempts for failed API calls
+# Number of retry attempts for temporary API errors (server errors, HTTP 5xx)
+# Streaming requests are retried until their first chunk arrives
 # Default: 2
 GOOGLE_RETRY_COUNT=2
 
@@ -415,7 +418,7 @@ Listed models are handled like Gemini 3 image models: requests are sent without 
 The Google Gemini pipeline supports video generation using **Google Veo models** (Veo 3.1, 3, and 2). Veo models appear automatically in the model list with a 🎬 indicator.
 
 > [!IMPORTANT]
-> Video generation uses a different API path than text/image generation. Requests are **always non-streaming** — the pipeline submits a video generation job, polls for completion, uploads the result to Open WebUI, and attaches it to the chat as a generated file entry. Native inline playback after reload depends on Open WebUI's frontend support for video files.
+> Video generation uses a different API path than text/image generation. Requests are **always non-streaming** — the pipeline submits a video generation job, polls for completion, uploads the result to Open WebUI, and attaches it to the chat as a generated file entry (API clients without a chat get a link to the uploaded video in the answer instead). Native inline playback after reload depends on Open WebUI's frontend support for video files.
 
 ### Supported Models
 

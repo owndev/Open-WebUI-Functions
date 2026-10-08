@@ -11,9 +11,10 @@ license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
   - Optimized asynchronous API calls for maximum performance
-  - Intelligent model caching with configurable TTL
+  - Intelligent model caching with configurable TTL, refreshed at once when model valves change
   - Streamlined dynamic model specification with automatic prefix handling
   - Smart streaming response handling with safety checks
+  - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
@@ -23,9 +24,10 @@ features:
   - Search grounding left out for image models without Search support (gemini-2.5-flash-image, gemini-3.1-flash-lite-image)
   - Intelligent image optimization with size-aware compression algorithms
   - Automated image upload to Open WebUI with robust fallback support
+  - Generated images and videos linked in the answer for API clients
   - Optimized text-to-image and image-to-image workflows
   - Non-streaming mode for image generation to prevent chunk overflow
-  - Progressive status updates for optimal user experience
+  - Progressive status updates, each closed when a request ends, fails or is stopped
   - Consolidated error handling and comprehensive logging
   - Seamless Google Generative AI and Vertex AI integration
   - Advanced generation parameters (temperature, max tokens, etc.)
@@ -69,7 +71,17 @@ import io
 import uuid
 import aiofiles
 from PIL import Image
-from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
+from typing import (
+    List,
+    Union,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+)
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -803,10 +815,17 @@ class Pipe:
         # Model cache
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
+        self._model_cache_key: Optional[Tuple[Any, ...]] = None
 
-    def _get_client(self) -> genai.Client:
+    def _get_client(self, user: Optional[UserModel] = None) -> genai.Client:
         """
         Validates API credentials and returns a genai.Client instance.
+
+        Args:
+            user: The requesting user, whose X-OpenWebUI-User-* headers are sent
+                when ENABLE_FORWARD_USER_INFO_HEADERS is on. Passed per call
+                (never kept on the shared Pipe instance), so concurrent
+                requests of different users cannot forward each other's headers.
         """
         self._validate_api_key()
 
@@ -822,11 +841,7 @@ class Pipe:
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
             headers = {}
-            if (
-                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
-                and hasattr(self, "user")
-                and self.user
-            ):
+            if self.valves.ENABLE_FORWARD_USER_INFO_HEADERS and user:
 
                 def sanitize_header_value(value: Any, max_length: int = 255) -> str:
                     if value is None:
@@ -842,16 +857,16 @@ class Pipe:
 
                 user_attrs = {
                     "X-OpenWebUI-User-Name": sanitize_header_value(
-                        getattr(self.user, "name", None)
+                        getattr(user, "name", None)
                     ),
                     "X-OpenWebUI-User-Id": sanitize_header_value(
-                        getattr(self.user, "id", None)
+                        getattr(user, "id", None)
                     ),
                     "X-OpenWebUI-User-Email": sanitize_header_value(
-                        getattr(self.user, "email", None)
+                        getattr(user, "email", None)
                     ),
                     "X-OpenWebUI-User-Role": sanitize_header_value(
-                        getattr(self.user, "role", None)
+                        getattr(user, "role", None)
                     ),
                 }
                 headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
@@ -902,10 +917,26 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
+    def _get_model_cache_key(self) -> Tuple[Any, ...]:
+        """The valves that decide which models are listed and how they are named."""
+        return (
+            self.valves.BASE_URL,
+            self.valves.API_VERSION,
+            self.valves.USE_VERTEX_AI,
+            self.valves.VERTEX_PROJECT,
+            self.valves.VERTEX_LOCATION,
+            self.valves.MODEL_WHITELIST,
+            self.valves.MODEL_ADDITIONAL,
+            self.valves.IMAGE_GENERATION_MODELS,
+        )
+
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
         """
         Retrieve available Google models suitable for content generation.
-        Uses caching to reduce API calls.
+        Uses caching to reduce API calls. The cache is only used while the
+        valves that shape the list (endpoint, whitelist, additional and image
+        generation models) are unchanged, so a valve change shows on the next
+        model list refresh instead of after MODEL_CACHE_TTL.
 
         Args:
             force_refresh: Whether to force refreshing the model cache
@@ -915,9 +946,11 @@ class Pipe:
         """
         # Check cache first
         current_time = time.time()
+        cache_key = self._get_model_cache_key()
         if (
             not force_refresh
             and self._model_cache is not None
+            and self._model_cache_key == cache_key
             and (current_time - self._model_cache_time) < self.valves.MODEL_CACHE_TTL
         ):
             self.log.debug("Using cached model list")
@@ -998,6 +1031,7 @@ class Pipe:
             # Update cache
             self._model_cache = list(filtered_models.values())
             self._model_cache_time = current_time
+            self._model_cache_key = cache_key
             self.log.debug(f"Found {len(self._model_cache)} Gemini models")
             return self._model_cache
 
@@ -1408,13 +1442,96 @@ class Pipe:
             )
 
     async def _close_client(self, client: Optional[genai.Client]) -> None:
-        """Close the async transport of a per-request genai client."""
+        """Close both transports (async and sync) of a per-request genai client."""
         if client is None:
             return
         try:
             await client.aio.aclose()
         except Exception as close_error:
             self.log.debug(f"Failed to close Gemini client: {close_error}")
+        try:
+            client.close()
+        except Exception as close_error:
+            self.log.debug(f"Failed to close Gemini sync client: {close_error}")
+
+    @staticmethod
+    def _track_statuses(
+        __event_emitter__: Optional[Callable], running: Dict[str, Dict[str, Any]]
+    ) -> Optional[Callable]:
+        """Wrap an event emitter to record the status actions still running.
+
+        `running` maps every status action whose last event had done=False
+        (thinking, image_processing, video_generation, ...) to that event's
+        data; an event of the same action with done=True removes it.
+        """
+        if not __event_emitter__:
+            return __event_emitter__
+
+        async def emit(event: Dict[str, Any]) -> Any:
+            data = event.get("data") if event.get("type") == "status" else None
+            if isinstance(data, dict) and data.get("action"):
+                if data.get("done") is False:
+                    running[data["action"]] = data
+                elif data.get("done"):
+                    running.pop(data["action"], None)
+            return await __event_emitter__(event)
+
+        return emit
+
+    async def _finish_running_statuses(
+        self,
+        __event_emitter__: Optional[Callable],
+        running: Dict[str, Dict[str, Any]],
+        cancelled: bool,
+    ) -> None:
+        """Send a final done=True status for every action still running.
+
+        Called from `finally`, so a stopped (cancelled) or failed request leaves
+        no "Thinking…", "Processing image request..." or "Generating video..."
+        status behind.
+        """
+        for action in list(running):
+            data: Dict[str, Any] = {"action": action, "done": True}
+            if action == "thinking":
+                data["hidden"] = True
+            else:
+                label = action.replace("_", " ").capitalize()
+                data["description"] = f"{label} {'stopped' if cancelled else 'failed'}"
+            await self._safe_emit(__event_emitter__, {"type": "status", "data": data})
+        running.clear()
+
+    @staticmethod
+    def _is_chat_message(__metadata__: Optional[Dict[str, Any]]) -> bool:
+        """Whether the request belongs to a chat message (browser path).
+
+        API requests (POST /api/chat/completions without chat_id) get an event
+        emitter in Open WebUI 0.9+ too, but with an empty chat_id/message_id:
+        events such as "files" are neither saved nor shown to the client then.
+        """
+        metadata = __metadata__ or {}
+        return bool(metadata.get("chat_id")) and bool(metadata.get("message_id"))
+
+    @staticmethod
+    def _content_chunk(content: str, model: str) -> Dict[str, Any]:
+        """An OpenAI chat.completion.chunk carrying `content` as delta.
+
+        Yielded instead of a plain str: Open WebUI forwards a str chunk that
+        starts with "data:" as a raw SSE line, which loses such an answer.
+        """
+        return {
+            "id": f"{model}-{uuid.uuid4()}",
+            "created": int(time.time()),
+            "model": model,
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": None,
+                    "delta": {"role": "assistant", "content": content},
+                }
+            ],
+        }
 
     async def _emit_generated_image_files(
         self,
@@ -1537,11 +1654,19 @@ class Pipe:
         generated_images: List[str],
         generated_image_files: List[Dict[str, Any]],
         __event_emitter__: Optional[Callable],
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Attach collected images to the message and return the final content."""
-        files_emitted = await self._emit_generated_image_files(
-            generated_image_files, __event_emitter__
-        )
+        """Attach collected images to the message and return the final content.
+
+        Uploaded images are attached to the chat message with a "files" event.
+        Without a chat message (API clients) that event reaches nobody, so the
+        answer links the uploaded images as markdown instead.
+        """
+        files_emitted = False
+        if self._is_chat_message(__metadata__):
+            files_emitted = await self._emit_generated_image_files(
+                generated_image_files, __event_emitter__
+            )
 
         if generated_image_files and not files_emitted:
             generated_images.extend(
@@ -2387,7 +2512,7 @@ class Pipe:
                 },
             )
 
-            self.user = user = await Users.get_user_by_id(__user__["id"])
+            user = await Users.get_user_by_id(__user__["id"])
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -2619,7 +2744,7 @@ class Pipe:
                 },
             )
 
-            self.user = user = await Users.get_user_by_id(__user__["id"])
+            user = await Users.get_user_by_id(__user__["id"])
             chat_id = __metadata__.get("chat_id") if __metadata__ else None
             message_id = __metadata__.get("message_id") if __metadata__ else None
             video_url, file_entry = await self._upload_video(
@@ -3118,29 +3243,72 @@ class Pipe:
 
         return replaced_text if replaced_text is not None else text
 
+    async def _start_stream(
+        self, open_stream: Callable[[], Awaitable[AsyncIterator[Any]]]
+    ) -> AsyncIterator[Any]:
+        """Open a Gemini stream, retrying temporary errors up to its first chunk.
+
+        generate_content_stream returns a lazy iterator: the HTTP request, and a
+        ServerError (5xx) with it, only happens when the first chunk is read.
+        Opening the stream and reading that chunk are therefore retried together
+        (RETRY_COUNT), before anything has been sent to Open WebUI. Errors after
+        the first chunk are not retried, because the answer has already started.
+        """
+
+        async def open_and_read_first() -> Tuple[AsyncIterator[Any], List[Any]]:
+            stream = (await open_stream()).__aiter__()
+            try:
+                return stream, [await stream.__anext__()]
+            except StopAsyncIteration:
+                return stream, []
+
+        stream, first = await self._retry_with_backoff(open_and_read_first)
+
+        async def chunks() -> AsyncIterator[Any]:
+            for chunk in first:
+                yield chunk
+            async for chunk in stream:
+                yield chunk
+
+        return chunks()
+
     async def _handle_streaming_response(
         self,
-        response_iterator: Any,
+        open_stream: Callable[[], Awaitable[AsyncIterator[Any]]],
         __event_emitter__: Optional[Callable],
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
         client: Optional[genai.Client] = None,
+        model: str = "",
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
 
         Args:
-            response_iterator: Iterator from generate_content
+            open_stream: Coroutine function that calls generate_content_stream.
+                It is called (and retried on temporary errors, see _start_stream)
+                when Open WebUI starts reading this generator.
             __event_emitter__: Event emitter for status updates
-            client: The per-request genai client that created response_iterator.
-                The iterator sends its HTTP request lazily through this client's
-                transport, so the client must stay referenced until the stream
-                ends. If it were garbage collected, google-genai would close the
-                transport and the stream would fail. It is closed at the end.
+            client: The per-request genai client used by open_stream. The stream
+                sends its HTTP request lazily through this client's transport, so
+                the client must stay referenced until the stream ends. If it were
+                garbage collected, google-genai would close the transport and the
+                stream would fail. It is closed at the end.
+            model: Model ID of the request (Open WebUI's, with function prefix)
+                for the chat.completion.chunk dicts.
+            __metadata__: Request metadata (decides how generated images are
+                attached).
 
         Returns:
-            Generator yielding text chunks
+            Generator yielding chat.completion.chunk dicts (answer and error
+            messages) and a usage chunk
         """
+        # Remember statuses that are still running, to close them if the request
+        # is stopped or fails (see finally).
+        running_statuses: Dict[str, Dict[str, Any]] = {}
+        __event_emitter__ = self._track_statuses(__event_emitter__, running_statuses)
+        cancelled = False
 
         async def emit_chat_event(event_type: str, data: Dict[str, Any]) -> None:
             if not __event_emitter__:
@@ -3165,6 +3333,7 @@ class Pipe:
         last_finish_reason: Any = None
 
         try:
+            response_iterator = await self._start_stream(open_stream)
             async for chunk in response_iterator:
                 # Capture usage metadata (final chunk has complete data)
                 if getattr(chunk, "usage_metadata", None):
@@ -3189,7 +3358,7 @@ class Pipe:
                                 "error": True,
                             },
                         )
-                        yield message
+                        yield self._content_chunk(message, model)
                     else:
                         message = "[Blocked by safety settings]"
                         await emit_chat_event(
@@ -3201,7 +3370,7 @@ class Pipe:
                                 "error": True,
                             },
                         )
-                        yield message
+                        yield self._content_chunk(message, model)
                     return  # Stop generation
 
                 if chunk.candidates[0].grounding_metadata:
@@ -3361,6 +3530,7 @@ class Pipe:
                     generated_images,
                     generated_image_files,
                     __event_emitter__,
+                    __metadata__,
                 )
 
             # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
@@ -3394,7 +3564,13 @@ class Pipe:
 
             # Yield final content to ensure the async iterator completes properly.
             # This ensures the response is persisted even if the user navigates away.
-            yield final_content
+            # As a chunk dict, so an answer starting with "data:" stays content.
+            yield self._content_chunk(final_content, model)
+
+        except (asyncio.CancelledError, GeneratorExit):
+            # Stopped by the user or the client went away
+            cancelled = True
+            raise
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
@@ -3415,9 +3591,12 @@ class Pipe:
                     "error": True,
                 },
             )
-            yield message
+            yield self._content_chunk(message, model)
 
         finally:
+            await self._finish_running_statuses(
+                __event_emitter__, running_statuses, cancelled
+            )
             await self._close_client(client)
 
     @staticmethod
@@ -3550,8 +3729,12 @@ class Pipe:
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
         __metadata__: Optional[Dict[str, Any]] = None,
+        user: Optional[UserModel] = None,
     ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
-        """Generate video using Google Veo models (long-running operation with polling)."""
+        """Generate video using Google Veo models (long-running operation with polling).
+
+        `user` is the requesting user for the forwarded user info headers.
+        """
 
         async def emit_status(description: str, done: bool) -> None:
             if not __event_emitter__:
@@ -3601,7 +3784,41 @@ class Pipe:
 
         await emit_status(f"Starting video generation with {model_id}...", False)
 
-        client = self._get_client()
+        client = self._get_client(user)
+        try:
+            return await self._run_video_generation(
+                client=client,
+                model_id=model_id,
+                prompt=prompt,
+                reference_image=reference_image,
+                config=config,
+                emit_status=emit_status,
+                body=body,
+                __event_emitter__=__event_emitter__,
+                __request__=__request__,
+                __user__=__user__,
+                __metadata__=__metadata__,
+            )
+        finally:
+            # The client is per request: close it after polling and the
+            # downloads (which use its sync transport), also on error or stop.
+            await self._close_client(client)
+
+    async def _run_video_generation(
+        self,
+        client: genai.Client,
+        model_id: str,
+        prompt: str,
+        reference_image: Optional[types.Image],
+        config: types.GenerateVideosConfig,
+        emit_status: Callable[[str, bool], Awaitable[None]],
+        body: Dict[str, Any],
+        __event_emitter__: Optional[Callable],
+        __request__: Optional[Request],
+        __user__: Optional[dict],
+        __metadata__: Optional[Dict[str, Any]],
+    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
+        """Start a Veo operation, poll it, then upload and attach the videos."""
         try:
             # The prompt/image arguments are deprecated in google-genai; the
             # inputs go into a GenerateVideosSource instead.
@@ -3753,9 +3970,13 @@ class Pipe:
 
         await emit_status(f"Video generation complete ({elapsed}s)", True)
 
-        files_emitted = await self._emit_generated_video_files(
-            generated_video_files, __event_emitter__
-        )
+        # Without a chat message (API clients) a "files" event reaches nobody,
+        # so the answer links the uploaded videos instead.
+        files_emitted = False
+        if self._is_chat_message(__metadata__):
+            files_emitted = await self._emit_generated_video_files(
+                generated_video_files, __event_emitter__
+            )
 
         content_parts: List[str] = []
         if generated_video_files and files_emitted:
@@ -3766,9 +3987,6 @@ class Pipe:
                 else f"Generated {video_count} videos attached."
             )
         else:
-            content_parts.extend(generated_video_links)
-
-        if generated_video_files and not files_emitted:
             content_parts.extend(generated_video_links)
 
         if upload_failure_count:
@@ -3861,10 +4079,17 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        if __user__:
-            self.user = await Users.get_user_by_id(__user__["id"])
-        else:
-            self.user = None
+        # The requesting user for the forwarded user info headers. A local, not
+        # an attribute: the Pipe instance is shared by concurrent requests.
+        user: Optional[UserModel] = None
+        if __user__ and self.valves.ENABLE_FORWARD_USER_INFO_HEADERS:
+            user = await Users.get_user_by_id(__user__["id"])
+
+        # Remember statuses that are still running, to close them if the request
+        # is stopped or fails (see finally).
+        running_statuses: Dict[str, Dict[str, Any]] = {}
+        __event_emitter__ = self._track_statuses(__event_emitter__, running_statuses)
+        cancelled = False
 
         try:
             # Parse and validate model ID
@@ -3885,6 +4110,7 @@ class Pipe:
                     __request__,
                     __user__,
                     __metadata__,
+                    user=user,
                 )
 
             # Check if this model supports image generation
@@ -3939,7 +4165,7 @@ class Pipe:
             )
 
             # Make the API call
-            client = self._get_client()
+            client = self._get_client(user)
             if stream:
                 # For image generation models, disable streaming to avoid chunk size issues
                 if supports_image_generation:
@@ -3948,35 +4174,27 @@ class Pipe:
                     )
                     stream = False
                 else:
-                    try:
 
-                        async def get_streaming_response():
-                            return await client.aio.models.generate_content_stream(
-                                model=model_id,
-                                contents=contents,
-                                config=generation_config,
-                            )
-
-                        response_iterator = await self._retry_with_backoff(
-                            get_streaming_response
-                        )
-                        self.log.debug(f"Request {request_id}: Got streaming response")
-                        # Hand the client over so it lives (and is closed) with the
-                        # stream; the request itself only starts on iteration.
-                        return self._handle_streaming_response(
-                            response_iterator,
-                            __event_emitter__,
-                            __request__,
-                            __user__,
-                            client=client,
+                    async def get_streaming_response():
+                        return await client.aio.models.generate_content_stream(
+                            model=model_id,
+                            contents=contents,
+                            config=generation_config,
                         )
 
-                    except Exception as e:
-                        self.log.exception(
-                            f"Error in streaming request {request_id}: {e}"
-                        )
-                        await self._close_client(client)
-                        return f"Error during streaming: {e}"
+                    self.log.debug(f"Request {request_id}: Streaming response")
+                    # The request (with its retries) only starts when Open WebUI
+                    # reads the stream. Hand the client over so it lives (and is
+                    # closed) with the stream.
+                    return self._handle_streaming_response(
+                        get_streaming_response,
+                        __event_emitter__,
+                        __request__,
+                        __user__,
+                        client=client,
+                        model=body.get("model", model_id),
+                        __metadata__=__metadata__,
+                    )
 
             # Non-streaming path (now also used for image generation)
             if not stream or supports_image_generation:
@@ -4142,6 +4360,7 @@ class Pipe:
                         generated_images,
                         generated_image_files,
                         __event_emitter__,
+                        __metadata__,
                     )
 
                     # Build response with usage for middleware to extract and save to DB
@@ -4181,6 +4400,11 @@ class Pipe:
                     # The client is per request; nothing uses it after this point.
                     await self._close_client(client)
 
+        except asyncio.CancelledError:
+            # Stopped by the user
+            cancelled = True
+            raise
+
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
             error_msg = f"{error_type}: {api_error}"
@@ -4201,3 +4425,11 @@ class Pipe:
 
             # Return a user-friendly error message
             return f"An error occurred while processing your request: {e}"
+
+        finally:
+            # A started action (image_processing, video_generation, ...) gets a
+            # final status even if the request was stopped or failed. A returned
+            # stream closes its own statuses.
+            await self._finish_running_statuses(
+                __event_emitter__, running_statuses, cancelled
+            )
