@@ -34,10 +34,21 @@ IMAGE_GA = f"{FID}.gemini-3.1-flash-image"
 VEO = f"{FID}.veo-3.1-generate-preview"
 EMBEDDING = f"{FID}.text-embedding-004"
 SEARCH_FILTER = "google_search_tool"
+# grounding chunk URI returned by mocks/mock_gemini.py
+GROUNDING_URI = "https://example.com/a"
 
 
 def _generate(entry: dict) -> bool:
     return entry.get("action") in ("generateContent", "streamGenerateContent")
+
+
+def _strings(value) -> list:
+    """All string values nested anywhere in ``value`` (dicts and lists)."""
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return [value] if isinstance(value, str) else []
 
 
 def _image_delivered(chat) -> bool:
@@ -344,7 +355,7 @@ async def grounding(t: Suite, mock) -> None:
         "browser path: googleSearch sent, grounding sources + [1] citation saved",
         c.done
         and "googleSearch" in (req.get("tool_kinds") or [])
-        and any("example.com" in str(s) for s in c.sources)
+        and any(s == GROUNDING_URI for s in _strings(c.sources))
         and "[1]" in c.content,
         c.brief() + f" tool_kinds={req.get('tool_kinds')}",
     )
