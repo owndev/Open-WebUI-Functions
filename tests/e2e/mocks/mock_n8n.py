@@ -25,7 +25,10 @@ n8n sends), SSE streams ``text/event-stream``; every piece is its own write.
   stream-plain          text/event-stream of plain text lines only
   stream-utf8-split     NDJSON with raw (unescaped) UTF-8 content, the bytes cut
                         right after every multi-byte lead byte, 0.3 s per write
-  stream-braces         NDJSON items with braces and quotes inside the strings
+  stream-braces         n8n items with braces and quotes inside the strings,
+                        written back to back ('{..}{..}', no line break between
+                        them, one write each), so only a string-aware scanner
+                        finds where an object ends
   stream-sse-fields     SSE with event:/id:/retry: fields and a multi-line data:
   stream-openai         OpenAI chat.completion.chunk events (deltas, finish and
                         usage chunk, [DONE]) in one write
@@ -142,6 +145,15 @@ def _large_flat() -> list:
     return [raw[i : i + 1024] for i in range(0, len(raw), 1024)]
 
 
+def _back_to_back(items: list) -> list:
+    """Begin and end lines, the items as JSON objects back to back on one line
+    (each object its own write)."""
+    lines = _ndjson(items)
+    objects = [line.rstrip("\n") for line in lines[1:-1]]
+    objects[-1] += "\n"
+    return [lines[0], *objects, lines[-1]]
+
+
 def _error_chunk() -> list:
     lines = [
         {"type": "begin", "metadata": NDJSON_META},
@@ -166,7 +178,7 @@ def _stream(scenario: str):
         raw = "".join(_ndjson(UTF8_ITEMS, ensure_ascii=False)).encode()
         return NDJSON, _split_after_lead_bytes(raw), 0.3
     if scenario == "stream-braces":
-        return NDJSON, _ndjson(BRACE_ITEMS), STREAM_DELAY
+        return NDJSON, _back_to_back(BRACE_ITEMS), STREAM_DELAY
     if scenario == "stream-sse-fields":
         pieces = [
             'event: message\nid: 1\nretry: 1000\ndata: {"content": "Event one. "}\n\n',

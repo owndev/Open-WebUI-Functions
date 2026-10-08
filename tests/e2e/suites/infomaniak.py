@@ -321,7 +321,10 @@ async def browser(t: Suite, mock) -> None:
             known=known.INFOMANIAK_MIDFAIL,
         )
 
-        for name, kind in (("slow", "stream"), ("slowheaders", "headers")):
+        for name, kind, when in (
+            ("slow", "stream", "during the stream"),
+            ("slowheaders", "headers", "while waiting for the response headers"),
+        ):
             c = await b.chat(
                 model(name),
                 "Hello",
@@ -332,10 +335,7 @@ async def browser(t: Suite, mock) -> None:
             last = c.status_history[-1] if c.status_history else {}
             t.check(
                 f"browser.stop.{kind}",
-                "Stop "
-                + ("during the stream" if name == "slow" else "while waiting for the ")
-                + ("" if name == "slow" else "response headers")
-                + ": final status 'Stopped' (done)",
+                f"Stop {when}: final status 'Stopped' (done)",
                 bool(c.stopped)
                 and all(status == 200 for status, _ in c.stopped)
                 and last.get("description") == "Stopped"
