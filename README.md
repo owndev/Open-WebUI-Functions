@@ -253,10 +253,13 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
 - Uses OpenAI's `tiktoken` library for token counting (accurate only for OpenAI models).
-- Falls back to an estimate (about 4 characters per token) while no `tiktoken` encoding is loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through. The encoding is downloaded in the background; requests do not wait for it (the very first one at most 5 seconds).
+- Falls back to an estimate (about 4 characters per token) while no `tiktoken` encoding is loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through. The encoding is downloaded in the background; requests do not wait for it (the very first one at most 5 seconds). Estimated counts are marked: `tokensEstimated` in the Log Analytics record and the log line, `~` in the status message.
 - Also works for API requests. Since Open WebUI 0.10, the filter's outlet step runs for them too. There is no chat window to show a status message, but the metrics are still logged and sent to Log Analytics.
 - On Open WebUI 0.11, response time and request tokens stay correct when Open WebUI adds RAG context or a code interpreter prompt to the user message after the filter's inlet step.
-- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`).
+- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`). The record is sent in the background with a 10 second timeout, so responses do not wait for Log Analytics.
+
+> [!WARNING]
+> The filter uses the Azure Monitor HTTP Data Collector API. Microsoft ended support for it on September 14, 2026; ingestion still works, but not for workspaces behind Azure Monitor Private Link (AMPLS). The [Logs ingestion API](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/custom-logs-migrate) that replaces it is not supported yet. See [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md).
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 

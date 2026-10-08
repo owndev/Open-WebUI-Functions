@@ -13,10 +13,10 @@ features:
   - Tracks Token Usage.
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
-  - Sends metrics to Azure Log Analytics.
-  - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests.
+  - Sends metrics to Azure Log Analytics in the background (10 s timeout), so responses do not wait for it.
+  - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests. Estimates are marked (tokensEstimated in the record and the log line, "~" in the status).
 changelog:
-  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
+  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). Open WebUI awaits outlet() before it returns an API response, so the Log Analytics send now runs in a background task with its own timeout (10 s, 5 s to connect) instead of AIOHTTP_CLIENT_TIMEOUT (no timeout by default); a slow or unreachable Log Analytics endpoint no longer delays or stalls responses. The record timestamp is UTC with a "Z" suffix, and the new boolean record field tokensEstimated tells estimated token counts from exact ones. SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
@@ -32,7 +32,7 @@ import os
 import logging
 import aiohttp
 from typing import Optional, Any
-from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+from open_webui.env import SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import tiktoken
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -69,6 +69,16 @@ _ENCODING_FIRST_LOAD_WAIT = 5
 _encodings: dict[str, Any] = {}
 _encoding_loads: dict[str, asyncio.Task] = {}
 _encoding_failures: dict[str, float] = {}
+
+# Open WebUI awaits outlet() before it returns the response of an API request,
+# so outlet() hands the Log Analytics send to a background task instead of
+# waiting for the round trip. The event loop keeps only weak references to
+# tasks; this set keeps each send alive until it is done.
+_log_analytics_sends: set[asyncio.Task] = set()
+
+# Own timeout for the send. Open WebUI's AIOHTTP_CLIENT_TIMEOUT is unset by
+# default, which means no timeout at all.
+_LOG_ANALYTICS_TIMEOUT = aiohttp.ClientTimeout(total=10, sock_connect=5)
 
 
 def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
@@ -293,8 +303,15 @@ class Filter:
         )
         return authorization
 
-    async def _send_to_log_analytics_async(self, data):
-        """Send data to Azure Log Analytics asynchronously using aiohttp."""
+    def _send_to_log_analytics(self, data, chat_id: str, message_id: str) -> bool:
+        """
+        Sign the request now and send it to Azure Log Analytics in a
+        background task. Returns False when sending is not configured.
+
+        The request is built here, before outlet() returns, so the background
+        task gets the valve values of this request and only the signature,
+        never the decrypted key.
+        """
         if (
             not self.valves.SEND_TO_LOG_ANALYTICS
             or not self.valves.LOG_ANALYTICS_WORKSPACE_ID
@@ -330,13 +347,23 @@ class Filter:
             "time-generated-field": "timestamp",
         }
 
+        task = asyncio.create_task(
+            self._post_to_log_analytics(uri, headers, data, chat_id, message_id)
+        )
+        _log_analytics_sends.add(task)
+        task.add_done_callback(_log_analytics_sends.discard)
+        return True
+
+    async def _post_to_log_analytics(
+        self, uri: str, headers: dict, data, chat_id: str, message_id: str
+    ) -> bool:
+        """POST a signed record to Azure Log Analytics (runs as a background task)."""
         session = None
         response = None
 
         try:
             session = aiohttp.ClientSession(
-                trust_env=True,
-                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+                trust_env=True, timeout=_LOG_ANALYTICS_TIMEOUT
             )
 
             response = await session.request(
@@ -347,22 +374,31 @@ class Filter:
             )
 
             if response.status == 200:
-                self.log.debug("Log Analytics accepted the payload (HTTP 200)")
+                self.log.info(
+                    f"Log Analytics data sent successfully "
+                    f"(chat={chat_id}, message={message_id})"
+                )
                 return True
             else:
                 response_text = await response.text()
                 self.log.error(
                     f"Error sending to Log Analytics: {response.status} - {response_text}"
                 )
-                return False
 
         except Exception as e:
+            # str() of a timeout is empty: name the exception type.
             self.log.error(
-                f"Exception when sending to Log Analytics asynchronously: {str(e)}"
+                f"Exception when sending to Log Analytics asynchronously: "
+                f"{type(e).__name__}: {e}"
             )
-            return False
         finally:
             await cleanup_response(response, session)
+
+        self.log.warning(
+            f"Failed to send data to Log Analytics "
+            f"(chat={chat_id}, message={message_id})"
+        )
+        return False
 
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""
@@ -467,16 +503,28 @@ class Filter:
             )
             return None
 
-    def _count_tokens(self, encoding, text: str) -> int:
-        """Count tokens with tiktoken, or estimate them as len(text) // 4."""
+    def _count_tokens(self, encoding, text: str) -> tuple[int, bool]:
+        """
+        Count tokens with tiktoken, or estimate them as len(text) // 4.
+        Returns (count, estimated).
+        """
         if encoding is not None:
             try:
                 # disallowed_special=(): text such as "<|endoftext|>" in a
                 # message is counted as plain text instead of raising.
-                return len(encoding.encode(text, disallowed_special=()))
+                return len(encoding.encode(text, disallowed_special=())), False
             except Exception as e:
                 self.log.warning(f"tiktoken could not encode text ({e}), estimating")
-        return len(text) // 4
+        return len(text) // 4, True
+
+    def _count_messages(self, encoding, messages) -> tuple[int, bool]:
+        """Sum the token counts of messages; True if any count is an estimate."""
+        counts = [
+            self._count_tokens(encoding, self._get_message_content(m))
+            for m in messages
+            if m
+        ]
+        return sum(n for n, _ in counts), any(e for _, e in counts)
 
     async def inlet(
         self,
@@ -532,16 +580,15 @@ class Filter:
                 )
                 request_messages = [last_user_system] if last_user_system else []
 
-        request_token_count = sum(
-            self._count_tokens(encoding, self._get_message_content(m))
-            for m in request_messages
-            if m
+        request_token_count, tokens_estimated = self._count_messages(
+            encoding, request_messages
         )
 
         entry = {
             "key": storage_key,
             "start_time": time.time(),
             "request_token_count": request_token_count,
+            "tokens_estimated": tokens_estimated,
         }
         _request_data[storage_key] = entry
         if isinstance(__metadata__, dict):
@@ -550,7 +597,8 @@ class Filter:
         self.log.info(
             f"Inlet complete: key={storage_key}, model={model}, "
             f"request_tokens={request_token_count}, "
-            f"counted_messages={len(request_messages)}"
+            f"counted_messages={len(request_messages)}, "
+            f"tokens_estimated={tokens_estimated}"
         )
 
         return body
@@ -603,6 +651,7 @@ class Filter:
         end_time = time.time()
         response_time = end_time - request_data.get("start_time", end_time)
         request_token_count = request_data.get("request_token_count", 0)
+        tokens_estimated = bool(request_data.get("tokens_estimated", False))
 
         encoding = await self._get_encoding(model)
 
@@ -622,22 +671,18 @@ class Filter:
 
         # response_token_count is a local variable here; unlike the original
         # global, it does not need to persist beyond this method.
-        response_token_count = sum(
-            self._count_tokens(encoding, self._get_message_content(m))
-            for m in assistant_messages
-            if m
-        )  # Calculate tokens per second (only for the last assistant response)
+        response_token_count, response_estimated = self._count_messages(
+            encoding, assistant_messages
+        )
+        tokens_estimated = tokens_estimated or response_estimated
+        # Calculate tokens per second (only for the last assistant response)
         resp_tokens_per_sec = 0
         if self.valves.SHOW_TOKENS_PER_SECOND:
             last_assistant_msg = next(
                 (m for m in reversed_messages if m.get("role") == "assistant"), None
             )
-            last_assistant_tokens = (
-                self._count_tokens(
-                    encoding, self._get_message_content(last_assistant_msg)
-                )
-                if last_assistant_msg
-                else 0
+            last_assistant_tokens, _ = self._count_messages(
+                encoding, [last_assistant_msg]
             )
             resp_tokens_per_sec = (
                 0 if response_time == 0 else last_assistant_tokens / response_time
@@ -654,6 +699,8 @@ class Filter:
             avg_response_tokens = response_token_count / resp_count if resp_count else 0
 
         # Shorter style, e.g.: "10.90s | Req: 175 (Ø 87.50) | Resp: 439 (Ø 219.50) | 40.18 T/s"
+        # Estimated token numbers get a "~", e.g. "Req: ~175 (Ø ~87.50)".
+        est = "~" if tokens_estimated else ""
         description_parts = []
         if self.valves.SHOW_RESPONSE_TIME:
             description_parts.append(f"{response_time:.2f}s")
@@ -661,21 +708,25 @@ class Filter:
             if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 # Add averages (Ø) into short output
                 short_str = (
-                    f"Req: {request_token_count} (Ø {avg_request_tokens:.2f}) | "
-                    f"Resp: {response_token_count} (Ø {avg_response_tokens:.2f})"
+                    f"Req: {est}{request_token_count} (Ø {est}{avg_request_tokens:.2f}) | "
+                    f"Resp: {est}{response_token_count} (Ø {est}{avg_response_tokens:.2f})"
                 )
             else:
-                short_str = f"Req: {request_token_count} | Resp: {response_token_count}"
+                short_str = (
+                    f"Req: {est}{request_token_count} | "
+                    f"Resp: {est}{response_token_count}"
+                )
             description_parts.append(short_str)
         if self.valves.SHOW_TOKENS_PER_SECOND:
-            description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
+            description_parts.append(f"{est}{resp_tokens_per_sec:.2f} T/s")
         description = " | ".join(description_parts)
 
         self.log.info(
             f"Outlet complete: key={storage_key}, model={model}, "
             f"response_time={response_time:.2f}s, "
             f"req_tokens={request_token_count}, resp_tokens={response_token_count}, "
-            f"tokens_per_sec={resp_tokens_per_sec:.2f}"
+            f"tokens_per_sec={resp_tokens_per_sec:.2f}, "
+            f"tokens_estimated={tokens_estimated}"
         )
         self.log.debug(f"Status event: {description}")
 
@@ -705,7 +756,10 @@ class Filter:
             # Create log data for Log Analytics
             log_data = [
                 {
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                    # ISO 8601 in UTC with "Z", as time-generated-field expects
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "chatId": chat_id,
                     "messageId": message_id,
                     "model": model,
@@ -714,6 +768,7 @@ class Filter:
                     "requestTokens": request_token_count,
                     "responseTokens": response_token_count,
                     "tokensPerSecond": resp_tokens_per_sec,
+                    "tokensEstimated": tokens_estimated,
                 }
             ]
 
@@ -722,15 +777,10 @@ class Filter:
                 log_data[0]["avgRequestTokens"] = avg_request_tokens
                 log_data[0]["avgResponseTokens"] = avg_response_tokens
 
-            # Send to Log Analytics asynchronously (non-blocking)
+            # Sent in a background task: outlet() returns without waiting for
+            # Log Analytics, the task logs the outcome.
             try:
-                result = await self._send_to_log_analytics_async(log_data)
-                if result:
-                    self.log.info(
-                        f"Log Analytics data sent successfully "
-                        f"(chat={chat_id}, message={message_id})"
-                    )
-                else:
+                if not self._send_to_log_analytics(log_data, chat_id, message_id):
                     self.log.warning(
                         f"Failed to send data to Log Analytics "
                         f"(chat={chat_id}, message={message_id})"
