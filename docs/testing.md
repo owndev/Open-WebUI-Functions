@@ -49,8 +49,8 @@ Open WebUI healthy after 67s (http://localhost:49213)
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [KNOWN] gemini.api.stream  API stream without websocket session: answer streamed
           -> known B1 (no issue filed): Gemini API stream without a websocket session ends
-             with 'Error during streaming' ...; fix pending in branch hotfix/gemini-1.16.2
-             (not merged yet)
+             with 'Error during streaming' ...; fix pending in PR #185 (not
+             merged yet)
 ...
 SUMMARY: 98 PASS, 0 FAIL, 27 KNOWN in 258s
 total runtime: 368s
@@ -138,9 +138,9 @@ Open WebUI handed it (`__metadata__` features/params, `__task__`, whether an
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known.py` (key, summary, issue reference, branch with the pending
-  fix, evidence). Printed with the bug, e.g.
-  `known B1 (no issue filed): ...; fix pending in branch hotfix/gemini-1.16.2 (not merged yet)`.
+  `tests/e2e/harness/known.py` (key, summary, issue reference, pull request with the
+  pending fix, evidence). Printed with the bug, e.g.
+  `known B1 (no issue filed): ...; fix pending in PR #185 (not merged yet)`.
   KNOWN does not fail the run. When a KNOWN scenario starts to pass (the fix was merged)
   the driver prints `known B1 no longer reproduces: drop the known= marker`.
 

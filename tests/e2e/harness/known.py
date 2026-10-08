@@ -20,9 +20,9 @@ When the fix is merged the scenario starts to PASS and the driver prints a
 reminder to drop the ``known=`` argument (and the entry here, once nothing
 references it).
 
-``fixed_by`` names the branch that carries the fix. Until the fix is merged that
-branch may only exist as an open pull request, or not be published yet; the
-issue in ``ref`` (when there is one) is the stable pointer.
+``fixed_by`` names the pull request (or branch) that carries the fix. Until it is
+merged the scenario stays KNOWN; the issue in ``ref`` (when there is one) is the
+stable pointer.
 """
 
 import re
@@ -51,7 +51,7 @@ class KnownIssue:
     def label(self) -> str:
         ref = f" ({self.ref})" if self.ref else ""
         fix = (
-            f"fix pending in branch {self.fixed_by} (not merged yet)"
+            f"fix pending in {self.fixed_by} (not merged yet)"
             if self.fixed_by
             else "no fix yet"
         )
@@ -71,10 +71,10 @@ class KnownIssue:
         return asdict(self)
 
 
-GEMINI_FIX = "hotfix/gemini-1.16.2"
-AZURE_FIX = "hotfix/azure-2.7.1"
-FILTERS_FIX = "hotfix/filters-owui-0.10-compat"
-N8N_INFOMANIAK_FIX = "hotfix/n8n-infomaniak-streaming"
+GEMINI_FIX = "PR #185"
+AZURE_FIX = "PR #183"
+FILTERS_FIX = "PR #184"
+N8N_INFOMANIAK_FIX = "PR #182"
 NO_ISSUE = "no issue filed"
 FOUND_BY_E2E = "found by tests/e2e, no issue filed"
 
