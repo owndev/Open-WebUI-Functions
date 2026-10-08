@@ -64,9 +64,11 @@ on the first `time_token_tracker` call). Without those the suites run in seconds
 
 The exit code is `0` when there is no FAIL (KNOWN results are fine), `1` when at least
 one scenario FAILs and `2` for setup errors: Docker missing, `docker run` failing (port
-busy, image missing), container not healthy, an option without its value, an unknown
-suite, `--file` path or git ref, an `--only` regex that selects no scenario group, a
-crashed driver.
+busy, image missing), container not healthy, a volume `NAME-data` left over from an
+earlier run (see `--force`), an option without its value, an unknown suite, `--file`
+path or git ref, an `--only` regex that selects no scenario group, a driver error, a
+driver that outlived `E2E_TIMEOUT` and had to be stopped. After Ctrl-C (SIGINT) or
+SIGTERM the script exits with `130` / `143`; see [Interrupted runs](#interrupted-runs).
 
 ## Options
 
@@ -80,10 +82,23 @@ crashed driver.
 | `--file PATH=FILE` | – | replace one function file, e.g. `--file pipelines/azure/azure_ai_foundry.py=/tmp/fix.py` (repeatable); `PATH` must be one of the function files the harness installs, anything else is an error |
 | `-n, --name NAME` | `$E2E_NAME` or `owui-e2e-<time>-<random>` | container name; the volume is `NAME-data` |
 | `-p, --port PORT` | `$E2E_PORT` or a free port picked by Docker | host port of the UI (bound to 127.0.0.1) |
-| `-o, --out DIR` | `tests/e2e/out/<timestamp>-<name>` | output directory (git-ignored) |
-| `-k, --keep` | off | keep container and volume after the run |
-| `--reuse` | off | reuse the running container `--name` (implies `--keep`), skips the start-up |
+| `-o, --out DIR` | `$E2E_OUT` or `tests/e2e/out/<timestamp>-<name>` | output directory (git-ignored) |
+| `-k, --keep` | off (`E2E_KEEP=1` turns it on) | keep container and volume after the run |
+| `--reuse` | off | reuse the running container `--name` (implies `--keep`): skips the start-up, stops drivers left over from an interrupted run, copies the current files, restarts the mocks |
+| `--force` | off | delete a volume `NAME-data` left over from an earlier run; without it `run.sh` refuses to start (exit 2) instead of silently deleting data |
 | `-v, --verbose` | off | print details of passing scenarios too |
+| `--strict-known` | off (`E2E_STRICT_KNOWN=1` turns it on; on in CI) | a check tagged with a known bug that passes while its marker still applies is a FAIL, see [Results](#results-pass-fail-known) |
+
+Environment variables (all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OWUI_IMAGE`, `E2E_NAME`, `E2E_PORT`, `E2E_OUT`, `E2E_KEEP=1`, `E2E_STRICT_KNOWN=1` | – | defaults of `--image`, `--name`, `--port`, `--out`, `--keep`, `--strict-known` |
+| `E2E_TIMEOUT` | `1800` | time budget of the driver in seconds. A suite still running when it is used up is a `<suite>.timeout` FAIL, suites that can no longer start get the same FAIL, and `results.json` is written. If the driver itself hangs, `run.sh` stops it 60 s later (SIGTERM, then SIGKILL after another 60 s) and exits with 2 |
+| `E2E_SUITE_TIMEOUT` | `900` | time limit of one suite in seconds (`<suite>.timeout` FAIL; the next suite still runs) |
+| `E2E_HEALTH_TIMEOUT` | `600` | seconds to wait for Open WebUI's `/health` after the container start |
+| `E2E_SECRET_KEY` | a fixed test key | `WEBUI_SECRET_KEY` of the container (encrypts the valves) |
+| `E2E_MOCK_FAULT` | – | an HTTP status (e.g. `500`) every provider route of the mocks answers with; used by the CI meta-test ([CI](#ci)) |
 
 `--only` takes a plain Python regex. Write alternatives with an unescaped pipe inside
 quotes:
@@ -138,11 +153,12 @@ Open WebUI handed it (`__metadata__` features/params, `__task__`, whether an
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known.py` (key, summary, issue reference, pull request with the
-  pending fix, evidence). Printed with the bug, e.g.
-  `known B1 (no issue filed): ...; fix pending in PR #185 (not merged yet)`.
-  KNOWN does not fail the run. When a KNOWN scenario starts to pass (the fix was merged)
-  the driver prints `known B1 no longer reproduces: drop the known= marker`.
+  `tests/e2e/harness/known_<area>.py` (`known_gemini.py`, `known_azure.py`,
+  `known_filters.py`, `known_n8n.py` for n8n + Infomaniak; re-exported by `known.py`):
+  key, summary, issue reference, pull request with the pending fix, evidence, and the
+  function `file` plus the version `fixed_in` that fixes it. Printed with the bug, e.g.
+  `known B1 (no issue filed): ...; fix pending in PR #185 (not merged yet), fixed in
+  pipelines/google/google_gemini.py 1.17.0`. KNOWN does not fail the run.
 
 A tagged check only counts as KNOWN when the failure **looks like that bug**: one of the
 bug's `evidence` regexes matches the check's detail text, or (for checks that pass
@@ -150,27 +166,61 @@ bug's `evidence` regexes matches the check's detail text, or (for checks that pa
 check that fails in another way (an HTTP 500, a missing model, ...) is a FAIL and says
 `tagged known <key>, but the failure does not show it`.
 
+**Version gating.** A known marker only applies while the tested copy of its `file`
+(the staged file in `functions/`) has a docstring `version:` lower than `fixed_in`:
+
+| Tested file | Tagged check fails | Tagged check passes |
+| --- | --- | --- |
+| older than `fixed_in` (e.g. `main` before the fix is merged) | KNOWN | PASS with the reminder `no longer reproduces, but <file> is older than <fixed_in>` (a FAIL in strict mode) |
+| `fixed_in` or newer (the fix branch, `main` after the merge, a mutant of the fixed file) | FAIL `regression of known <key> (fixed in <file> <version>)` | PASS, listed under **Obsolete known markers: drop marker** in `summary.md` and `obsolete_markers` in `results.json` (not a failure) |
+
+So `main` stays green while a fix is pending, the fix branch is protected against
+regressions of exactly that bug, and the markers switch off by themselves once the fix
+(with its version bump) is merged. A bug without a fix has `fixed_in=""` and is never
+gated.
+
+**Strict mode** (`--strict-known` or `E2E_STRICT_KNOWN=1`, on in CI): a tagged check that
+passes while its marker still applies is a FAIL. It catches a fix without a version bump
+and evidence that no longer describes the bug.
+
 The fixing branch named in a KNOWN line may only exist as an open pull request (or not be
 published yet) until the fix is merged; the issue link, where there is one, is the
 stable reference.
 
-The `server-log` check fails on every ERROR / Traceback block logged while the suite ran,
-except blocks provoked on purpose (e.g. an upstream HTTP 400/500 test) and blocks that
-match the narrow log signature of a known bug that reproduced in this suite (function
-name plus error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is
-not callable`). A different error in the same function, or the same error in another
+The `server-log` check fails on every ERROR / Traceback / `ResourceWarning` block logged
+while the suite ran, on plaintext values of password valves (any log level), and on
+WARNING blocks a suite registered with `fail_on_warnings`, except blocks provoked on
+purpose (`expect_errors` with the signature of the provoked error) and blocks that match
+the narrow log signature of a known bug that reproduced in this suite (function name plus
+error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is not
+callable`). A different error in the same function, or the same error in another
 function, still fails it.
+
+The driver adds a few checks of its own; they only show up when something is wrong:
+
+| Check | FAIL when |
+| --- | --- |
+| `<suite>.timeout` | the suite ran longer than `E2E_SUITE_TIMEOUT`, or the run's budget `E2E_TIMEOUT` was used up (also for suites that could not start any more); the detail names the last check the suite recorded |
+| `<suite>.crash` | the suite raised an exception (also `CancelledError`, `KeyboardInterrupt` or `SystemExit` from suite code); the other suites still run |
+| `<suite>.no-checks` | the suite recorded no check at all |
+| `<suite>.interrupted` | Ctrl-C / SIGTERM stopped the run during the suite (partial results) |
+| `<suite>.server-log` | also recorded by the driver for a suite that ended before its own log scan (crash, timeout, return after a failed install) |
+| `run.server-log` | an unexpected error block or a plaintext secret in a part of the server log no suite's `server-log` check read: before the first suite, between suites (the driver waits 1 s after each suite so late lines are not charged to the next one) and after the last one (late background tasks). The detail names the window (`after azure`) and the `function_<id>` that logged it |
+| `run.mocks-log` | an error in the output of the provider mocks (`mocks.txt`). A mock answer that was cut short because the client (the pipe) closed the connection is listed as a note in `summary.md`, not a FAIL |
 
 The output directory contains:
 
 | File | Content |
 | --- | --- |
 | `driver.txt` | console output of the run |
-| `results.json` | `meta` (image, Open WebUI version, function sources, duration), `summary`, one entry per scenario (`suite`, `id`, `title`, `status`, `detail`, `known`) |
-| `summary.md` | Markdown summary (used as GitHub Actions job summary) |
-| `server.log` | `docker logs` of the Open WebUI container |
+| `results.json` | `meta` (image, Open WebUI version, function sources and their `versions`, `strict_known`, time limits, `completed`, `interrupted` / `setup_error` / `driver_error` when the run was cut short, `mock_notes`), `summary`, `obsolete_markers`, one entry per scenario (`suite`, `id`, `title`, `status`, `detail`, `known`, `marker`) |
+| `summary.md` | Markdown summary (used as GitHub Actions job summary), with notes on partial results and cut-short mock answers |
+| `server.log` | output of the Open WebUI server (`/tmp/e2e/server.log` in the container, the same text as `docker logs`) |
 | `mocks.txt` | output of the mock servers |
-| `functions/` | the exact function files that were tested, plus `SOURCES.txt` (where they came from) |
+| `functions/` | the exact function files that were tested (converted to LF line endings), plus `SOURCES.txt` (where they came from) |
+
+`results.json` and `summary.md` are also written when the run is cut short (Ctrl-C,
+SIGTERM, `E2E_TIMEOUT`, a driver error); `meta.completed` is then `false`.
 
 ## Testing a fix, another branch or another Open WebUI version
 
@@ -183,11 +233,19 @@ tests/e2e/run.sh --image v0.11.3-slim gemini             # A/B against an older 
 OWUI_IMAGE=ghcr.io/open-webui/open-webui:main tests/e2e/run.sh
 ```
 
-A fix is complete when its KNOWN scenarios turn into PASS (and the `known=` markers are
-removed in the same PR). To test fixes from several branches together, export each file
-(`git show my-fix-branch:pipelines/azure/azure_ai_foundry.py > /tmp/azure.py`) and pass
-one `--file` per file. `functions/SOURCES.txt` in the output directory records where each
-tested file came from.
+A fix is complete when its KNOWN scenarios turn into PASS on the fix branch. The fix
+bumps the file's `version:`, and `fixed_in` of the bug's `KnownIssue` names that version:
+from then on the markers are off for every file with that version (a regression is a
+FAIL), while `main` keeps reporting KNOWN until the fix is merged. Once it is merged,
+drop the markers listed under "Obsolete known markers" in `summary.md` (the `known=`
+arguments and the `KnownIssue` entry). To test fixes from several branches together,
+export each file (`git show my-fix-branch:pipelines/azure/azure_ai_foundry.py >
+/tmp/azure.py`) and pass one `--file` per file. `functions/SOURCES.txt` in the output
+directory records where each tested file came from.
+
+Function files are staged with LF line endings whatever their source: a Windows checkout
+(`core.autocrlf=true`) has CRLF, `--ref` and the Open WebUI editor give LF.
+`SOURCES.txt` says `CRLF converted to LF` for a converted file.
 
 ## Debugging a failure
 
@@ -202,7 +260,8 @@ tested file came from.
    `Passw0rd!e2e`). The mocks keep running, so you can chat with the functions in the
    browser.
 3. Iterate without waiting for the start-up again: `tests/e2e/run.sh --reuse --name owui-dbg azure`
-   (copies the current files, restarts the mocks, reruns; `--only` works here too).
+   (stops a driver left over from an interrupted run, copies the current files,
+   restarts the mocks, reruns; `--only` works here too).
 4. Look at what reached a mock (Git Bash: prefix with `MSYS_NO_PATHCONV=1`):
 
    ```bash
@@ -211,6 +270,35 @@ tested file came from.
    ```
 
 5. Clean up: `docker rm -f owui-dbg && docker volume rm owui-dbg-data`.
+
+### Interrupted runs
+
+Ctrl-C (SIGINT) or SIGTERM during a run is handled at once, also while the driver runs:
+`run.sh` asks the driver in the container to stop (it records `<suite>.interrupted`
+and writes the partial `results.json` / `summary.md`), copies the output directory,
+removes container and volume (unless `--keep` / `--reuse`) and exits with 130 / 143.
+That takes a few seconds; a second Ctrl-C does not cut the cleanup short.
+
+If `run.sh` itself is killed (SIGKILL, a closed terminal on some systems, a CI job
+cancelled without grace), nothing can clean up:
+
+- the container and its volume stay; remove them with
+  `docker rm -f <name> && docker volume rm <name>-data`. A later run with the same
+  `--name` stops at the existing container, and at a leftover volume unless you pass
+  `--force`;
+- the **driver keeps running inside the container** (an orphan) and would share the
+  mocks and the server log with the next run there. `--reuse` stops such orphans before
+  it starts (`stopped 1 driver(s) left over from an earlier run`). To look for them by
+  hand (the image has no `ps`):
+
+  ```bash
+  MSYS_NO_PATHCONV=1 docker exec owui-dbg bash -c \
+    'for p in /proc/[0-9]*; do tr "\0" " " <$p/cmdline 2>/dev/null; echo; done | grep "[e]2e.py"'
+  ```
+
+`E2E_TIMEOUT` (default 1800 s) bounds a run that hangs: the suite that is still running
+becomes a `<suite>.timeout` FAIL and the driver writes its results. A driver that does
+not react is stopped by `timeout` in the container 60 s later (exit code 2).
 
 ## Adding a scenario or a mock behaviour
 
@@ -249,24 +337,34 @@ async def api(t: Suite, mock) -> None:
   `c.events`, `c.title`.
 - Valves: use `t.owui.update_valves(fid, NAME=value)` (merges, see gotchas).
 - Server log: `mark = t.mark()` before, `t.log.errors(mark)` after;
-  `t.expect_errors(mark)` for errors you provoke on purpose. Pass `since=mark` to a
-  check tagged `known=` when the bug shows in the server log rather than in the detail
-  text (e.g. a failing background task).
+  `t.expect_errors(mark, signature)` for an error you provoke on purpose (only blocks
+  matching the signature, e.g. `("function_azure:pipe", "request: 400")`, are
+  ignored; anything else in the window still fails `server-log`).
+  `t.fail_on_warnings(signature)` makes matching WARNING blocks fail `server-log`, and
+  `t.assert_no_secrets(value)` checks that a secret never shows up in the log. Pass
+  `since=mark` to a check tagged `known=` when the bug shows in the server log rather
+  than in the detail text (e.g. a failing background task).
 - Groups: wrap related scenarios in `if t.selected("group"):` so `--only` can select
   them, and list the group in the module's `GROUPS` (an unlisted group raises).
 - Mock behaviour: mocks pick behaviour from the request (model name, webhook path or a
   trigger word in the last user message, e.g. `force-400`). Add a branch in
   `tests/e2e/mocks/mock_<provider>.py`; requests are recorded automatically.
-- New known bug: add a `KnownIssue` to `harness/known.py` and pass it as `known=`. Give
-  it `evidence` (regexes that match the failing check's detail, so other failures stay
-  FAIL), `log_patterns` when it logs errors (a string or a tuple of strings that must
-  all occur in one error block; include the function, e.g. `function_gemini:pipe`), the
-  fixing branch (or `""` when no fix exists yet) and an issue `ref`.
-- New suite: add `tests/e2e/suites/<name>.py` (with `GROUPS` and `async def run(t)`)
-  and its name to `SUITES` in `harness/config.py`; `run.sh` accepts every module in
-  `tests/e2e/suites/`. For a new function file add it to `FUNCTION_FILES` in `run.sh`.
-  Mention the suite in this guide, in `CLAUDE.md` ("What to run") and, if it should
-  appear there, in the `suites` input description of `.github/workflows/e2e.yml`.
+- New known bug: add a `KnownIssue` to the area's `harness/known_<area>.py` and pass it
+  as `known=`. Give it `evidence` (regexes that match the failing check's detail and
+  nothing else: include proof that the request itself worked, e.g. `HTTP 200`, so an
+  unrelated failure stays FAIL), `log_patterns` when it logs errors (a string or a tuple
+  of strings that must all occur in one error block; include the function, e.g.
+  `function_gemini:pipe`), `file` and `fixed_in` (the function file and the version that
+  fixes it, `""` while no fix exists), the fixing branch (or `""`) and an issue `ref`.
+  The CI meta-test fails when the evidence also matches a failing upstream (see
+  [CI](#ci)); a bug that shows in the request sent upstream goes into
+  `REQUEST_SIDE_KNOWN` in `.github/workflows/e2e.yml` instead.
+- New suite: add `tests/e2e/suites/<name>.py` (with `GROUPS` and `async def run(t)`);
+  `run.sh` and the driver discover every module there (names starting with `_` are
+  skipped), `all` runs new suites after the existing ones in alphabetical order. For a
+  new function file add it to `FUNCTION_FILES` in `run.sh`. Mention the suite in this
+  guide, in `CLAUDE.md` ("What to run") and, if it should appear there, in the `suites`
+  input description of `.github/workflows/e2e.yml`.
 
 Python under `tests/e2e/` follows the repo's Ruff settings:
 `uvx ruff@0.11.10 format tests/e2e && uvx ruff@0.11.10 check tests/e2e` (or `pixi run lint`).
@@ -279,23 +377,34 @@ tests/e2e/check_owui_api.sh latest     # against the latest Open WebUI release
 tests/e2e/check_owui_api.sh v0.12.0    # any tag or branch
 ```
 
-It reads every `from open_webui... import ...` in `pipelines/` and `filters/`, fetches the
-corresponding Open WebUI backend modules at that tag (`gh api` when authenticated,
-otherwise `curl` from raw.githubusercontent.com) and checks that each imported symbol,
-each method called on it (`Users.get_user_by_id`, ...) and each injected `__param__`
-still exists; definitions marked legacy/deprecated are reported as `WARN` (for example
-`SRC_LOG_LEVELS` is an empty legacy dict since 0.10, so per-module log levels have no
-effect). It also prints the frontmatter of every function, the event types Open WebUI
-persists and the versions of shared dependencies. Run it whenever Open WebUI publishes a
-release, then run the Docker suites with the new image.
+It reads every `from open_webui... import ...` and `import open_webui...` in
+`pipelines/` and `filters/`, fetches the corresponding Open WebUI backend modules at that
+tag (`gh api` when authenticated, otherwise `curl` from raw.githubusercontent.com) and
+checks that each imported module and symbol, each method called on it
+(`Users.get_user_by_id`, ...) and each injected `__param__` still exists; definitions
+marked legacy/deprecated are reported as `WARN` (for example `SRC_LOG_LEVELS` is an empty
+legacy dict since 0.10, so per-module log levels have no effect). It also prints the
+frontmatter of every function, the event types Open WebUI persists and the versions of
+shared dependencies. A fetch that fails for another reason than "not found" is tried
+3 times; if it still fails the result is `incomplete` (exit 2) rather than a missing
+API. Run it whenever Open WebUI publishes a release, then run the Docker suites with the
+new image.
 
 ## CI
 
-`.github/workflows/e2e.yml` runs `tests/e2e/run.sh all` on pull requests that touch
-`pipelines/**`, `filters/**` or `tests/**`, and on demand (*Actions → E2E → Run workflow*,
-with an image tag input). It uploads the output directory as an artifact and writes
-`summary.md` to the job summary. The job is **informational**: it is not a required
-check and does not block merging.
+`.github/workflows/e2e.yml` runs on pull requests and on pushes to `main` / `dev` that
+touch `pipelines/**`, `filters/**`, `tests/**` or the workflow, every Monday, and on
+demand (*Actions → E2E → Run workflow*, with an image tag and a suites input). Jobs:
+
+| Job | What it does |
+| --- | --- |
+| `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. Exceptions are the bugs listed in `REQUEST_SIDE_KNOWN` in the workflow, which show in the request the pipe sends upstream and therefore reproduce whatever the mock answers (e.g. `azure-double-strip`: the mock records `body.model='1'`). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `api` | `check_owui_api.sh latest` |
+
+`E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario
+ends as a `<suite>.timeout` FAIL with results instead of a cancelled job. The jobs are
+**informational**: they are not required checks and do not block merging.
 
 ## Troubleshooting and gotchas
 
@@ -326,13 +435,16 @@ check and does not block merging.
 - **Never remove images** to "clean up" – only the container and its volume are
   throw-away; the image is shared with other runs.
 - **Slow or unhealthy start:** the first start of a fresh volume runs all database
-  migrations (~75 s on Docker Desktop, several minutes on a busy machine). The wait is
-  limited to 600 s (`E2E_HEALTH_TIMEOUT=900` to raise it); if the container exits, see
-  `server.log` in the output dir.
-- **Older images download an embedding model at start-up.** `v0.11.3-slim` fetches
-  `sentence-transformers/all-MiniLM-L6-v2` from huggingface.co before `/health` answers
-  (several minutes on a slow or busy network); `v0.11.4-slim` does not. The suites do
-  not use RAG, the download only costs time.
+  migrations (~60-75 s on Docker Desktop, several minutes on a busy machine). The wait
+  is limited to 600 s (`E2E_HEALTH_TIMEOUT=900` to raise it); if the container exits,
+  see `server.log` in the output dir.
+- **Older images and the embedding model.** Without further settings `v0.11.3-slim`
+  downloads `sentence-transformers/all-MiniLM-L6-v2` from huggingface.co before
+  `/health` answers (1522 s once on a busy network, more than the 600 s limit). The
+  suites do not use RAG, so `run.sh` starts the container with
+  `RAG_EMBEDDING_ENGINE=openai`: no download, and `v0.11.3-slim` became healthy after
+  158 s on a busy machine, with the same results as `v0.11.4-slim`. A container you
+  start by hand needs the same variable.
 - **First `time_token_tracker` call is slow:** tiktoken downloads its `cl100k_base`
   encoding on first use (needs network); the first filters scenario took 50-120 s here.
 - **`WEBUI_SECRET_KEY`** is set by the harness; without it Open WebUI generates one and
