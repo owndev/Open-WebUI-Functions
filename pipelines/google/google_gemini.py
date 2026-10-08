@@ -3162,12 +3162,17 @@ class Pipe:
         generated_image_files: List[Dict[str, Any]] = []
         seen_generated_image_hashes: set[str] = set()
         last_thought_image: Any = None
+        last_finish_reason: Any = None
 
         try:
             async for chunk in response_iterator:
                 # Capture usage metadata (final chunk has complete data)
                 if getattr(chunk, "usage_metadata", None):
                     stream_usage_metadata = chunk.usage_metadata
+                if chunk.candidates and getattr(
+                    chunk.candidates[0], "finish_reason", None
+                ):
+                    last_finish_reason = chunk.candidates[0].finish_reason
 
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
@@ -3295,7 +3300,11 @@ class Pipe:
 
             # seen_generated_image_hashes records every final (non-thought) image
             # part. If the response had thought images only, attach the last one.
-            if last_thought_image is not None and not seen_generated_image_hashes:
+            if (
+                last_thought_image is not None
+                and not seen_generated_image_hashes
+                and self._allows_thought_image_fallback(last_finish_reason)
+            ):
                 self.log.warning(
                     "Gemini returned thought images but no final image; "
                     "attaching the last thought image instead"
@@ -3519,6 +3528,19 @@ class Pipe:
             return "[Content blocked due to prohibited content policy violation]"
 
         return None
+
+    def _allows_thought_image_fallback(self, finish_reason: Any) -> bool:
+        """
+        Whether the last thought image may stand in for a missing final image.
+
+        Only for a normal finish: any other reason (IMAGE_SAFETY,
+        IMAGE_PROHIBITED_CONTENT, NO_IMAGE, ...) means Gemini withheld the final
+        image, so no interim image is shown in its place.
+        """
+        if finish_reason is None:
+            return True
+        name = getattr(finish_reason, "name", None) or str(finish_reason)
+        return name in ("STOP", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED")
 
     async def _generate_video(
         self,
@@ -4053,6 +4075,9 @@ class Pipe:
                     if (
                         last_thought_image is not None
                         and not seen_generated_image_hashes
+                        and self._allows_thought_image_fallback(
+                            getattr(candidate, "finish_reason", None)
+                        )
                     ):
                         self.log.warning(
                             "Gemini returned thought images but no final image; "
