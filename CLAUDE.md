@@ -93,7 +93,7 @@ Expose a `Filter` class with `inlet(body)` and/or `outlet(body)`, mutating the r
 
 - **Azure** (`azure_ai_foundry.py`): model goes in the `x-ms-model-mesh-model-name` header, or in the body when `AZURE_AI_MODEL_IN_BODY=true`. `AZURE_AI_MODEL` accepts semicolon/comma/space-separated lists. Azure AI Search citations are extracted, normalized into Open WebUI `source` events, and `[docX]` references are rewritten into markdown links — the streaming path has its own citation-aware processor (`stream_processor_with_citations`).
 - **Gemini** (`google_gemini.py`, ~3.6k lines): streaming is force-disabled for image-generation models; thinking output is wrapped in `<details>` and emitted incrementally; generated images/videos are uploaded through Open WebUI's file API and referenced by `url_path_for("get_file_content_by_id", ...)`.
-- **N8N** (`n8n.py`): responses may be a mixed SSE/plain stream — `parse_n8n_streaming_chunk` and `extract_content_from_mixed_stream` handle both. Tool-usage display only works non-streaming.
+- **N8N** (`n8n.py`): streamed responses may mix SSE, NDJSON / back-to-back JSON and plain text — `N8NStreamParser` handles all of them incrementally (line-based, string-aware brace matching whose state persists across `feed()` calls, so keep it linear). n8n `{"type": "error"}` chunks end up in `parser.errors` and the final status. Tool-usage display only works non-streaming.
 
 ## Docs and release
 

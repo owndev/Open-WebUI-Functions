@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
-version: 2.3.0
+version: 2.3.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats. Now includes configurable AI Agent tool usage display with three verbosity levels (minimal, compact, detailed) and customizable length limits for tool inputs/outputs (non-streaming mode only).
@@ -22,6 +22,12 @@ features:
   - Three display modes: minimal (tool names only), compact (names + preview), detailed (full collapsible sections).
   - Customizable length limits for tool inputs and outputs.
   - Shows tool calls, inputs, and results from intermediateSteps in non-streaming mode (N8N limitation - streaming responses do not include intermediateSteps).
+  - Parses n8n native streaming (NDJSON), Server-Sent Events (data lines, [DONE], comments) and plain-text streams line by line without leaking SSE framing.
+  - Forwards token usage from a non-streamed JSON reply of the workflow to Open WebUI, for streaming and non-streaming chats.
+  - Sends Open WebUI tasks (title, tags, follow-ups, ...) without chat_id/message_id, so they stay out of the workflow's chat memory.
+  - Final status on completion, on error or when the response is stopped.
+  - Shows n8n stream error chunks as 'N8N Error: ...' and ends a failed or interrupted stream with an error status.
+  - Parses large JSON objects streamed in small chunks in linear time, without blocking Open WebUI.
 """
 
 from typing import (
@@ -30,18 +36,17 @@ from typing import (
     Awaitable,
     Any,
     Dict,
-    AsyncIterator,
     Union,
     Generator,
     Iterator,
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
-from starlette.background import BackgroundTask
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
 import os
 import base64
+import codecs
 import hashlib
 import logging
 import json
@@ -50,6 +55,7 @@ from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from pydantic_core import core_schema
 import time
 import re
+import uuid
 
 
 # Simplified encryption implementation with automatic handling
@@ -148,129 +154,290 @@ async def cleanup_response(
         await session.close()
 
 
-async def stream_processor(
-    content: aiohttp.StreamReader,
-    __event_emitter__=None,
-    response: Optional[aiohttp.ClientResponse] = None,
-    session: Optional[aiohttp.ClientSession] = None,
-    logger: Optional[logging.Logger] = None,
-) -> AsyncIterator[str]:
+# Characters the JSON object scanner has to look at, outside and inside strings
+_JSON_STRUCTURE = re.compile(r'[{}"]')
+_JSON_STRING_SPECIAL = re.compile(r'["\\]')
+_NON_SPACE = re.compile(r"\S")
+
+
+def _scan_json_object(text: str, pos: int, depth: int, in_string: bool) -> tuple:
     """
-    Process streaming content from n8n and yield chunks for StreamingResponse.
+    Scan text from pos for the brace that closes a JSON object, ignoring braces
+    inside JSON strings. The scan can be resumed with the returned state once more
+    text has been appended, so an object that arrives in many small chunks is
+    scanned only once (linear instead of quadratic time).
 
-    Args:
-        content: The streaming content from the response
-        __event_emitter__: Optional event emitter for status updates
-        response: The response object for cleanup
-        session: The session object for cleanup
-        logger: Logger for debugging
-
-    Yields:
-        String content from the streaming response
+    Returns:
+        (index of the closing brace or -1, pos, depth, in_string) where the last
+        three values are the state to resume from
     """
-    try:
-        if logger:
-            logger.info("Starting stream processing...")
-
-        buffer = ""
-        # Attempt to read preserve flag later via closure if needed
-        async for chunk_bytes in content:
-            chunk_str = chunk_bytes.decode("utf-8", errors="ignore")
-            if not chunk_str:
+    end = len(text)
+    while pos < end:
+        if in_string:
+            match = _JSON_STRING_SPECIAL.search(text, pos)
+            if match is None:
+                return -1, end, depth, True
+            i = match.start()
+            if text[i] == "\\":
+                pos = i + 2  # Skip the escaped character (it may arrive later)
                 continue
-            buffer += chunk_str
+            in_string = False
+            pos = i + 1
+        else:
+            match = _JSON_STRUCTURE.search(text, pos)
+            if match is None:
+                return -1, end, depth, False
+            i = match.start()
+            pos = i + 1
+            if text[i] == '"':
+                in_string = True
+            elif text[i] == "{":
+                depth += 1
+            else:
+                depth -= 1
+                if depth == 0:
+                    return i, pos, depth, False
+    return -1, pos, depth, in_string
 
-            # Process complete lines (retain trailing newline info)
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                had_newline = True
-                original_line = line  # without \n
-                if line.endswith("\r"):
-                    line = line[:-1]
 
-                if logger:
-                    logger.debug(f"Raw line received: {repr(line)}")
+def _find_json_object_end(text: str, start: int = 0) -> int:
+    """
+    Return the index of the brace closing the JSON object that starts at
+    text[start], or -1 if the object is not complete yet. Braces inside JSON
+    strings are ignored.
+    """
+    return _scan_json_object(text, start, 0, False)[0]
 
-                # Preserve blank lines
-                if line == "":
-                    yield "\n"
-                    continue
 
-                content_text = ""
+def _split_json_objects(text: str) -> tuple:
+    """
+    Split back-to-back JSON objects ('{..}{..}' or NDJSON) from the start of text.
 
-                if line.startswith("data: "):
-                    data_part = line[6:]
-                    if logger:
-                        logger.debug(f"SSE data part: {repr(data_part)}")
-                    if data_part == "[DONE]":
-                        if logger:
-                            logger.debug("Received [DONE] signal")
-                        buffer = ""
-                        break
+    Returns:
+        (list of parsed objects, unparsed remainder)
+    """
+    objects = []
+    pos = 0
+    while True:
+        match = _NON_SPACE.search(text, pos)
+        if match is None or text[match.start()] != "{":
+            break
+        start = match.start()
+        end = _find_json_object_end(text, start)
+        if end == -1:
+            break
+        try:
+            obj = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            break
+        objects.append(obj)
+        pos = end + 1
+    return objects, text[pos:]
+
+
+class N8NStreamParser:
+    """
+    Incremental parser for streamed n8n replies.
+
+    Text is processed line by line first:
+      - SSE framing is removed: 'data:' prefixes are stripped, '[DONE]' sentinels,
+        ':' comments and 'event:'/'id:'/'retry:' fields are skipped, consecutive
+        'data:' lines of one event are joined with a newline (SSE spec)
+      - JSON payloads (n8n native streaming / NDJSON, OpenAI-style chunks) are
+        parsed and their content extracted, 'intermediateSteps' are collected
+      - n8n error chunks ({"type": "error", ...}) are kept as content and
+        collected in 'errors'
+      - anything else is plain text and kept, including its line break
+    A string-aware brace matcher is used only for JSON objects, so objects written
+    back to back ('{..}{..}') or split across network chunks are still parsed
+    without dropping plain text that arrived in the same chunk. The matcher keeps
+    its state across feed() calls, so every character is scanned only once.
+    """
+
+    _SSE_FIELD = re.compile(r"^(event|id|retry)\s*:")
+
+    def __init__(
+        self,
+        extract_content: Callable[[dict], Optional[str]],
+        sse: bool = False,
+    ):
+        self._extract_content = extract_content
+        self.sse = sse
+        self.intermediate_steps: list = []
+        self.errors: list = []  # Contents of n8n error chunks
+        self._has_output = False
+        self._buffer = ""
+        self._start = 0  # Start of the unprocessed text in _buffer
+        self._sse_data: list = []
+        self._reset_scan()
+
+    def _reset_scan(self) -> None:
+        """
+        Forget what is known about the unprocessed text. Positions are relative
+        to self._start and stay valid while text is only appended.
+        """
+        self._space = 0  # Leading characters known to be whitespace
+        self._obj = -1  # Start of a JSON object at the beginning, -1 if none
+        self._obj_scan = (0, 0, False)  # Brace scan state: pos, depth, in_string
+        self._obj_end = -1  # Closing brace of that object, -1 while incomplete
+        self._obj_is_text = False  # Complete, but not JSON: handle it as text
+        self._newline_from = 0  # There is no line break before this position
+
+    def _consume(self, end: int) -> None:
+        """Mark the text before the absolute position end as processed."""
+        self._start = end
+        self._reset_scan()
+
+    def feed(self, text: str) -> list:
+        """Add decoded text and return the content pieces that are complete."""
+        self._buffer += text
+        return self._drain(final=False)
+
+    def close(self) -> list:
+        """Flush everything that is still buffered at the end of the stream."""
+        out = self._drain(final=True)
+        line = self._buffer
+        self._buffer = ""
+        self._reset_scan()
+        if line:
+            # Last line without a trailing newline
+            out += self._handle_line(line, newline=False)
+        out += self._flush_sse_event()
+        return out
+
+    def _drain(self, final: bool) -> list:
+        out = []
+        while self._start < len(self._buffer):
+            # NDJSON / concatenated JSON: parse an object as soon as it is complete
+            if not self._sse_data:
+                end = self._json_object_end()
+                if end >= 0 and not self._obj_is_text:
                     try:
-                        event_data = json.loads(data_part)
-                        if logger:
-                            logger.debug(f"Parsed SSE JSON: {event_data}")
-                        for key in ("content", "text", "output", "data"):
-                            val = event_data.get(key)
-                            if isinstance(val, str) and val:
-                                content_text = val
-                                break
+                        obj = json.loads(
+                            self._buffer[self._start + self._obj : end + 1]
+                        )
                     except json.JSONDecodeError:
-                        content_text = data_part
-                        if logger:
-                            logger.debug(
-                                f"Using raw data as content: {repr(content_text)}"
-                            )
-                elif not line.startswith(":"):
-                    # Plain text (non-SSE)
-                    content_text = original_line
-                    if logger:
-                        logger.debug(f"Plain text content: {repr(content_text)}")
+                        self._obj_is_text = True  # Not JSON: handle it as text
+                    else:
+                        self._consume(end + 1)
+                        out += self._handle_json(obj)
+                        continue
+                elif end == -1 and not final:
+                    break  # Incomplete JSON object, wait for more data
+            newline = self._buffer.find("\n", self._start + self._newline_from)
+            if newline == -1:
+                self._newline_from = len(self._buffer) - self._start
+                break
+            line = self._buffer[self._start : newline]
+            self._consume(newline + 1)
+            out += self._handle_line(line, newline=True)
+        if self._start:
+            # Drop the processed text once per call (positions are relative)
+            self._buffer = self._buffer[self._start :]
+            self._start = 0
+        return out
 
-                if content_text:
-                    if not content_text.endswith("\n"):
-                        content_text += "\n"
-                    if logger:
-                        logger.debug(f"Yielding content: {repr(content_text)}")
-                    yield content_text
+    def _json_object_end(self) -> int:
+        """
+        Return the absolute index of the brace closing the JSON object at the
+        start of the unprocessed text, -1 while that object is incomplete, or -2
+        if the text does not start with '{'. Resumes the previous scan.
+        """
+        if self._obj_end >= 0:
+            return self._start + self._obj_end
+        if self._obj < 0:
+            match = _NON_SPACE.search(self._buffer, self._start + self._space)
+            if match is None:
+                self._space = len(self._buffer) - self._start
+                return -2
+            self._space = match.start() - self._start
+            if self._buffer[match.start()] != "{":
+                return -2
+            self._obj = self._space
+            self._obj_scan = (self._obj, 0, False)
+        pos, depth, in_string = self._obj_scan
+        end, pos, depth, in_string = _scan_json_object(
+            self._buffer, self._start + pos, depth, in_string
+        )
+        self._obj_scan = (pos - self._start, depth, in_string)
+        if end == -1:
+            return -1
+        self._obj_end = end - self._start
+        return end
 
-        # Send completion status update when streaming is done
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "status": "complete",
-                        "description": "N8N streaming completed successfully",
-                        "done": True,
-                    },
-                }
-            )
+    def _handle_line(self, line: str, newline: bool) -> list:
+        line = line.rstrip("\r")
+        if line.startswith("data:"):
+            self.sse = True
+            payload = line[5:]
+            if payload.startswith(" "):
+                payload = payload[1:]
+            self._sse_data.append(payload)
+            return []
 
-        if logger:
-            logger.info("Stream processing completed successfully")
+        # Any other line ends the pending SSE event
+        out = self._flush_sse_event()
+        if not line.strip():
+            return out  # Blank line (SSE event separator)
+        if self.sse and (line.startswith(":") or self._SSE_FIELD.match(line)):
+            return out  # SSE comment / keep-alive or non-data field
+        return out + self._handle_payload(line, "\n" if newline else "")
 
-    except Exception as e:
-        if logger:
-            logger.error(f"Error processing stream: {e}")
+    def _flush_sse_event(self) -> list:
+        if not self._sse_data:
+            return []
+        payload = "\n".join(self._sse_data)
+        self._sse_data = []
+        if payload.strip() == "[DONE]":
+            return []
+        return self._handle_payload(payload, "")
 
-        # Send error status update
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "status": "error",
-                        "description": f"N8N streaming error: {str(e)}",
-                        "done": True,
-                    },
-                }
-            )
-        raise
-    finally:
-        # Always attempt to close response and session to avoid resource leaks
-        await cleanup_response(response, session)
+    def _handle_payload(self, payload: str, plain_suffix: str) -> list:
+        stripped = payload.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                objects, rest = _split_json_objects(stripped)
+                if objects:
+                    out = []
+                    for obj in objects:
+                        out += self._handle_json(obj)
+                    if rest.strip():
+                        out += self._output(rest + plain_suffix)
+                    return out
+            else:
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                if (
+                    isinstance(parsed, list)
+                    and parsed
+                    and all(isinstance(item, dict) for item in parsed)
+                ):
+                    out = []
+                    for obj in parsed:
+                        out += self._handle_json(obj)
+                    return out
+        return self._output(payload + plain_suffix)
+
+    def _handle_json(self, obj: Any) -> list:
+        if not isinstance(obj, dict):
+            return []
+        steps = obj.get("intermediateSteps")
+        if isinstance(steps, list) and steps:
+            self.intermediate_steps.extend(steps)
+        content = self._extract_content(obj)
+        if content and obj.get("type") == "error":
+            self.errors.append(content)
+            if self._has_output:
+                content = "\n\n" + content  # Separate it from the answer so far
+        return self._output(content)
+
+    def _output(self, text: Optional[str]) -> list:
+        if not text:
+            return []
+        self._has_output = True
+        return [text]
 
 
 class Pipe:
@@ -560,6 +727,36 @@ class Pipe:
                 }
             )
 
+    def _stream_with_usage(
+        self, model: str, content: str, usage: Any
+    ) -> Generator[dict, None, None]:
+        """
+        Yield a complete answer and its token usage as OpenAI chat.completion.chunk
+        objects, for streaming requests answered by a non-streaming n8n reply.
+
+        This is a plain (sync) generator on purpose: Open WebUI appends the
+        finish_reason "stop" chunk and "data: [DONE]" to a Generator result in
+        every supported version, but in older versions (e.g. 0.8.0) not to an
+        async generator.
+        """
+        base = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+        }
+        yield {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield {**base, "choices": [], "usage": usage}
+
     def extract_event_info(self, event_emitter):
         if not event_emitter or not event_emitter.__closure__:
             return None, None
@@ -595,119 +792,74 @@ class Pipe:
 
         return headers
 
-    def parse_n8n_streaming_chunk(self, chunk_text: str) -> Optional[str]:
-        """Parse N8N streaming chunk and extract content, filtering out metadata"""
-        if not chunk_text.strip():
+    def extract_stream_chunk_content(self, data: dict) -> Optional[str]:
+        """Extract the content of one parsed N8N streaming JSON object, skipping metadata"""
+        # Check if this chunk contains intermediateSteps (will be handled separately)
+        # Note: Don't skip chunks just because they have a type field
+        chunk_type = data.get("type", "")
+
+        # n8n reports a failed node as {"type": "error", "content": "<message>"}:
+        # show it instead of dropping it (the stream then ends with an error status)
+        if chunk_type == "error":
+            message = data.get("content") or data.get("message")
+            return f"N8N Error: {message or 'The workflow reported an error.'}"
+
+        # Skip only true metadata chunks that have no content or intermediateSteps
+        if (
+            chunk_type in ["begin", "end", "metadata"]
+            and "intermediateSteps" not in data
+        ):
+            self.log.debug(f"Skipping N8N metadata chunk: {chunk_type}")
             return None
 
-        try:
-            data = json.loads(chunk_text.strip())
+        # Skip metadata-only chunks (but allow intermediateSteps)
+        if "metadata" in data and len(data) <= 2 and "intermediateSteps" not in data:
+            return None
 
-            if isinstance(data, dict):
-                # Check if this chunk contains intermediateSteps (will be handled separately)
-                # Note: Don't skip chunks just because they have a type field
-                chunk_type = data.get("type", "")
+        # Extract content from various possible field names
+        content = (
+            data.get("text")
+            or data.get("content")
+            or data.get("output")
+            or data.get("message")
+            or data.get("delta")
+            or data.get("data")
+            or data.get("response")
+            or data.get("result")
+        )
 
-                # Skip only true metadata chunks that have no content or intermediateSteps
-                if (
-                    chunk_type in ["begin", "end", "error", "metadata"]
-                    and "intermediateSteps" not in data
-                ):
-                    self.log.debug(f"Skipping N8N metadata chunk: {chunk_type}")
-                    return None
+        # Handle OpenAI-style streaming format
+        if not content and "choices" in data:
+            choices = data.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content", "") if isinstance(delta, dict) else ""
 
-                # Skip metadata-only chunks (but allow intermediateSteps)
-                if (
-                    "metadata" in data
-                    and len(data) <= 2
-                    and "intermediateSteps" not in data
-                ):
-                    return None
+        if content:
+            self.log.debug(f"Extracted content from JSON: {repr(str(content)[:100])}")
+            return str(content)
 
-                # Extract content from various possible field names
-                content = (
-                    data.get("text")
-                    or data.get("content")
-                    or data.get("output")
-                    or data.get("message")
-                    or data.get("delta")
-                    or data.get("data")
-                    or data.get("response")
-                    or data.get("result")
-                )
-
-                # Handle OpenAI-style streaming format
-                if not content and "choices" in data:
-                    choices = data.get("choices", [])
-                    if choices and isinstance(choices[0], dict):
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-
-                if content:
-                    self.log.debug(
-                        f"Extracted content from JSON: {repr(content[:100])}"
-                    )
-                    return str(content)
-
-                # Return non-metadata objects as strings (be more permissive)
-                if not any(
-                    key in data
-                    for key in [
-                        "type",
-                        "metadata",
-                        "nodeId",
-                        "nodeName",
-                        "timestamp",
-                        "id",
-                    ]
-                ):
-                    # For smaller models, return the entire object if it's simple
-                    self.log.debug(
-                        f"Returning entire object as content: {repr(str(data)[:100])}"
-                    )
-                    return str(data)
-
-        except json.JSONDecodeError:
-            # Handle plain text content - be more permissive
-            stripped = chunk_text.strip()
-            if stripped and not stripped.startswith("{"):
-                self.log.debug(f"Returning plain text content: {repr(stripped[:100])}")
-                return stripped
+        # Return non-metadata objects as strings (be more permissive)
+        if not any(
+            key in data
+            for key in [
+                "type",
+                "metadata",
+                "nodeId",
+                "nodeName",
+                "timestamp",
+                "id",
+                "choices",
+                "usage",
+            ]
+        ):
+            # For smaller models, return the entire object if it's simple
+            self.log.debug(
+                f"Returning entire object as content: {repr(str(data)[:100])}"
+            )
+            return str(data)
 
         return None
-
-    def extract_content_from_mixed_stream(self, raw_text: str) -> str:
-        """Extract content from mixed stream containing both metadata and content"""
-        content_parts = []
-
-        # First try to handle concatenated JSON objects
-        if "{" in raw_text and "}" in raw_text:
-            parts = raw_text.split("}{")
-
-            for i, part in enumerate(parts):
-                # Reconstruct valid JSON
-                if i > 0:
-                    part = "{" + part
-                if i < len(parts) - 1:
-                    part = part + "}"
-
-                extracted = self.parse_n8n_streaming_chunk(part)
-                if extracted:
-                    content_parts.append(extracted)
-
-        # If no JSON content found, treat as plain text
-        if not content_parts:
-            # Remove common streaming artifacts but preserve actual content
-            cleaned = raw_text.strip()
-            if (
-                cleaned
-                and not cleaned.startswith("data:")
-                and not cleaned.startswith(":")
-            ):
-                self.log.debug(f"Using raw text as content: {repr(cleaned[:100])}")
-                return cleaned
-
-        return "".join(content_parts)
 
     def dedupe_system_prompt(self, text: str) -> str:
         """Remove duplicated content from the system prompt.
@@ -756,6 +908,9 @@ class Pipe:
         __user__: Optional[dict] = None,
         __event_emitter__: Callable[[dict], Awaitable[None]] = None,
         __event_call__: Callable[[dict], Awaitable[dict]] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
+        __task__: Optional[str] = None,
     ) -> Union[str, Generator, Iterator, Dict[str, Any], StreamingResponse]:
         """
         Main method for sending requests to the N8N endpoint.
@@ -763,9 +918,14 @@ class Pipe:
         Args:
             body: The request body containing messages and other parameters
             __event_emitter__: Optional event emitter function for status updates
+            __chat_id__: Chat ID passed by Open WebUI (empty for API calls without a chat)
+            __message_id__: Assistant message ID passed by Open WebUI
+            __task__: Open WebUI task type (title, tags, follow-ups, ...), None for chat turns
 
         Returns:
-            Response from N8N API, which could be a string, dictionary or streaming response
+            Response from N8N API: a string, an OpenAI-style dict (non-streaming
+            request with usage) or a generator of OpenAI chunks (streaming request
+            with usage)
         """
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
@@ -783,8 +943,25 @@ class Pipe:
             if "Prompt: " in question:
                 question = question.split("Prompt: ")[-1]
             try:
-                # Extract chat_id and message_id
-                chat_id, message_id = self.extract_event_info(__event_emitter__)
+                if __task__:
+                    # Open WebUI tasks (title, tag, follow-up, search query
+                    # generation, ...) are not chat turns. Send them without
+                    # chat_id / message_id (title, tag and follow-up tasks were
+                    # already sent that way), so workflows that key their memory on
+                    # chat_id (like the templates) do not store task prompts in the
+                    # chat's memory.
+                    chat_id, message_id = None, None
+                    self.log.debug(f"Open WebUI task '{__task__}': no chat context")
+                else:
+                    # chat_id / message_id are passed by Open WebUI; fall back to
+                    # the event emitter closure if they are missing
+                    chat_id, message_id = __chat_id__, __message_id__
+                    if not chat_id or not message_id:
+                        fallback_chat_id, fallback_message_id = self.extract_event_info(
+                            __event_emitter__
+                        )
+                        chat_id = chat_id or fallback_chat_id
+                        message_id = message_id or fallback_message_id
 
                 self.log.info(f"Starting N8N workflow request for chat ID: {chat_id}")
 
@@ -886,150 +1063,64 @@ class Pipe:
                         # Enhanced streaming like in stream-example.py
                         self.log.info("Processing streaming response from N8N")
                         n8n_response = ""
-                        buffer = ""
                         completed_thoughts: list[str] = []
-                        intermediate_steps = []  # Collect tool calls
+                        # Line-oriented parser: strips SSE framing, parses NDJSON /
+                        # concatenated JSON and keeps plain text in the same chunk
+                        parser = N8NStreamParser(
+                            self.extract_stream_chunk_content,
+                            sse="text/event-stream" in content_type,
+                        )
+                        # Tool calls found in streamed JSON objects (future-proof:
+                        # works automatically if N8N adds intermediateSteps to streams)
+                        intermediate_steps = parser.intermediate_steps
+                        # Incremental decoder so multi-byte characters split across
+                        # network chunks are not dropped
+                        decoder = codecs.getincrementaldecoder("utf-8")(
+                            errors="replace"
+                        )
 
+                        async def emit_stream_content(pieces: list) -> None:
+                            nonlocal n8n_response
+                            for content in pieces:
+                                if not content:
+                                    continue
+                                # Normalize escaped newlines to actual newlines (like non-streaming)
+                                content = content.replace("\\n", "\n")
+
+                                # Just accumulate content without processing think blocks yet
+                                n8n_response += content
+
+                                # Emit delta without think block processing
+                                if __event_emitter__:
+                                    await __event_emitter__(
+                                        {
+                                            "type": "chat:message:delta",
+                                            "data": {
+                                                "role": "assistant",
+                                                "content": content,
+                                            },
+                                        }
+                                    )
+
+                        # Exception that ended the stream early, if any
+                        stream_error: Optional[Exception] = None
                         try:
                             async for chunk in response.content.iter_any():
                                 if not chunk:
                                     continue
-
-                                text = chunk.decode(errors="ignore")
-                                buffer += text
-
-                                # Handle different streaming formats
-                                if "{" in buffer and "}" in buffer:
-                                    # Process complete JSON objects like in stream-example.py
-                                    while True:
-                                        start_idx = buffer.find("{")
-                                        if start_idx == -1:
-                                            break
-
-                                        # Find matching closing brace
-                                        brace_count = 0
-                                        end_idx = -1
-
-                                        for i in range(start_idx, len(buffer)):
-                                            if buffer[i] == "{":
-                                                brace_count += 1
-                                            elif buffer[i] == "}":
-                                                brace_count -= 1
-                                                if brace_count == 0:
-                                                    end_idx = i
-                                                    break
-
-                                        if end_idx == -1:
-                                            # Incomplete JSON, wait for more data
-                                            break
-
-                                        # Extract and process the JSON chunk
-                                        json_chunk = buffer[start_idx : end_idx + 1]
-                                        buffer = buffer[end_idx + 1 :]
-
-                                        # Try to parse the chunk as JSON to extract intermediateSteps
-                                        # This must happen BEFORE parse_n8n_streaming_chunk filters out metadata
-                                        # Future-proof: If N8N adds intermediateSteps support in streaming, this will work automatically
-                                        try:
-                                            parsed_chunk = json.loads(json_chunk)
-                                            if isinstance(parsed_chunk, dict):
-                                                # Extract intermediateSteps if present (future-proof for when N8N supports this)
-                                                chunk_steps = parsed_chunk.get(
-                                                    "intermediateSteps", []
-                                                )
-                                                if chunk_steps:
-                                                    intermediate_steps.extend(
-                                                        chunk_steps
-                                                    )
-                                                    self.log.info(
-                                                        f"✓ Found {len(chunk_steps)} intermediate steps in streaming chunk"
-                                                    )
-                                        except json.JSONDecodeError:
-                                            pass  # Continue with content parsing
-
-                                        # Parse N8N streaming chunk for content
-                                        content = self.parse_n8n_streaming_chunk(
-                                            json_chunk
-                                        )
-                                        if content:
-                                            # Normalize escaped newlines to actual newlines (like non-streaming)
-                                            content = content.replace("\\n", "\n")
-
-                                            # Just accumulate content without processing think blocks yet
-                                            n8n_response += content
-
-                                            # Emit delta without think block processing
-                                            if __event_emitter__:
-                                                await __event_emitter__(
-                                                    {
-                                                        "type": "chat:message:delta",
-                                                        "data": {
-                                                            "role": "assistant",
-                                                            "content": content,
-                                                        },
-                                                    }
-                                                )
-                                else:
-                                    # Handle plain text streaming (for smaller models)
-                                    # Process line by line for plain text
-                                    while "\n" in buffer:
-                                        line, buffer = buffer.split("\n", 1)
-                                        if line.strip():  # Only process non-empty lines
-                                            self.log.debug(
-                                                f"Processing plain text line: {repr(line[:100])}"
-                                            )
-
-                                            # Normalize content
-                                            content = line.replace("\\n", "\n")
-                                            n8n_response += content + "\n"
-
-                                            # Emit delta for plain text
-                                            if __event_emitter__:
-                                                await __event_emitter__(
-                                                    {
-                                                        "type": "chat:message:delta",
-                                                        "data": {
-                                                            "role": "assistant",
-                                                            "content": content + "\n",
-                                                        },
-                                                    }
-                                                )
-
-                            # Process any remaining content in buffer (CRITICAL FIX)
-                            if buffer.strip():
-                                self.log.debug(
-                                    f"Processing remaining buffer content: {repr(buffer[:100])}"
+                                await emit_stream_content(
+                                    parser.feed(decoder.decode(chunk))
                                 )
 
-                                # Try to extract from mixed content first
-                                remaining_content = (
-                                    self.extract_content_from_mixed_stream(buffer)
+                            # Flush the decoder and whatever is left in the buffer
+                            await emit_stream_content(
+                                parser.feed(decoder.decode(b"", final=True))
+                                + parser.close()
+                            )
+                            if intermediate_steps:
+                                self.log.info(
+                                    f"✓ Found {len(intermediate_steps)} intermediate steps in streaming response"
                                 )
-
-                                # If that doesn't work, use buffer as-is
-                                if not remaining_content:
-                                    remaining_content = buffer.strip()
-
-                                if remaining_content:
-                                    # Normalize escaped newlines to actual newlines (like non-streaming)
-                                    remaining_content = remaining_content.replace(
-                                        "\\n", "\n"
-                                    )
-
-                                    # Accumulate final buffer content
-                                    n8n_response += remaining_content
-
-                                    # Emit final buffer delta
-                                    if __event_emitter__:
-                                        await __event_emitter__(
-                                            {
-                                                "type": "chat:message:delta",
-                                                "data": {
-                                                    "role": "assistant",
-                                                    "content": remaining_content,
-                                                },
-                                            }
-                                        )
 
                             # NOW process all think blocks in the complete response
                             if n8n_response and "<think>" in n8n_response.lower():
@@ -1117,6 +1208,7 @@ class Pipe:
                             )
 
                         except Exception as e:
+                            stream_error = e
                             self.log.error(f"Streaming error: {e}")
 
                             # In case of streaming errors, try to emit whatever we have
@@ -1155,9 +1247,29 @@ class Pipe:
                         body["messages"].append(
                             {"role": "assistant", "content": n8n_response}
                         )
-                        await self.emit_simple_status(
-                            __event_emitter__, "complete", "Streaming complete", True
-                        )
+                        # Final status: an interrupted stream or an n8n error chunk
+                        # must not end with a success status
+                        if stream_error is not None:
+                            await self.emit_simple_status(
+                                __event_emitter__,
+                                "error",
+                                f"N8N streaming error: {stream_error}",
+                                True,
+                            )
+                        elif parser.errors:
+                            self.log.warning(
+                                f"Error chunk in the N8N stream: {parser.errors[-1]}"
+                            )
+                            await self.emit_simple_status(
+                                __event_emitter__, "error", parser.errors[-1], True
+                            )
+                        else:
+                            await self.emit_simple_status(
+                                __event_emitter__,
+                                "complete",
+                                "Streaming complete",
+                                True,
+                            )
                         return n8n_response
                     else:
                         # Fallback to non-streaming response (robust parsing)
@@ -1168,7 +1280,6 @@ class Pipe:
                         async def read_body_safely():
                             text_body = None
                             json_body = None
-                            lowered = content_type.lower()
                             try:
                                 # Read as text first (works for all content types)
                                 text_body = await response.text()
@@ -1385,8 +1496,18 @@ class Pipe:
                             __event_emitter__, "complete", "Complete", True
                         )
 
-                        # Return OpenAI-format dict with usage so the middleware saves it to DB
+                        # Return OpenAI-format data with usage so the middleware saves it to DB
                         if usage:
+                            if body.get("stream"):
+                                # Open WebUI forwards a dict returned to a streaming
+                                # request as a single SSE event without choices[].delta,
+                                # so the answer would be saved empty. Stream the answer
+                                # and the usage as chat.completion.chunk events instead
+                                # (sync generator: Open WebUI appends the finish chunk
+                                # and [DONE], see _stream_with_usage).
+                                return self._stream_with_usage(
+                                    body.get("model", ""), n8n_response, usage
+                                )
                             return {
                                 "choices": [
                                     {
@@ -1415,7 +1536,7 @@ class Pipe:
                             user_error_msg = f"N8N Error: {error_json['message']}"
                         if "hint" in error_json:
                             user_error_msg += f"\n\nHint: {error_json['hint']}"
-                    except:
+                    except (ValueError, TypeError):
                         # If not JSON, use raw text but truncate if too long
                         if error_text:
                             truncated = (
@@ -1447,6 +1568,19 @@ class Pipe:
                     True,
                 )
                 return error_msg
+            except asyncio.CancelledError:
+                # Stopped by the user (or the client went away): close the request
+                # and end the status, so the message keeps no in-progress indicator
+                self.log.info("N8N request stopped before completion")
+                if session:
+                    await session.close()
+                try:
+                    await self.emit_simple_status(
+                        __event_emitter__, "cancelled", "Stopped", True
+                    )
+                except Exception as emit_error:
+                    self.log.debug(f"Could not emit stopped status: {emit_error}")
+                raise
 
         # If no message is available alert user
         else:
