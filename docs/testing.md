@@ -375,7 +375,8 @@ async def api(t: Suite, mock) -> None:
         "API stream: answer streamed",
         r.status == 200 and "Hello from mock" in r.content,
         r.brief(),                                # printed for FAIL/KNOWN
-        known=known.GEMINI_B1,                    # only while a known bug breaks it
+        known=known.MY_BUG,                       # KnownIssue from harness/known_*.py,
+                                                  # only while a known bug breaks it
     )
 ```
 
