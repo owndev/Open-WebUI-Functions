@@ -201,7 +201,6 @@ async def api(t: Suite, mock) -> None:
             + (" (with Traceback)" if any("Traceback" in b for b in blocks) else "")
             for blocks in error_logs
         ),
-        known=known.INFOMANIAK_ERROR_DETAIL,
     )
     for stream in (False, True):
         mark = t.mark()
@@ -214,7 +213,6 @@ async def api(t: Suite, mock) -> None:
             f"description (stream={stream})",
             r.status == 200 and r.content == ERROR_DESC,
             r.brief(),
-            known=known.INFOMANIAK_ERROR_DETAIL,
         )
 
 
@@ -236,7 +234,6 @@ async def browser(t: Suite, mock) -> None:
             "(done)",
             statuses(c) == [(SENDING, False), ("Request completed", True)],
             f"{status_brief(c)} answer_ok={c.content == NONSTREAM_ANSWER}",
-            known=known.INFOMANIAK_STATUS,
         )
         for name, answer in (
             ("mixtral", "Hello from Infomaniak (stream)."),
@@ -251,17 +248,15 @@ async def browser(t: Suite, mock) -> None:
                 f"browser path stream ({name}): answer saved",
                 c.done and c.content == answer,
                 c.brief(),
-                known=None if name == "mixtral" else known.INFOMANIAK_CHUNKING,
             )
-            # The chunking bug drops usage the upstream did send (include_usage
-            # requested); a missing include_usage is a different failure.
+            # The detail tells usage lost in the stream (include_usage requested)
+            # from usage the upstream never sent (include_usage missing).
             t.check(
                 f"browser.stream.{name}.usage",
                 f"browser path stream ({name}): usage saved",
                 (c.usage or {}).get("total_tokens") == 13,
                 f"usage={c.usage} include_usage_sent={sent.get('include_usage')} "
                 + (f"answer_ok={c.content == answer}" if c.content else "content="),
-                known=known.INFOMANIAK_CHUNKING,
             )
             if name == "mixtral":
                 t.check(
@@ -275,7 +270,6 @@ async def browser(t: Suite, mock) -> None:
                         ("Streaming completed", True),
                     ],
                     f"{status_brief(c)} answer_ok={c.content == answer}",
-                    known=known.INFOMANIAK_STATUS,
                 )
 
         mark = t.mark()
@@ -289,13 +283,9 @@ async def browser(t: Suite, mock) -> None:
             statuses(c) == [(SENDING, False), (ERROR_400, True)]
             and c.content == ERROR_400,
             f"{status_brief(c)} answer_ok={c.content == ERROR_400}",
-            known=known.INFOMANIAK_STATUS,
         )
 
-        for name, answer, issue in (
-            ("noeol", "No EOL.", known.INFOMANIAK_REMAINDER),
-            ("crlf", "CR LF.", known.INFOMANIAK_CRLF),
-        ):
+        for name, answer in (("noeol", "No EOL."), ("crlf", "CR LF.")):
             c = await b.chat(model(name), "Hello", stream=True)
             t.check(
                 f"browser.stream.{name}",
@@ -304,7 +294,6 @@ async def browser(t: Suite, mock) -> None:
                 and c.content == answer
                 and (c.usage or {}).get("total_tokens") == 13,
                 c.brief(),
-                known=issue,
             )
 
         mark = t.mark()
@@ -320,7 +309,6 @@ async def browser(t: Suite, mock) -> None:
             and str(last.get("description")).startswith(f"Error: {MIDFAIL}")
             and last.get("done") is True,
             f"{status_brief(c)} {c.brief()}",
-            known=known.INFOMANIAK_MIDFAIL,
         )
 
         for name, kind, when in (
@@ -344,5 +332,4 @@ async def browser(t: Suite, mock) -> None:
                 and last.get("done") is True
                 and (name != "slow" or c.content.startswith("t0 ")),
                 f"{status_brief(c)} stopped={short(c.stopped, 120)} {c.brief()}",
-                known=known.INFOMANIAK_STOP,
             )

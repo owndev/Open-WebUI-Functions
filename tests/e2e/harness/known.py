@@ -1,9 +1,10 @@
 """
 Registry of known bugs that make scenarios fail on ``main`` today.
 
-The entries live in one module per area (``known_gemini.py``, ``known_azure.py``,
-``known_filters.py``, ``known_n8n.py`` for n8n + Infomaniak) and are re-exported
-here, so suites keep writing ``known.GEMINI_B1``.
+The entries live in one module per area, ``known_<area>.py`` (today only
+``known_n8n.py`` for n8n + Infomaniak), and are re-exported here, so suites write
+``known.INFOMANIAK_NAME_PREFIX``. A new area module needs its own import at the
+bottom of this file.
 
 A failing scenario that carries a ``KnownIssue`` is reported as KNOWN and does
 not fail the run, but only when the failure looks like that bug:
@@ -122,18 +123,10 @@ class KnownIssue:
         return asdict(self)
 
 
-GEMINI_FIX = "PR #185"
-AZURE_FIX = "PR #183"
-FILTERS_FIX = "PR #184"
-N8N_INFOMANIAK_FIX = "PR #182"
-NO_ISSUE = "no issue filed"
 FOUND_BY_E2E = "found by tests/e2e, no issue filed"
 
 # The entries, one module per area. They import the names above, so these
 # imports stay at the bottom; every KnownIssue they define is re-exported.
-from .known_azure import *  # noqa: E402, F403
-from .known_filters import *  # noqa: E402, F403
-from .known_gemini import *  # noqa: E402, F403
 from .known_n8n import *  # noqa: E402, F403
 
 

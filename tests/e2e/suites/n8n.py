@@ -24,7 +24,7 @@ from typing import Optional
 
 import httpx
 
-from harness import Suite, known, short
+from harness import Suite, short
 from harness.config import ADMIN_EMAIL
 
 GROUPS = ("api", "browser", "tasks")
@@ -179,7 +179,6 @@ async def api(t: Suite, mock, scenario) -> None:
             + (", delta chunks and [DONE])" if stream else ")"),
             ok,
             r.brief() + (f" done={r.done} chunks={r.chunks}" if stream else ""),
-            known=known.N8N_DICT_IN_STREAM if stream else None,
         )
 
     await tools(t, scenario)
@@ -358,15 +357,12 @@ async def streams(t: Suite, scenario) -> None:
             f"SSE stream ({name}): the plain line between the events is kept",
             SSE_ANSWER in r.content,
             r.brief(),
-            # main keeps the plain line when it arrives in its own chunk
-            known=known.N8N_PLAIN_LINE if name == "stream-sse-coalesced" else None,
         )
         t.check(
             f"api.{name}.control-lines",
             f"SSE stream ({name}): comments and [DONE] are not part of the answer",
             "[DONE]" not in r.content and "keep-alive" not in r.content,
             r.brief(),
-            known=known.N8N_SSE_CONTROL_LINES,
         )
 
     await scenario("stream-sse-fields")
@@ -376,7 +372,6 @@ async def streams(t: Suite, scenario) -> None:
         "SSE event:/id:/retry: fields dropped, multi-line data: joined",
         r.status == 200 and r.content == "Event one. multi\nline",
         r.brief(),
-        known=known.N8N_SSE_FIELDS,
     )
 
     await scenario("stream-openai")
@@ -387,7 +382,6 @@ async def streams(t: Suite, scenario) -> None:
         "not in the answer",
         r.status == 200 and r.content == "OpenAI style.",
         r.brief(),
-        known=known.N8N_OPENAI_CHUNKS,
     )
 
     await scenario("stream-utf8-split")
@@ -397,7 +391,6 @@ async def streams(t: Suite, scenario) -> None:
         "UTF-8 characters split across network chunks arrive intact",
         r.status == 200 and r.content == UTF8_ANSWER,
         r.brief(),
-        known=known.N8N_UTF8_SPLIT,
     )
 
     await scenario("stream-braces")
@@ -407,7 +400,6 @@ async def streams(t: Suite, scenario) -> None:
         "braces and quotes inside streamed JSON strings do not break the parser",
         r.status == 200 and r.content == BRACES_ANSWER,
         r.brief(),
-        known=known.N8N_BRACES,
     )
 
 
@@ -469,13 +461,13 @@ async def large_flat(t: Suite, scenario) -> None:
 
 async def browser(t: Suite, mock, scenario) -> None:
     async with t.browser() as b:
-        for name, stream, expect, issue in (
-            ("json", True, "Hello from n8n (json).", None),
-            ("json", False, "Hello from n8n (json).", None),
-            ("json-usage", False, "Hello with usage.", None),
-            ("json-usage", True, "Hello with usage.", known.N8N_DICT_IN_STREAM),
-            ("stream-ndjson", True, "Hello from n8n (ndjson stream).", None),
-            ("json-tools", True, TOOL_HEADER, None),
+        for name, stream, expect in (
+            ("json", True, "Hello from n8n (json)."),
+            ("json", False, "Hello from n8n (json)."),
+            ("json-usage", False, "Hello with usage."),
+            ("json-usage", True, "Hello with usage."),
+            ("stream-ndjson", True, "Hello from n8n (ndjson stream)."),
+            ("json-tools", True, TOOL_HEADER),
         ):
             await scenario(name)
             c = await b.chat(MODEL, f"browser {name}", stream=stream)
@@ -486,7 +478,6 @@ async def browser(t: Suite, mock, scenario) -> None:
                 f"browser path {name} stream={stream}: answer saved, final status done",
                 c.done and expect in c.content and last.get("done") is True,
                 f"{c.brief()} {status_brief(c)}",
-                known=issue,
             )
             if name == "json-usage":
                 t.check(
@@ -512,7 +503,6 @@ async def browser(t: Suite, mock, scenario) -> None:
             "browser path: UTF-8 split across network chunks saved intact",
             c.done and c.content == UTF8_ANSWER,
             c.brief(),
-            known=known.N8N_UTF8_SPLIT,
         )
 
         await scenario("stream-error-chunk")
@@ -526,7 +516,6 @@ async def browser(t: Suite, mock, scenario) -> None:
             and last.get("description") == ERROR_CHUNK
             and last.get("done") is True,
             f"{c.brief()} {status_brief(c)}",
-            known=known.N8N_ERROR_CHUNK,
         )
 
         await scenario("stream-midfail")
@@ -543,7 +532,6 @@ async def browser(t: Suite, mock, scenario) -> None:
             and str(last.get("description")).startswith("N8N streaming error:")
             and last.get("done") is True,
             f"{c.brief()} {status_brief(c)}",
-            known=known.N8N_MIDSTREAM_STATUS,
         )
 
         await scenario("error")
@@ -643,7 +631,6 @@ async def stop(t: Suite, b, scenario) -> None:
             and not leaks,
             f"{status_brief(c)} unclosed={len(leaks)} stopped={short(c.stopped, 120)} "
             f"{c.brief()}",
-            known=known.N8N_STOP,
         )
 
 
