@@ -104,7 +104,14 @@ SEARCH_ENUMS = {
 RAG_SEARCH_KEY = "mock-search-key-456"
 RAG_SEARCH_TOKEN = "mock-search-token-789"
 RAG_EMBED_KEY = "mock-embed-key-321"
+RAG_EMBED_TOKEN = "mock-embed-token-e2e"
 RAG_JSON_KEY = "json-plaintext-key-000"
+# Hint the pipe appends (2.9.0+) when Azure answers 400 / 404 to a request
+# with data_sources; never for other errors.
+RETIRED_HINT = (
+    "(Azure OpenAI On Your Data was retired on 2026-10-14; set "
+    "AZURE_AI_SEARCH_MODE=pipeline)"
+)
 # Texts the rag group sends to the Search mock or gets back (generated
 # queries, document titles and URLs): not at INFO in the server log.
 SEARCH_TEXTS = ("x100 warranty", "Release Notes", "docs.example.com/x100")
@@ -195,8 +202,18 @@ LINE_TOO_LONG = "Got more than 131072 bytes"
 STREAM_ERROR = ("function_azure:stream_processor_with_citations", "Error processing")
 
 
+# First line of the task in Open WebUI's RAG template (a file attached to a
+# chat message): it starts with "### Task:" too, but is no background task.
+RAG_TEMPLATE_TASK = "Respond to the user query using the provided context"
+
+
 def _is_task(entry: dict) -> bool:
-    return "### Task:" in json.dumps((entry.get("body") or {}).get("messages"))
+    """A background-task request: a "### Task:" that is not the RAG template."""
+    text = json.dumps((entry.get("body") or {}).get("messages"))
+    return any(
+        not part.removeprefix("\\n").lstrip().startswith(RAG_TEMPLATE_TASK)
+        for part in text.split("### Task:")[1:]
+    )
 
 
 def _is_answer(entry: dict) -> bool:
@@ -589,8 +606,11 @@ async def api(t: Suite, mock, base_valves: dict) -> None:
         t.expect_errors(mark, ("function_azure:pipe", "Error in Azure AI request: 400"))
         t.check(
             f"api.error-400.{'stream' if stream else 'nonstream'}",
-            f"upstream HTTP 400 -> readable error (stream={stream})",
-            r.status == 200 and "content management policy" in r.content,
+            f"upstream HTTP 400 -> readable error (stream={stream}), no On Your "
+            "Data retirement hint (the request had no data_sources)",
+            r.status == 200
+            and "content management policy" in r.content
+            and RETIRED_HINT not in r.content,
             r.brief(),
         )
 
@@ -665,9 +685,11 @@ async def browser(t: Suite, mock) -> None:
     last = _last_status(c.status_history)
     t.check(
         "browser.error-status",
-        "browser path upstream HTTP 400: error saved, final 'Error: ...' status done",
+        "browser path upstream HTTP 400: error saved, final 'Error: ...' status "
+        "done, no On Your Data retirement hint (no data_sources)",
         c.done
         and "content management policy" in c.content
+        and RETIRED_HINT not in c.content
         and str(last.get("description", "")).startswith("Error:")
         and last.get("done") is True,
         f"{c.brief()} statuses={_statuses(c.status_history)}",
@@ -1345,17 +1367,18 @@ def logs(t: Suite, rag_mark=None) -> None:
         RAG_SEARCH_KEY,
         RAG_SEARCH_TOKEN,
         RAG_EMBED_KEY,
+        RAG_EMBED_TOKEN,
         RAG_JSON_KEY,
         sid="logs.no-secrets",
-        title="the API key, the search keys and the search token never appear "
-        "in the server log (any level)",
+        title="the API key, the search keys and tokens never appear in the "
+        "server log (INFO and above; the pipe at DEBUG: rag.log.debug)",
     )
     if not (t.selected("oyd") or t.selected("rag")):
         return  # no citations were fetched
     logged = t.log.since(t.log_start).count(CITATION_TEXT)
     t.check(
         "logs.no-citation-content",
-        "citation content (document text) is not logged at INFO",
+        "citation content (document text) is not logged at INFO or above",
         not logged,
         f"citation text logged {logged}x",
     )
@@ -1366,7 +1389,7 @@ def logs(t: Suite, rag_mark=None) -> None:
     t.check(
         "logs.no-search-text",
         "generated search queries, document titles and URLs are not logged at "
-        "INFO (pipeline mode)",
+        "INFO or above (pipeline mode)",
         not found,
         f"logged: {found}",
     )

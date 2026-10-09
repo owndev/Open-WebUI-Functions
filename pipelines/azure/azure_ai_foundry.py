@@ -314,6 +314,8 @@ class Pipe:
     # Dated GA api-version added to an embedding_dependency endpoint URL
     EMBEDDINGS_API_VERSION = "2024-10-21"
     SEARCH_REQUEST_TIMEOUT = 30  # seconds per search or embeddings request
+    # Largest search or embeddings answer read (a larger one is an error)
+    SEARCH_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
     QUERY_GENERATION_TIMEOUT = 10  # seconds
     # Query generation, embeddings and search together (with retries)
     RETRIEVAL_DEADLINE = 45  # seconds
@@ -336,6 +338,9 @@ class Pipe:
     DETAILS_PATTERN = re.compile(r"<details\b.*?</details>", re.DOTALL | re.IGNORECASE)
     # Tags that could close or open the <documents> block inside document text
     DOCUMENTS_TAG_PATTERN = re.compile(r"<\s*/?\s*documents\b[^>]*>", re.IGNORECASE)
+    # A "<" that still starts such a tag after the tags were removed (removing
+    # an inner tag joins its neighbours: "</docu<documents>ments>")
+    DOCUMENTS_TAG_START_PATTERN = re.compile(r"<(?=\s*/?\s*documents)", re.IGNORECASE)
     DOC_LABEL_IN_TEXT_PATTERN = re.compile(r"\[(doc)", re.IGNORECASE)
     QUERY_GENERATION_PROMPT = (
         "Write search queries for Azure AI Search.\n"
@@ -430,7 +435,7 @@ class Pipe:
         # retrieval or the legacy Azure OpenAI On Your Data (data_sources).
         AZURE_AI_SEARCH_MODE: str = Field(
             default=os.getenv("AZURE_AI_SEARCH_MODE", "pipeline"),
-            description="How AZURE_AI_DATA_SOURCES is used. 'pipeline' (default): the pipeline queries Azure AI Search itself and adds the documents to the prompt; works with every chat endpoint and model, keeps tools and token usage. 'on_your_data': legacy Azure OpenAI On Your Data (data_sources), retired by Microsoft on October 14, 2026.",
+            description="How AZURE_AI_DATA_SOURCES is used. 'pipeline' (default): the pipeline queries Azure AI Search itself and adds the documents to the prompt; works with every chat endpoint and model, keeps tools and token usage. 'on_your_data': legacy Azure OpenAI On Your Data (data_sources), retired by Microsoft on October 14, 2026. data_sources sent in the request by an API client or an inlet filter are an error in pipeline mode (also without AZURE_AI_DATA_SOURCES); on_your_data forwards them.",
             json_schema_extra={"enum": ["pipeline", "on_your_data"]},
         )
 
@@ -507,7 +512,7 @@ class Pipe:
         # already logged, documents per chat message for tool rounds, query
         # generation timeouts per model
         self._warned: Set[str] = set()
-        self._retrieval_cache: "OrderedDict[Tuple[str, str], Dict[str, Any]]" = (
+        self._retrieval_cache: "OrderedDict[Tuple[str, str, str], Dict[str, Any]]" = (
             OrderedDict()
         )
         self._query_generation_timeouts: Dict[str, int] = {}
@@ -678,13 +683,18 @@ class Pipe:
     def _search_mode(self) -> str:
         """
         AZURE_AI_SEARCH_MODE as "pipeline" or "on_your_data". Case, spaces and
-        "-" for "_" do not matter (on-your-data from an env file works); any
-        other value counts as "pipeline" with a warning.
+        "-" for "_" do not matter (on-your-data from an env file works); an
+        empty value is the default "pipeline" (e.g.
+        AZURE_AI_SEARCH_MODE=${AZURE_AI_SEARCH_MODE} in docker compose with
+        the variable unset); any other value counts as "pipeline" with a
+        warning.
         """
         raw = str(self.valves.AZURE_AI_SEARCH_MODE or "")
         mode = raw.strip().lower().replace("-", "_")
         if mode in self.SEARCH_MODES:
             return mode
+        if not mode:
+            return "pipeline"
         self._warn_once(
             f"search-mode:{mode}",
             f"Azure AI Search: AZURE_AI_SEARCH_MODE={raw.strip()[:40]!r} is not "
@@ -814,6 +824,18 @@ class Pipe:
             return (parts.hostname or "").lower(), parts.port
         except ValueError:
             return "", None
+
+    @staticmethod
+    def _url_origin(url: str) -> Tuple[str, str, Optional[int]]:
+        """(scheme, host, port with the scheme's default) of a URL; empty
+        parts if invalid. Two URLs with the same origin get the same key."""
+        try:
+            parts = urlsplit((url or "").strip())
+            scheme = parts.scheme.lower()
+            port = parts.port or {"http": 80, "https": 443}.get(scheme)
+            return scheme, (parts.hostname or "").lower(), port
+        except ValueError:
+            return "", "", None
 
     def _get_search_config(self, mode: str) -> Optional[Dict[str, Any]]:
         """
@@ -1162,10 +1184,15 @@ class Pipe:
                 )
             auth = dependency.get("authentication")
             if auth is None:
-                if self._url_host(url) != self._url_host(self.valves.AZURE_AI_ENDPOINT):
+                # the chat key only goes to the same scheme, host and port as
+                # AZURE_AI_ENDPOINT (never downgraded to http, never elsewhere)
+                if self._url_origin(url) != self._url_origin(
+                    self.valves.AZURE_AI_ENDPOINT
+                ):
                     raise AzureSearchError(
                         "embedding_dependency.authentication is missing; the chat "
-                        "key is only sent to the host of AZURE_AI_ENDPOINT"
+                        "key is only sent to the scheme, host and port of "
+                        "AZURE_AI_ENDPOINT"
                     )
                 emb_auth = None  # the auth header of the chat call
             elif not isinstance(auth, dict):
@@ -2832,10 +2859,13 @@ class Pipe:
         before its own RAG template is added; without a leading
         <attached_files> block), else the text of the current turn's user
         message. Whitespace collapsed, at most 1,000 characters. Empty for an
-        image-only turn.
+        image-only turn. A user_prompt that is Open WebUI's tool-images
+        message (a conversation replayed by an API client) is not used.
         """
         prompt = metadata.get("user_prompt") if isinstance(metadata, dict) else None
-        if isinstance(prompt, str):
+        if isinstance(prompt, str) and not prompt.lstrip().startswith(
+            self.TOOL_IMAGES_TEXT
+        ):
             text = self.ATTACHED_FILES_PATTERN.sub("", prompt)
         elif current is not None:
             text = self._message_text(messages[current])
@@ -2955,7 +2985,9 @@ class Pipe:
         for match in re.finditer(r"\{", text):
             try:
                 value, _ = decoder.raw_decode(text, match.start())
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError: deeply nested brackets (the answer can be
+                # steered by the conversation)
                 continue
             if isinstance(value, dict) and "queries" in value:
                 found = value
@@ -2965,7 +2997,7 @@ class Pipe:
             if 0 <= start < end:
                 try:
                     value = json.loads(text[start : end + 1])
-                except ValueError:
+                except (ValueError, RecursionError):
                     value = None
                 if isinstance(value, dict) and "queries" in value:
                     found = value
@@ -3048,7 +3080,9 @@ class Pipe:
             reason = f"no answer within {timeout:.0f} s"
         except aiohttp.ClientError as e:
             reason = type(e).__name__
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        except Exception:
+            # any other failure (an answer of an unexpected shape, deeply
+            # nested JSON, ...) also falls back to the user message
             reason = "unexpected answer"
         self._track_query_generation_timeout(model, timed_out)
         if reason:
@@ -3084,7 +3118,8 @@ class Pipe:
             (HTTP status, parsed JSON body or text, request-id header)
 
         Raises:
-            AzureSearchError: timeout or connection error
+            AzureSearchError: timeout or connection error, or an answer larger
+                than SEARCH_RESPONSE_MAX_BYTES
         """
         loop = asyncio.get_running_loop()
         host = self._url_host(url)[0] or "the server"
@@ -3099,6 +3134,13 @@ class Pipe:
                     f"{self.RETRIEVAL_DEADLINE} s retrieval limit"
                 )
             timeout = min(self.SEARCH_REQUEST_TIMEOUT, remaining)
+            max_bytes = self.SEARCH_RESPONSE_MAX_BYTES
+            too_large = AzureSearchError(
+                f"{what}the answer from {host} is larger than "
+                f"{max_bytes // (1024 * 1024)} MB; use an index with chunked "
+                "documents or set fields_mapping (only the mapped fields are "
+                "returned)"
+            )
             try:
                 async with session.post(
                     url,
@@ -3108,11 +3150,22 @@ class Pipe:
                     allow_redirects=False,
                 ) as resp:
                     status = resp.status
-                    raw = await resp.read()
                     retry_after = resp.headers.get("Retry-After")
                     request_id = resp.headers.get("request-id") or resp.headers.get(
                         "x-ms-request-id"
                     )
+                    if (resp.content_length or 0) > max_bytes:
+                        raise too_large
+                    # Bounded read: a whole document per hit (an index without
+                    # chunking) can make the answer huge.
+                    chunks: List[bytes] = []
+                    size = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise too_large
+                        chunks.append(chunk)
+                    raw = b"".join(chunks)
             except asyncio.TimeoutError:
                 limit = (
                     f"{self.SEARCH_REQUEST_TIMEOUT} s"
@@ -3130,8 +3183,14 @@ class Pipe:
                 ) from None
             text = raw.decode("utf-8", errors="replace")
             try:
-                data = json.loads(text) if text.strip() else None
-            except ValueError:
+                if not text.strip():
+                    data = None
+                elif len(text) > 1024 * 1024:
+                    # a large answer is parsed off the event loop
+                    data = await asyncio.to_thread(json.loads, text)
+                else:
+                    data = json.loads(text)
+            except (ValueError, RecursionError):
                 data = text
             if status in (429, 503) and attempt < len(delays):
                 delay = delays[attempt] + random.uniform(0, 0.25)
@@ -3285,8 +3344,20 @@ class Pipe:
                 )
             try:
                 if auth["type"] == "user_assigned_managed_identity":
+                    # azure-identity's async credentials send identity_config
+                    # as query parameters as they are, and the hosts name the
+                    # resource ID differently: App Service, Functions and
+                    # Container Apps (IDENTITY_ENDPOINT + IDENTITY_HEADER)
+                    # mi_res_id, the VM / IMDS endpoint msi_res_id. An unknown
+                    # name would be ignored (system-assigned identity) or fail.
+                    resource_key = (
+                        "mi_res_id"
+                        if os.environ.get("IDENTITY_ENDPOINT")
+                        and os.environ.get("IDENTITY_HEADER")
+                        else "msi_res_id"
+                    )
                     credential = ManagedIdentityCredential(
-                        identity_config={"resource_id": auth["resource_id"]}
+                        identity_config={resource_key: auth["resource_id"]}
                     )
                 else:
                     credential = DefaultAzureCredential()
@@ -3701,8 +3772,14 @@ class Pipe:
         """
         Remove <documents> / </documents> tags and turn "[doc" into "[ doc",
         so indexed text cannot close the documents block or fake a label.
+        Removing a tag can join its neighbours into a new one
+        ("</docu<documents>ments>"), so every "<" that still starts a
+        documents tag afterwards becomes U+2039 (single left-pointing angle
+        quotation mark; one pass: replacing a character never forms a new
+        tag, unlike removing one).
         """
         text = self.DOCUMENTS_TAG_PATTERN.sub("", text)
+        text = self.DOCUMENTS_TAG_START_PATTERN.sub("‹", text)  # U+2039
         return self.DOC_LABEL_IN_TEXT_PATTERN.sub(r"[ \1", text)
 
     def _relevance(
@@ -3757,14 +3834,24 @@ class Pipe:
     # --- Azure AI Search in pipeline mode: retrieval ---------------------------
 
     @staticmethod
-    def _retrieval_cache_key(metadata: Optional[dict]) -> Optional[Tuple[str, str]]:
-        """(chat_id, message_id) of a browser chat message, None otherwise."""
+    def _retrieval_cache_key(
+        metadata: Optional[dict],
+    ) -> Optional[Tuple[str, str, str]]:
+        """
+        (user_id, chat_id, message_id) of a chat message, None without a
+        message id. The message id can be chosen by an API client (the "id"
+        of the request), so the user is part of the key.
+        """
         if not isinstance(metadata, dict) or not metadata.get("message_id"):
             return None
-        return str(metadata.get("chat_id") or ""), str(metadata["message_id"])
+        return (
+            str(metadata.get("user_id") or ""),
+            str(metadata.get("chat_id") or ""),
+            str(metadata["message_id"]),
+        )
 
     def _cached_retrieval(
-        self, key: Tuple[str, str], fingerprint: str, query: str
+        self, key: Tuple[str, str, str], fingerprint: str, query: str
     ) -> Optional[Dict[str, Any]]:
         """The retrieval of an earlier round of the same message, if valid."""
         entry = self._retrieval_cache.get(key)
@@ -3782,7 +3869,7 @@ class Pipe:
 
     def _store_retrieval(
         self,
-        key: Tuple[str, str],
+        key: Tuple[str, str, str],
         fingerprint: str,
         query: str,
         retrieval: Dict[str, Any],
@@ -3857,7 +3944,18 @@ class Pipe:
             )
             return None
         cache_key = self._retrieval_cache_key(metadata)
-        if cache_key:
+        # Only a tool round (tool results or tool calls after the current
+        # user message) reuses the documents of its message; any other
+        # request with the same message id searches again.
+        tool_round = current is not None and any(
+            isinstance(message, dict)
+            and (
+                message.get("role") == "tool"
+                or (message.get("role") == "assistant" and message.get("tool_calls"))
+            )
+            for message in messages[current + 1 :]
+        )
+        if cache_key and tool_round:
             cached = self._cached_retrieval(
                 cache_key, config["fingerprint"], query_text
             )

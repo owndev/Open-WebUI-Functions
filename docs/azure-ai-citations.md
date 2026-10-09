@@ -73,7 +73,7 @@ When a non-streamed answer has citations:
 
 #### Tool Rounds (Pipeline Mode)
 
-With native function calling Open WebUI calls the pipeline again for every tool round of an answer, with the same message. The pipeline reuses the documents of the first round (same numbering, no new search), a round that ends in tool calls emits only the documents it references (never the "show all" fallback), and every document is emitted at most once per answer. The fallback for an answer without references applies only when no round referenced a document. The documents are kept per Open WebUI worker process, so with several workers a tool round on another process searches again and can add a source twice.
+With native function calling Open WebUI calls the pipeline again for every tool round of an answer, with the same message. The pipeline reuses the documents of the first round (same numbering, no new search; only for a tool round of the same user and message with unchanged search valves), a round that ends in tool calls emits only the documents it references (never the "show all" fallback), and every document is emitted at most once per answer. The fallback for an answer without references applies only when no round referenced a document. The documents are kept per Open WebUI worker process, so with several workers a tool round on another process searches again and can add a source twice.
 
 ## Citation Format
 
@@ -123,7 +123,7 @@ In pipeline mode the pipeline builds the same shape from each search hit it puts
 | Citation key | From the search hit |
 |---|---|
 | `title`, `url`, `filepath` | the fields named by `fields_mapping` (`title_field`, `url_field`, `filepath_field`; default `title`, `url`, `filepath`); lists joined with `, `, `null` when empty |
-| `content` | the `content_fields` (default `content`) joined with `content_fields_separator`, after removing `<documents>` tags and turning `[doc` into `[ doc`, cut to the token budget: exactly the text the model received |
+| `content` | the `content_fields` (default `content`) joined with `content_fields_separator`, after removing `<documents>` tags (a `<` that would still start such a tag afterwards, e.g. from nested tags like `</docu<documents>ments>`, becomes `‹`) and turning `[doc` into `[ doc`, cut to the token budget: exactly the text the model received |
 | `chunk_id` | the hit's `chunk_id` field, else the document number (informative only) |
 | `original_search_score` | `@search.score` (only with `AZURE_AI_INCLUDE_SEARCH_SCORES=true`) |
 | `rerank_score` | `@search.rerankerScore` of semantic queries (only with scores on, left out when absent) |

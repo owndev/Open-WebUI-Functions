@@ -142,16 +142,24 @@ def annotate(request: web.Request, **fields: Any) -> None:
     request["e2e_entry"].update(fields)
 
 
+# First line of the task in Open WebUI's RAG template (DEFAULT_RAG_TEMPLATE,
+# files or knowledge around the user message of a chat): it starts with
+# "### Task:" too, but is no background task.
+RAG_TEMPLATE_TASK = "Respond to the user query using the provided context"
+
+
 def task_answer(text: str) -> Optional[str]:
     """Return the JSON answer for an Open WebUI background-task prompt.
 
     Open WebUI's task templates start with ``### Task:``; returns ``None`` for
-    ordinary chat messages.
+    ordinary chat messages, also for those wrapped in its RAG template.
     """
     if not isinstance(text, str) or "### Task:" not in text:
         return None
     # The first line after "### Task:" names the task.
     task_line = (text.split("### Task:", 1)[1].strip().splitlines() or [""])[0]
+    if task_line.startswith(RAG_TEMPLATE_TASK):
+        return None
     task_line = task_line.lower()
     if "follow-up" in task_line or "follow up" in task_line:
         return json.dumps({"follow_ups": TASK_FOLLOW_UPS})

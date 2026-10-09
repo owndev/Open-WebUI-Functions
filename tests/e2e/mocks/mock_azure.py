@@ -42,17 +42,25 @@ Behaviour
     {"queries": ["x100 charging", "x100 warranty"]}; trigger words in the
     transcript: ``qgen-bad-json`` (prose, no JSON), ``qgen-400`` (content
     filter 400), ``qgen-partial`` (["x100 charging", "qfail-x100"]),
-    ``qgen-think`` (a <think> block with braces before the JSON),
-    ``qgen-many`` (6 queries with a case duplicate and a 405-character one),
-    ``qgen-slow`` (answers after 12 s, past the pipe's 10 s timeout)
+    ``qgen-allfail`` (two queries whose searches both fail),
+    ``qgen-think`` (a <think> block with its own draft queries before the
+    JSON), ``qgen-many`` (6 queries with a case duplicate and a
+    405-character one), ``qgen-order`` (["x100 order one", "x100 order
+    two"], merge order), ``qgen-scale`` (["x100 charging", "x100 low
+    scores"], per-query strictness), ``qgen-deep`` (JSON nested 3,000
+    levels deep), ``qgen-slow`` (answers after 12 s, past the pipe's 10 s
+    timeout)
   - ``use-tool`` with ``tools`` and no ``role: tool`` message yet -> a
     ``tool_calls`` answer for ``get_current_timestamp`` (Open WebUI's built-in
     tool) or else the first tool, arguments ``{}``, finish_reason tool_calls;
-    once a tool message is there -> the normal (grounded) answer
+    ``use-tool-ref``: the streamed tool round first writes "According to
+    [doc1] " (text that references a document before the tool call); once a
+    tool message is there -> the normal (grounded) answer
   - embeddings: ``POST .../openai/v1/embeddings`` (model in the body,
     api-version optional) and ``POST /<path>/embeddings`` (api-version
-    required); api-key / Bearer ``mock-key-123`` or api-key
-    ``mock-embed-key-321``; one 8-float vector per input (``dimensions``
+    required); api-key / Bearer ``mock-key-123``, api-key
+    ``mock-embed-key-321`` or Bearer ``mock-embed-token-e2e`` (auth_mode
+    embed-key / embed-bearer); one 8-float vector per input (``dimensions``
     floats when given); an input containing ``embed-fail`` -> HTTP 500
   - Open WebUI task prompts (title/tags/follow-ups) get the JSON they expect;
     with ``data_sources`` the citations context is still attached
@@ -104,6 +112,7 @@ from common import annotate, last_user_text, new_app, record, task_answer
 
 API_KEY = "mock-key-123"
 EMBED_KEY = "mock-embed-key-321"  # embedding_dependency.authentication.key
+EMBED_TOKEN = "mock-embed-token-e2e"  # embedding_dependency access_token
 EMBED_DIMS = 8  # vector length of the Search mock's vector fields
 # Models Azure OpenAI On Your Data still accepts (emulated retirement).
 OYD_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4.1"}
@@ -121,6 +130,14 @@ QG_MANY = [
     "x100 manual",
 ]
 QG_SLOW_SECONDS = 12
+QG_ALL_FAIL = ["qfail-x100 charging", "qfail-x100 warranty"]
+QG_ORDER = ["x100 order one", "x100 order two"]
+QG_SCALE = ["x100 charging", "x100 low scores"]
+QG_THINK = (
+    '<think>{"queries": ["draft-think-e2e"]}</think>{"queries": ["x100 charging"]}'
+)
+QG_DEEP = '{"queries": ' + "[" * 3000  # RecursionError in json without a guard
+TOOL_REF_TEXT = "According to [doc1] "  # use-tool-ref: text before the tool call
 RULES_MARKER = "## Retrieved documents"
 IN_SCOPE_TRUE = "Answer only with information from the documents"
 IN_SCOPE_FALSE = "you may answer from your own knowledge"
@@ -239,6 +256,8 @@ def _auth_mode(request: web.Request, embed: bool = False):
         return "bearer"
     if embed and request.headers.get("api-key") == EMBED_KEY:
         return "embed-key"
+    if embed and request.headers.get("authorization") == f"Bearer {EMBED_TOKEN}":
+        return "embed-bearer"
     return None
 
 
@@ -431,10 +450,18 @@ async def _query_generation(request: web.Request, body: dict, model):
         content = "Sure! Search for the X100 charging specs and the warranty terms."
     elif "qgen-partial" in transcript:
         content = json.dumps({"queries": ["x100 charging", "qfail-x100"]})
+    elif "qgen-allfail" in transcript:
+        content = json.dumps({"queries": QG_ALL_FAIL})
     elif "qgen-think" in transcript:
-        content = '<think>{"draft": 1}</think>{"queries": ["x100 charging"]}'
+        content = QG_THINK
     elif "qgen-many" in transcript:
         content = json.dumps({"queries": QG_MANY})
+    elif "qgen-order" in transcript:
+        content = json.dumps({"queries": QG_ORDER})
+    elif "qgen-scale" in transcript:
+        content = json.dumps({"queries": QG_SCALE})
+    elif "qgen-deep" in transcript:
+        content = QG_DEEP
     else:
         content = json.dumps({"queries": QG_QUERIES})
     return _completion(model, {"role": "assistant", "content": content})
@@ -602,9 +629,13 @@ async def _stream(
                 "type": "function",
                 "function": {"name": tool, "arguments": ""},
             }
-            await send(
-                delta({"role": "assistant", "content": None, "tool_calls": [call]})
-            )
+            if "use-tool-ref" in text:
+                await send(delta({"role": "assistant", "content": TOOL_REF_TEXT}))
+                await send(delta({"tool_calls": [call]}))
+            else:
+                await send(
+                    delta({"role": "assistant", "content": None, "tool_calls": [call]})
+                )
             arguments = {"index": 0, "function": {"arguments": "{}"}}
             await send(delta({"tool_calls": [arguments]}))
             await send(delta({}, "tool_calls"))

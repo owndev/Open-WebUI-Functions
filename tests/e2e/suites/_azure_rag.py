@@ -15,32 +15,43 @@ would not fail with that evidence on older files (no ``data_sources`` sent,
 
 Order: all pipeline-mode checks, then ``rag.notice.none`` (pipeline mode never
 logs the On Your Data notice), then the ``on_your_data`` sub-checks, which log
-it legitimately (the notice is logged once per loaded copy of the module).
+it legitimately (the notice is logged once per loaded copy of the module), and
+last ``rag.log.debug``, which runs the staged file in the driver process with
+every logger at DEBUG.
 
 Loaded by suites/azure.py when the group runs (modules starting with ``_`` are
 not suites).
 """
 
 import asyncio
+import importlib.util
 import json
+import logging
+import os
 import re
+import sys
 import time
+import types
 from typing import Optional
 
 from harness import Suite, known, short
+from harness.config import FUNCTIONS_DIR
 from harness.known import staged_version, version_tuple
 from suites.azure import (
     ALL_SOURCES,
     FID,
+    KEY,
     LINKED,
     NO_REFS,
     PAREN_LINKED,
     PATH,
     RAG_EMBED_KEY,
+    RAG_EMBED_TOKEN,
     RAG_JSON_KEY,
     RAG_SEARCH_KEY,
     RAG_SEARCH_TOKEN,
     REFERENCED_SOURCES,
+    RETIRED_HINT,
     SEARCH_SINCE,
     SHOW_ALL,
     SPLIT_LINK,
@@ -60,6 +71,7 @@ KNOWN = known.AZURE_OYD_RETIRED
 DEPLOYMENT = "gpt-5-mini"
 MODEL = f"{FID}.{DEPLOYMENT}"
 PAUSE_DEPLOYMENT = "gpt-5-pause"  # query generation pause (per model)
+RESET_DEPLOYMENT = "gpt-5-reset"  # timeouts that are not in a row
 OYD_DEPLOYMENT = "gpt-4.1"  # still accepted with data_sources by the mock
 QUESTION = "x100 charging and warranty?"
 AGAIN = "x100 charging and warranty again?"
@@ -99,10 +111,6 @@ CLIENT_DS_ERROR = (
     "Error: Azure AI Search: data_sources in the request is not supported in "
     "pipeline mode"
 )
-RETIRED_HINT = (
-    "(Azure OpenAI On Your Data was retired on 2026-10-14; set "
-    "AZURE_AI_SEARCH_MODE=pipeline)"
-)
 CONTEXT_HINT = (
     "lower AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS or top_n_documents, or start a new chat"
 )
@@ -126,6 +134,28 @@ PNG = (
     "2mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
 )
 IMAGE_PART = {"type": "image_url", "image_url": {"url": PNG}}
+# Open WebUI's user message after a tool returned images (a tool round)
+TOOL_IMAGES_PROMPT = (
+    "Here are the images from the tool results above. Please analyze them."
+)
+TOOL_CALL = {
+    "id": "call_e2e_cache",
+    "type": "function",
+    "function": {"name": "get_current_timestamp", "arguments": "{}"},
+}
+# A tool round as Open WebUI sends it to the pipe: the question, the tool
+# call and its result after it.
+TOOL_ROUND = [
+    {"role": "user", "content": QUESTION},
+    {"role": "assistant", "content": "", "tool_calls": [TOOL_CALL]},
+    {"role": "tool", "tool_call_id": TOOL_CALL["id"], "content": "2026-10-09T12:00Z"},
+]
+# Order of the merged documents of qgen-order (mock_search: "x100 order one"
+# -> docs 3, 1; "x100 order two" -> docs 2, 1): reciprocal rank fusion for
+# BM25, the best reranker score for semantic (first appearance: 3, 1, 2).
+ORDER_RRF = ["X100 Product Manual", "Release Notes", "Warranty FAQ"]
+ORDER_RERANK = ["Release Notes", "Warranty FAQ", "X100 Product Manual"]
+_BLOCK_TITLES = re.compile(r"(?m)^\[doc\d+\] Title: (.*)$")
 FULL_MAPPING = {
     "content_fields": ["content"],
     "title_field": "title",
@@ -430,6 +460,7 @@ async def rag(t: Suite, mock, base_valves: dict) -> None:
     await rag_api(r)
     await rag_browser(r)
     await rag_tool_round(r)
+    await rag_cache(r)
     await rag_links(r)
     await rag_query_text(r)
     await rag_no_refs(r)
@@ -456,6 +487,7 @@ async def rag(t: Suite, mock, base_valves: dict) -> None:
     await rag_notice_none(r, notice_before, group_mark)
     # on_your_data on purpose: these log the On Your Data notice
     await rag_oyd_mode(r)
+    await rag_debug_log(r)
     await t.owui.update_valves(FID, **base_valves)
 
 
@@ -663,6 +695,100 @@ async def rag_tool_round(r: Rag) -> None:
         f"{_search_brief(searches)} log_errors={errors[:2]}",
     )
 
+    # The tool round itself references [doc1] before its tool call: doc1 is
+    # emitted in that round and must not be emitted again in the final one.
+    async with t.browser() as b:
+        await r.reset()
+        c = await b.chat(MODEL, QUESTION + " use-tool-ref", stream=True)
+    chats, searches = await r.chats(), await r.searches()
+    doc1 = REFERENCED_SOURCES[0]
+    r.check(
+        "tool-round.ref",
+        "tool round whose text references [doc1] before the tool call: doc1 "
+        "saved once (emitted in the tool round, skipped in the final round), "
+        "doc2 from the final round",
+        c.done
+        and LINKED in c.content
+        and c.source_names == REFERENCED_SOURCES
+        and c.source_names.count(doc1) == 1
+        and len(searches) == 1
+        and len(chats) == 2
+        and all(_grounded(e) for e in chats),
+        f"{c.brief()} chats={len(chats)} {_search_brief(searches)}",
+    )
+
+    # Non-stream answer with tool calls and no content (streaming off in the
+    # browser): a tool round, so no "show all" fallback.
+    async with t.browser() as b:
+        await r.reset()
+        c = await b.chat(MODEL, QUESTION + " use-tool", stream=False)
+    chats, searches = await r.chats(), await r.searches()
+    first = chats[0] if chats else {}
+    r.check(
+        "tool-round.nonstream",
+        "non-stream answer with tool calls and no text (browser, streaming "
+        "off): no sources (a tool round never uses the show-all fallback), "
+        "terminal status",
+        c.source_names == []
+        and _last_status(c.status_history).get("done") is True
+        and len(searches) == 1
+        and bool(chats)
+        and _grounded(first)
+        and bool(first.get("tools_present")),
+        f"{c.brief()} {_chat_brief(first)} {_search_brief(searches)}",
+    )
+
+
+async def rag_cache(r: Rag) -> None:
+    """The documents of a message are reused only by a tool round of the same
+    user and message (API requests with a fixed ``id``, which Open WebUI
+    passes on as the message id), and never after a valve change."""
+    t = r.t
+    msg_id = f"e2e-cache-{int(time.time())}"
+    await r.set(AZURE_AI_SEARCH_QUERY_GENERATION="off")
+    await r.reset()
+    res1 = await t.owui.chat(MODEL, QUESTION, stream=False, id=msg_id)
+    first = len(await r.searches())
+    res2 = await t.owui.chat(MODEL, TOOL_ROUND, stream=False, id=msg_id)
+    second, chat2 = len(await r.searches()), await r.chat()
+    res3 = await t.owui.chat(MODEL, QUESTION, stream=False, id=msg_id)
+    third = len(await r.searches())
+    r.check(
+        "cache.tool-round",
+        "same message id: the tool round reuses the documents (no new search, "
+        "the same documents injected again); a request that is no tool round "
+        "searches again",
+        res1.content == LINKED
+        and res2.content == LINKED
+        and res3.content == LINKED
+        and [first, second, third] == [1, 1, 2]
+        and _grounded(chat2)
+        and chat2.get("current_user_index") == 1,  # after the added system message
+        f"{_answer(res1.content)} round2={short(res2.content, 60)} "
+        f"plain={short(res3.content, 60)} searches after each={[first, second, third]} "
+        f"{_chat_brief(chat2)}",
+    )
+
+    # Another index (a valve change) between the rounds: no reuse.
+    await r.set(
+        r.ds(index_name=CUSTOM_INDEX, fields_mapping=CUSTOM_MAPPING),
+        AZURE_AI_SEARCH_QUERY_GENERATION="off",
+    )
+    await r.reset()
+    res4 = await t.owui.chat(MODEL, TOOL_ROUND, stream=False, id=msg_id)
+    searches, chat4 = await r.searches(), await r.chat()
+    r.check(
+        "cache.valve-change",
+        "tool round after AZURE_AI_DATA_SOURCES changed (another index): the "
+        "cached documents of the old index are not reused, a new search on "
+        "the new index",
+        res4.content == LINKED
+        and len(searches) == 1
+        and (searches[0] if searches else {}).get("index") == CUSTOM_INDEX
+        and _grounded(chat4),
+        f"{_answer(res4.content)} {_search_brief(searches)} {_chat_brief(chat4)}",
+    )
+
 
 async def rag_links(r: Rag) -> None:
     """[docX] handling of the 2.8.0 code with the pipeline's citations."""
@@ -741,6 +867,63 @@ async def rag_query_text(r: Rag) -> None:
         and boundary,
         f"{_answer(res.content)} search={first!r} long: {_answer(res2.content)} "
         f"len={len(second)} word_boundary={boundary}",
+    )
+
+    # Open WebUI's tool round after a tool returned images ends with its own
+    # user message: the question stays the current user message.
+    messages = TOOL_ROUND + [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": TOOL_IMAGES_PROMPT}, IMAGE_PART],
+        }
+    ]
+    await r.reset()
+    res = await t.owui.chat(MODEL, messages, stream=False)
+    chat, searches, qgens = await r.chat(), await r.searches(), await r.qgens()
+    r.check(
+        "query-text.tool-images",
+        "tool round ending with Open WebUI's 'Here are the images from the "
+        "tool results above' user message: search text, documents and the "
+        "first-turn rule of query generation use the question before it",
+        res.content == LINKED
+        and [s.get("search") for s in searches] == [QUESTION]
+        and _grounded(chat)
+        and chat.get("current_user_index") == 1  # after the added system message
+        and not qgens,
+        f"{_answer(res.content)} {_search_brief(searches)} qgen={len(qgens)} "
+        f"{_chat_brief(chat)}",
+    )
+
+    # A file attached in the browser: Open WebUI puts an <attached_files>
+    # block (native function calling) and its RAG template with the file
+    # around the last user message; __metadata__.user_prompt keeps the typed
+    # prompt (after the block).
+    async with t.browser() as b:
+        earlier = await b.chat(MODEL, "x100 earlier chat e2e?", stream=True)
+        await r.reset()
+        attached = {
+            "type": "chat",
+            "id": earlier.chat_id,
+            "name": "earlier chat e2e",
+            "context": "full",
+        }
+        c = await b.chat(MODEL, QUESTION, stream=True, files=[attached])
+    chat, searches = await r.chat(), await r.searches()
+    question = _current_text(chat)
+    question = question[question.rfind("</documents>") + len("</documents>") :]
+    r.check(
+        "query-text.attached",
+        "browser chat with a file attached (another chat, full context): "
+        "Open WebUI's <attached_files> block and RAG template change the user "
+        "message, the search text is still the typed prompt",
+        c.done
+        and LINKED in c.content
+        and "<attached_files>" in question
+        and [s.get("search") for s in searches] == [QUESTION]
+        and _grounded(chat),
+        f"{c.brief()} attached_block={'<attached_files>' in question} "
+        f"question={short(question, 120)} {_search_brief(searches)} "
+        f"{_chat_brief(chat)}",
     )
 
 
@@ -887,7 +1070,19 @@ async def rag_query_types(r: Rag) -> None:
             "semantic.partial",
             {"query_type": "semantic", "semantic_configuration": "x100-semantic"},
             QUESTION + " semantic-partial",
-            None,  # HTTP 206 without reranker scores still answers
+            # HTTP 206 without reranker scores still answers: BM25 / 100
+            ("partial", 0.425, "BM25 relevance (42.5 / 100)"),
+        ),
+        (
+            "semantic.partial.hybrid",
+            {
+                "query_type": "vectorSemanticHybrid",
+                "semantic_configuration": "x100-semantic",
+            },
+            QUESTION + " semantic-partial",
+            # fused lists (search + one vector field) without reranker
+            # scores: RRF rescaled by rank, 0.0328 x 60 / 2
+            ("partial", 0.984, "RRF relevance (0.0328 x 60 / 2)"),
         ),
         (
             "query-type.vector",
@@ -930,17 +1125,19 @@ async def rag_query_types(r: Rag) -> None:
         searches, embeds = await r.searches(), await r.embeds()
         s = searches[0] if searches else {}
         citations = _context(res.json).get("citations") or []
-        if expected is None:
+        if isinstance(expected, tuple):
+            _, value, label = expected
             relevance = (citations[0] if citations else {}).get("relevance")
             ok = (
                 s.get("status") == 206
                 and len(citations) == 3
                 and not any("rerank_score" in c for c in citations)
-                and abs(float(relevance or 0) - 0.425) < 0.005
+                and abs(float(relevance or 0) - value) < 0.005
             )
             title = (
-                "semantic partial result (HTTP 206, no reranker scores): linked "
-                "answer, citations without rerank_score, BM25 relevance (0.425)"
+                f"{parameters['query_type']} partial result (HTTP 206, no "
+                "reranker scores): linked answer, citations without "
+                f"rerank_score, {label}"
             )
         else:
             ok = s.get("body") == expected and s.get("status") == 200
@@ -1083,6 +1280,22 @@ async def rag_vector(r: Rag) -> None:
             "api-key",
             {"input": [QUESTION]},
         ),
+        (
+            "vector.endpoint.token",
+            "endpoint dependency with authentication access_token: "
+            "'Authorization: Bearer <token>', no api-key",
+            {
+                "type": "endpoint",
+                "endpoint": endpoint,
+                "authentication": {
+                    "type": "access_token",
+                    "access_token": RAG_EMBED_TOKEN,
+                },
+            },
+            EMBED_API_VERSION,
+            "embed-bearer",
+            {"input": [QUESTION]},
+        ),
     )
     for sid, title, dependency, api_version, auth, body in cases:
         await r.set(
@@ -1103,6 +1316,7 @@ async def rag_vector(r: Rag) -> None:
             and e.get("path") == f"/openai/deployments/{EMBED_DEPLOYMENT}/embeddings"
             and e.get("api_version") == api_version
             and e.get("auth_mode") == auth
+            and (auth != "embed-bearer" or "api-key" not in (e.get("headers") or {}))
             and e.get("body") == body
             and vq.get("kind") == "vector"
             and vq.get("vector_len") == 8,
@@ -1110,7 +1324,8 @@ async def rag_vector(r: Rag) -> None:
             f"vq={vq}",
         )
 
-    # another host without authentication: the chat key must not go there
+    # another host (or scheme) without authentication: the chat key must not
+    # go there
     other = endpoint.replace("127.0.0.1", "localhost")
     cases = (
         (
@@ -1118,7 +1333,15 @@ async def rag_vector(r: Rag) -> None:
             "endpoint dependency without authentication on another host: "
             "configuration error, nothing sent",
             {"type": "endpoint", "endpoint": other},
-            "",
+            "authentication is missing",
+        ),
+        (
+            "vector.endpoint.other-scheme",
+            "endpoint dependency without authentication on the chat host and "
+            "port but another scheme (https instead of http): configuration "
+            "error, the chat key is never sent",
+            {"type": "endpoint", "endpoint": endpoint.replace("http://", "https://")},
+            "authentication is missing",
         ),
         (
             "config-error.embedding-v1",
@@ -1310,6 +1533,34 @@ async def rag_selection(r: Rag) -> None:
         f"{_answer(res.content)} top={s.get('top')}",
     )
 
+    await r.set(r.ds(top_n_documents=8))
+    await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION, stream=False)
+    searches = await r.searches()
+    s = searches[0] if searches else {}
+    r.check(
+        "filter-topn.headroom",
+        "top_n_documents 8 -> top 16 candidates (2 x top_n headroom for "
+        "strictness and duplicates)",
+        res.content == LINKED and s.get("top") == 16,
+        f"{_answer(res.content)} top={s.get('top')}",
+    )
+
+    await r.set(AZURE_AI_SEARCH_API_VERSION="2024-07-01")
+    await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION, stream=False)
+    searches = await r.searches()
+    s = searches[0] if searches else {}
+    r.check(
+        "api-version",
+        "AZURE_AI_SEARCH_API_VERSION=2024-07-01: the search request uses that "
+        "api-version",
+        res.content == LINKED
+        and len(searches) == 1
+        and s.get("api_version") == "2024-07-01",
+        f"{_answer(res.content)} api_version={s.get('api_version')!r}",
+    )
+
     for kind, parameters in (
         ("simple", {}),
         (
@@ -1346,6 +1597,17 @@ async def rag_budget(r: Rag) -> None:
             -1,
             32000,
             [1, 2, 3],
+            {},
+        ),
+        (
+            "budget.auto.top-n",
+            "auto with top_n_documents 25 (min(32000, 1600 x 25) tokens = "
+            "128,000 chars, more than 32,000, less than the 150,000 of the "
+            "documents)",
+            -1,
+            128000,
+            [1, 2, 3],
+            {"top_n_documents": 25},
         ),
         (
             "budget.valve",
@@ -1353,6 +1615,7 @@ async def rag_budget(r: Rag) -> None:
             1000,
             4000,
             [1, 2, 3],
+            {},
         ),
         (
             "budget.unlimited",
@@ -1360,6 +1623,7 @@ async def rag_budget(r: Rag) -> None:
             0,
             None,
             [1, 2, 3],
+            {},
         ),
         (
             "budget.drop",
@@ -1368,10 +1632,11 @@ async def rag_budget(r: Rag) -> None:
             300,
             1200,
             [1, 2],
+            {},
         ),
     )
-    for sid, label, tokens, chars, expected_docs in cases:
-        await r.set(AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS=tokens)
+    for sid, label, tokens, chars, expected_docs, parameters in cases:
+        await r.set(r.ds(**parameters), AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS=tokens)
         await r.reset()
         res = await t.owui.chat(MODEL, QUESTION + " big-context", stream=False)
         chat = await r.chat()
@@ -1384,6 +1649,7 @@ async def rag_budget(r: Rag) -> None:
         else:
             size_ok = (
                 sum(lengths) <= chars + 3 * 3
+                and sum(lengths) > chars * 3 // 4  # the budget is used
                 and all(500 <= n < 50000 for n in lengths)
                 and chat.get("docs_chars", 0) <= chars + 1000
             )
@@ -1521,21 +1787,34 @@ async def rag_sanitize(r: Rag) -> None:
     citations = _context(res.json).get("citations") or []
     card = str((citations[0] if citations else {}).get("content") or "")
     tags = re.findall(r"<\s*/?\s*documents\b[^>]*>", text, re.IGNORECASE)
+    starts = re.findall(r"<\s*/?\s*documents", text, re.IGNORECASE)
+    header = next((ln for ln in text.splitlines() if ln.startswith("[doc1] ")), "")
+    file_line = next((ln for ln in text.splitlines() if ln.startswith("File: ")), "")
+    marker = text.find("PWNED-E2E")
     r.check(
         "sanitize",
-        "document text that closes the block or fakes labels is sanitized: one "
-        "<documents> and one </documents> tag, [doc9] shown as [ doc9] in the "
-        "block and the citation",
+        "document text, title and file name that close the block (also with "
+        "nested tags a single removal pass would rebuild, e.g. "
+        "'</docu<documents>ments>') or fake labels are sanitized: one "
+        "<documents> and one </documents> tag, the injected text inside the "
+        "block, [doc9] shown as [ doc9] in the block, its header and the "
+        "citation",
         res.content == LINKED
         and tags == ["<documents>", "</documents>"]
+        and len(starts) == 2
+        and 0 <= marker < text.find("</documents>")
         and "[ doc9]" in block
         and "[doc9]" not in lowered
         and "[doc7]" not in lowered
+        and "[ doc9]" in header
+        and "[ doc9]" in file_line
         and "[ doc9]" in card
         and not re.search(r"<\s*/?\s*documents", card, re.IGNORECASE)
         and chat.get("prompt_docs") == [1, 2, 3],
-        f"{_answer(res.content)} tags={tags} docs={chat.get('prompt_docs')} "
-        f"card={short(card, 160)}",
+        f"{_answer(res.content)} tags={tags} tag_starts={len(starts)} "
+        f"injected_text_at={marker}/{text.find('</documents>')} "
+        f"header={short(header, 80)} file={short(file_line, 60)} "
+        f"docs={chat.get('prompt_docs')} card={short(card, 160)}",
     )
 
 
@@ -1634,10 +1913,12 @@ async def _error_case(
     searches_expected: Optional[int] = None,
     tagged: bool = True,
     log_absent: tuple = (),
+    max_seconds: Optional[float] = None,
 ) -> tuple:
     """One request that must end with 'Error: Azure AI Search: ...' and no
     chat request (the valves are set by the caller); the provoked error is
-    logged without traceback, ``log_absent`` nowhere in the log."""
+    logged without traceback, ``log_absent`` nowhere in the log; the answer
+    within ``max_seconds`` when given."""
     t = r.t
     mark = await r.reset()
     started = time.monotonic()
@@ -1661,6 +1942,7 @@ async def _error_case(
         and (searches_expected is None or len(searches) == searches_expected)
         and not traceback
         and not logged
+        and (max_seconds is None or elapsed < max_seconds)
     )
     r.check(
         sid,
@@ -1725,6 +2007,26 @@ async def rag_search_errors(r: Rag) -> None:
         QUESTION + " search-302",
         ("302",),
         searches_expected=1,
+    )
+    await _error_case(
+        r,
+        "search-error.too-large",
+        "search answer of 17 MiB (chunked, no Content-Length): the read stops "
+        "at 16 MB, error naming chunked documents and fields_mapping",
+        QUESTION + " search-huge",
+        ("larger than 16 MB", "chunked", "fields_mapping"),
+        searches_expected=1,
+    )
+    await _error_case(
+        r,
+        "search-error.deadline",
+        "search answers HTTP 503 after 20 s every time: retried, the third "
+        "attempt is cut off by the 45 s retrieval limit (error naming it), "
+        "within 52 s",
+        QUESTION + " search-deadline",
+        ("within the 45 s retrieval limit",),
+        searches_expected=3,
+        max_seconds=52,
     )
 
     await r.set(r.ds(index_name="no-such-index"))
@@ -2181,6 +2483,7 @@ async def rag_qgen(r: Rag) -> None:
     for sid, trigger, expect_line in (
         ("qgen.fallback.bad-json", "qgen-bad-json", False),
         ("qgen.fallback.400", "qgen-400", True),
+        ("qgen.fallback.deep", "qgen-deep", False),  # RecursionError in json
     ):
         latest = f"{AGAIN} {trigger}"
         mark = await r.reset()
@@ -2221,11 +2524,93 @@ async def rag_qgen(r: Rag) -> None:
     searches = await r.searches()
     r.check(
         "qgen.think",
-        "generation answer with a <think> block holding braces: the JSON after "
-        "it is used (one search 'x100 charging')",
+        "generation answer with a <think> block holding its own draft queries: "
+        "the JSON after it is used (one search 'x100 charging', none for the "
+        "draft)",
         res.content == LINKED
         and [s.get("search") for s in searches] == ["x100 charging"],
         f"{_answer(res.content)} {_search_brief(searches)}",
+    )
+
+    # [CONVERSATION SUMMARY] of Open WebUI's compaction in the system message
+    summary = "[CONVERSATION SUMMARY] summary-marker-e2e: the X100 charger."
+    await r.reset()
+    res = await t.owui.chat(
+        MODEL,
+        [{"role": "system", "content": f"Be brief.\n\n{summary}"}]
+        + _followup("and the warranty?"),
+        stream=False,
+    )
+    qgens = await r.qgens()
+    transcript = (qgens[0] if qgens else {}).get("transcript") or ""
+    r.check(
+        "qgen.summary",
+        "the conversation summary Open WebUI's compaction put into the system "
+        "message is part of the generation transcript",
+        res.content == LINKED
+        and len(qgens) == 1
+        and "[CONVERSATION SUMMARY]" in transcript
+        and "summary-marker-e2e" in transcript,
+        f"{_answer(res.content)} qgen={len(qgens)} transcript={short(transcript, 200)}",
+    )
+
+    # Merge order of several queries: reciprocal rank fusion (BM25), the best
+    # reranker score (semantic); never the order of first appearance.
+    for kind, parameters, expected in (
+        ("simple", {}, ORDER_RRF),
+        (
+            "semantic",
+            {"query_type": "semantic", "semantic_configuration": "x100-semantic"},
+            ORDER_RERANK,
+        ),
+    ):
+        await r.set(r.ds(**parameters))
+        await r.reset()
+        res = await t.owui.chat(
+            MODEL, _followup("and the warranty? qgen-order"), stream=False
+        )
+        chat, searches = await r.chat(), await r.searches()
+        citations = _context(res.json).get("citations") or []
+        block_titles = _BLOCK_TITLES.findall(_block(chat))
+        r.check(
+            f"qgen.merge-order.{kind}",
+            f"two generated queries ({kind}): documents ordered by "
+            + (
+                "reciprocal rank fusion"
+                if kind == "simple"
+                else "the best reranker score"
+            )
+            + f" {expected}, in the prompt ([docN]) and the citations",
+            res.status == 200
+            and res.content.startswith("The X100 charges via USB-C [[doc1]](")
+            and sorted(s.get("search") for s in searches)
+            == ["x100 order one", "x100 order two"]
+            and _titles(citations) == expected
+            and block_titles == expected,
+            f"{_answer(res.content)} citations={_titles(citations)} "
+            f"block={block_titles} {_search_brief(searches)}",
+        )
+
+    # Strictness per query: the weaker query's best hit (BM25 8.0) is far
+    # below the other query's best (42.5) but kept.
+    await r.set()
+    await r.reset()
+    res = await t.owui.chat(
+        MODEL, _followup("and the warranty? qgen-scale"), stream=False
+    )
+    searches = await r.searches()
+    citations = _context(res.json).get("citations") or []
+    r.check(
+        "qgen.strictness-per-query",
+        "strictness compares a hit with the best hit of its own query: the only "
+        "hit of a query with low BM25 scores (8.0, the other query's best is "
+        "42.5) is kept",
+        res.content.startswith("The X100 charges via USB-C [[doc1]](")
+        and sorted(s.get("search") for s in searches)
+        == ["x100 charging", "x100 low scores"]
+        and _titles(citations) == ORDER_RRF,
+        f"{_answer(res.content)} citations={_titles(citations)} "
+        f"{_search_brief(searches)}",
     )
 
     older = [
@@ -2309,18 +2694,40 @@ async def rag_qgen(r: Rag) -> None:
             f"{_search_brief(searches)}",
         )
 
+    await r.set(r.ds(allow_partial_result=True))
+    mark = await r.reset()
+    res = await t.owui.chat(
+        MODEL, _followup("and the warranty? qgen-allfail"), stream=False
+    )
+    await r.settle_errors(mark, SEARCH_ERROR)
+    searches, chats = await r.searches(), await r.chats()
+    r.check(
+        "qgen.partial.all-failed",
+        "two generated queries, both searches fail (HTTP 500), "
+        "allow_partial_result True: the request fails (no answer without "
+        "documents)",
+        res.content.startswith(ERROR_PREFIX)
+        and "500" in res.content
+        and len(searches) == 2
+        and not chats,
+        f"{_answer(res.content)} chats={len(chats)} {_search_brief(searches)}",
+    )
+
     # Timeouts (10 s) on a separate model: after 3 in a row the generation is
     # paused for that model (15 minutes), so the other checks are not affected.
-    await r.set(AZURE_AI_MODEL=f"{DEPLOYMENT};{PAUSE_DEPLOYMENT}")
+    await r.set(AZURE_AI_MODEL=f"{DEPLOYMENT};{PAUSE_DEPLOYMENT};{RESET_DEPLOYMENT}")
     model = f"{FID}.{PAUSE_DEPLOYMENT}"
     pause_mark = t.mark()
     rounds = []
+    paused_at = time.monotonic()
     for i in range(4):
         latest = f"{AGAIN} qgen-slow {i}"
         await r.reset()
         started = time.monotonic()
         res = await t.owui.chat(model, _followup(latest), stream=False)
         elapsed = time.monotonic() - started
+        if i == 2:
+            paused_at = time.monotonic()  # the third timeout starts the pause
         qgens, searches = await r.qgens(), await r.searches()
         rounds.append(
             (res, elapsed, len(qgens), [s.get("search") for s in searches], latest)
@@ -2354,6 +2761,56 @@ async def rag_qgen(r: Rag) -> None:
         and len(warned) == 1,
         f"{_answer(last[0].content)} generations={[x[2] for x in rounds]} "
         f"elapsed={[round(x[1], 1) for x in rounds]} warnings={len(warned)}",
+    )
+
+    # The pause is per model: another deployment still generates queries.
+    await r.reset()
+    res = await t.owui.chat(MODEL, _followup(f"{AGAIN} other model"), stream=False)
+    qgens = await r.qgens()
+    r.check(
+        "qgen.pause.other-model",
+        f"while {PAUSE_DEPLOYMENT} is paused, {DEPLOYMENT} still sends its "
+        "generation request (the pause is per model)",
+        res.content == LINKED and len(qgens) == 1,
+        f"{_answer(res.content)} qgen={len(qgens)}",
+    )
+
+    # Timeouts that are not in a row: timeout, success, timeout, timeout ->
+    # the count was reset by the success, so the next follow-up still
+    # generates queries.
+    reset_model = f"{FID}.{RESET_DEPLOYMENT}"
+    sequence = []
+    first_answer = None
+    for i, trigger in enumerate(("qgen-slow", "", "qgen-slow", "qgen-slow", "")):
+        await r.reset()
+        res = await t.owui.chat(
+            reset_model, _followup(f"{AGAIN} {trigger} reset {i}"), stream=False
+        )
+        first_answer = res.content if first_answer is None else first_answer
+        sequence.append((res.content == LINKED, len(await r.qgens())))
+    r.check(
+        "qgen.pause.not-in-a-row",
+        "timeout, success, timeout, timeout on one model: a success resets the "
+        "count, so the fifth follow-up still sends a generation request",
+        all(ok for ok, _ in sequence) and [n for _, n in sequence] == [1] * 5,
+        f"{_answer(first_answer)} answers linked={[ok for ok, _ in sequence]} "
+        f"generations={[n for _, n in sequence]}",
+    )
+
+    # 15 minutes, not seconds: still paused after more than 16 s.
+    wait = 16.5 - (time.monotonic() - paused_at)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    await r.reset()
+    res = await t.owui.chat(model, _followup(f"{AGAIN} still paused"), stream=False)
+    qgens = await r.qgens()
+    r.check(
+        "qgen.pause.lasts",
+        f"{PAUSE_DEPLOYMENT} is still paused more than 16 s after the third "
+        "timeout (the pause lasts 15 minutes): no generation request",
+        res.content == LINKED and not qgens and time.monotonic() - paused_at > 16,
+        f"{_answer(res.content)} qgen={len(qgens)} "
+        f"since pause={time.monotonic() - paused_at:.0f}s",
     )
 
 
@@ -2421,12 +2878,15 @@ async def rag_auth(r: Rag) -> None:
     )
 
     # Managed identity: run.sh emulates App Service managed identity
-    # (IDENTITY_ENDPOINT -> mock_search /msi/token).
+    # (IDENTITY_ENDPOINT -> mock_search /msi/token). App Service, Functions and
+    # Container Apps select a user-assigned identity by its resource ID with
+    # the query parameter mi_res_id (an unknown name such as resource_id is
+    # ignored there: the token of the system-assigned identity comes back).
     for sid, auth, ids in (
         (
             "auth.mi.system",
             {"type": "system_assigned_managed_identity"},
-            [],
+            {},
         ),
         (
             "auth.mi.user",
@@ -2434,7 +2894,7 @@ async def rag_auth(r: Rag) -> None:
                 "type": "user_assigned_managed_identity",
                 "managed_identity_resource_id": MI_RESOURCE_ID,
             },
-            [MI_RESOURCE_ID],
+            {"mi_res_id": MI_RESOURCE_ID},
         ),
     ):
         await r.set(r.ds(auth=auth))
@@ -2446,12 +2906,18 @@ async def rag_auth(r: Rag) -> None:
         r.check(
             sid,
             f"{auth['type']}: an Entra token of the Open WebUI host (scope "
-            "search.azure.com) as Bearer; the second request uses the cached token",
+            "search.azure.com"
+            + (
+                ", the identity selected with mi_res_id=<resource id>"
+                if ids
+                else ", no identity parameter"
+            )
+            + ") as Bearer; the second request uses the cached token",
             res.content == LINKED
             and res2.content == LINKED
             and len(tokens) == 1
             and str(token.get("resource", "")).rstrip("/") == SEARCH_RESOURCE
-            and sorted((token.get("identity_ids") or {}).values()) == ids
+            and (token.get("identity_ids") or {}) == ids
             and [s.get("auth_mode") for s in searches] == ["bearer", "bearer"],
             f"{_answer(res.content)} token requests={len(tokens)} "
             f"resource={token.get('resource')!r} ids={token.get('identity_ids')} "
@@ -2480,6 +2946,24 @@ async def rag_auth(r: Rag) -> None:
 
 async def rag_mode_unknown(r: Rag) -> None:
     t = r.t
+    # empty (e.g. AZURE_AI_SEARCH_MODE=${AZURE_AI_SEARCH_MODE} in docker
+    # compose with the variable unset): the default, no warning. Runs before
+    # the other mode values, so a warning could not have been logged earlier.
+    mark = t.mark()
+    await r.set(AZURE_AI_SEARCH_MODE="")
+    await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION, stream=False)
+    await t.log.settle(0.5)
+    chat, searches = await r.chat(), await r.searches()
+    warned = _warnings(t, mark, "AZURE_AI_SEARCH_MODE")
+    r.check(
+        "mode.empty",
+        "AZURE_AI_SEARCH_MODE empty: pipeline mode without a warning",
+        res.content == LINKED and _grounded(chat) and len(searches) == 1 and not warned,
+        f"{_answer(res.content)} searches={len(searches)} warnings={len(warned)} "
+        f"{_chat_brief(chat)}",
+    )
+
     mark = t.mark()
     await r.set(AZURE_AI_SEARCH_MODE="bogus")
     await r.reset()
@@ -2511,10 +2995,12 @@ async def rag_context_length(r: Rag) -> None:
     r.check(
         "context-length",
         "chat HTTP 400 context_length_exceeded on a request with documents: "
-        "Azure's message plus the budget / new chat hint",
+        "Azure's message plus the budget / new chat hint, no On Your Data "
+        "retirement hint (pipeline mode sends no data_sources)",
         res.content.startswith("Error:")
         and "maximum context length" in res.content
         and CONTEXT_HINT in res.content
+        and RETIRED_HINT not in res.content
         and _grounded(chat),
         f"{_answer(res.content)} {_chat_brief(chat)}",
     )
@@ -2548,6 +3034,46 @@ async def rag_stop(r: Rag) -> None:
         and not errors,
         f"{c.brief()} stop_ok={stop_ok} last={last} chats={len(chats)} "
         f"searches={len(searches)} log_errors={errors[:2]}",
+    )
+
+    # Stop while the search queries are generated (follow-up, slow generation)
+    async with t.browser() as b:
+        c1 = await b.chat(MODEL, QUESTION, stream=True)
+        mark = await r.reset()
+        c = await b.chat(
+            MODEL,
+            "and the warranty? qgen-slow stop",
+            stream=True,
+            history=[
+                {"role": "user", "content": QUESTION},
+                {"role": "assistant", "content": c1.content},
+            ],
+            chat_id=c1.chat_id,
+            parent_id=c1.message_id,
+            stop_after_s=3,
+            stop_wait=10,
+        )
+        await asyncio.sleep(2)
+        c = await b.reload(c)
+    await t.log.settle(0.5)
+    chats, searches, qgens = await r.chats(), await r.searches(), await r.qgens()
+    errors = t.log.errors(mark)
+    stop_ok = bool(c.stopped) and all(code == 200 for code, _ in c.stopped)
+    last = _last_status(c.status_history)
+    r.check(
+        "stop.qgen",
+        "Stop while the search queries are generated: the 'Generating search "
+        "queries...' status is ended (last status done), no search, no chat "
+        "request, no ERROR / Traceback",
+        stop_ok
+        and last.get("done") is True
+        and c.status_descriptions[:1] == [STATUS_QGEN]
+        and len(qgens) == 1
+        and not searches
+        and not chats
+        and not errors,
+        f"{c.brief()} stop_ok={stop_ok} last={last} qgen={len(qgens)} "
+        f"searches={len(searches)} chats={len(chats)} log_errors={errors[:2]}",
     )
 
 
@@ -2597,6 +3123,44 @@ async def rag_oyd_mode(r: Rag) -> None:
         and not searches,
         f"{_answer(res.content)} auth={'key' if auth else auth} "
         f"stored_has_key={RAG_SEARCH_KEY in str(stored)} searches={len(searches)}",
+        tagged=False,
+    )
+
+    # data_sources of the client (endpoint and auth chosen by the client):
+    # forwarded as sent, AZURE_AI_SEARCH_KEY never goes into them.
+    client_auth = {"type": "api_key", "key": "client-key-e2e"}
+    results = []
+    for label, auth_value in (("own key", client_auth), ("no authentication", None)):
+        parameters = {"endpoint": r.search.url, "index_name": "client-index"}
+        if auth_value is not None:
+            parameters["authentication"] = auth_value
+        client = [{"type": "azure_search", "parameters": parameters}]
+        await r.reset()
+        res = await t.owui.chat(model, QUESTION, stream=False, data_sources=client)
+        chat = await r.chat()
+        body = chat.get("body") or {}
+        sent = ((body.get("data_sources") or [{}])[0].get("parameters")) or {}
+        ok = (
+            res.content == LINKED
+            and sent.get("index_name") == "client-index"
+            and sent.get("authentication") == auth_value
+            and RAG_SEARCH_KEY not in json.dumps(body)
+        )
+        results.append(
+            (
+                ok,
+                f"{label}: {_answer(res.content)} index={sent.get('index_name')} "
+                f"auth_as_sent={sent.get('authentication') == auth_value} "
+                f"valve_key_in_body={RAG_SEARCH_KEY in json.dumps(body)}",
+            )
+        )
+    r.check(
+        "auth.key-valve.oyd-client",
+        "on_your_data mode with AZURE_AI_SEARCH_KEY: data_sources sent by the "
+        "client (with their own key and without authentication) are forwarded "
+        "as sent; the valve's key is never put into them",
+        all(ok for ok, _ in results),
+        " | ".join(detail for _, detail in results),
         tagged=False,
     )
 
@@ -2653,5 +3217,256 @@ async def rag_oyd_mode(r: Rag) -> None:
         and "Access denied" in res401.content
         and RETIRED_HINT not in res401.content,
         f"400: {short(res.content, 200)} 401: {short(res401.content, 160)}",
+        tagged=False,
+    )
+
+
+# ------------------------------------------------------------- DEBUG log
+# The server runs at INFO (logs.no-secrets reads its log). Open WebUI at DEBUG
+# logs the stored valves itself (aiosqlite), so the pipe's own DEBUG output is
+# checked here: the staged file runs in this driver process with every logger
+# at DEBUG, against the same mocks.
+class _LogCapture(logging.Handler):
+    """Every log record of this process (message and traceback)."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        self.records: list = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = self.format(record)
+        except Exception as exc:  # the raw parts still count
+            text = f"{record.msg!r} {record.args!r} ({exc!r})"
+        self.records.append((record.name, record.levelno, text))
+
+
+def _load_staged_pipe():
+    """The staged pipe file as a module of this process.
+
+    ``open_webui.env`` is a stub during the import (the real one sets the
+    process up like a server); SRC_LOG_LEVELS OPENAI=DEBUG is what
+    GLOBAL_LOG_LEVEL=DEBUG gives the pipe's logger in Open WebUI.
+    """
+    env = types.ModuleType("open_webui.env")
+    env.AIOHTTP_CLIENT_TIMEOUT = 300
+    env.SRC_LOG_LEVELS = {"OPENAI": "DEBUG"}
+    names = ("open_webui", "open_webui.env")
+    saved = {name: sys.modules.get(name) for name in names}
+    sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
+    sys.modules["open_webui.env"] = env
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "e2e_azure_debug", os.path.join(FUNCTIONS_DIR, PATH)
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+async def _pipe_in_process(pipe, valves: dict, model: str, messages, n: int) -> str:
+    """One pipe() call in this process: the answer text or the SSE stream."""
+    pipe.valves = pipe.Valves(**valves)
+    stream = isinstance(messages, tuple)  # a tuple: stream=True
+
+    async def emit(event):
+        pass
+
+    result = await pipe.pipe(
+        {"model": model, "stream": stream, "messages": list(messages)},
+        __event_emitter__=emit,
+        __metadata__={
+            "user_id": "debug-user",
+            "chat_id": "debug-chat",
+            "message_id": f"debug-{n}",
+            "user_prompt": _text(messages[-1]["content"]),
+        },
+    )
+    if hasattr(result, "body_iterator"):
+        parts = []
+        async for chunk in result.body_iterator:
+            parts.append(
+                chunk.decode("utf-8", "replace")
+                if isinstance(chunk, bytes)
+                else str(chunk)
+            )
+        return "".join(parts)
+    if isinstance(result, dict):
+        choice = (result.get("choices") or [{}])[0]
+        return str((choice.get("message") or {}).get("content") or "")
+    return str(result or "")
+
+
+async def rag_debug_log(r: Rag) -> None:
+    """The pipe at DEBUG logs no key or token (2.9.0+, untagged)."""
+    if not r.fixed:
+        return
+    secrets = {
+        KEY: "AZURE_AI_API_KEY",
+        RAG_SEARCH_KEY: "AZURE_AI_SEARCH_KEY",
+        RAG_JSON_KEY: "key in AZURE_AI_DATA_SOURCES",
+        RAG_SEARCH_TOKEN: "search token",
+        RAG_EMBED_KEY: "embedding key",
+        RAG_EMBED_TOKEN: "embedding token",
+    }
+    embed = f"{r.mock.url}/openai/deployments/{EMBED_DEPLOYMENT}/embeddings"
+
+    def hybrid(auth: dict) -> dict:
+        dependency = {"type": "endpoint", "endpoint": embed, "authentication": auth}
+        return {
+            "query_type": "vector_simple_hybrid",
+            "embedding_dependency": dependency,
+        }
+
+    def mi(resource_id: str) -> dict:
+        return {
+            "type": "user_assigned_managed_identity",
+            "managed_identity_resource_id": resource_id,
+        }
+
+    question = [{"role": "user", "content": QUESTION}]
+    oyd = {
+        "AZURE_AI_SEARCH_MODE": "on_your_data",
+        "AZURE_AI_ENDPOINT": f"{r.mock.url}/openai/deployments/{OYD_DEPLOYMENT}"
+        "/chat/completions?api-version=2025-01-01-preview",
+        "AZURE_AI_MODEL": OYD_DEPLOYMENT,
+    }
+    json_key = {"type": "api_key", "key": RAG_JSON_KEY}
+    token = {"type": "access_token", "access_token": RAG_SEARCH_TOKEN}
+    # (label, valves, model, messages (a tuple streams), error expected)
+    cases = (
+        (
+            "valve key over the JSON key, stream",
+            r.valves(r.ds(auth=json_key), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY),
+            MODEL,
+            tuple(question),
+            False,
+        ),
+        (
+            "valve key, follow-up with query generation",
+            r.valves(r.ds(auth=None), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY),
+            MODEL,
+            _followup(AGAIN),
+            False,
+        ),
+        (
+            "search token, embedding key",
+            r.valves(
+                r.ds(auth=token, **hybrid({"type": "api_key", "key": RAG_EMBED_KEY}))
+            ),
+            MODEL,
+            question,
+            False,
+        ),
+        (
+            "embedding token, chat key as Bearer, stream",
+            r.valves(
+                r.ds(
+                    **hybrid({"type": "access_token", "access_token": RAG_EMBED_TOKEN})
+                ),
+                USE_AUTHORIZATION_HEADER=True,
+            ),
+            MODEL,
+            tuple(question),
+            False,
+        ),
+        (
+            "system-assigned managed identity",
+            r.valves(r.ds(auth={"type": "system_assigned_managed_identity"})),
+            MODEL,
+            question,
+            False,
+        ),
+        (
+            "user-assigned managed identity",
+            r.valves(r.ds(auth=mi(MI_RESOURCE_ID))),
+            MODEL,
+            question,
+            False,
+        ),
+        (
+            "managed identity token error",
+            r.valves(r.ds(auth=mi(MI_FAIL_ID))),
+            MODEL,
+            question,
+            True,
+        ),
+        (
+            "search HTTP 403",
+            r.valves(r.ds(auth=None), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY),
+            MODEL,
+            [{"role": "user", "content": "x100 search-403"}],
+            True,
+        ),
+        (
+            "on_your_data, the valve key in data_sources",
+            r.valves(r.ds(auth=None), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY, **oyd),
+            f"{FID}.{OYD_DEPLOYMENT}",
+            question,
+            False,
+        ),
+    )
+    capture = _LogCapture()
+    root = logging.getLogger()
+    level = root.level
+    root.addHandler(capture)
+    root.setLevel(logging.DEBUG)
+    results, failure = [], ""
+    await r.reset()
+    try:
+        module = _load_staged_pipe()
+        pipe = module.Pipe()
+        for n, (label, valves, model, messages, error) in enumerate(cases):
+            text = await asyncio.wait_for(
+                _pipe_in_process(pipe, valves, model, messages, n), 120
+            )
+            results.append((label, bool(text) and text.startswith("Error:") == error))
+    except Exception as exc:  # the check reports it
+        failure = f"{type(exc).__name__}: {short(str(exc), 200)}"
+    finally:
+        root.removeHandler(capture)
+        root.setLevel(level)
+        logging.getLogger("azure_ai.pipe").setLevel(logging.NOTSET)
+    embeds, tokens, chats = await r.embeds(), await r.tokens(), await r.chats()
+    oyd_chat = [c for c in chats if (c.get("body") or {}).get("data_sources")]
+    debug = sum(
+        1
+        for name, levelno, _ in capture.records
+        if name.startswith("azure_ai") and levelno == logging.DEBUG
+    )
+    leaks = []
+    for value, label in secrets.items():
+        hits = [text for _, _, text in capture.records if value in text]
+        if hits:
+            line = hits[0]
+            for other in secrets:
+                line = line.replace(other, "***")
+            leaks.append(f"{label} in {len(hits)} record(s): {short(line, 160)}")
+    r.check(
+        "log.debug",
+        "the pipe with every logger at DEBUG (run in the test driver; the "
+        "server logs at INFO): the API key, the search key of the valve and the "
+        "JSON, the search and embedding tokens and the embedding key are in no "
+        "log record (keys, tokens, managed identity, query generation, errors, "
+        "on_your_data)",
+        not failure
+        and len(results) == len(cases)
+        and all(ok for _, ok in results)
+        and len(embeds) == 2
+        and len(tokens) >= 3
+        and len(oyd_chat) == 1
+        and debug > 0
+        and not leaks,
+        f"{failure or 'ran'} cases_ok={[label for label, ok in results if ok]} "
+        f"failed={[label for label, ok in results if not ok]} "
+        f"embeds={len(embeds)} tokens={len(tokens)} oyd_chats={len(oyd_chat)} "
+        f"records={len(capture.records)} azure_ai_debug={debug} leaks={leaks}",
         tagged=False,
     )

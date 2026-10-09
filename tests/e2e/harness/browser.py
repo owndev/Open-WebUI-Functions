@@ -178,6 +178,7 @@ class BrowserSession:
         models: Optional[list] = None,
         stop_after_s: Optional[float] = None,
         stop_wait: float = 15,
+        files: Optional[list] = None,
     ) -> BrowserChat:
         """Send one user message and wait until the saved answer is ``done``.
 
@@ -194,6 +195,10 @@ class BrowserSession:
         ``stop_after_s``: press Stop that many seconds after sending
         (``POST /api/tasks/stop/<task id>`` for every task); then wait up to
         ``stop_wait`` seconds for ``done`` (a stopped answer may never be done).
+
+        ``files``: items attached to the user message, as the web UI sends
+        them (saved on the user message and sent as the request's ``files``),
+        e.g. ``{"type": "chat", "id": <chat id>, "context": "full"}``.
         """
         if models:
             ids = list(models) if models[0] == model else [model, *models]
@@ -221,6 +226,9 @@ class BrowserSession:
             "params": params or {},
             "background_tasks": background_tasks or {},
         }
+        if files:
+            user_message["files"] = list(files)
+            body["files"] = list(files)
         if models:
             body["message_ids"] = [
                 {"model_id": m, "message_id": a, "modelIdx": i}
