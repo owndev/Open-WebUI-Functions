@@ -156,8 +156,8 @@ async def cleanup_response(
 # Azure OpenAI On Your Data (the data_sources API behind the Azure AI Search
 # integration) is retired by Microsoft on October 14, 2026. pipe() logs this
 # notice once per process (per loaded copy of this function) for the first
-# request that sends data_sources. The data_sources themselves are never
-# logged: they can contain a search key.
+# request that sends a non-empty data_sources. The data_sources themselves
+# are never logged: they can contain a search key.
 ON_YOUR_DATA_RETIREMENT_NOTICE = (
     "Azure AI Search: this request uses Azure OpenAI On Your Data (data_sources), "
     "which Microsoft retires on October 14, 2026. From that date on, requests "
@@ -2045,8 +2045,9 @@ class Pipe:
 
         if uses_data_sources:
             # From the valve or from the client; background tasks never get
-            # here with data_sources (removed above).
-            if _first_on_your_data_request():
+            # here with data_sources (removed above). An empty list from the
+            # client uses no data source and must not use up the notice.
+            if filtered_body.get("data_sources") and _first_on_your_data_request():
                 log.warning(ON_YOUR_DATA_RETIREMENT_NOTICE)
 
             # Azure OpenAI "On Your Data" does not support `stream_options`

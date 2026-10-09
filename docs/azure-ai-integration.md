@@ -84,7 +84,7 @@ The pipeline supports **Azure AI Search** integration for **Retrieval-Augmented 
 > **Azure AI Search integration only works with Azure OpenAI endpoints** in this specific format:
 > `https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview`
 
-The examples use `api-version=2025-01-01-preview`. The On Your Data API reference lists `2024-02-01`, `2024-02-15-preview` and `2024-05-01-preview` (the latest there) as its supported versions; `2025-01-01-preview` is not on that list. It is a later preview version of the Azure OpenAI inference API whose specification still contains `data_sources`, but no longer `role_information` (removed in `2024-08-01-preview` according to the [API version changelog](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle#api-version-changelog)), which the advanced example below uses.
+The examples use `api-version=2025-01-01-preview`. The On Your Data API reference lists `2024-02-01`, `2024-02-15-preview` and `2024-05-01-preview` (the latest there) as its supported versions; `2025-01-01-preview` is not on that list. It is a later preview version of the Azure OpenAI inference API whose specification still contains `data_sources`, but no longer `role_information` (removed in `2024-08-01-preview` according to the [API version changelog](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle#api-version-changelog)). `role_information` therefore only works with an API version that still has it, such as `2024-05-01-preview`; with `2025-01-01-preview`, put these instructions in the system prompt instead.
 
 #### Behavior with `data_sources`
 
@@ -154,15 +154,20 @@ For advanced use cases, you can include additional parameters:
         "type": "api_key",
         "key": "YOUR-SEARCH-API-KEY"
       },
-      "query_type": "vectorSimpleHybrid",
+      "query_type": "vector_semantic_hybrid",
       "semantic_configuration": "default",
+      "embedding_dependency": {
+        "type": "deployment_name",
+        "deployment_name": "YOUR-EMBEDDING-DEPLOYMENT"
+      },
       "top_n_documents": 20,
-      "strictness": 3,
-      "role_information": "You are an AI assistant that helps with questions based on the provided documents."
+      "strictness": 3
     }
   }
 ]
 ```
+
+Property keys and enum values are snake case (`vector_semantic_hybrid`, not `vectorSemanticHybrid`). `vector`, `vector_simple_hybrid` and `vector_semantic_hybrid` require `embedding_dependency` (here an embedding model deployment in the same Azure OpenAI resource), `semantic` and `vector_semantic_hybrid` require `semantic_configuration` (the name of a semantic configuration of your index); without vector fields or a semantic configuration, omit `query_type` (default `simple`). See the [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/azure-search?tabs=rest#parameters) for all parameters.
 
 #### Index Schema and Field Mapping for Citations
 

@@ -19,8 +19,10 @@ Groups (``--only azure.<group>``)
            valve), relevance scores, no data_sources for background tasks (#123,
            also without a websocket session), no tools / stream_options with
            data_sources, large context events, content null; the On Your Data
-           retirement warning: none for requests without data_sources, exactly
-           one for all data_sources requests, never with the search key
+           retirement warning: none for requests without (or with empty)
+           data_sources, one for the first valve request and one for the first
+           client request after the function was saved again, none for later
+           requests, never with the search key
   logs     no API key and no citation text in the server log
 
 Browser chats of the oyd group that test the stream / citation handling send
@@ -107,9 +109,10 @@ DATA_SOURCES = [
         },
     }
 ]
-# The On Your Data retirement warning (since 2.8.1): logged once per process
-# for the first request that sends data_sources. Lines with all of
-# OYD_NOTICE count as the notice, whatever their level.
+# The On Your Data retirement warning (since 2.8.1): logged once per loaded
+# copy of the module (saving the function loads it again) for the first
+# request that sends a non-empty data_sources. Lines with all of OYD_NOTICE
+# count as the notice, whatever their level.
 OYD_NOTICE = ("On Your Data", "October 14, 2026")
 OYD_NOTICE_SINCE = "2.8.1"
 MANUAL_URL = "https://docs.example.com/x100/manual.pdf"
@@ -187,14 +190,56 @@ def _upstream(entry: dict) -> str:
     )
 
 
-def _oyd_notices(t: Suite) -> list:
-    """Full server-log lines of the On Your Data retirement notice since the
-    suite started (before the function was installed)."""
+def _oyd_notices(t: Suite, mark: int) -> list:
+    """Full server-log lines of the On Your Data retirement notice since
+    ``mark``."""
     return [
         line
-        for line in t.log.since(t.log_start).splitlines()
+        for line in t.log.since(mark).splitlines()
         if all(part in line for part in OYD_NOTICE)
     ]
+
+
+def _oyd_notice_expected() -> int:
+    """Notices per loaded copy of the module: 1 for the staged pipeline from
+    OYD_NOTICE_SINCE on, 0 before."""
+    version = staged_version(PATH)
+    return int(version_tuple(version) >= version_tuple(OYD_NOTICE_SINCE))
+
+
+async def _check_oyd_notice(
+    t: Suite, sid: str, title: str, mark: int, expected: int, ok=True, detail=""
+) -> bool:
+    """Check: exactly ``expected`` retirement notices since ``mark`` (and
+    ``ok``), each a WARNING of the pipe with the link to #187 and without any
+    part of the data_sources."""
+    await t.log.settle(0.5)
+    notices = _oyd_notices(t, mark)
+    leaked = [
+        name
+        for name, value in (
+            ("search key", SEARCH_KEY),
+            ("endpoint", SEARCH_ENDPOINT),
+            ("index", SEARCH_INDEX),
+        )
+        if any(value in notice for notice in notices)
+    ]
+    shape = all(
+        "| WARNING" in notice
+        and "function_azure:pipe" in notice
+        and "issues/187" in notice
+        and "once per process" in notice
+        for notice in notices
+    )
+    first = notices[0].replace(SEARCH_KEY, "***") if notices else ""
+    return t.check(
+        sid,
+        title,
+        bool(ok) and len(notices) == expected and shape and not leaked,
+        f"{detail} version={staged_version(PATH)} notices={len(notices)} "
+        f"expected={expected} WARNING of the pipe with #187={shape} "
+        f"data_sources parts in the notice={leaked} line={short(first, 400)}",
+    )
 
 
 def _allow_listed(body: dict) -> bool:
@@ -601,12 +646,14 @@ async def oyd(t: Suite, mock, base_valves: dict) -> None:
 
 async def oyd_notice_none(t: Suite, mock, base_valves: dict, oyd_valves: dict) -> None:
     """Requests without data_sources log no retirement notice: a chat without
-    AZURE_AI_DATA_SOURCES and a title task with it (tasks drop data_sources).
-    Runs before the first data_sources request of the suite, because the
-    notice is logged only once per process."""
+    AZURE_AI_DATA_SOURCES, the same with an empty data_sources list from the
+    client and a title task with the valve (tasks drop data_sources). Runs
+    before the first data_sources request of the suite, because the notice
+    is logged only once per loaded copy of the module."""
     await t.owui.update_valves(FID, **base_valves)
     await mock.reset()
     r = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=True)
+    empty = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=False, data_sources=[])
     await t.owui.update_valves(FID, **oyd_valves)
     status, answer, _ = await t.owui.title_task(
         model=f"{FID}.gpt-4.1",
@@ -614,70 +661,60 @@ async def oyd_notice_none(t: Suite, mock, base_valves: dict, oyd_valves: dict) -
     )
     requests = await mock.requests()
     tasks = [e for e in requests if _is_task(e)]
-    with_sources = [e for e in requests if "data_sources" in (e.get("body") or {})]
-    await t.log.settle(0.5)
-    notices = _oyd_notices(t)
-    t.check(
+    with_sources = [e for e in requests if (e.get("body") or {}).get("data_sources")]
+    empty_sent = [
+        e for e in requests if (e.get("body") or {}).get("data_sources") == []
+    ]
+    await _check_oyd_notice(
+        t,
         "oyd.notice.none",
-        "requests without data_sources (no AZURE_AI_DATA_SOURCES; title task "
-        "with it) log no On Your Data retirement notice",
-        r.status == 200
+        "requests without data_sources (no AZURE_AI_DATA_SOURCES, also with "
+        "data_sources [] from the client; title task with the valve) log no On "
+        "Your Data retirement notice",
+        t.log_start,
+        0,
+        ok=r.status == 200
         and _answered(r.content)
+        and empty.status == 200
+        and _answered(empty.content)
         and status == 200
         and bool(answer)
         and len(requests) > len(tasks) > 0
-        and not with_sources
-        and not notices,
-        f"{r.brief()} task HTTP {status} answer={short(answer)} "
-        f"upstream requests={len(requests)} (tasks {len(tasks)}) "
-        f"with data_sources={len(with_sources)} "
-        f"notices={len(notices)} "
-        f"{short([n.replace(SEARCH_KEY, '***') for n in notices[:1]], 300)}",
+        and not with_sources,
+        detail=f"{r.brief()} empty data_sources: {empty.brief()} "
+        f"(forwarded as [] {len(empty_sent)}x) task HTTP {status} "
+        f"answer={short(answer)} upstream requests={len(requests)} "
+        f"(tasks {len(tasks)}) with data_sources={len(with_sources)}",
     )
 
 
 async def oyd_notice_once(t: Suite) -> None:
     """After all data_sources requests of the group (valve and client, API and
-    browser path, stream and non-stream): exactly one retirement notice, a
-    WARNING of the pipe with the issue link, without any part of the
-    data_sources; the search key appears nowhere in the server log."""
-    await t.log.settle(0.5)
-    version = staged_version(PATH)
-    expected = 1 if version_tuple(version) >= version_tuple(OYD_NOTICE_SINCE) else 0
-    notices = _oyd_notices(t)
-    line = notices[0] if len(notices) == 1 else ""
-    leaked = [
-        name
-        for name, value in (
-            ("search key", SEARCH_KEY),
-            ("endpoint", SEARCH_ENDPOINT),
-            ("index", SEARCH_INDEX),
-        )
-        if any(value in notice for notice in notices)
-    ]
+    browser path, stream and non-stream, history, tools, big contexts): one
+    retirement notice per loaded copy of the module (oyd.notice.valve and,
+    after the reload, oyd.notice.client), none for the later requests; the
+    search key appears nowhere in the server log."""
     key_logged = t.log.since(t.log_start).count(SEARCH_KEY)
-    shape = expected == 0 or (
-        "| WARNING" in line
-        and "function_azure:pipe" in line
-        and "issues/187" in line
-        and "once per process" in line
-    )
-    t.check(
+    expected = 2 * _oyd_notice_expected()
+    await _check_oyd_notice(
+        t,
         "oyd.notice.once",
-        "On Your Data retirement notice: exactly one WARNING of the pipe (link "
-        "to #187) for all data_sources requests, without any part of the "
-        f"data_sources; search key never logged (since {OYD_NOTICE_SINCE})",
-        len(notices) == expected and shape and not leaked and not key_logged,
-        f"version={version} notices={len(notices)} expected={expected} "
-        f"data_sources parts in the notice={leaked} "
-        f"search key logged {key_logged}x "
-        f"line={short(line.replace(SEARCH_KEY, '***'), 400)}",
+        "On Your Data retirement notice once per loaded copy of the module: "
+        f"{expected} in the suite (valve and client window), none for the later "
+        "data_sources requests; search key never logged "
+        f"(since {OYD_NOTICE_SINCE})",
+        t.log_start,
+        expected,
+        ok=not key_logged,
+        detail=f"search key logged {key_logged}x",
     )
 
 
 async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
     question = "x100 charging and warranty?"
+    expected_notices = _oyd_notice_expected()
     await mock.reset()
+    mark = t.mark()  # first data_sources request of the suite (valve)
     r = await t.owui.chat(model, question, stream=False)
     req = await mock.last()
     parameters = (
@@ -689,6 +726,18 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         "On Your Data non-stream: [docX] rewritten to markdown links",
         r.status == 200 and r.content == LINKED,
         f"{r.brief()} include_contexts={parameters.get('include_contexts')}",
+    )
+    await _check_oyd_notice(
+        t,
+        "oyd.notice.valve",
+        "the first request with data_sources from AZURE_AI_DATA_SOURCES (API, "
+        "non-stream) logs the On Your Data retirement notice once: a WARNING "
+        "of the pipe with the link to #187, without any part of the "
+        f"data_sources (since {OYD_NOTICE_SINCE})",
+        mark,
+        expected_notices,
+        ok=r.status == 200 and bool(parameters),
+        detail=f"HTTP {r.status} data_sources upstream={bool(parameters)}",
     )
     t.check(
         "oyd.api-version",
@@ -776,9 +825,16 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         r.brief(),
     )
 
-    # data_sources sent by the client (no AZURE_AI_DATA_SOURCES valve)
+    # data_sources sent by the client (no AZURE_AI_DATA_SOURCES valve). Saving
+    # the function again loads a fresh copy of the module, so this is the
+    # first data_sources request of that copy and must log the notice itself.
+    reload_status, reload_data = await t.owui.install_function(
+        FID, "Azure AI Foundry", t.source(PATH)
+    )
+    # also tells the harness the password valves again (install forgets them)
     await t.owui.update_valves(FID, **{**oyd_valves, "AZURE_AI_DATA_SOURCES": ""})
     await mock.reset()
+    mark = t.mark()
     r = await t.owui.chat(model, question, stream=True, data_sources=DATA_SOURCES)
     req = await mock.last()
     await t.log.settle(0.5)
@@ -794,6 +850,20 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         and "stream_options" not in body,
         f"{r.brief()} done={r.done} upstream "
         f"stream_options={body.get('stream_options')} {_upstream(req)}",
+    )
+    reloaded = reload_status == 200 and isinstance(reload_data, dict)
+    await _check_oyd_notice(
+        t,
+        "oyd.notice.client",
+        "after the function was saved again (fresh module), the first request "
+        "with data_sources from the client (API, stream, no "
+        "AZURE_AI_DATA_SOURCES) logs the On Your Data retirement notice once "
+        f"(since {OYD_NOTICE_SINCE})",
+        mark,
+        expected_notices,
+        ok=reloaded and r.status == 200 and bool(body.get("data_sources")),
+        detail=f"function saved again: HTTP {reload_status} "
+        f"{'' if reloaded else short(reload_data, 200)} {r.brief()}",
     )
     await t.owui.update_valves(FID, **oyd_valves)
 
