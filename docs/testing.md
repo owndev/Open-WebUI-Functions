@@ -55,10 +55,8 @@ function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 2.8.0, n8n.py 2.
 [PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
 ...
 [PASS ] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
-          -> known gemini-tools-afc is fixed in pipelines/google/google_gemini.py 1.18.0: drop
-             marker (known= argument and its entry in tests/e2e/harness/known_*.py)
 ...
---- gemini: 244s
+--- gemini: 237s
 ...
 === infomaniak ===
 ...
@@ -68,15 +66,15 @@ function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 2.8.0, n8n.py 2.
              __init__); no fix yet
           name='Infomaniak: Mixtral Mock'
 ...
-SUMMARY: 339 PASS, 0 FAIL, 1 KNOWN in 544s, 42 obsolete known markers (drop marker)
-total runtime: 587s
+SUMMARY: 339 PASS, 0 FAIL, 1 KNOWN in 536s
+total runtime: 572s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
-A full run of all suites took 8-10.5 minutes on a shared 8-CPU Docker host (with
-`google_gemini.py` 1.18.0 587 s: 43 s container start-up, then gemini 244 s, azure
-67 s, n8n 78 s, infomaniak 36 s, filters 115 s; the gemini suite alone took 199-263 s). Network downloads
-on first use come on top
+A full run of all suites took 9.5-11 minutes on a shared 8-CPU Docker host (572 s:
+24 s container start-up, then gemini 237 s, azure 69 s, n8n 81 s, infomaniak 37 s,
+filters 110 s; 655 s with gemini 308 s while other harness runs shared the host).
+Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
 and how many are KNOWN today is listed under [What is tested](#what-is-tested).
@@ -251,11 +249,11 @@ back to the output text because Open WebUI's final save of a tool turn leaves
 
 **Preflight and `mock_ok`.** Both groups start with a plain API request to
 `gemini-2.5-flash`; every detail line starts with `mock_ok=<bool>` (the request got
-`Hello from mock`). The evidence of every `gemini-tools-*` known bug requires
+`Hello from mock`). The evidence of a known bug of these groups must require
 `mock_ok=True` plus a token that the request itself got the provider's answer
-(`upstream=[fc,...]`, `upstream=[mock-error]`, `answered=<n>`, ...), so with
-`E2E_MOCK_FAULT` none of them can be KNOWN. The detail tokens are stable (the evidence
-matches them): `http=`, `done=`, `calls=[name:status,...]`, `outputs=<n>`,
+(`upstream=[fc,...]`, `upstream=[mock-error]`, `answered=<n>`, ...), so that with
+`E2E_MOCK_FAULT` it can never be KNOWN. The detail tokens are stable (evidence can
+match them): `http=`, `done=`, `calls=[name:status,...]`, `outputs=<n>`,
 `rd=[format:id,...]`, `upstream=[answers in order]`, `declared_n=`, `safe_names=`,
 `sig_echoed=[id:sig,...]`, `fr=[id:name:keys,...]`, `kinds=`, `tool_kinds=`,
 `include_flag=`, `server_echoed=`, `finish=[...]`, `openai_finish=`, `usage=` and
@@ -266,50 +264,29 @@ fail the `server-log` check unless a scenario provokes one (`t.expect_warnings`)
 `tools.log` fails on `'callable'`, `__signature__`, `Duplicate function declaration` or
 `AFC is enabled` anywhere in the server log of the group.
 
-**Known bugs of `google_gemini.py` 1.17.0** (`harness/known_gemini.py`, all gated on
-`fixed_in="1.18.0"`, fixed by `feature/gemini-native-tool-calling`):
-
-| Key | What `main` does | Checks |
-| --- | --- | --- |
-| `gemini-tools-afc` (#169) | google-genai's automatic function calling runs the tool inside the pipe; Open WebUI saves no function call, nothing waits for approval. On v0.11.4-slim (google-genai 2.x from pip) the SDK's follow-up request (model content split per chunk, responses without ids) gets the mock's 400; on v0.11.3-slim (google-genai 1.66.0 bundled) a streamed AFC round stops after the function calls | `tools.builtin*`, `multiturn`, `multiturn-other-model`, `multiturn-back`, `parallel*`, `rounds*`, `text-before`, `thinking*`, `image-result`, `approval*`, `unknown`, `grounding3-next-turn`, `nostream`, `log`; `workspace` on v0.11.3-slim |
-| `gemini-tools-annotations` (#169) | the workspace tool fails on its string annotations under AFC (`isinstance() arg 2 must be a type` in the function responses; only visible where AFC sends its follow-up) | `tools.workspace` on v0.11.4-slim |
-| `gemini-tools-duplicate` (#169) | OpenAPI tool callables are all named `tool_function`: `Duplicate function declaration found: tool_function` | `tools.openapi` |
-| `gemini-tools-mcp` (#169) | MCP callables have no `__signature__`: the request fails before it is sent | `tools.mcp` |
-| `gemini-tools-direct` (#169) | direct tools have no callable: `KeyError: 'callable'` | `tools.direct` |
-| `gemini-tools-api` | client `tools` of API requests are ignored: nothing declared, no `tool_calls` | `toolsapi.stream`, `nonstream`, `nostream`, `tool-choice*`, `names`, `default-api`, `schema`, `noid` |
-| `gemini-tools-history` | tool calls and results in the history are sent as text | `toolsapi.continuation*`, `history-edge`, `odd-shapes` |
-| `gemini-tools-grounding` | Gemini 2.5 + web_search gets functions next to grounding; Gemini 3 gets them without `includeServerSideToolInvocations` | `tools.grounding25`, `tools.grounding3` |
-| `gemini-tools-malformed` | `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` give an empty or generic answer | `tools.malformed`, `toolsapi.malformed` |
-
-`tools.multiturn-approved`, `tools.task`, `tools.legacy`, `tools.nobuiltin`,
-`toolsapi.stream-text` and `toolsapi.unchanged` already pass on `main`. Open WebUI 0.11.4's approval defects (an
-approved call loses its result in the saved message; with two calls only the first is
-asked and the second is not run) are only recorded in the detail of
+The two groups came with native tool calling (`google_gemini.py` 1.18.0) and carry no
+known-bug markers, so a `--ref` run of an older `google_gemini.py` reports most of
+their checks as FAIL (42 of the 48 with 1.17.0). Open WebUI 0.11.4's approval defects
+(an approved call loses its result in the saved message; with two calls only the first
+is asked and the second is not run) are only recorded in the detail of
 `tools.approval-parallel`, never asserted.
 
-Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09):
+Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09,
+`google_gemini.py` 1.18.0):
 
-| Suite | Checks | `google_gemini.py` 1.18.0 (`main` after the merge of `feature/gemini-native-tool-calling`): PASS / KNOWN | 1.17.0 (`main` 4d09a55 before it): PASS / KNOWN |
-| --- | ---: | ---: | ---: |
-| `gemini` | 129 | 129 / 0 | 87 / 42 |
-| `azure` | 71 | 71 / 0 | 71 / 0 |
-| `n8n` | 51 | 51 / 0 | 51 / 0 |
-| `infomaniak` | 32 | 31 / 1 | 31 / 1 |
-| `filters` | 57 | 57 / 0 | 57 / 0 |
-| **all** | **340** | **339 / 1** | **297 / 43** |
+| Suite | Checks | PASS / KNOWN |
+| --- | ---: | ---: |
+| `gemini` | 129 | 129 / 0 |
+| `azure` | 71 | 71 / 0 |
+| `n8n` | 51 | 51 / 0 |
+| `infomaniak` | 32 | 31 / 1 |
+| `filters` | 57 | 57 / 0 |
+| **all** | **340** | **339 / 1** |
 
-There is no FAIL. `harness/known_*.py` registers ten known bugs: the nine
-`gemini-tools-*` bugs of `google_gemini.py` 1.17.0 (42 tagged checks of the `tools` and
-`toolsapi` groups, gated on 1.18.0, see [Native
-tool calling](#native-tool-calling-geminitools-geminitoolsapi)) and
-`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`).
-With 1.18.0 the 42 tagged checks pass on both images (gemini 129 / 0 on `v0.11.3-slim`
-too) and are listed as obsolete markers ("drop marker"); the markers stay until the
-merge, so that `--ref` runs of 1.17.0 report these bugs as KNOWN instead of FAIL, and
-are dropped right after it, together with the 1.17.0 column. The 1.17.0 column was
-measured for the tool groups (`--ref origin/main --only 'gemini.(tools|toolsapi)'`:
-11 PASS / 42 KNOWN); the other groups do not depend on the change. The markers of the
-62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and must
+There is no FAIL and no obsolete marker. `harness/known_*.py` registers one known bug,
+`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`):
+the one KNOWN. The `gemini` suite gives 129 / 0 on `v0.11.3-slim` too. The markers of
+the 62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and must
 pass.
 
 ### API path vs. browser path
@@ -331,9 +308,8 @@ pass.
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known_<area>.py` (today `known_gemini.py` and `known_n8n.py` for
-  n8n + Infomaniak; re-exported by `known.py`): key, summary, issue reference, pull
-  request with the
+  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak;
+  re-exported by `known.py`): key, summary, issue reference, pull request with the
   pending fix, evidence, and the function `file` plus the version `fixed_in` that fixes
   it. Printed with the bug, e.g. `known infomaniak-name-prefix (found by tests/e2e, no
   issue filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
@@ -592,7 +568,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 4d09a55, with the `gemini.tools` / `toolsapi` groups of `feature/gemini-native-tool-calling`): 39 PASS / 241 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 3ff6cf9, with the `gemini.tools` / `toolsapi` groups of `feature/gemini-native-tool-calling`): 39 PASS / 241 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

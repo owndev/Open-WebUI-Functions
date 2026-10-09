@@ -12,8 +12,9 @@ mocks/mock_tools.py (OpenAPI on 9111, MCP on 9112) and probe/workspace_tool.py
 Conventions (docs/testing.md, "Native tool calling"):
 - every group starts with a preflight: a plain API request to the text model
   must answer "Hello from mock"; every detail starts with ``mock_ok=<bool>``, the
-  proof the known-bug evidence needs that the provider works (with
-  ``E2E_MOCK_FAULT`` it is False, so nothing is reported as KNOWN)
+  proof that the provider works, which the evidence of a known bug of these
+  groups must include (with ``E2E_MOCK_FAULT`` it is False, so nothing is
+  reported as KNOWN)
 - stable detail tokens: ``http= done= calls=[name:status] outputs=<n>
   rd=[format:id] upstream=[answers] declared_n= safe_names= sig_echoed=[id:sig]
   fr=[id:name:keys] kinds=[role:parts] tool_kinds=[...] include_flag=
@@ -29,7 +30,7 @@ from typing import Optional
 
 import httpx
 
-from harness import Suite, known, short
+from harness import Suite, short
 from harness.config import ADMIN_EMAIL, MCP_PORT, MOCK_HOST, MOCK_PORTS
 from harness.config import WORKSPACE_TOOL_FILE
 
@@ -284,10 +285,8 @@ class Ctx:
         self.mock_ok = mock_ok
         self.answered = 0  # generate requests the mock answered with HTTP 200
 
-    def check(self, sid, title, ok, detail, known=None, since=None) -> bool:
-        return self.t.check(
-            sid, title, ok, f"mock_ok={self.mock_ok} {detail}", known=known, since=since
-        )
+    def check(self, sid, title, ok, detail) -> bool:
+        return self.t.check(sid, title, ok, f"mock_ok={self.mock_ok} {detail}")
 
     async def chat(self, b, *args, **kwargs):
         """b.chat(...); a chat that is neither done nor waiting for approval is
@@ -354,7 +353,6 @@ async def tools(t: Suite, mock) -> None:
         "function declaration or AFC is enabled",
         not found,
         f"answered={ctx.answered} found={found}",
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -427,7 +425,6 @@ async def builtin(ctx: Ctx, b, stream: bool):
             f"statuses_closed={_status_closed(c)} "
             f"reasoning={[(short(x, 40), len(d)) for x, d in c.reasoning_items]}",
         ),
-        known=known.GEMINI_TOOLS_AFC,
     )
     return c
 
@@ -468,7 +465,6 @@ async def multiturn(ctx: Ctx, b, first) -> None:
                 f"old_fr={len(old_fr)} orphan_fr={req.get('orphan_fr')} "
                 f"{_req_tokens(req)}",
             ),
-            known=known.GEMINI_TOOLS_AFC,
         )
         parent = c.message_id
 
@@ -505,7 +501,6 @@ async def parallel(ctx: Ctx, b) -> None:
             and "get_current_timestamp=" in final
             and "calculate_timestamp=" in final,
             _bdetail(c, reqs, _req_tokens(second)),
-            known=known.GEMINI_TOOLS_AFC,
         )
 
 
@@ -534,7 +529,6 @@ async def rounds(ctx: Ctx, b) -> None:
         ]
         and usage == USAGE_ROUNDS,
         _bdetail(c, reqs, f"{_req_tokens(third)} usage={usage}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
     await _set(ctx.t, INCLUDE_THOUGHTS=False)
@@ -560,7 +554,6 @@ async def rounds(ctx: Ctx, b) -> None:
         # informational: Open WebUI merges two rounds without text or reasoning in
         # between into one assistant message (fc_contents=1)
         _bdetail(c, reqs, f"fc_contents={len(contents)} {_req_tokens(third)}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -602,7 +595,6 @@ async def text_before(ctx: Ctx, b) -> None:
             f"message_at={message_at} call_at={call_at} model_parts={model_parts} "
             f"{_req_tokens(second)}",
         ),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -623,7 +615,6 @@ async def thinking(ctx: Ctx, b) -> None:
         and len(pondering) >= 2
         and _no_details(c),
         _bdetail(c, reqs, f"reasoning={[(short(x, 40), len(d)) for x, d in items]}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
     await _set(ctx.t, INCLUDE_THOUGHTS=False)
     try:
@@ -643,7 +634,6 @@ async def thinking(ctx: Ctx, b) -> None:
         and _no_details(c)
         and "Mock pondering." not in json.dumps(c.output),
         _bdetail(c, reqs, f"reasoning={[(short(x, 40), len(d)) for x, d in items]}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -679,13 +669,6 @@ async def workspace(ctx: Ctx, b, ws: tuple) -> None:
             f"create_tool={ws[0]} add={added} whoami={short(who, 160)} "
             f"statuses={c.status_descriptions} responses={responses}",
         ),
-        # The annotation failure only shows when automatic function calling
-        # sends its follow-up (google-genai 2.x); with google-genai 1.66.0
-        # (bundled in Open WebUI 0.11.3) a streamed AFC round stops after the
-        # function calls and the tool never runs.
-        known=known.GEMINI_TOOLS_ANNOTATIONS
-        if "isinstance" in responses
-        else known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -714,7 +697,6 @@ async def image_result(ctx: Ctx, b) -> None:
         and _final(c).startswith("MOCK-FINAL make_image=")
         and _no_details(c),
         _bdetail(c, reqs, f"no_details={_no_details(c)} {_req_tokens(second)}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -760,7 +742,6 @@ async def openapi(ctx: Ctx, b, tool_mock) -> None:
             f"server_log={[e.get('path') for e in log]} mapped_declared="
             f"{mapped in names}",
         ),
-        known=known.GEMINI_TOOLS_DUPLICATE,
     )
 
 
@@ -788,7 +769,6 @@ async def mcp(ctx: Ctx, b) -> None:
         _bdetail(
             c, reqs, f"mcp_mock_up={mcp_up} {_req_tokens(reqs[-1] if reqs else {})}"
         ),
-        known=known.GEMINI_TOOLS_MCP,
     )
 
 
@@ -819,7 +799,6 @@ async def direct(ctx: Ctx, b) -> None:
         and _json(c.function_outputs.get(CALL_0)) == {"value": "client:k1"}
         and "client:k1" in _final(c),
         _bdetail(c, reqs, f"execute_calls={executed}"),
-        known=known.GEMINI_TOOLS_DIRECT,
     )
 
 
@@ -876,7 +855,6 @@ async def approval(ctx: Ctx, b) -> None:
             _bdetail(
                 c, reqs, f"paused={paused} resolved={resolved} {_req_tokens(follow)}"
             ),
-            known=known.GEMINI_TOOLS_AFC,
         )
         # Open WebUI 0.11.4 drops an approved call from the saved history
         await ctx.mock.reset()
@@ -915,7 +893,6 @@ async def approval(ctx: Ctx, b) -> None:
             _bdetail(
                 c, reqs, f"paused={paused} resolved={resolved} responses={responses}"
             ),
-            known=known.GEMINI_TOOLS_AFC,
         )
 
         c, paused, resolved = await _ask(
@@ -933,7 +910,6 @@ async def approval(ctx: Ctx, b) -> None:
             and all(e.get("status") == 200 for e in reqs)
             and _final(c).startswith("MOCK-FINAL"),
             _bdetail(c, reqs, f"paused={paused} resolved={resolved}"),
-            known=known.GEMINI_TOOLS_AFC,
         )
     finally:
         await ctx.t.owui.set_chat_config(**previous)
@@ -959,7 +935,6 @@ async def unknown(ctx: Ctx, b) -> None:
         and responses == [{"error": NOT_FOUND}]
         and _final(c).startswith("MOCK-FINAL"),
         _bdetail(c, reqs, f"responses={responses}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -973,7 +948,6 @@ async def malformed(ctx: Ctx, b) -> None:
         "turn completes",
         c.done and "MALFORMED_FUNCTION_CALL" in c.content,
         _bdetail(c, reqs, f"content={short(c.content, 160)}"),
-        known=known.GEMINI_TOOLS_MALFORMED,
     )
 
 
@@ -1033,7 +1007,6 @@ async def grounding(ctx: Ctx, b) -> None:
             f"{GROUNDING_URI in sources}/{TOOL_ROUND_URI in sources} "
             f"{_req_tokens(second)}",
         ),
-        known=known.GEMINI_TOOLS_GROUNDING,
     )
     # The stored content (with the server-side toolCall / toolResponse) is only
     # replayed in its own turn; a later request may have no Search grounding.
@@ -1056,7 +1029,6 @@ async def grounding(ctx: Ctx, b) -> None:
         _bdetail(c2, reqs2, f"old_fc={old} old_fr={old_fr} {_req_tokens(req)}")
         if c2
         else "no chat",
-        known=known.GEMINI_TOOLS_AFC,
     )
 
     await t.owui.upsert_model(TEXT, "Gemini 2.5 Flash", [SEARCH_FILTER])
@@ -1078,7 +1050,6 @@ async def grounding(ctx: Ctx, b) -> None:
             reqs,
             f"tool_kinds={_kinds(first)} include_flag={first.get('include_flag')}",
         ),
-        known=known.GEMINI_TOOLS_GROUNDING,
     )
 
 
@@ -1183,7 +1154,6 @@ async def nostream(ctx: Ctx, b) -> None:
         and _no_details(c)
         and actions == ["generateContent", "generateContent"],
         _bdetail(c, reqs, f"actions={actions} no_details={_no_details(c)}"),
-        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -1241,7 +1211,6 @@ async def api_stream(ctx: Ctx) -> None:
         and "<details" in r.content
         and not r.reasoning_content,
         _adetail(r, reqs, f"reasoning_content={short(r.reasoning_content, 40)}"),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1294,7 +1263,6 @@ async def api_nostream(ctx: Ctx) -> None:
         and r.done_last
         and actions == ["generateContent"],
         _adetail(r, reqs, f"actions={actions}"),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1329,7 +1297,6 @@ async def api_malformed(ctx: Ctx) -> None:
         "call: an error text that names it, streamed and non-streamed",
         ok,
         f"http={http} upstream=[{','.join(answers)}] seen={seen}",
-        known=known.GEMINI_TOOLS_MALFORMED,
     )
 
 
@@ -1354,7 +1321,6 @@ async def api_nonstream(ctx: Ctx) -> None:
         and r.finish_reasons == ["tool_calls"]
         and bool(r.usage),
         _adetail(r, reqs),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1406,7 +1372,6 @@ async def api_continuation(ctx: Ctx) -> None:
         and responses == [{"output": '{"y": 2}'}]
         and "MOCK-FINAL client_fn=" in r.content,
         _adetail(r, reqs, _req_tokens(req)),
-        known=known.GEMINI_TOOLS_HISTORY,
     )
 
 
@@ -1435,7 +1400,6 @@ async def api_continuation_psf(ctx: Ctx) -> None:
         and _fcs(req) == [(CALL_0, "client_fn", "issued")]
         and "MOCK-FINAL client_fn=" in r.content,
         _adetail(r, reqs, _req_tokens(req)),
-        known=known.GEMINI_TOOLS_HISTORY,
     )
 
 
@@ -1461,7 +1425,6 @@ async def api_continuation_nosig(ctx: Ctx) -> None:
         and _fcs(req)
         == [("old-call-1", "client_fn", "none"), (CALL_0, "client_fn", "skip")],
         _adetail(r, reqs, _req_tokens(req)),
-        known=known.GEMINI_TOOLS_HISTORY,
     )
 
 
@@ -1537,7 +1500,6 @@ async def api_history_edge(ctx: Ctx) -> None:
             reqs,
             f"warned={warned} old_fc={old_fc} old_fr={old_fr} {_req_tokens(req)}",
         ),
-        known=known.GEMINI_TOOLS_HISTORY,
     )
 
 
@@ -1582,7 +1544,6 @@ async def api_odd_shapes(ctx: Ctx) -> None:
         and warned
         and "MOCK-FINAL client_fn=" in r.content,
         _adetail(r, reqs, f"warned={warned} {_req_tokens(req)}"),
-        known=known.GEMINI_TOOLS_HISTORY,
     )
 
 
@@ -1623,7 +1584,6 @@ async def api_tool_choice(ctx: Ctx) -> None:
         ok,
         f"http=200 upstream={_answers(reqs_all)} "
         f"declared_n=[{','.join(str(n) for _, _, n in seen)}] modes=[{modes}]",
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1662,7 +1622,6 @@ async def api_tool_choice_grounding(ctx: Ctx) -> None:
             f"tool_kinds={_kinds(req)} include_flag={req.get('include_flag')} "
             f"mode={mode}",
         ),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1703,7 +1662,6 @@ async def api_names(ctx: Ctx) -> None:
         and warned
         and returned == names,
         _adetail(r, reqs, f"declared={declared} warned={warned} returned={returned}"),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1726,7 +1684,6 @@ async def api_default_api(ctx: Ctx) -> None:
         "a function call named default_api.client_fn is returned as client_fn",
         r.status == 200 and _answers(reqs) == "[fc]" and names == ["client_fn"],
         _adetail(r, reqs, f"names={names}"),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1801,7 +1758,6 @@ async def api_schema(ctx: Ctx) -> None:
         "specified; a tool without parameters sends none",
         r.status == 200 and not failed,
         _adetail(r, reqs, f"failed={failed} schema={short(schema, 200)}"),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
@@ -1858,7 +1814,6 @@ async def api_noid(ctx: Ctx) -> None:
             f"synthetic_ids_upstream={req.get('synthetic_ids_upstream')} "
             f"answer2={short(r2.content, 80)}",
         ),
-        known=known.GEMINI_TOOLS_API,
     )
 
 
