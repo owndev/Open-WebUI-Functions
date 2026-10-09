@@ -768,7 +768,7 @@ Image generation models, background tasks (title, tag and follow-up generation) 
 
 - Open WebUI ends the tool loop after `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS` rounds (default 256). The pipeline adds no limit of its own.
 - Tool approval on Open WebUI 0.11.4: after an approved call the saved message loses the tool result, and when Gemini calls several tools at once, only the first call is asked for and run.
-- Tool calling was verified with Open WebUI 0.11.3 and 0.11.4.
+- Tool calling was verified with Open WebUI 0.11.3 and 0.11.4. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
 
 ## Default System Prompt
 

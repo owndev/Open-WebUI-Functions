@@ -17,6 +17,7 @@ Container and volume are removed afterwards.
 - [Debugging a failure](#debugging-a-failure)
 - [Adding a scenario or a mock behaviour](#adding-a-scenario-or-a-mock-behaviour)
 - [Static Open WebUI API check](#static-open-webui-api-check)
+- [Real-API smoke test (manual, needs a key)](#real-api-smoke-test-manual-needs-a-key)
 - [CI](#ci)
 - [Troubleshooting and gotchas](#troubleshooting-and-gotchas)
 
@@ -433,7 +434,10 @@ Ctrl-C (SIGINT) or SIGTERM during a run is handled at once, also while the drive
 `run.sh` asks the driver in the container to stop (it records `<suite>.interrupted`
 and writes the partial `results.json` / `summary.md`), copies the output directory,
 removes container and volume (unless `--keep` / `--reuse`) and exits with 130 / 143.
-That takes a few seconds; a second Ctrl-C does not cut the cleanup short.
+That takes a few seconds; a second Ctrl-C does not cut the cleanup short. The browser
+session's socket.io client is created with `handle_sigint=False`: otherwise engine.io
+replaces the driver's SIGINT handler once a browser-path scenario ran (its handler cancels
+every task and stops the event loop), and the stop was not recorded as interrupted.
 
 If `run.sh` itself is killed (SIGKILL, a closed terminal on some systems, a CI job
 cancelled without grace), nothing can clean up:
@@ -558,6 +562,101 @@ shared dependencies. A fetch that fails for another reason than "not found" is t
 3 times; if it still fails the result is `incomplete` (exit 2) rather than a missing
 API. Run it whenever Open WebUI publishes a release, then run the Docker suites with the
 new image.
+
+## Real-API smoke test (manual, needs a key)
+
+The suites run against mocks, so they cannot show what the real Gemini API accepts.
+`tests/e2e/smoke/gemini-tools.sh` checks the server-side assumptions of the Gemini
+pipe's native tool calling (risks R1-R15 of the 1.18.0 design) against
+`generativelanguage.googleapis.com`. It is opt-in and never runs in CI: it needs a key
+and makes billed requests (about 40 small ones on flash models, with the defaults).
+
+```bash
+export GOOGLE_API_KEY=...                       # from the environment only, never as an argument
+tests/e2e/smoke/gemini-tools.sh                 # v0.11.4-slim, gemini-3-flash-preview + gemini-2.5-flash
+tests/e2e/smoke/gemini-tools.sh --image v0.11.3-slim --only R3,R14   # some risks, another image
+tests/e2e/smoke/gemini-tools.sh --dry-run-mock  # no key: the same run against the e2e Gemini mock
+```
+
+How it works:
+
+- A fresh Open WebUI container is started with `run.sh`'s helpers (`run.sh` only defines
+  its functions when it is sourced). `google_gemini.py` and `google_search_tool.py` come
+  from the worktree (`--src DIR` for another checkout). The key goes into the encrypted
+  `GOOGLE_API_KEY` valve. The tools are deterministic: Open WebUI's built-in tools, the
+  e2e workspace tool (`probe/workspace_tool.py`), the OpenAPI and MCP tool mocks and
+  client tools on the API path.
+- The pipe's `BASE_URL` points at a recording pass-through proxy (`smoke/proxy.py`,
+  127.0.0.1:9120 in the container). It forwards every request unchanged to the real API
+  and streams the answer back. For each request it records the declared functions,
+  tool kinds, `toolConfig`, the part kinds of every content, whether replayed function
+  calls carry a signature (`yes` / `skip` / `none`), the HTTP status, the error message,
+  finish reasons, the returned function calls with their signature flags, server-side
+  tool parts, text lengths and usage. It never records headers, the query string,
+  signature values or request texts. `--dry-run-mock` forwards to the e2e Gemini mock
+  instead and adds the `MOCKTOOLS:` directive to the prompts; the key is then a dummy.
+- Each scenario tells the model exactly which tool to call. A scenario whose model did
+  not do what was asked (no call, one call instead of two, no search in the tool round
+  of R3) or that got HTTP 429 / 5xx is repeated, at most `--retries` times (default 2).
+  Every request carries `max_tokens` (default 2048; on the browser path Open WebUI
+  keeps it for the continuations). The valves are `THINKING_LEVEL=low` (Gemini 3) and
+  `THINKING_BUDGET=512` (Gemini 2.5, whose thinking counts against `maxOutputTokens`).
+  The runner prints the planned number of requests at the start, and the actual count
+  and token usage at the end.
+- Results: `PASS`, `FAIL` or `SKIP` per risk, with the evidence lines (one `upstream #n`
+  line per request), plus `LOG` (the server log scan of the suites, which also fails on the
+  pipe's WARNINGs for lost tool data) and `SECRETS`. Exit code 0 = no FAIL, 1 = a FAIL, 2 =
+  setup error (install, or the preflight: one plain request per model, which catches a
+  bad key or an unavailable model). A model that the API does not list is added with
+  `MODEL_ADDITIONAL`.
+- The key is never printed. The runner redacts its stdout, stderr and output files, and
+  `SECRETS` fails when the key shows up in the server log, the mocks' output or the
+  runner's output. After the run the script scans every output file for the key,
+  redacts any hit in place and exits 1.
+- Container and volume are removed on exit, also after Ctrl-C (the runner writes partial
+  results). Images are never removed. Output: `tests/e2e/out/<time>-<name>/` with
+  `driver.txt`, `summary.md`, `smoke.json`, `upstream.jsonl` (the proxy record),
+  `server.log`, `mocks.txt` and the staged `functions/`.
+
+| Risk | Scenario | PASS when |
+| --- | --- | --- |
+| R1 | Browser turn on both models with the workspace tool and the OpenAPI and MCP servers (27 built-ins + 7 tools declared). API request on both models with client tools in the schema styles of pydantic (`title`, `default`, `anyOf` + `null`), OpenAPI (`format`, integer `enum`) and MCP (`$defs`, `$ref`, `additionalProperties: false`), plus `oneOf` / `const`, type arrays and a tool without parameters | Every request gets HTTP 200. Built-ins that another Open WebUI version lacks are listed |
+| R2 | Browser, `stream=false`, Gemini 3: `get_current_timestamp` | The tool is declared without a schema and called, the continuation gets 200, the answer is saved |
+| R3 | Gemini 3 with `google_search_tool` and web search: Search and `get_current_timestamp` in one round, continued; the next turn with web search off; API `tool_choice` `required` and `none` with web search | `googleSearch` + functions + `includeServerSideToolInvocations` accepted, the call made, the server-side parts sent back within the turn and not in the next one, mode `ANY` gives a call and `NONE` none. If Gemini still did not search in the tool round after the retries, the result is PASS with a note that the replay was not exercised |
+| R4 | API continuation without `reasoning_details` on Gemini 3 (placeholder signature), Gemini 2.5 (no signature) and `--model-latest` (default `gemini-flash-latest`) when the API lists it | 200 and an answer |
+| R5 | Two calls in one round | At least 2 calls in one round, replayed as one model content and one user content with as many responses, 200 |
+| R6 | `make_image` (a tool result with an image) | The continuation has the function responses followed by Open WebUI's image message, 200 |
+| R7 | A tool turn, then a turn with `function_calling=legacy` | The second request declares no functions and gets 200 (the evidence says whether Open WebUI sent the old call) |
+| R8 | Gemini 2.5 with thinking: a tool turn, a second tool turn, a plain turn | Every request 200 (the evidence counts the signatures on thought parts that are not sent back) |
+| R9 | Vertex AI: a tool turn, a 64-character tool name, web search with tools, a Vertex AI Search data store (`--vertex-rag-store`) | Each turn done without an error. SKIP without credentials |
+| R10 | Gemini 2.5 with web search | `googleSearch` without `functionDeclarations`, 200 |
+| R11 | Note only: the installed `google-genai` version | SKIP with the note; FAIL when it is older than 1.68.0 after the function was saved |
+| R12 | Streamed tool turn on Gemini 3 | No partial function call parts, the final text is not empty |
+| R13 | `--turns` API tool turns (default 4), plus every answer of the run | Counts the finish reasons, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` and `default_api.` names. FAIL only when such an answer did not become the pipe's error text |
+| R14 | Tool approval (ask) with two calls, approve | The turn pauses, the continuation gets 200, also when Open WebUI 0.11.4 replays fewer calls than Gemini made |
+| R15 | `INCLUDE_THOUGHTS=false` tool turn on Gemini 3 | The call carries a thought signature and the saved reasoning item has it |
+
+Read the evidence, not only the status: it shows which risks were exercised (for example
+`server_parts_in_round=0` in R3, `history_fc=False` in R7) and what to change if one fails.
+For example, a 400 in R7 means that function-call history has to be rendered as text
+when no functions are declared.
+
+**Vertex AI (R9).** `--vertex-credentials FILE` (a service account key or the JSON of
+`gcloud auth application-default login`; default `$GOOGLE_APPLICATION_CREDENTIALS`) and
+`--vertex-project ID` (default `$GOOGLE_CLOUD_PROJECT`, else the file's `project_id`),
+plus `--vertex-location` (default `global`). The file is streamed into the container as
+its Application Default Credentials file (never into the output directory), and a
+second copy of the pipe, `gemini_vertex`, runs with `USE_VERTEX_AI=true`. Its requests do
+not go through the proxy, so the evidence is what Open WebUI saved plus the server log.
+This path has not run yet: no Vertex project was available.
+
+**Dry run.** `--dry-run-mock` checks the runner itself without a key: every scenario runs
+end to end against the e2e Gemini mock, which answers the `MOCKTOOLS:` directive instead
+of following the prompt. Observed 2026-10-09 on v0.11.4-slim: 15 PASS (R1-R8, R10, R12-R15,
+`LOG`, `SECRETS`), 0 FAIL, 2 SKIP (R9 without Vertex credentials, R11 note), 38
+generate requests (the mock received the same 38), 90-100 s including the container
+start. The mock always follows the directive, so no retry happens. Its answers prove
+only the mechanics: real results can differ.
 
 ## CI
 

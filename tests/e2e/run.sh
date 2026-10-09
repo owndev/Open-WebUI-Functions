@@ -6,7 +6,7 @@
 # container and removes container + volume again. Host needs: Docker and bash
 # (Linux, macOS, Git Bash on Windows). No host Python.
 #
-# The whole script runs inside main() (called on the last line), so editing or
+# The whole script runs inside main() (called at the end), so editing or
 # checking out another version of this file during a run does not break it.
 #
 # Docs: docs/testing.md
@@ -494,5 +494,8 @@ main() {
   exit "$RC"
 }
 
-# main never returns (every path ends in exit or die).
-main "$@"
+# main never returns (every path ends in exit or die). Sourced, the file only
+# defines its helpers (tests/e2e/smoke/gemini-tools.sh reuses the container ones).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

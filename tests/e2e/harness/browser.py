@@ -204,7 +204,10 @@ class BrowserSession:
     async def connect(self) -> None:
         import socketio  # python-socketio ships with the Open WebUI image
 
-        self.sio = socketio.AsyncClient(reconnection=False)
+        # handle_sigint=False: engine.io would replace the driver's SIGINT
+        # handler on the event loop with one that cancels every task and stops
+        # the loop, so an interrupted run was not reported as interrupted.
+        self.sio = socketio.AsyncClient(reconnection=False, handle_sigint=False)
 
         @self.sio.on("events")
         async def _on_events(data):
