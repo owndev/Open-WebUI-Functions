@@ -74,7 +74,8 @@ depending on the load; with `main`'s files 487 s: 30 s container start-up, then
 gemini 152 s, azure 69 s, n8n 76 s, infomaniak 41 s, filters 106 s). The azure `rag`
 group adds about 2 minutes with the 2.8.x pipeline (its requests fail at once) and
 about 3 minutes with 2.9.0 (query-generation timeouts take 30 s); on a busy host the
-whole run took 966 s (azure 290 s). Network downloads on first use come on top
+whole run took 966 s with 2.8.1 (azure 290 s) and 782-802 s with 2.9.0 (azure
+253-289 s). Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
 and how many are KNOWN today is listed under [What is tested](#what-is-tested).
@@ -179,35 +180,36 @@ resource id containing `mi-fail` gets HTTP 400). A container started by an older
 `run.sh` lacks these variables; the managed identity checks then fail with `--reuse`.
 
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09 on
-branch `feature/azure-search-pipeline-mode-e2e`, based on
-`hotfix/azure-oyd-retirement-notice` with the Azure pipeline 2.8.1, i.e. before the
-pipeline mode of 2.9.0 exists):
+branch `feature/azure-search-pipeline-mode` with the Azure pipeline 2.9.0; the last
+column is the same harness with the Azure pipeline 2.8.1 of
+`hotfix/azure-oyd-retirement-notice`, i.e. before the pipeline mode of 2.9.0 exists):
 
-| Suite | Checks | PASS / KNOWN |
-| --- | ---: | ---: |
-| `gemini` | 81 | 81 / 0 |
-| `azure` | 188 | 76 / 112 |
-| `n8n` | 51 | 51 / 0 |
-| `infomaniak` | 32 | 31 / 1 |
-| `filters` | 57 | 57 / 0 |
-| **all** | **409** | **296 / 113** |
+| Suite | Checks | PASS / KNOWN | with Azure 2.8.1: checks, PASS / KNOWN |
+| --- | ---: | ---: | ---: |
+| `gemini` | 81 | 81 / 0 | 81, 81 / 0 |
+| `azure` | 194 | 194 / 0 | 188, 76 / 112 |
+| `n8n` | 51 | 51 / 0 | 51, 51 / 0 |
+| `infomaniak` | 32 | 31 / 1 | 32, 31 / 1 |
+| `filters` | 57 | 57 / 0 | 57, 57 / 0 |
+| **all** | **415** | **414 / 1** | **409, 296 / 113** |
 
-There is no FAIL and no obsolete marker. `harness/known_*.py` registers two known bugs:
-`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`,
-1 KNOWN) and `azure-oyd-retired` (#187, `known_azure.py`: Azure AI Search only works
-through On Your Data, which Azure retires on 2026-10-14; fixed in
-`azure_ai_foundry.py` 2.9.0 by `feature/azure-search-pipeline-mode`). The rag valves
-use the deployment `gpt-5-mini`, for which the Azure mock rejects `data_sources` with
-"On Your Data is retired (mock)", so on 2.8.x the 112 tagged `rag` checks fail with
-that answer and are KNOWN. Seven `rag` checks only run from 2.9.0 on and are not tagged
-(`not-configured`, `config-error.invalid-json`, `notice.none`, `auth.key-valve.oyd`,
-`mode.alias`, `oyd.invalid-json`, `oyd-retired-hint`): on 2.8.x they would pass
-anyway or could not fail with that evidence. With the 2.9.0 pipeline a full azure run
-has 194 checks (the six other gated checks are added; `notice.none` is only recorded
-when `oyd` is not selected, because the notice is logged once per loaded module), every
-one must PASS, and the 112 tagged ones are listed as obsolete markers to drop after the
-merge. The markers of the 62 bugs fixed by #182-#185 were dropped after their merge;
-their checks stay and must pass.
+There is no FAIL; `v0.11.3-slim` gives the same azure counts. `harness/known_*.py`
+registers two known bugs: `infomaniak-name-prefix` (`NAME_PREFIX` is read only once,
+no fix yet, `fixed_in=""`, 1 KNOWN) and `azure-oyd-retired` (#187, `known_azure.py`:
+Azure AI Search only works through On Your Data, which Azure retires on 2026-10-14;
+fixed in `azure_ai_foundry.py` 2.9.0 by `feature/azure-search-pipeline-mode`). With
+2.9.0 the 112 `rag` checks tagged with it pass and are listed as obsolete markers, to
+drop after the merge. The rag valves use the deployment `gpt-5-mini`, for which the
+Azure mock rejects `data_sources` with "On Your Data is retired (mock)", so on 2.8.x
+the 112 tagged `rag` checks fail with that answer and are KNOWN (no obsolete marker).
+Seven `rag` checks only run from 2.9.0 on and are not tagged (`not-configured`,
+`config-error.invalid-json`, `notice.none`, `auth.key-valve.oyd`, `mode.alias`,
+`oyd.invalid-json`, `oyd-retired-hint`): on 2.8.x they would pass anyway or could not
+fail with that evidence. A full azure run with 2.9.0 has six of them (194 checks):
+`notice.none` is only recorded when `oyd` is not selected, because the notice is logged
+once per loaded module (e.g. `--only 'azure.(valves|rag|logs)'`: 126 checks). The
+markers of the 62 bugs fixed by #182-#185 were dropped after their merge; their checks
+stay and must pass.
 
 ### API path vs. browser path
 
@@ -483,7 +485,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; with the azure `rag` group and the Azure pipeline 2.8.1: 42 PASS / 310 FAIL / 0 KNOWN (639 s on a busy host; no `rag` check passes). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; with the azure `rag` group and the Azure pipeline 2.8.1: 42 PASS / 310 FAIL / 0 KNOWN (639 s on a busy host; no `rag` check passes); the same with `main` 4d09a55 (Azure pipeline 2.8.0) and the harness of `feature/azure-search-pipeline-mode` (617 s). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario
@@ -507,6 +509,17 @@ ends as a `<suite>.timeout` FAIL with results instead of a cancelled job. The jo
 - **Background tasks have no event emitter.** `/api/v1/tasks/*/completions` call the
   pipe with `__task__` set and `__event_emitter__=None`; pipes and filters must handle
   `None`.
+- **A saved status can get lost in a new chat with a title task (Open WebUI race).**
+  For a new saved chat, Open WebUI 0.11.4 runs the title generation as its own task,
+  in parallel with the answer, and `Chats.update_chat_title_by_id` writes back the
+  whole chat JSON it read before. A status event the pipe saves in between
+  (`Chats.add_message_status_to_chat_by_id_and_message_id`) is then overwritten. Both
+  writes started together lose the status in about half of the attempts (reproduced
+  in the container, 20 of 40). `azure.oyd.no-session.sources` failed once that way
+  (`statuses=[('Request completed', True, False)]`: the first status
+  `Sending request to Azure AI...` missing) and passed in the next four runs. If only
+  a status is missing and the server log shows a normal request, it is this race;
+  rerun the group to confirm.
 - **First Gemini install is slow.** Creating the Gemini function pip-installs
   `google-genai` (~30-60 s); the create request waits for it.
 - **Git Bash on Windows:** MSYS rewrites arguments that look like paths (`/e2e` →
