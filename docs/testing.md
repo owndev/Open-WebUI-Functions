@@ -3,9 +3,9 @@
 The functions in this repo only run inside Open WebUI, so they are tested end-to-end
 against a **real Open WebUI container**: `tests/e2e/run.sh` starts a throw-away
 container, installs the function files through the Open WebUI API, points them at
-**mock provider APIs** (Gemini, Azure OpenAI / AI Foundry, n8n, Infomaniak, Azure Log
-Analytics) and runs scenario suites that chat with them the way an API client and the
-browser UI do.
+**mock provider APIs** (Gemini, Azure OpenAI / AI Foundry, Azure AI Search, n8n,
+Infomaniak, Azure Log Analytics) and runs scenario suites that chat with them the way
+an API client and the browser UI do.
 Container and volume are removed afterwards.
 
 - [Prerequisites](#prerequisites)
@@ -71,8 +71,10 @@ output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 
 A full run of all suites took 7-9.5 minutes on a shared 8-CPU Docker host (427-565 s,
 depending on the load; with `main`'s files 487 s: 30 s container start-up, then
-gemini 152 s, azure 69 s, n8n 76 s, infomaniak 41 s, filters 106 s). Network downloads
-on first use come on top
+gemini 152 s, azure 69 s, n8n 76 s, infomaniak 41 s, filters 106 s). The azure `rag`
+group adds about 2 minutes with the 2.8.x pipeline (its requests fail at once) and
+about 3 minutes with 2.9.0 (query-generation timeouts take 30 s); on a busy host the
+whole run took 966 s (azure 290 s). Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
 and how many are KNOWN today is listed under [What is tested](#what-is-tested).
@@ -142,7 +144,7 @@ events), a **background title task** and that the server log has no unexpected
 | Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
 | `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream) |
-| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; ignores `data_sources` when tools are sent, as Azure does) | `valves`, `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status), `tasks` (title task, also with Azure AI Search valves, #123), `oyd` (Azure AI Search "On Your Data": `[docX]` → links, also split across stream deltas, already linked or with parentheses in the URL; links in the history sent back as `[docX]`; only referenced sources saved and the show-all valve; relevance scores; no `data_sources` for background tasks, also without a websocket session; no tools or `stream_options` together with `data_sources`; a 300 KB and a > 4 MiB context event; `content: null`; the On Your Data retirement warning: none for requests without `data_sources` or with an empty list, one for the first request with them from `AZURE_AI_DATA_SOURCES` and one for the first from the client after the function was saved again (a fresh module), none for the later ones, never with the search key), `logs` (no API key and no citation text in the log) |
+| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; ignores `data_sources` when tools are sent, as Azure does; rejects `data_sources` for models other than gpt-4o, gpt-4o-mini and gpt-4.1 as an emulated On Your Data retirement; query generation, embeddings, tool calls), `mock_search.py` (Azure AI Search and an App Service managed identity token endpoint, see below) | `valves` (from 2.9.0 also the `AZURE_AI_SEARCH_*` valves, their defaults, enums and the password input of the key), `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status), `tasks` (title task, also with Azure AI Search valves, #123), `oyd` (Azure AI Search "On Your Data", pinned to `AZURE_AI_SEARCH_MODE=on_your_data`, the legacy mode from 2.9.0 on: `[docX]` → links, also split across stream deltas, already linked or with parentheses in the URL; links in the history sent back as `[docX]`; only referenced sources saved and the show-all valve; relevance scores; no `data_sources` for background tasks, also without a websocket session; no tools or `stream_options` together with `data_sources`; a 300 KB and a > 4 MiB context event; `content: null`; the On Your Data retirement warning: none for requests without `data_sources` or with an empty list, one for the first request with them from `AZURE_AI_DATA_SOURCES` and one for the first from the client after the function was saved again (a fresh module), none for the later ones, never with the search key), `rag` (pipeline-side Azure AI Search retrieval of 2.9.0, #187, `AZURE_AI_SEARCH_MODE=pipeline`; `suites/_azure_rag.py`: API and browser path, stream and non-stream, Foundry `/models` endpoint; search request body per `query_type`, query text rules, embeddings for `deployment_name` (v1 route, gateway prefix, Bearer) and `endpoint` (api-version, own key, chat key only on the chat host), integrated vectorizer; `fields_mapping` with `select`, separator and fallback, list-valued titles; `filter`, `top_n_documents`, `strictness`, the document budget (auto, valve, unlimited, dropping a document); prompt placement, one block and one system message, `in_scope` and the tool-results clause, `role_information`, sanitizing, list and image-only content; citations, `context` event and `message.context`, scores per score type, `[docX]` links, history unlinking, show-all valve; tool rounds (one search, no duplicate sources), tools and `stream_options` forwarded, tasks without retrieval; query generation (follow-ups, `always` / `off`, transcript, max queries, `<think>`, fallback, partial results, model in the body, the per-model pause after 3 timeouts); auth: key, key valve, access token, system- and user-assigned managed identity, token errors; fail-closed errors with a terminal status (HTTP 500/403/402/404/400/302/429/503, connection, retries, configuration errors, client `data_sources`, `context_length_exceeded`); Stop during a search; mode values; `on_your_data` key injection, invalid JSON and the retirement hint), `logs` (no API key, no search key or token, no citation text, no generated queries, document titles or URLs in the log) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
 | `filters` | `filters/*.py` + probe pipe | `mock_la.py` (Azure Log Analytics Data Collector API; the suite starts it, see below) | `model` / `global` (filters attached per model via `meta.filterIds` and as global filters: `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path with exact token counts, its status in the browser path, background task without `__event_emitter__`), `spec` (`SEND_TO_LOG_ANALYTICS` env parsing, encrypted shared key, valve names), `la` (Log Analytics records: signature, headers, payload and exact counts on the API and browser path, special tokens, multi-turn averages, sending switched off, HTTP errors, a slow and a hanging endpoint do not delay the answer, estimate marker), `valves` (compact status), `correlation` (inlet/outlet correlation when Open WebUI rewrites the last user message, concurrent identical requests), `encoding` (model-specific encoding, `gpt-4o` → `o200k_base`), `offline` (the tiktoken download hangs: estimates, one load at a time, retry, server not blocked), `multimodel` (multi-model chat and the features dict the models share), `search` (`google_search_tool` with features `{}`, `null` or without web_search, other feature keys kept, no per-user permission check), `vertex` (per-request data store, store only with the feature, `features: null`) |
@@ -162,23 +164,50 @@ a throw-away test CA into the container's trust store and starts `mocks/mock_la.
 The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
 process), so do not rerun it with `--reuse`.
 
+The azure `rag` group uses `mocks/mock_search.py` (127.0.0.1:9106, started with the
+other mocks): Azure AI Search *Documents - Search Post* with the indexes `x100-docs`,
+`x100-custom` (other field names, no vector field) and `client-index` (must never be
+queried), Search-like validation (api-version, `api-key` / Bearer, `select`, vector
+length, `Content-Type`), scores by rank, and trigger words in the search text
+(`no-hits`, `search-500`, `search-503-once`, `search-slow`, `doc-inject`, ...; the
+list is in the mock's docstring). It also answers `GET /msi/token`, the App Service
+managed identity endpoint: `run.sh` starts the container with
+`IDENTITY_ENDPOINT=http://127.0.0.1:9106/msi/token` and
+`IDENTITY_HEADER=e2e-identity-header`, so azure-identity's `ManagedIdentityCredential`
+and `DefaultAzureCredential` in the Open WebUI process mint their tokens there (a
+resource id containing `mi-fail` gets HTTP 400). A container started by an older
+`run.sh` lacks these variables; the managed identity checks then fail with `--reuse`.
+
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09 on
-branch `hotfix/azure-oyd-retirement-notice`, based on `main` 4d09a55, with the Azure
-pipeline 2.8.1 and its four `oyd.notice.*` checks):
+branch `feature/azure-search-pipeline-mode-e2e`, based on
+`hotfix/azure-oyd-retirement-notice` with the Azure pipeline 2.8.1, i.e. before the
+pipeline mode of 2.9.0 exists):
 
 | Suite | Checks | PASS / KNOWN |
 | --- | ---: | ---: |
 | `gemini` | 81 | 81 / 0 |
-| `azure` | 75 | 75 / 0 |
+| `azure` | 188 | 76 / 112 |
 | `n8n` | 51 | 51 / 0 |
 | `infomaniak` | 32 | 31 / 1 |
 | `filters` | 57 | 57 / 0 |
-| **all** | **296** | **295 / 1** |
+| **all** | **409** | **296 / 113** |
 
-There is no FAIL and no obsolete marker. `harness/known_*.py` registers one known bug,
-`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`):
-the one KNOWN. The markers of the 62 bugs fixed by #182-#185 were dropped after the
-merge; their checks stay and must pass.
+There is no FAIL and no obsolete marker. `harness/known_*.py` registers two known bugs:
+`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`,
+1 KNOWN) and `azure-oyd-retired` (#187, `known_azure.py`: Azure AI Search only works
+through On Your Data, which Azure retires on 2026-10-14; fixed in
+`azure_ai_foundry.py` 2.9.0 by `feature/azure-search-pipeline-mode`). The rag valves
+use the deployment `gpt-5-mini`, for which the Azure mock rejects `data_sources` with
+"On Your Data is retired (mock)", so on 2.8.x the 112 tagged `rag` checks fail with
+that answer and are KNOWN. Seven `rag` checks only run from 2.9.0 on and are not tagged
+(`not-configured`, `config-error.invalid-json`, `notice.none`, `auth.key-valve.oyd`,
+`mode.alias`, `oyd.invalid-json`, `oyd-retired-hint`): on 2.8.x they would pass
+anyway or could not fail with that evidence. With the 2.9.0 pipeline a full azure run
+has 194 checks (the six other gated checks are added; `notice.none` is only recorded
+when `oyd` is not selected, because the notice is logged once per loaded module), every
+one must PASS, and the 112 tagged ones are listed as obsolete markers to drop after the
+merge. The markers of the 62 bugs fixed by #182-#185 were dropped after their merge;
+their checks stay and must pass.
 
 ### API path vs. browser path
 
@@ -199,12 +228,14 @@ merge; their checks stay and must pass.
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak;
-  re-exported by `known.py`): key, summary, issue reference, pull request with the
-  pending fix, evidence, and the function `file` plus the version `fixed_in` that fixes
-  it. Printed with the bug, e.g. `known infomaniak-name-prefix (found by tests/e2e, no
-  issue filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
-  PR #<n> (not merged yet), fixed in <file> <version>`. KNOWN does not fail the run.
+  `tests/e2e/harness/known_<area>.py` (today `known_azure.py` and `known_n8n.py` for
+  n8n + Infomaniak; re-exported by `known.py`): key, summary, issue reference, pull
+  request (or branch) with the pending fix, evidence, and the function `file` plus the
+  version `fixed_in` that fixes it. Printed with the bug, e.g. `known
+  infomaniak-name-prefix (found by tests/e2e, no issue filed): ...; no fix yet`, or for
+  a bug with a pending fix `known azure-oyd-retired (#187): ...; fix pending in
+  feature/azure-search-pipeline-mode (not merged yet), fixed in
+  pipelines/azure/azure_ai_foundry.py 2.9.0`. KNOWN does not fail the run.
 
 A tagged check only counts as KNOWN when the failure **looks like that bug**: one of the
 bug's `evidence` regexes matches the check's detail text, or (for checks that pass
@@ -312,7 +343,7 @@ editor gives LF. `SOURCES.txt` says `CRLF converted to LF` for a converted file.
 4. Look at what reached a mock (Git Bash: prefix with `MSYS_NO_PATHCONV=1`):
 
    ```bash
-   docker exec owui-dbg curl -s http://127.0.0.1:9102/__requests   # 9101 gemini, 9102 azure, 9103 n8n, 9104 infomaniak
+   docker exec owui-dbg curl -s http://127.0.0.1:9102/__requests   # 9101 gemini, 9102 azure, 9103 n8n, 9104 infomaniak, 9106 Azure AI Search
    docker exec owui-dbg tail -n 100 /tmp/e2e/server.log
    ```
 
@@ -359,9 +390,11 @@ harness/             driver library: owui.py (REST client, API-path chat, valves
                      browser.py (socket.io + saved chats), logs.py (server log),
                      mocks.py, results.py, known.py + known_<area>.py (known bugs),
                      suite.py, config.py
-suites/              one module per suite: GROUPS + async def run(t: Suite)
-mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container);
-                     mock_la.py (Log Analytics) is started by the filters suite (:443, :9105)
+suites/              one module per suite: GROUPS + async def run(t: Suite); _*.py are
+                     helper modules (e.g. _azure_rag.py, the azure rag group), not suites
+mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 and :9106 in
+                     the container); mock_la.py (Log Analytics) is started by the filters
+                     suite (:443, :9105)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 ```
 
@@ -450,7 +483,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; with the azure `rag` group and the Azure pipeline 2.8.1: 42 PASS / 310 FAIL / 0 KNOWN (639 s on a busy host; no `rag` check passes). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

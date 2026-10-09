@@ -13,7 +13,13 @@ ADMIN_PASSWORD = "Passw0rd!e2e"
 
 # Provider mocks (tests/e2e/mocks/serve_all.py), reachable from the pipes.
 MOCK_HOST = "127.0.0.1"
-MOCK_PORTS = {"gemini": 9101, "azure": 9102, "n8n": 9103, "infomaniak": 9104}
+MOCK_PORTS = {
+    "gemini": 9101,
+    "azure": 9102,
+    "n8n": 9103,
+    "infomaniak": 9104,
+    "search": 9106,  # Azure AI Search; 9105 is the Log Analytics mock control port
+}
 
 # Layout inside the container (run.sh copies tests/e2e/ to E2E_ROOT).
 E2E_ROOT = os.environ.get("E2E_ROOT", "/e2e")

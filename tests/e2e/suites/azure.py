@@ -13,7 +13,8 @@ Groups (``--only azure.<group>``)
   dotted   model names containing dots reach upstream intact
   browser  browser path: saved answer, usage, full status sequence, error status
   tasks    background title task, also with Azure AI Search valves (#123)
-  oyd      Azure AI Search "On Your Data": [docX] links (also split across
+  oyd      Azure AI Search "On Your Data" (AZURE_AI_SEARCH_MODE=on_your_data,
+           the legacy mode since 2.9.0): [docX] links (also split across
            stream deltas, already linked, URL with parentheses), links in the
            history sent back as [docX], only referenced sources saved (show-all
            valve), relevance scores, no data_sources for background tasks (#123,
@@ -23,13 +24,22 @@ Groups (``--only azure.<group>``)
            data_sources, one for the first valve request and one for the first
            client request after the function was saved again, none for later
            requests, never with the search key
-  logs     no API key and no citation text in the server log
+  rag      pipeline-side Azure AI Search retrieval (AZURE_AI_SEARCH_MODE=
+           pipeline, 2.9.0, #187) against mocks/mock_search.py: request bodies
+           per query_type, embeddings, auth (key, key valve, token, managed
+           identity), query generation (fallback, pause), strictness, merge,
+           top-n, budget, sanitizing, prompt placement, citations, scores,
+           links, tool rounds, tasks, client data_sources, fail-closed errors,
+           Stop; see suites/_azure_rag.py. KNOWN azure-oyd-retired before 2.9.0
+  logs     no API key, no search key or token and no citation or search text
+           in the server log
 
 Browser chats of the oyd group that test the stream / citation handling send
 ``params.function_calling = "legacy"``, so Open WebUI does not add its built-in
 tools (with tools Azure ignores data_sources, see the mock). The chats without
 that parameter are the realistic web UI case and check that the pipe drops the
-built-in tools.
+built-in tools. Every place that sets AZURE_AI_DATA_SOURCES goes through
+``_oyd_valves`` (on_your_data mode) or the rag group's valves (pipeline mode).
 """
 
 import asyncio
@@ -41,7 +51,19 @@ from harness import Suite, short
 from harness.known import staged_version, version_tuple
 from harness.owui import completion_text
 
-GROUPS = ("valves", "models", "api", "dotted", "browser", "tasks", "oyd", "logs")
+# "rag" runs after "oyd" (oyd.notice.none needs the first data_sources request
+# of the module) and before "logs" (which scans what rag logged).
+GROUPS = (
+    "valves",
+    "models",
+    "api",
+    "dotted",
+    "browser",
+    "tasks",
+    "oyd",
+    "rag",
+    "logs",
+)
 FID = "azure"
 PATH = "pipelines/azure/azure_ai_foundry.py"
 KEY = "mock-key-123"
@@ -63,6 +85,29 @@ MAIN_VALVES = (
 )
 SHOW_ALL = "AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES"
 SHOW_ALL_SINCE = "2.8.0"  # first version with the SHOW_ALL valve
+# Pipeline-side Azure AI Search (#187): first version and its valves with
+# their defaults (None: no default checked).
+SEARCH_SINCE = "2.9.0"
+SEARCH_MODE = "AZURE_AI_SEARCH_MODE"
+SEARCH_VALVES = {
+    SEARCH_MODE: "pipeline",
+    "AZURE_AI_SEARCH_KEY": None,  # encrypted, password input
+    "AZURE_AI_SEARCH_API_VERSION": "2026-04-01",
+    "AZURE_AI_SEARCH_QUERY_GENERATION": "auto",
+    "AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS": -1,
+}
+SEARCH_ENUMS = {
+    SEARCH_MODE: {"pipeline", "on_your_data"},
+    "AZURE_AI_SEARCH_QUERY_GENERATION": {"auto", "always", "off"},
+}
+# Secrets of the rag group (mock values); never in the server log.
+RAG_SEARCH_KEY = "mock-search-key-456"
+RAG_SEARCH_TOKEN = "mock-search-token-789"
+RAG_EMBED_KEY = "mock-embed-key-321"
+RAG_JSON_KEY = "json-plaintext-key-000"
+# Texts the rag group sends to the Search mock or gets back (generated
+# queries, document titles and URLs): not at INFO in the server log.
+SEARCH_TEXTS = ("x100 warranty", "Release Notes", "docs.example.com/x100")
 # Client keys Open WebUI passes through to the pipe but the allow-list must drop.
 NOT_ALLOWED = {"user": "u-e2e", "logit_bias": {"50256": -100}, "foo_not_allowed": "x"}
 ALLOWED = {
@@ -262,6 +307,9 @@ async def _models(t: Suite) -> dict:
 
 
 def _oyd_valves(mock, base_valves: dict) -> dict:
+    """On Your Data valves. AZURE_AI_SEARCH_MODE=on_your_data keeps the
+    legacy path from 2.9.0 on (older files ignore the unknown valve);
+    DATA_SOURCES point at a host pipeline mode would really try to reach."""
     return {
         **base_valves,
         "AZURE_AI_ENDPOINT": f"{mock.url}/openai/deployments/gpt-4.1/chat/completions"
@@ -270,6 +318,7 @@ def _oyd_valves(mock, base_valves: dict) -> dict:
         "AZURE_AI_DATA_SOURCES": json.dumps(DATA_SOURCES),
         "AZURE_AI_INCLUDE_SEARCH_SCORES": True,
         SHOW_ALL: True,
+        SEARCH_MODE: "on_your_data",
     }
 
 
@@ -315,9 +364,15 @@ async def run(t: Suite) -> None:
         await tasks(t, mock, base_valves)
     if t.selected("oyd"):
         await oyd(t, mock, base_valves)
+    rag_mark = None
+    if t.selected("rag"):
+        from suites._azure_rag import rag  # needs this module's names
+
+        rag_mark = t.mark()
+        await rag(t, mock, base_valves)
     await t.owui.update_valves(FID, **base_valves)
     if t.selected("logs"):
-        logs(t)
+        logs(t, rag_mark)
     t.scan_log()
 
 
@@ -326,14 +381,36 @@ def valves_compat(t: Suite, spec: dict) -> None:
     required = list(MAIN_VALVES)
     if version_tuple(version) >= version_tuple(SHOW_ALL_SINCE):
         required.append(SHOW_ALL)
+    search = version_tuple(version) >= version_tuple(SEARCH_SINCE)
+    if search:
+        required.extend(SEARCH_VALVES)
     missing = [name for name in required if name not in spec]
     show_all_default = (spec.get(SHOW_ALL) or {}).get("default")
+    wrong = []
+    if search:
+        for name, default in SEARCH_VALVES.items():
+            got = (spec.get(name) or {}).get("default")
+            if default is not None and got != default:
+                wrong.append(f"{name}.default={got!r}")
+        for name, values in SEARCH_ENUMS.items():
+            enum = (spec.get(name) or {}).get("enum")
+            if set(enum or ()) != values:
+                wrong.append(f"{name}.enum={enum}")
+        key_input = ((spec.get("AZURE_AI_SEARCH_KEY") or {}).get("input") or {}).get(
+            "type"
+        )
+        if key_input != "password":
+            wrong.append(f"AZURE_AI_SEARCH_KEY.input={key_input!r}")
     t.check(
         "valves.compat",
         f"valve names of 2.7.0 kept; {SHOW_ALL} defaults to true "
-        f"(since {SHOW_ALL_SINCE})",
-        not missing and (SHOW_ALL not in required or show_all_default is True),
-        f"version={version} missing={missing} {SHOW_ALL}.default={show_all_default}",
+        f"(since {SHOW_ALL_SINCE}); the Azure AI Search valves with their "
+        f"defaults, enums and a password input for the key (since {SEARCH_SINCE})",
+        not missing
+        and (SHOW_ALL not in required or show_all_default is True)
+        and not wrong,
+        f"version={version} missing={missing} {SHOW_ALL}.default={show_all_default} "
+        f"wrong={wrong}",
     )
 
 
@@ -650,7 +727,7 @@ async def oyd_notice_none(t: Suite, mock, base_valves: dict, oyd_valves: dict) -
     client and a title task with the valve (tasks drop data_sources). Runs
     before the first data_sources request of the suite, because the notice
     is logged only once per loaded copy of the module."""
-    await t.owui.update_valves(FID, **base_valves)
+    await t.owui.update_valves(FID, **{**base_valves, SEARCH_MODE: "on_your_data"})
     await mock.reset()
     r = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=True)
     empty = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=False, data_sources=[])
@@ -1262,13 +1339,18 @@ async def oyd_usage_capability(t: Suite, mock, model: str) -> None:
         await t.owui.delete_model(model)
 
 
-def logs(t: Suite) -> None:
+def logs(t: Suite, rag_mark=None) -> None:
     t.assert_no_secrets(
         KEY,
+        RAG_SEARCH_KEY,
+        RAG_SEARCH_TOKEN,
+        RAG_EMBED_KEY,
+        RAG_JSON_KEY,
         sid="logs.no-secrets",
-        title="the API key never appears in the server log (any level)",
+        title="the API key, the search keys and the search token never appear "
+        "in the server log (any level)",
     )
-    if not t.selected("oyd"):
+    if not (t.selected("oyd") or t.selected("rag")):
         return  # no citations were fetched
     logged = t.log.since(t.log_start).count(CITATION_TEXT)
     t.check(
@@ -1276,4 +1358,15 @@ def logs(t: Suite) -> None:
         "citation content (document text) is not logged at INFO",
         not logged,
         f"citation text logged {logged}x",
+    )
+    if rag_mark is None:
+        return
+    text = t.log.since(rag_mark)
+    found = {needle: text.count(needle) for needle in SEARCH_TEXTS if needle in text}
+    t.check(
+        "logs.no-search-text",
+        "generated search queries, document titles and URLs are not logged at "
+        "INFO (pipeline mode)",
+        not found,
+        f"logged: {found}",
     )
