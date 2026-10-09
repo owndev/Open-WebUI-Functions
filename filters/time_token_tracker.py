@@ -16,7 +16,7 @@ features:
   - Sends metrics to Azure Log Analytics in the background (10 s timeout), so responses do not wait for it: through the Azure Monitor Logs Ingestion API (data collection rule, Microsoft Entra ID token from a client secret, a managed identity on App Service / Functions / Container Apps / VMs, or AKS workload identity; tokens are cached and refreshed before they expire), or through the deprecated HTTP Data Collector API (shared key) as a fallback. LOG_ANALYTICS_INGESTION_API selects auto, logs_ingestion, data_collector or both.
   - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests. Estimates are marked (tokensEstimated in the record and the log line, "~" in the status).
 changelog:
-  - 2.7.0 - Azure Monitor Logs Ingestion API (#188). New valves LOG_ANALYTICS_INGESTION_API, LOG_ANALYTICS_DCR_ENDPOINT, LOG_ANALYTICS_DCR_IMMUTABLE_ID, LOG_ANALYTICS_DCR_STREAM_NAME, LOG_ANALYTICS_AUTH_MODE, LOG_ANALYTICS_TENANT_ID, LOG_ANALYTICS_CLIENT_ID, LOG_ANALYTICS_CLIENT_SECRET, LOG_ANALYTICS_AUTHORITY_HOST and LOG_ANALYTICS_INGESTION_SCOPE, all with environment variable defaults; LOG_ANALYTICS_LOG_TYPE can now also be set by environment variable (an installation that set that variable before, when it was ignored, and never saved the valve now sends to that log type). With the default "auto", records go to the Logs Ingestion API as soon as its settings are complete, otherwise through the HTTP Data Collector API exactly as in 2.6.2, which now logs a one-time deprecation warning. Tokens (client secret, managed identity, AKS workload identity) are requested without extra packages, cached per identity and refreshed before they expire; concurrent records share one token request, and a failed refresh keeps using the still-valid token. After a failed token request, or when fresh tokens keep being rejected (401), new token requests pause for 30 s. Endpoint and authority must use https. Any 2xx counts as success (the API answers 204). 400, 401, 403, 404, 413 and 429 are logged once each with a hint (scope, role assignment, DCR ID, stream name, 1 MB limit, Retry-After); records are not retried. "both" writes each record to both APIs for a side-by-side migration.
+  - 2.7.0 - Azure Monitor Logs Ingestion API (#188). New valves LOG_ANALYTICS_INGESTION_API, LOG_ANALYTICS_DCR_ENDPOINT, LOG_ANALYTICS_DCR_IMMUTABLE_ID, LOG_ANALYTICS_DCR_STREAM_NAME, LOG_ANALYTICS_AUTH_MODE, LOG_ANALYTICS_TENANT_ID, LOG_ANALYTICS_CLIENT_ID, LOG_ANALYTICS_CLIENT_SECRET, LOG_ANALYTICS_AUTHORITY_HOST and LOG_ANALYTICS_INGESTION_SCOPE, all with environment variable defaults; LOG_ANALYTICS_LOG_TYPE can now also be set by environment variable (an installation that set that variable before, when it was ignored, and never saved the valve now sends to that log type; an empty variable counts as unset). With the default "auto", records go to the Logs Ingestion API as soon as its settings are complete, otherwise through the HTTP Data Collector API exactly as in 2.6.2, which now logs a one-time deprecation warning. Tokens (client secret, managed identity, AKS workload identity) are requested without extra packages, cached per identity and refreshed before they expire; concurrent records share one token request, and a failed refresh keeps using the still-valid token. After a failed token request, or when fresh tokens keep being rejected (401), new token requests pause for 30 s. Endpoint and authority must use https. Any 2xx counts as success (the API answers 204). 400, 401, 403, 404, 413 and 429 are logged once each with a hint (scope, role assignment, DCR ID, stream name, 1 MB limit, Retry-After); records are not retried. "both" writes each record to both APIs for a side-by-side migration.
   - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). Open WebUI awaits outlet() before it returns an API response, so the Log Analytics send now runs in a background task with its own timeout (10 s, 5 s to connect) instead of AIOHTTP_CLIENT_TIMEOUT (no timeout by default); a slow or unreachable Log Analytics endpoint no longer delays or stalls responses. The record timestamp is UTC with a "Z" suffix, and the new boolean record field tokensEstimated tells estimated token counts from exact ones. SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
@@ -153,6 +153,13 @@ _AADSTS_HINTS = {
     700212: "the federated token has the wrong audience (direct federation needs "
     "api://AzureADTokenExchange).",
 }
+# The App Service / Container Apps token service answers 400 ("Unable to load
+# the proper Managed Identity.") for an unknown user-assigned client ID, or for
+# the system-assigned identity when only user-assigned ones are assigned.
+_APP_SERVICE_400_HINT = (
+    "check LOG_ANALYTICS_CLIENT_ID: the client ID of a user-assigned identity of "
+    "this app, or empty for its enabled system-assigned identity."
+)
 _IMDS_UNREACHABLE = (
     "no managed identity endpoint reachable (not running on Azure, or no identity "
     "assigned)"
@@ -427,7 +434,11 @@ class Filter:
             json_schema_extra={"input": {"type": "password"}},
         )
         LOG_ANALYTICS_LOG_TYPE: str = Field(
-            default=os.getenv("LOG_ANALYTICS_LOG_TYPE", "OpenWebuiMetrics"),
+            # An empty variable (compose: LOG_ANALYTICS_LOG_TYPE=${UNSET}) counts
+            # as unset: 2.6.2 ignored the variable, and an empty log type breaks
+            # both APIs.
+            default=os.getenv("LOG_ANALYTICS_LOG_TYPE", "").strip()
+            or "OpenWebuiMetrics",
             description="Log Analytics log type name (HTTP Data Collector API); "
             "also the base of the default stream name Custom-<log type>_CL.",
         )
@@ -1014,14 +1025,35 @@ class Filter:
     def _token_error_text(
         source: str, status: int, payload: Any, body: str, secrets: list
     ) -> str:
-        """Loggable text of a failed token response (redacted, then truncated)."""
+        """
+        Loggable text of a failed token response. Every field is redacted
+        before it is truncated: a secret cut by the truncation would no longer
+        match and a fragment of it would be logged.
+        """
+
+        def field(value: Any, limit: int) -> str:
+            return " ".join(_redact(str(value or ""), secrets).split())[:limit]
+
         if not isinstance(payload, dict):
             return f"{status} response: {_redact(_first_line(body), secrets)[:200]}"
-        error = " ".join(str(payload.get("error") or "error").split())[:100]
         description = _redact(_first_line(payload.get("error_description")), secrets)
-        description = description[:200]
         if source not in ("client_secret", "workload_identity"):
-            return f"{status} {error} - {description}"
+            # IMDS answers {error, error_description}; App Service, Functions
+            # and Container Apps answer {statusCode, message, correlationId}.
+            error = field(payload.get("error"), 100)
+            if not description:
+                description = _redact(_first_line(payload.get("message")), secrets)
+            description = description[:200] or "no error description"
+            if source == "app_service" and status == 400:
+                description = f"{_APP_SERVICE_400_HINT} Detail: {description}"
+            text = f"{status} {error} - " if error else f"{status} - "
+            text += description
+            correlation_id = field(payload.get("correlationId"), 64)
+            if correlation_id:
+                text += f" (correlationId={correlation_id})"
+            return text
+        error = field(payload.get("error"), 100) or "error"
+        description = description[:200]
         codes = payload.get("error_codes")
         try:
             code = int(codes[0]) if isinstance(codes, list) and codes else None
@@ -1031,7 +1063,7 @@ class Filter:
         hint = _AADSTS_HINTS.get(code) if code is not None else None
         text = f"{head}: " + (f"{hint} " if hint else "") + f"Detail: {description}"
         ids = [
-            f"{name}={str(payload[name])[:64]}"
+            f"{name}={field(payload[name], 64)}"
             for name in ("trace_id", "correlation_id")
             if payload.get(name)
         ]

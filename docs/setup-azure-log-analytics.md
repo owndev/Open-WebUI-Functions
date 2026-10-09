@@ -26,6 +26,7 @@
 - `auto` switches to the Logs Ingestion API as soon as its valves are complete. Keep `data_collector` while you prepare the new setup, and switch when everything is in place.
 - `both` writes every record through both APIs. Use it only with a **separate** table ([Option B](#option-b-new-table-side-by-side)). With a migrated table ([Option A](#option-a-migrate-the-table-in-place)) every record would be stored twice.
 - The choice depends on the configuration only. A failed send is logged and never switches the API.
+- While no API can send (for example `logs_ingestion` with incomplete settings, or `auto` / `both` when neither API is complete), every response also logs the warning `Failed to send data to Log Analytics (chat=..., message=...)`. The one-time warning logged before it names the missing valves.
 
 ## Logs Ingestion API
 
@@ -294,7 +295,7 @@ Set the valves of the Time Token Tracker filter (**Admin Panel → Functions →
 | `LOG_ANALYTICS_LOG_TYPE` | `OpenWebuiMetrics` | The custom log name of the HTTP Data Collector API (`<log type>_CL`) and the base of the default stream name. |
 
 > [!NOTE]
-> Since 2.7.0 `LOG_ANALYTICS_LOG_TYPE` can also be set by an environment variable; version 2.6.2 ignored it. An installation that set this variable anyway and never saved the valve now sends to `<value>_CL` instead of `OpenWebuiMetrics_CL`.
+> Since 2.7.0 `LOG_ANALYTICS_LOG_TYPE` can also be set by an environment variable; version 2.6.2 ignored it. An installation that set this variable anyway and never saved the valve now sends to `<value>_CL` instead of `OpenWebuiMetrics_CL`. An empty variable (for example `LOG_ANALYTICS_LOG_TYPE=${LOG_ANALYTICS_LOG_TYPE}` in a compose file while the host variable is not set) counts as unset.
 
 The Logs Ingestion settings count as complete when the endpoint, the immutable ID and a stream name are set, `LOG_ANALYTICS_AUTH_MODE` is valid, the endpoint and authority use `https://` and, for `client_secret`, the tenant ID, client ID and client secret are set.
 
@@ -318,6 +319,7 @@ Each failed record logs one line in the Open WebUI log. Records are not retried.
 
 | Log line contains | Cause | Fix |
 | --- | --- | --- |
+| `Exception when sending to Logs Ingestion API: ClientConnectorError` or `TimeoutError` | The endpoint cannot be reached, or does not answer within 10 s: wrong `LOG_ANALYTICS_DCR_ENDPOINT`, DNS, a firewall or proxy, or a workspace behind private link (AMPLS) that needs a DCE. | Check the endpoint and the network path from the Open WebUI container; see [DCE and private link](#dce-and-private-link). |
 | `Error sending to Logs Ingestion API: 400` | The record does not match the DCR's stream declaration. | Compare the `streamDeclarations` with the [record fields](#record-fields-and-sending). |
 | `Error sending to Logs Ingestion API: 401` | The token was rejected. | `LOG_ANALYTICS_INGESTION_SCOPE` must match the cloud of the endpoint. A second 401 in a row pauses token requests for 30 s. |
 | `Error sending to Logs Ingestion API: 403` | The identity has no Monitoring Metrics Publisher role on the DCR, or the assignment is younger than 30 minutes. | Assign the role on the DCR ([Role assignment](#role-assignment)) and wait. |
@@ -331,11 +333,15 @@ Each failed record logs one line in the Open WebUI log. Records are not retried.
 | `... AADSTS70011` or `AADSTS500011` | Invalid scope. | `LOG_ANALYTICS_INGESTION_SCOPE` must match the cloud. |
 | `... AADSTS700212` | Workload identity: the federated token has the wrong audience. | The federated credential needs the audience `api://AzureADTokenExchange`. |
 | `... no managed identity endpoint reachable` | `managed_identity` outside Azure, or no identity assigned. | Assign an identity, or use a client secret. |
+| `... (managed identity (App Service)): 400 - check LOG_ANALYTICS_CLIENT_ID` | App Service, Functions or Container Apps: `LOG_ANALYTICS_CLIENT_ID` is not the client ID of a user-assigned identity assigned to the app, or it is empty while the app has no system-assigned identity. The line ends with the token service's message (for example `Unable to load the proper Managed Identity.`) and `correlationId`. | Correct the client ID, or assign the identity to the app (or enable its system-assigned identity). |
+| `... workload identity needs a tenant and client ID` | AKS: `AZURE_FEDERATED_TOKEN_FILE` is set, but `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` are not and the valves are empty. The webhook takes the client ID from the service account annotation. | Annotate the service account with `azure.workload.identity/client-id`, check that the pod is labelled `azure.workload.identity/use: "true"` and has the variables (restart it after a change), or set `LOG_ANALYTICS_TENANT_ID` / `LOG_ANALYTICS_CLIENT_ID`. |
+| `... AZURE_FEDERATED_TOKEN_FILE could not be read` or `is empty` | AKS: the projected service account token is missing or not readable at that path. | Check the pod label, the service account and the volume the webhook mounts. |
 | `... is not supported` | Managed identity on Service Fabric, Azure Arc, Cloud Shell / Azure ML, or AKS identity bindings. | Use a client secret. |
 | `could not be decrypted` | The stored client secret was encrypted with another `WEBUI_SECRET_KEY`. | Enter the client secret again. |
 | `keeping the cached token for Ns` | A token refresh failed; the still-valid token is used until shortly before it expires. | Fix the cause shown in the line. |
 | `Log Analytics record dropped: no usable token` | A token request failed (or tokens keep being rejected) less than 30 s ago. | See the token error logged before it; the next attempt follows automatically after 30 s. |
 | `not fully configured (missing: ...)` | Logs Ingestion valves are missing or invalid (`must use https`, `unknown value`). | Set the listed valves. Logged once per process. |
+| `Failed to send data to Log Analytics (chat=..., message=...)` | A warning per record: no API can send (see the one-time `not fully configured` warning before it), or the HTTP Data Collector API send failed (see the line before it). | Set the missing valves, or fix the cause shown before it. |
 | `does not look like an immutable ID` | `LOG_ANALYTICS_DCR_IMMUTABLE_ID` is not `dcr-` followed by 32 hex characters (it is still used). | Copy `immutableId` from the DCR's JSON view, not the DCR name or resource ID. |
 | `HTTP Data Collector API, which Microsoft deprecated` | The filter still sends through the deprecated API. | Set up the Logs Ingestion API. Logged once per process. |
 | `Log Analytics data sent via the Logs Ingestion API`, but no rows | The API accepted the record (204), the DCR dropped it. | See Option A step 8: DCR metrics and `DCRLogErrors`; usually `transformKql` does not match the table. |

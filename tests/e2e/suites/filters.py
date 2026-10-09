@@ -23,14 +23,22 @@ Groups (``--only filters.<group>``)
                counts on the API and browser path, special tokens, multi-turn
                averages, the "exactly two messages" rule, send switched off, HTTP
                errors, slow / hanging endpoint, estimate marker
-  ingest       Logs Ingestion API: request shape and 204, token cache /
-               concurrency / refresh, refresh failure with a still-valid token,
-               the 30 s token back-off and its end, token and HTTP errors with one
-               log line each, undecryptable secret, https-only and invalid
-               settings, slow / unreachable endpoints, mode selection and
-               fallback, both APIs, deprecation warning, sovereign cloud, App
-               Service / IMDS / workload identity (environment set through the
+  ingest       Logs Ingestion API: request shape and 204, token cache (scope and
+               tenant in its key) / concurrency / refresh, refresh failure with a
+               still-valid token (also inside the back-off), the 30 s token
+               back-off (still on after 20 s) and its end, token and HTTP errors
+               with one log line each (a secret echoed at the cut points of the
+               error text, a second revocation, a late 401 for a replaced
+               token), undecryptable secret, https-only (endpoint and authority)
+               and invalid settings, slow / unreachable endpoints, mode selection
+               and fallback, both APIs (also with one side incomplete),
+               deprecation warning, sovereign cloud, App Service (also its error
+               shape) / IMDS / workload identity (environment set through the
                probe pipe's PROBE_ENV hook)
+
+While the Log Analytics groups run, the probe pipe's PROBE_LOG hook writes
+everything the tracker logs, DEBUG included, to /e2e/out/tracker_debug.log;
+log.no-secrets-debug scans it (the server log runs at INFO).
   valves       compact status (CALCULATE_ALL_MESSAGES / SHOW_* off)
   correlation  inlet/outlet correlation when Open WebUI rewrites the last user
                message after the inlet, concurrent identical requests
@@ -64,6 +72,7 @@ import httpx
 
 from harness import Suite, short
 from harness.config import VERTEX_RAG_STORE
+from harness.logs import ServerLog
 
 GROUPS = (
     "model",
@@ -250,6 +259,12 @@ PROBE_ENV_NAMES = (
 # Issued tokens, identity headers, assertions etc. of the ingest group for the
 # final log.no-secrets check (collected in the group's finally).
 INGEST_SECRETS: list = []
+# The server log runs at INFO: while the Log Analytics groups run, the probe
+# pipe (PROBE_LOG) also writes everything the tracker's logger logs, DEBUG
+# included, to this file; log.no-secrets-debug scans it.
+DEBUG_LOG = "/e2e/out/tracker_debug.log"
+DEBUG_CAPTURE: dict = {"started": False, "problems": []}
+TRACKER_LOADED = "Loaded module: function_time_token_tracker"
 
 # tiktoken's encoding host; the offline group points it at the mock's tarpit
 TIKTOKEN_HOST = "openaipublic.blob.core.windows.net"
@@ -784,7 +799,46 @@ async def run(t: Suite) -> None:
             f"{len(warnings)} warnings: " + " || ".join(warnings[:3]),
         )
     t.assert_no_secrets(LA_KEY, *INGEST_SECRETS)
+    if DEBUG_CAPTURE["started"]:
+        debug_no_secrets(t)
     t.scan_log()
+
+
+async def tracker_debug_capture(t: Suite, target: str) -> list:
+    """Start (``target`` an absolute path) or stop (``"off"``) the probe
+    pipe's PROBE_LOG capture of the tracker's logger at DEBUG. Returns
+    problems."""
+    await upsert_derived_model(t, ENV_MODEL, "E2E Probe Env", [])
+    r = await t.owui.chat(ENV_MODEL, f"PROBE_LOG={target}")
+    rep = probe_report(r.content)
+    if r.status == 200 and rep.get("log_capture") == target:
+        return []
+    return [
+        f"PROBE_LOG={target}: HTTP {r.status} capture={rep.get('log_capture')} "
+        f"error={rep.get('log_error')}"
+    ]
+
+
+def debug_no_secrets(t: Suite) -> None:
+    """log.no-secrets for the tracker's DEBUG output (DEBUG_LOG): the same
+    secrets as the server log check."""
+    secrets = dict(t.owui.secrets)
+    for value in (LA_KEY, *INGEST_SECRETS):
+        if value:
+            secrets.setdefault(value, "secret")
+    capture = ServerLog(DEBUG_LOG)
+    debug = sum(
+        " DEBUG time_token_tracker " in line for line in capture.since(0).splitlines()
+    )
+    problems = DEBUG_CAPTURE["problems"] + capture.secrets(0, secrets)
+    t.check(
+        "log.no-secrets-debug",
+        "no plaintext secrets in what time_token_tracker logs, DEBUG included "
+        "(captured through the probe pipe's PROBE_LOG; the server log runs at INFO)",
+        debug > 0 and not problems,
+        f"{debug} DEBUG lines captured; "
+        + (" || ".join(problems[:5]) if problems else "no secret logged"),
+    )
 
 
 async def warm_up(t: Suite) -> None:
@@ -1067,6 +1121,9 @@ async def spec(t: Suite) -> None:
 async def la_groups(t: Suite) -> None:
     proc, la = await start_la_mock()
     try:
+        # After the install: a module load resets the tracker's logger level.
+        DEBUG_CAPTURE["problems"] = await tracker_debug_capture(t, DEBUG_LOG)
+        DEBUG_CAPTURE["started"] = True
         await t.owui.update_valves(
             TRACKER,
             SEND_TO_LOG_ANALYTICS=True,
@@ -1089,6 +1146,8 @@ async def la_groups(t: Suite) -> None:
         if t.selected("ingest"):
             await ingest_group(t, la)
     finally:
+        if DEBUG_CAPTURE["started"]:
+            DEBUG_CAPTURE["problems"] += await tracker_debug_capture(t, "off")
         await la.close()
         proc.terminate()
         try:
@@ -1562,6 +1621,21 @@ def header(entry: dict, name: str) -> Optional[str]:
     return None
 
 
+def once_per_process(t: Suite, needle: str) -> tuple:
+    """(ok, detail) for a warning the tracker logs once per process, i.e. per
+    module load: exactly once in this run when the module was loaded during
+    it (the install loads it, also with --reuse), otherwise at most once in
+    this run and at least once since the server started."""
+    run_lines = t.log.lines(t.log_start, needle)
+    if t.log.lines(t.log_start, TRACKER_LOADED):
+        return len(run_lines) == 1, f"{len(run_lines)} in this run (module loaded)"
+    all_lines = t.log.lines(0, needle)
+    return (
+        len(run_lines) <= 1 and len(all_lines) >= 1,
+        f"{len(run_lines)} in this run, {len(all_lines)} since the server started",
+    )
+
+
 async def ingest_group(t: Suite, la: LogAnalytics) -> None:
     state: dict = {"secrets": []}
     try:
@@ -1571,6 +1645,8 @@ async def ingest_group(t: Suite, la: LogAnalytics) -> None:
         await ingest_api(t, la)
         await ingest_token_cache(t, la)
         retry = await ingest_token_errors(t, la, state)
+        await ingest_http_401(t, la)
+        await ingest_token_backoff(t, la, retry)  # 20 s after token-error
         await ingest_http_errors(t, la)
         await ingest_refresh(t, la)
         await ingest_slow(t, la)
@@ -1734,6 +1810,52 @@ async def ingest_token_cache(t: Suite, la: LogAnalytics) -> None:
         f"arrived={arrived} success_lines={len(sent)}",
     )
 
+    # Scope and tenant are part of the cache key: the other scenarios change
+    # the client id as well, this one keeps it.
+    await la.reset()
+    client_id = (await set_li_valves(t))["LOG_ANALYTICS_CLIENT_ID"]
+    await li_chat(t, "cache key: default scope")
+    await la.wait(1, timeout=10, kind="ingest")
+    alt_scope = "https://monitor.azure.com//.default"
+    await set_li_valves(
+        t, LOG_ANALYTICS_CLIENT_ID=client_id, LOG_ANALYTICS_INGESTION_SCOPE=alt_scope
+    )
+    await li_chat(t, "cache key: other scope")
+    await la.wait(2, timeout=10, kind="ingest")
+    other_tenant = "22222222-3333-4444-5555-666666666666"  # unknown to the mock
+    await set_li_valves(
+        t, LOG_ANALYTICS_CLIENT_ID=client_id, LOG_ANALYTICS_TENANT_ID=other_tenant
+    )
+    mark = t.mark()
+    await li_chat(t, "cache key: other tenant")
+    await wait_log(t, mark, TOKEN_ERROR, 10)
+    await t.log.settle(1)
+    errors = t.log.lines(mark, TOKEN_ERROR)
+    posts = await la.records("ingest")
+    toks = await la.records("token")
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    got = [(tok.get("tenant"), tok.get("scope"), tok.get("client_id")) for tok in toks]
+    want = [
+        (TENANT, DEFAULT_SCOPE, client_id),
+        (TENANT, alt_scope, client_id),
+        (other_tenant, DEFAULT_SCOPE, client_id),
+    ]
+    statuses = [(p.get("status"), p.get("token_index")) for p in posts]
+    t.check(
+        "ingest.token-cache-key",
+        "the same client id with another scope, then with another tenant: one "
+        "new token request each (scope and tenant are part of the cache key); "
+        "the unknown tenant logs one ERROR with the AADSTS90002 hint, nothing "
+        "is sent with the old tenant's token",
+        got == want
+        and statuses
+        == [(204, toks[0].get("token_index")), (204, toks[1].get("token_index"))]
+        and len(errors) == 1
+        and "AADSTS90002" in errors[0]
+        and "LOG_ANALYTICS_TENANT_ID" in errors[0],
+        f"token_requests={got} posts={statuses} errors={errors[:2]}",
+    )
+
 
 async def ingest_token_errors(t: Suite, la: LogAnalytics, state: dict) -> dict:
     """Wrong secret (one ERROR with the AADSTS hint, then the 30 s back-off),
@@ -1800,6 +1922,34 @@ async def ingest_token_errors(t: Suite, la: LogAnalytics, state: dict) -> dict:
         f"redacted={'***' in (blocks[0] if blocks else '')}",
     )
 
+    cut = "e2e-cut+secret/3=x"
+    state["secrets"].append(quote_plus(cut))
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_SECRET=cut)
+    await la.mode(target="token", echo_secret=True, echo_at_cut=True)
+    mark = t.mark()
+    await li_chat(t, "token error echo at the cut points")
+    await wait_log(t, mark, TOKEN_ERROR, 12)
+    await t.log.settle(0.5)
+    blocks = [b for b in t.log.error_blocks(mark) if TOKEN_ERROR in b]
+    # The first 8 characters of the plain and the form-encoded secret: the
+    # mock puts 10 of them before each cut point.
+    leaked = [
+        i
+        for i, prefix in enumerate((cut[:8], quote_plus(cut)[:8]))
+        if any(prefix in b for b in blocks)
+    ]
+    redacted = blocks[0].count("***") if blocks else 0
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    t.check(
+        "ingest.token-error-echo-cut",
+        "the client secret echoed across the cut points of the error text "
+        "(error, first line of error_description, trace_id, correlation_id) is "
+        "redacted before the text is cut: not even a prefix of it is logged",
+        len(blocks) == 1 and redacted == 4 and not leaked,
+        f"blocks={len(blocks)} leaked_prefixes={leaked} redacted={redacted}",
+    )
+
     value = "encrypted:e2e-not-a-fernet-token"
     state["secrets"].append(value)
     await la.reset()
@@ -1828,37 +1978,47 @@ async def ingest_token_errors(t: Suite, la: LogAnalytics, state: dict) -> dict:
     return retry
 
 
-async def ingest_http_errors(t: Suite, la: LogAnalytics) -> None:
-    """One actionable log line per failed record, no retry."""
+async def ingest_http_401(t: Suite, la: LogAnalytics) -> None:
+    """A revoked token (twice, with a 204 in between), every token rejected."""
     await la.reset()
     await set_li_valves(t)
-    r0, _ = await li_chat(t, "401 warm-up (caches token A)")
+    results = [(await li_chat(t, "401 warm-up (caches token A)"))[0]]
     await la.wait(1, timeout=10, kind="ingest")
     await la.revoke()
     mark = t.mark()
-    r1, _ = await li_chat(t, "401 with the revoked token A")
-    lines = await wait_log(t, mark, f"{INGEST_ERROR}: 401", 10)
-    r2, _ = await li_chat(t, "401 then a new token")
-    posts = await la.wait(3, timeout=10, kind="ingest")
+    results.append((await li_chat(t, "401 with the revoked token A"))[0])
+    await wait_log(t, mark, f"{INGEST_ERROR}: 401", 10)
+    results.append((await li_chat(t, "401 then a new token B"))[0])
+    await la.wait(3, timeout=10, kind="ingest")
+    # A later, single revocation: the 204 in between ended the "last token got
+    # a 401" state, so this is no second 401 in a row (no token back-off).
+    await la.revoke()
+    results.append((await li_chat(t, "401 with the revoked token B"))[0])
+    await wait_log(t, mark, f"{INGEST_ERROR}: 401", 10, n=2)
+    results.append((await li_chat(t, "401 then a new token C"))[0])
+    posts = await la.wait(5, timeout=10, kind="ingest")
     await t.log.settle(1)
     lines = t.log.lines(mark, INGEST_ERROR)
+    dropped = t.log.lines(mark, DROPPED)
     toks = await la.records("token")
     t.expect_errors(mark, ("time_token_tracker", f"{INGEST_ERROR}: 401"))
     statuses = [p.get("status") for p in posts]
     indexes = [p.get("token_index") for p in posts]
+    tok = [x.get("token_index") for x in toks]
     t.check(
         "ingest.http-401",
         "a revoked token (401): one line with the scope hint, the next record "
-        "requests exactly one new token and gets 204",
-        [r.status for r in (r0, r1, r2)] == [200] * 3
-        and len(lines) == 1
-        and "LOG_ANALYTICS_INGESTION_SCOPE" in lines[0]
-        and statuses == [204, 401, 204]
-        and len(toks) == 2
-        and indexes[:2] == [toks[0].get("token_index")] * 2
-        and indexes[2:] == [toks[1].get("token_index")],
+        "requests exactly one new token and gets 204; a second revocation after "
+        "that 204 is handled the same way (no token back-off, nothing dropped)",
+        [r.status for r in results] == [200] * 5
+        and len(lines) == 2
+        and all("LOG_ANALYTICS_INGESTION_SCOPE" in line for line in lines)
+        and statuses == [204, 401, 204, 401, 204]
+        and len(tok) == 3
+        and indexes == [tok[0], tok[0], tok[1], tok[1], tok[2]]
+        and not dropped,
         f"lines={lines[:2]} statuses={statuses} token_indexes={indexes} "
-        f"token_requests={len(toks)}",
+        f"token_requests={len(toks)} dropped={dropped[:1]}",
     )
 
     await la.reset()
@@ -1889,6 +2049,95 @@ async def ingest_http_errors(t: Suite, la: LogAnalytics) -> None:
         and len(dropped) == 1,
         f"lines={len(lines)} token_requests={len(toks)} posts={len(posts)} "
         f"dropped={dropped[:1]}",
+    )
+
+
+async def ingest_token_backoff(t: Suite, la: LogAnalytics, retry: dict) -> None:
+    """The token back-off lasts 30 s, not just a few: 20 s after the failed
+    token request of ingest.token-error, a record of that identity is still
+    dropped although the secret is fixed. ingest.token-retry-after-window
+    checks the end of the same back-off."""
+    client_id, failed_at, note = retry["client_id"], retry["failed_at"], ""
+    if time.time() > failed_at + 24:
+        # A slow run: too late for that back-off, start another one.
+        await la.reset()
+        client_id = fresh_client_id()
+        await set_li_valves(
+            t,
+            LOG_ANALYTICS_CLIENT_ID=client_id,
+            LOG_ANALYTICS_CLIENT_SECRET="e2e-wrong-secret-3",
+        )
+        mark = t.mark()
+        await li_chat(t, "token back-off: failed token request")
+        await wait_log(t, mark, TOKEN_ERROR, 12)
+        toks = await la.records("token")
+        failed_at = toks[0]["received"] if toks else time.time()
+        t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+        note = " (own failed token request, the run was slow)"
+    await asyncio.sleep(max(0.0, failed_at + 20 - time.time()))
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_ID=client_id)
+    mark = t.mark()
+    sent_at = round(time.time() - failed_at, 1)
+    await li_chat(t, "token back-off: 20 s later, secret fixed")
+    dropped = await wait_log(t, mark, DROPPED, 8)
+    await t.log.settle(1)
+    toks = await la.records("token")
+    posts = await la.records("ingest")
+    t.check(
+        "ingest.token-backoff-duration",
+        "20 s after a failed token request the identity is still in its 30 s "
+        "back-off: the record is dropped (one 'record dropped' WARNING), no token "
+        "request although the secret is fixed now",
+        20 <= sent_at < 28 and not toks and not posts and len(dropped) == 1,
+        f"sent {sent_at}s after the failure{note} token_requests={len(toks)} "
+        f"posts={len(posts)} dropped={dropped[:1]}",
+    )
+
+
+async def ingest_http_errors(t: Suite, la: LogAnalytics) -> None:
+    """A 401 that arrives after the token was replaced; one actionable log
+    line per failed record, no retry."""
+    await la.reset()
+    await set_li_valves(t)
+    await li_chat(t, "late 401 warm-up (caches token A)")
+    await la.wait(1, timeout=10, kind="ingest")
+    await la.revoke()
+    await la.mode(target="ingest", delay=4)
+    mark = t.mark()
+    await li_chat(t, "late 401: slow post with token A")  # its 401 comes 4 s later
+    await la.wait(2, timeout=5, kind="ingest")
+    await la.mode(target="ingest")
+    await li_chat(t, "late 401: fast post with token A")  # 401 at once
+    await wait_log(t, mark, f"{INGEST_ERROR}: 401", 4)
+    await li_chat(t, "late 401: new token B")
+    sent = await wait_log(t, mark, INGEST_SENT, 4)
+    late = await wait_log(t, mark, f"{INGEST_ERROR}: 401", 8, n=2)
+    await li_chat(t, "late 401: after the late 401")  # still token B
+    posts = await la.wait(5, timeout=10, kind="ingest")
+    await t.log.settle(1)
+    toks = await la.records("token")
+    dropped = t.log.lines(mark, DROPPED)
+    t.expect_errors(mark, ("time_token_tracker", f"{INGEST_ERROR}: 401"))
+    shape = [(p.get("status"), p.get("token_index")) for p in posts]
+    tok = [x.get("token_index") for x in toks]
+    # Token B must have been cached before the slow post's 401 came back.
+    ordered = len(toks) >= 2 and len(posts) >= 2
+    ordered = ordered and toks[1]["received"] < posts[1]["received"] + 3.5
+    t.check(
+        "ingest.http-401-late",
+        "two records in flight with a revoked token: the 401 of the slow one "
+        "arrives after the new token was cached and does not drop it (the next "
+        "record reuses it: 2 token requests in all)",
+        len(tok) == 2
+        and shape
+        == [(204, tok[0]), (401, tok[0]), (401, tok[0]), (204, tok[1]), (204, tok[1])]
+        and len(sent) == 1
+        and len(late) == 2
+        and ordered
+        and not dropped,
+        f"posts={shape} token_requests={len(toks)} success_lines={len(sent)} "
+        f"401_lines={len(late)} ordered={ordered} dropped={dropped[:1]}",
     )
 
     cases = (
@@ -1976,23 +2225,35 @@ async def ingest_refresh(t: Suite, la: LogAnalytics) -> None:
     # The filter posts right after it received the token: its refresh time is
     # at most 4 s after this post (the mock's token receipt is earlier).
     anchor = posts[0]["received"] if posts else time.time()
+    await li_chat(t, "refresh request 1b, well before half the lifetime")
+    posts = await la.wait(2, timeout=10, kind="ingest")
+    toks = await la.records("token")
+    early = (
+        round(posts[1]["received"] - toks[0]["received"], 2)
+        if len(posts) > 1 and toks
+        else None
+    )
     await asyncio.sleep(max(0.0, anchor + 5 - time.time()))
     await li_chat(t, "refresh request 2")
-    posts = await la.wait(2, timeout=10, kind="ingest")
+    posts = await la.wait(3, timeout=10, kind="ingest")
     toks = await la.records("token")
     gap = round(toks[1]["received"] - toks[0]["received"], 2) if len(toks) > 1 else None
     t.check(
         "ingest.token-refresh",
-        "a token with 8 s lifetime is refreshed after half of it: 2 token "
-        "requests, the second before the first token expired, the second post "
-        "uses the new token, no expired token is sent",
+        "a token with 8 s lifetime is reused for a record in the first half of "
+        "its lifetime and refreshed after half of it: 2 token requests, the "
+        "second before the first token expired, the last post uses the new "
+        "token, no expired token is sent",
         len(toks) == 2
         and gap is not None
         and gap < 8
-        and len(posts) == 2
-        and posts[1].get("token_index") == toks[1].get("token_index")
+        and early is not None
+        and early < 3.5
+        and len(posts) == 3
+        and posts[1].get("token_index") == toks[0].get("token_index")
+        and posts[2].get("token_index") == toks[1].get("token_index")
         and all(p.get("status") == 204 and not p.get("token_expired") for p in posts),
-        f"token_requests={len(toks)} gap={gap}s posts="
+        f"token_requests={len(toks)} early={early}s gap={gap}s posts="
         f"{[(p.get('status'), p.get('token_index')) for p in posts]}",
     )
 
@@ -2010,33 +2271,43 @@ async def ingest_refresh(t: Suite, la: LogAnalytics) -> None:
     mark2 = t.mark()
     sent2 = round(time.time() - t0, 2)
     await li_chat(t, "refresh fallback request 2")
-    posts = await la.wait(2, timeout=10, kind="ingest")
+    await la.wait(2, timeout=10, kind="ingest")
+    # Inside the 30 s token back-off that failure started, the token is still
+    # usable (until >= t0 + 9): sent with it, no token request.
+    sent2b = round(time.time() - anchor, 2)
+    await li_chat(t, "refresh fallback request 2b, in the back-off")
+    await la.wait(3, timeout=5, kind="ingest")
     keep = await wait_log(t, mark2, "keeping the cached token", 5)
     await asyncio.sleep(max(0.0, anchor + 9.8 - time.time()))
     mark3 = t.mark()
     sent3 = round(time.time() - t0, 2)
     await li_chat(t, "refresh fallback request 3")
-    dropped = await wait_log(t, mark3, DROPPED, 6)
+    await wait_log(t, mark3, DROPPED, 6)
     await t.log.settle(1)
     toks = await la.records("token")
     posts = await la.records("ingest")
     keep = t.log.lines(mark2, "keeping the cached token")
+    dropped = t.log.lines(mark2, DROPPED)
     t.expect_errors(mark2, ("time_token_tracker", "keeping the cached token"))
     t.check(
         "ingest.token-refresh-fallback",
         "the refresh fails while the token is still valid: one ERROR 'keeping the "
-        "cached token', the record is sent with the old token (204); after the "
-        "token's usable time the next record is dropped without a token request",
+        "cached token', the record is sent with the old token (204), and so is "
+        "the next one inside the 30 s back-off; after the token's usable time "
+        "the next record is dropped without a token request",
         len(keep) == 1
-        and len(posts) == 2
-        and posts[1].get("token_index") == toks[0].get("token_index")
-        and all(p.get("status") == 204 for p in posts)
         and len(toks) == 2
         and toks[1].get("status") == 500
-        and len(dropped) == 1,
-        f"request2_at={sent2}s request3_at={sent3}s keep={keep[:1]} posts="
+        and len(posts) == 3
+        and all(p.get("token_index") == toks[0].get("token_index") for p in posts)
+        and all(p.get("status") == 204 for p in posts)
+        and sent2b < 8.5
+        and len(dropped) == 1
+        and dropped[0] in t.log.lines(mark3, DROPPED),
+        f"request2_at={sent2}s request2b_at=post1+{sent2b}s request3_at={sent3}s "
+        f"keep={keep[:1]} posts="
         f"{[(p.get('status'), p.get('token_index')) for p in posts]} token_requests="
-        f"{[(x.get('status'), x.get('token_index')) for x in toks]} dropped={dropped[:1]}",
+        f"{[(x.get('status'), x.get('token_index')) for x in toks]} dropped={dropped[:2]}",
     )
 
 
@@ -2155,20 +2426,54 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
             )
     await asyncio.sleep(1)
     posts = await la.records("ingest")
-    needle = (
+    once, warnings = once_per_process(
+        t,
         "not fully configured (missing: LOG_ANALYTICS_CLIENT_SECRET); using the "
-        "HTTP Data Collector API"
+        "HTTP Data Collector API",
     )
-    run_lines = t.log.lines(t.log_start, needle)
-    all_lines = t.log.lines(0, needle)
     t.check(
         "ingest.mode.auto-incomplete",
         "auto with incomplete Logs Ingestion settings: the 2.6.2 Data Collector "
         "request (signature, headers, record), one WARNING naming the missing "
         "valve (once per process)",
-        not problems and not posts and len(run_lines) <= 1 and len(all_lines) >= 1,
-        f"problems={problems} ingest={len(posts)} warnings: this run "
-        f"{len(run_lines)}, since start {len(all_lines)}",
+        not problems and not posts and once,
+        f"problems={problems} ingest={len(posts)} warnings: {warnings}",
+    )
+
+    await la.reset()
+    await set_li_valves(
+        t,
+        LOG_ANALYTICS_AUTH_MODE="managed_identity",
+        LOG_ANALYTICS_DCR_ENDPOINT="",
+        LOG_ANALYTICS_DCR_IMMUTABLE_ID="",
+        LOG_ANALYTICS_TENANT_ID="",
+        LOG_ANALYTICS_CLIENT_ID="",
+        LOG_ANALYTICS_CLIENT_SECRET="",
+    )
+    r, _ = await li_chat(t, "auto, only LOG_ANALYTICS_AUTH_MODE is set")
+    dc = await la.wait(1, timeout=10)
+    await asyncio.sleep(1)
+    other = [e.get("kind") for e in await la.records("all") if e.get("kind") != "dc"]
+    problems = (
+        record_problems(
+            dc[0], expected(probe_report(r.content), r.content), PROBE_MODEL, user_id
+        )
+        if len(dc) == 1
+        else [f"dc posts={len(dc)}"]
+    )
+    once, warnings = once_per_process(
+        t,
+        "not fully configured (missing: LOG_ANALYTICS_DCR_ENDPOINT, "
+        "LOG_ANALYTICS_DCR_IMMUTABLE_ID); using the HTTP Data Collector API",
+    )
+    t.check(
+        "ingest.mode.auto-partial-auth",
+        "auto with LOG_ANALYTICS_AUTH_MODE=managed_identity as the only Logs "
+        "Ingestion setting: the 2.6.2 Data Collector request, one WARNING naming "
+        "the missing endpoint and DCR ID (once per process)",
+        r.status == 200 and not problems and not other and once,
+        f"HTTP {r.status} problems={problems} other_requests={other} "
+        f"warnings: {warnings}",
     )
 
     await la.reset()
@@ -2204,22 +2509,18 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
         statuses.append(r.status)
     await asyncio.sleep(2)
     everything = await la.records("all")
-    needle = (
+    once, warnings = once_per_process(
+        t,
         "LOG_ANALYTICS_INGESTION_API=logs_ingestion, but the Logs Ingestion API is "
-        "not fully configured (missing: LOG_ANALYTICS_DCR_ENDPOINT)"
+        "not fully configured (missing: LOG_ANALYTICS_DCR_ENDPOINT)",
     )
-    run_lines = t.log.lines(t.log_start, needle)
-    all_lines = t.log.lines(0, needle)
     t.check(
         "ingest.mode.logs-ingestion-incomplete",
         "logs_ingestion without LOG_ANALYTICS_DCR_ENDPOINT: nothing sent, one "
         "WARNING naming the valve (once per process)",
-        statuses == [200, 200]
-        and not everything
-        and len(run_lines) <= 1
-        and len(all_lines) >= 1,
-        f"HTTP {statuses} requests={[e.get('kind') for e in everything]} warnings: "
-        f"this run {len(run_lines)}, since start {len(all_lines)}",
+        statuses == [200, 200] and not everything and once,
+        f"HTTP {statuses} requests={[e.get('kind') for e in everything]} "
+        f"warnings: {warnings}",
     )
 
     await la.reset()
@@ -2254,6 +2555,68 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
         f"HTTP {r.status} problems={problems}",
     )
 
+    # both, one side incomplete: the record still goes through the other one.
+    await la.reset()
+    await set_li_valves(
+        t, LOG_ANALYTICS_INGESTION_API="both", LOG_ANALYTICS_CLIENT_SECRET=""
+    )
+    r, _ = await li_chat(t, "both, Logs Ingestion settings incomplete")
+    dc = await la.wait(1, timeout=10)
+    await asyncio.sleep(1)
+    other = [e.get("kind") for e in await la.records("all") if e.get("kind") != "dc"]
+    problems = (
+        record_problems(
+            dc[0], expected(probe_report(r.content), r.content), PROBE_MODEL, user_id
+        )
+        if len(dc) == 1
+        else [f"dc posts={len(dc)}"]
+    )
+    problems += [f"Logs Ingestion requests={other}"] if other else []
+    once_li, warnings_li = once_per_process(
+        t,
+        "LOG_ANALYTICS_INGESTION_API=both, but the Logs Ingestion API is not fully "
+        "configured (missing: LOG_ANALYTICS_CLIENT_SECRET); sending only through "
+        "the other one",
+    )
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_INGESTION_API="both")
+    try:
+        await t.owui.update_valves(TRACKER, LOG_ANALYTICS_WORKSPACE_ID="")
+        r2, _ = await li_chat(t, "both, Data Collector settings incomplete")
+        posts = await la.wait(1, timeout=10, kind="ingest")
+        await asyncio.sleep(1)
+        dc = await la.records()
+    finally:
+        await t.owui.update_valves(TRACKER, LOG_ANALYTICS_WORKSPACE_ID=WORKSPACE)
+    problems += (
+        li_transport_problems(posts[0])
+        + record_body_problems(
+            posts[0],
+            expected(probe_report(r2.content), r2.content),
+            PROBE_MODEL,
+            user_id,
+        )
+        if len(posts) == 1
+        else [f"ingest posts={len(posts)}"]
+    )
+    problems += [f"dc posts={len(dc)}"] if dc else []
+    once_dc, warnings_dc = once_per_process(
+        t,
+        "LOG_ANALYTICS_INGESTION_API=both, but the HTTP Data Collector API is not "
+        "fully configured (missing: LOG_ANALYTICS_WORKSPACE_ID); sending only "
+        "through the other one",
+    )
+    t.check(
+        "ingest.mode.both-one-side",
+        "both with one API incomplete: the record goes through the other one "
+        "(Logs Ingestion incomplete: the 2.6.2 Data Collector request; Data "
+        "Collector incomplete: Logs Ingestion 204), one WARNING each (once per "
+        "process)",
+        r.status == 200 and r2.status == 200 and not problems and once_li and once_dc,
+        f"HTTP {r.status}/{r2.status} problems={problems} warnings: "
+        f"Logs Ingestion side {warnings_li}; Data Collector side {warnings_dc}",
+    )
+
     hexa = uuid.uuid4().hex[:4]
     endpoint_a = f"http://{DCR_HOST}"
     dcr_c = f"my-dcr-{hexa}"
@@ -2263,20 +2626,29 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
         ("a", {"LOG_ANALYTICS_DCR_ENDPOINT": endpoint_a}),
         ("b", {"LOG_ANALYTICS_AUTH_MODE": f"bogus-{hexa}"}),
         ("c", {"LOG_ANALYTICS_DCR_IMMUTABLE_ID": dcr_c}),
+        # The client secret must never go out over plain HTTP.
+        ("d", {"LOG_ANALYTICS_AUTHORITY_HOST": "http://login.microsoftonline.com"}),
     ):
         await la.reset()
         await set_li_valves(t, LOG_ANALYTICS_INGESTION_API="logs_ingestion", **over)
         mark = t.mark()
-        r, _ = await li_chat(t, f"invalid Logs Ingestion setting {name}")
-        if name == "c":
-            await wait_log(t, mark, f"{INGEST_ERROR}: 404", 10)
+        # c: two records with the same value, the hint is logged once
+        for i in range(2 if name == "c" else 1):
+            r, _ = await li_chat(t, f"invalid Logs Ingestion setting {name} {i}")
+            if name == "c":
+                await wait_log(t, mark, f"{INGEST_ERROR}: 404", 10, n=i + 1)
         await asyncio.sleep(1.5)
         seen[name] = (r.status, [e.get("kind") for e in await la.records("all")])
     t.expect_errors(mark_a, ("time_token_tracker", f"{INGEST_ERROR}: 404"))
-    https = "LOG_ANALYTICS_DCR_ENDPOINT (must use https)"
-    run_https, all_https = t.log.lines(t.log_start, https), t.log.lines(0, https)
+    once_https, https = once_per_process(
+        t, "LOG_ANALYTICS_DCR_ENDPOINT (must use https)"
+    )
+    once_authority, authority = once_per_process(
+        t, "LOG_ANALYTICS_AUTHORITY_HOST (must use https)"
+    )
     auth = t.log.lines(mark_a, "LOG_ANALYTICS_AUTH_MODE (unknown value")
     dcr_hint = t.log.lines(mark_a, "does not look like an immutable ID")
+    token_errors = t.log.lines(mark_a, TOKEN_ERROR)
     # The DCR ID is no secret: the 404 hint names it on purpose.
     shown = [
         line
@@ -2285,19 +2657,22 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
     ]
     t.check(
         "ingest.config-invalid",
-        "invalid settings: an http:// endpoint and an unknown auth mode count as "
-        "missing (WARNING, nothing sent); a DCR ID that is not dcr-<32 hex> logs "
-        "a hint and is still used; the warnings do not show the values",
+        "invalid settings: an http:// endpoint, an http:// authority and an "
+        "unknown auth mode count as missing (WARNING, nothing sent, no token "
+        "request); a DCR ID that is not dcr-<32 hex> logs a hint once per value "
+        "and is still used; the warnings do not show the values",
         seen.get("a") == (200, [])
         and seen.get("b") == (200, [])
-        and seen.get("c") == (200, ["token", "ingest"])
-        and len(run_https) <= 1
-        and len(all_https) >= 1
+        and seen.get("c") == (200, ["token", "ingest", "ingest"])
+        and seen.get("d") == (200, [])
+        and once_https
+        and once_authority
         and len(auth) == 1
         and len(dcr_hint) == 1
+        and not token_errors
         and not shown,
-        f"requests={seen} https warnings: this run {len(run_https)}, since start "
-        f"{len(all_https)}; auth={auth[:1]} dcr_hint={len(dcr_hint)} "
+        f"requests={seen} https warnings: endpoint {https}, authority {authority}; "
+        f"auth={auth[:1]} dcr_hint={len(dcr_hint)} token_errors={token_errors[:1]} "
         f"values_shown={shown[:1]}",
     )
 
@@ -2320,14 +2695,13 @@ async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
         f"warnings={lines[:2]} ingest={[p.get('status') for p in posts]} dc={len(dc)}",
     )
 
-    run_lines = t.log.lines(t.log_start, DEPRECATION)
-    all_lines = t.log.lines(0, DEPRECATION)
+    once, warnings = once_per_process(t, DEPRECATION)
     t.check(
         "ingest.deprecation-warning",
         "sending through the HTTP Data Collector API logs one deprecation WARNING "
         "per process",
-        len(run_lines) <= 1 and len(all_lines) >= 1,
-        f"this run {len(run_lines)}, since start {len(all_lines)}: {all_lines[:1]}",
+        once,
+        f"{warnings}: {t.log.lines(0, DEPRECATION)[-1:]}",
     )
 
 
@@ -2443,6 +2817,50 @@ async def ingest_managed_identity(t: Suite, la: LogAnalytics, state: dict) -> No
         "resource without /.default, user-assigned client_id; 2 records with 204",
         len(posts) == 2 and not toks and not problems,
         f"problems={problems} posts={len(posts)} token_route={len(toks)}",
+    )
+
+    # App Service / Container Apps answer errors as {statusCode, message,
+    # correlationId}, not {error, error_description}.
+    header_c = f"e2e-idh-{uuid.uuid4().hex}"
+    state["secrets"].append(header_c)
+    env = {"IDENTITY_ENDPOINT": f"{MI_URL}/msi/token", "IDENTITY_HEADER": header_c}
+    await la.reset()
+    await la.config(identity_header=header_c)
+    await set_li_valves(
+        t, LOG_ANALYTICS_CLIENT_ID=fresh_client_id("e2e-unknown-uami"), **mi_valves
+    )
+    problems = env_problems + await set_env(t, env)
+    mark = t.mark()
+    try:
+        await li_chat(t, "App Service managed identity, client ID not assigned")
+        await wait_log(t, mark, TOKEN_ERROR, 10)
+        await t.log.settle(1)
+    finally:
+        problems += await set_env(t)
+        await la.config(identity_header="")
+    blocks = [b for b in t.log.error_blocks(mark) if TOKEN_ERROR in b]
+    msi = await la.records("msi")
+    posts = await la.records("ingest")
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    correlation_id = msi[0].get("correlation_id") if len(msi) == 1 else None
+    needles = (
+        "(managed identity (App Service)): 400 - check LOG_ANALYTICS_CLIENT_ID",
+        "Detail: Unable to load the proper Managed Identity.",
+        f"(correlationId={correlation_id})",
+    )
+    t.check(
+        "ingest.mi.app-service-error",
+        "the App Service / Container Apps token service answers 400 {statusCode, "
+        "message, correlationId} (client ID not assigned to the app): one ERROR "
+        "with the LOG_ANALYTICS_CLIENT_ID hint, the service's message and its "
+        "correlationId; nothing sent",
+        bool(correlation_id)
+        and len(blocks) == 1
+        and all(n in blocks[0] for n in needles)
+        and not posts
+        and not problems,
+        f"errors={[b[:400] for b in blocks[:2]]} msi={len(msi)} posts={len(posts)} "
+        f"problems={problems}",
     )
 
     await la.reset()

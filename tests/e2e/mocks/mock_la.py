@@ -30,14 +30,17 @@ because it needs the certificate and port 443.
     host's cloud (401), Content-Type application/json, configured DCR / stream
     (404), JSON array of objects (400), at most 1 MiB (413); 204 on success.
 - Managed identity on http://127.0.0.1:9106 and http://127.0.0.2:9106 (kind
-  ``msi``): ``GET /msi/token`` (App Service, ``X-IDENTITY-HEADER``) and
+  ``msi``): ``GET /msi/token`` (App Service, ``X-IDENTITY-HEADER``; a
+  ``client_id`` starting with ``e2e-unknown`` gets App Service's 400
+  ``{statusCode, message, correlationId}``) and
   ``GET /metadata/identity/oauth2/token`` (IMDS, ``Metadata: true``).
 - Tarpit on 127.0.0.3:443: accepts TLS connections, waits 8 s and closes them
   (a hanging download for tiktoken's encoding host, offline group).
 - Control on http://127.0.0.1:9105: ``GET /__requests[?kind=dc|token|ingest|msi|all]``
   (recorded requests, default ``dc``), ``POST /__reset`` (records, modes),
   ``POST /__mode`` ``{"target": "dc"|"token"|"ingest"|"msi", "status": 500,
-  "delay": 6, "expires_in", "retry_after", "error_code", "echo_secret"}`` (each
+  "delay": 6, "expires_in", "retry_after", "error_code", "echo_secret",
+  "echo_at_cut"}`` (each
   call replaces the whole mode of its target; target defaults to dc),
   ``POST /__config`` ``{tenant, client_secret, dcr_id, stream,
   identity_header, token_file}``, ``GET /__tokens`` (issued access tokens),
@@ -88,6 +91,7 @@ def default_mode() -> dict:
         "retry_after": None,
         "error_code": None,
         "echo_secret": False,
+        "echo_at_cut": False,
     }
 
 
@@ -137,13 +141,34 @@ def bare_host(request: web.Request) -> str:
 
 
 def entra_error(
-    host: str, status: int, error: str, code: int, text: str, echo: str = ""
+    host: str,
+    status: int,
+    error: str,
+    code: int,
+    text: str,
+    echo: str = "",
+    at_cut: bool = False,
 ) -> web.Response:
-    """An error response shaped like Microsoft Entra ID's token endpoint."""
+    """An error response shaped like Microsoft Entra ID's token endpoint.
+
+    ``echo``: the secret / assertion is echoed in the first line of
+    error_description (plain and form-encoded). With ``at_cut`` it straddles
+    the filter's cut points instead: ``error`` (100 characters), the first
+    line of ``error_description`` (200), ``trace_id`` and ``correlation_id``
+    (64 each), each with the first 10 characters of the secret (plain or
+    form-encoded) before the cut. A filter that truncates before it redacts
+    logs those characters.
+    """
     first = f"AADSTS{code}: {text} e2e mock"
-    if echo:
-        first = f"AADSTS{code}: echo {echo} {quote_plus(echo)} e2e mock"
     trace_id, correlation_id = str(uuid.uuid4()), str(uuid.uuid4())
+    if echo and at_cut:
+        head = f"AADSTS{code}: "
+        error = "e" * 90 + echo
+        first = head + "p" * (190 - len(head)) + quote_plus(echo)
+        trace_id = "t" * 54 + echo
+        correlation_id = "c" * 54 + quote_plus(echo)
+    elif echo:
+        first = f"AADSTS{code}: echo {echo} {quote_plus(echo)} e2e mock"
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     body = {
         "error": error,
@@ -277,66 +302,46 @@ def make_api(workspace: str, key: str) -> web.Application:
             f"https://monitor.azure.{cloud}/.default",
             f"https://monitor.azure.{cloud}//.default",
         )
+
+        def error(status: int, name: str, code: int, text: str) -> web.Response:
+            return entra_error(host, status, name, code, text, echo, m["echo_at_cut"])
+
         if rec["content_type"].split(";")[0].strip() != (
             "application/x-www-form-urlencoded"
         ):
-            resp = entra_error(host, 400, "invalid_request", 900144, "no form", echo)
+            resp = error(400, "invalid_request", 900144, "no form")
         elif form.get("grant_type") != "client_credentials":
-            resp = entra_error(
-                host, 400, "unsupported_grant_type", 70003, "grant type", echo
-            )
+            resp = error(400, "unsupported_grant_type", 70003, "grant type")
         elif rec["tenant"] != cfg["tenant"]:
-            resp = entra_error(
-                host, 400, "invalid_request", 90002, "Tenant not found.", echo
-            )
+            resp = error(400, "invalid_request", 90002, "Tenant not found.")
         elif not cloud or form.get("scope") not in scopes:
-            resp = entra_error(
-                host,
-                400,
-                "invalid_scope",
-                70011,
-                "The provided scope is invalid.",
-                echo,
-            )
+            resp = error(400, "invalid_scope", 70011, "The provided scope is invalid.")
         elif str(form.get("client_id") or "").startswith("e2e-unknown"):
-            resp = entra_error(
-                host,
+            resp = error(
                 400,
                 "unauthorized_client",
                 700016,
                 "Application not found in the directory.",
-                echo,
             )
         elif rec["auth"] == "secret" and not rec["secret_ok"]:
-            resp = entra_error(
-                host,
-                401,
-                "invalid_client",
-                7000215,
-                "Invalid client secret provided.",
-                echo,
+            resp = error(
+                401, "invalid_client", 7000215, "Invalid client secret provided."
             )
         elif rec["auth"] == "assertion" and not rec["assertion_ok"]:
-            resp = entra_error(
-                host,
+            resp = error(
                 401,
                 "invalid_client",
                 700212,
                 "No matching federated identity record found.",
-                echo,
             )
         elif rec["auth"] is None:
-            resp = entra_error(
-                host, 401, "invalid_client", 7000216, "Client credential missing.", echo
-            )
+            resp = error(401, "invalid_client", 7000216, "Client credential missing.")
         elif m["status"] != 200:
-            resp = entra_error(
-                host,
+            resp = error(
                 m["status"],
                 "temporarily_unavailable" if m["status"] >= 500 else "invalid_request",
                 int(m["error_code"] or 90000),
                 "Forced by the e2e mock.",
-                echo,
             )
         else:
             access, index = issue_token(cloud)
@@ -492,6 +497,22 @@ def make_msi() -> web.Application:
             await asyncio.sleep(m["delay"])
         if flavour == "unknown":
             resp = web.json_response({"error": "not_found"}, status=404)
+        elif (
+            flavour == "app_service"
+            and header_ok
+            and str(query.get("client_id") or "").startswith("e2e-unknown")
+        ):
+            # What App Service / Container Apps answer for a client ID that is
+            # not assigned to the app (microsoft/azure-container-apps#442).
+            rec["correlation_id"] = str(uuid.uuid4())
+            resp = web.json_response(
+                {
+                    "statusCode": 400,
+                    "message": "Unable to load the proper Managed Identity.",
+                    "correlationId": rec["correlation_id"],
+                },
+                status=400,
+            )
         elif not header_ok:
             if flavour == "imds":
                 resp = web.json_response(
@@ -593,6 +614,7 @@ def make_control() -> web.Application:
         new["retry_after"] = data.get("retry_after")
         new["error_code"] = data.get("error_code")
         new["echo_secret"] = bool(data.get("echo_secret", False))
+        new["echo_at_cut"] = bool(data.get("echo_at_cut", False))
         STATE["modes"][target] = new
         return web.json_response({"ok": True})
 
