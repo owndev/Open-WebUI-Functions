@@ -174,6 +174,10 @@ class Pipe:
     LINKED_DOC_REF_PATTERN = re.compile(
         r"\[\[doc(\d+)\]\]\((?:(?:[^()\n]|\([^()\n]*\))*|[^)\n]*)\)"
     )
+    LINKED_DOC_REF_START = re.compile(r"\[\[doc\d+\]\]\(")
+    # Each link is matched within this many characters, so a long history line
+    # full of unclosed "[[docX]](" cannot make the match quadratic.
+    LINKED_DOC_REF_MAX_LENGTH = 2048
 
     # End of a streamed piece of text that may still become a [docX] reference
     # or a link around one: "[", "[[", "[d" ... "[doc1", "[doc1]", "[[doc1]]",
@@ -999,12 +1003,29 @@ class Pipe:
             ):
                 message = {
                     **message,
-                    "content": self.LINKED_DOC_REF_PATTERN.sub(
-                        r"[doc\1]", message["content"]
-                    ),
+                    "content": self._unlink_doc_refs(message["content"]),
                 }
             result.append(message)
         return result
+
+    def _unlink_doc_refs(self, text: str) -> str:
+        """Replace every "[[docX]](url)" link in text with "[docX]"."""
+        parts: List[str] = []
+        pos = 0
+        for start in self.LINKED_DOC_REF_START.finditer(text):
+            if start.start() < pos:
+                continue
+            match = self.LINKED_DOC_REF_PATTERN.match(
+                text,
+                start.start(),
+                start.start() + self.LINKED_DOC_REF_MAX_LENGTH,
+            )
+            if match:
+                parts.append(text[pos : match.start()])
+                parts.append(f"[doc{match.group(1)}]")
+                pos = match.end()
+        parts.append(text[pos:])
+        return "".join(parts)
 
     def _link_doc_refs_in_sse_chunk(
         self,
