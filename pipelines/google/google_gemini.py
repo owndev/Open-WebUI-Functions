@@ -189,7 +189,8 @@ def _gemini_function_name(name: str) -> str:
     replaced and a hash suffix, so the mapping is deterministic (no state is
     needed across rounds and turns) and distinct names stay distinct.
     """
-    if _GEMINI_FUNCTION_NAME_RE.match(name):
+    # fullmatch: "$" alone would also accept a name with a trailing newline
+    if _GEMINI_FUNCTION_NAME_RE.fullmatch(name):
         return name
     base = re.sub(r"[^A-Za-z0-9_-]", "_", name)
     if not re.match(r"[A-Za-z_]", base[:1] or "0"):
@@ -2153,12 +2154,17 @@ class Pipe:
                 end = start
                 while end < len(messages) and messages[end].get("role") == "tool":
                     end += 1
+                current_turn = index > turn_start
                 contents.extend(
                     self._convert_tool_round(
                         message if tool_calls else None,
                         tool_calls,
                         messages[start:end],
-                        placeholder=strict and index > turn_start,
+                        placeholder=strict and current_turn,
+                        # Stored server-side parts only within their own turn:
+                        # a later request may have no Search grounding (web
+                        # search switched off), and Vertex AI cannot send them.
+                        restore_stored=current_turn and not self.valves.USE_VERTEX_AI,
                     )
                 )
                 index = end
@@ -2208,6 +2214,22 @@ class Pipe:
         """Whether Gemini checks the thought signatures of the model's function
         calls (Gemini 3 and later; not Gemini 1.x and 2.x)."""
         return not re.match(r"^gemini-(1|2)[.-]", model_id.lower())
+
+    @staticmethod
+    def _tool_call_id(value: Any) -> Optional[str]:
+        """A tool call id (or tool_call_id) as str; None when it is missing.
+
+        Some OpenAI-compatible clients send numeric ids; Gemini's ids are str.
+        """
+        if value is None or value == "":
+            return None
+        return value if isinstance(value, str) else str(value)
+
+    @staticmethod
+    def _tool_call_function(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """The "function" object of a tool call ({} when it is not an object)."""
+        function = tool_call.get("function")
+        return function if isinstance(function, dict) else {}
 
     @staticmethod
     def _is_synthetic_tool_call_id(call_id: Any) -> bool:
@@ -2267,6 +2289,7 @@ class Pipe:
         tool_calls: List[Dict[str, Any]],
         tool_messages: List[Dict[str, Any]],
         placeholder: bool,
+        restore_stored: bool = False,
     ) -> List[Union[Dict[str, Any], types.Content]]:
         """Convert an assistant message with tool_calls and its tool messages.
 
@@ -2281,17 +2304,22 @@ class Pipe:
             tool_messages: The tool messages directly after the message
             placeholder: Put SKIP_THOUGHT_SIGNATURE on the first function call
                 if it has no signature (current turn of a model that checks them)
+            restore_stored: Replay the stored model content of a round with
+                server-side tool parts (current turn on the Gemini API only)
         """
         contents: List[Union[Dict[str, Any], types.Content]] = []
         call_names: Dict[str, str] = {}
         if message is not None:
             answered = {
-                tool_message.get("tool_call_id")
-                for tool_message in tool_messages
-                if tool_message.get("tool_call_id")
+                call_id
+                for call_id in (
+                    self._tool_call_id(tool_message.get("tool_call_id"))
+                    for tool_message in tool_messages
+                )
+                if call_id
             }
             model_content, call_names = self._build_tool_call_content(
-                message, tool_calls, answered, placeholder
+                message, tool_calls, answered, placeholder, restore_stored
             )
             if model_content is not None:
                 contents.append(model_content)
@@ -2314,6 +2342,7 @@ class Pipe:
         tool_calls: List[Dict[str, Any]],
         answered: set,
         placeholder: bool,
+        restore_stored: bool = False,
     ) -> Tuple[Optional[types.Content], Dict[str, str]]:
         """Build the model content of an assistant message with tool_calls.
 
@@ -2324,8 +2353,15 @@ class Pipe:
         parts: Optional[List[types.Part]] = None
 
         # A round with server-side tool parts (Search grounding together with
-        # functions on Gemini 3) is replayed exactly as Gemini sent it.
-        stored = self._restore_stored_content(details, tool_calls)
+        # functions on Gemini 3) is replayed exactly as Gemini sent it within
+        # its own turn. Older turns are rebuilt from the tool calls and their
+        # signatures: Gemini checks only the current turn, and the server-side
+        # parts would need the same grounding tools in this request.
+        stored = (
+            self._restore_stored_content(details, tool_calls)
+            if restore_stored
+            else None
+        )
         if stored is not None:
             parts = list(stored.parts or [])
         else:
@@ -2334,16 +2370,17 @@ class Pipe:
             if text:
                 parts.append(types.Part(text=text))
             signatures = {
-                item.get("id"): item.get("data")
+                self._tool_call_id(item.get("id")): item.get("data")
                 for item in details
                 if item.get("type") == "reasoning.encrypted"
                 and item.get("format") == REASONING_FORMAT_SIGNATURE
-                and item.get("id")
+                and self._tool_call_id(item.get("id"))
             }
             for tool_call in tool_calls:
                 parts.append(
                     self._build_function_call_part(
-                        tool_call, signatures.get(tool_call.get("id"))
+                        tool_call,
+                        signatures.get(self._tool_call_id(tool_call.get("id"))),
                     )
                 )
 
@@ -2359,7 +2396,7 @@ class Pipe:
                 continue
             tool_call = tool_calls[position] if position < len(tool_calls) else {}
             position += 1
-            call_id = tool_call.get("id")
+            call_id = self._tool_call_id(tool_call.get("id"))
             if call_id and call_id in answered:
                 call_names[call_id] = part.function_call.name or ""
                 kept.append(part)
@@ -2392,7 +2429,7 @@ class Pipe:
         self, details: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]]
     ) -> Optional[types.Content]:
         """Restore the model content stored for a round with server-side parts."""
-        first_id = tool_calls[0].get("id") if tool_calls else None
+        first_id = self._tool_call_id(tool_calls[0].get("id")) if tool_calls else None
         if not first_id:
             return None
         item = next(
@@ -2400,7 +2437,7 @@ class Pipe:
                 item
                 for item in details
                 if item.get("format") == REASONING_FORMAT_CONTENT
-                and item.get("id") == first_id
+                and self._tool_call_id(item.get("id")) == first_id
             ),
             None,
         )
@@ -2414,11 +2451,11 @@ class Pipe:
                 part.function_call for part in content.parts or [] if part.function_call
             ]
             matches = len(calls) == len(tool_calls) and all(
-                call.id == tool_call.get("id")
+                call.id == self._tool_call_id(tool_call.get("id"))
                 if call.id
                 else call.name
                 == _gemini_function_name(
-                    str((tool_call.get("function") or {}).get("name") or "")
+                    str(self._tool_call_function(tool_call).get("name") or "")
                 )
                 for call, tool_call in zip(calls, tool_calls)
             )
@@ -2453,7 +2490,7 @@ class Pipe:
         self, tool_call: Dict[str, Any], signature: Optional[str]
     ) -> types.Part:
         """Build a function_call part from an OpenAI tool call."""
-        function = tool_call.get("function") or {}
+        function = self._tool_call_function(tool_call)
         name = _gemini_function_name(str(function.get("name") or ""))
         arguments = function.get("arguments")
         args: Any = arguments
@@ -2465,7 +2502,7 @@ class Pipe:
         if not isinstance(args, dict):
             self.log.warning(f"Invalid tool call arguments for '{name}'")
             args = {}
-        call_id = tool_call.get("id")
+        call_id = self._tool_call_id(tool_call.get("id"))
         function_call = types.FunctionCall(
             id=None if self._is_synthetic_tool_call_id(call_id) else call_id,
             name=name,
@@ -2486,7 +2523,7 @@ class Pipe:
         self, tool_message: Dict[str, Any], call_names: Dict[str, str]
     ) -> Optional[types.Part]:
         """Build a function_response part from a tool message."""
-        call_id = tool_message.get("tool_call_id") or ""
+        call_id = self._tool_call_id(tool_message.get("tool_call_id")) or ""
         name = call_names.get(call_id) if call_id else None
         if name is None and tool_message.get("name"):
             # API clients may send the function name with the result

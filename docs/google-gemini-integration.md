@@ -20,6 +20,9 @@ Version 1.68.0 is the first `google-genai` release that can send Google Search g
 
 Open WebUI runs `pip` for this requirement when the function is saved and again at every startup for active functions. Once the package is installed this is a no-op, but after the container is recreated (for example on an image upgrade) it is downloaded again, so Open WebUI needs access to PyPI or to a mirror configured via `PIP_OPTIONS` / `PIP_PACKAGE_INDEX_OPTIONS`. On Open WebUI 0.9.0 to 0.11.3, pip upgrades the bundled `google-genai` 1.66.0 when the function is saved. The pipeline reloads `google.genai` itself, so it uses the new version without a restart; other functions or tools that use `google.genai` only see the new version after a restart.
 
+> [!WARNING]
+> Without access to PyPI or a mirror (air-gapped or proxied instances), that upgrade fails on Open WebUI 0.9.0 to 0.11.3: saving version 1.18.0 then fails, Open WebUI switches the function off, and the Gemini models disappear. Before you update, either install `google-genai>=1.68.0,<3` yourself (see [Manual Installation](#manual-installation)), or set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`. In the second case the pipeline runs on the bundled 1.66.0 without Google Search grounding together with function calling: Gemini 3 with web search then uses grounding only and declares no tools in that request.
+
 > [!NOTE]
 > `google-genai` currently requires `websockets<17` ([googleapis/python-genai#2835](https://github.com/googleapis/python-genai/issues/2835)), so pip downgrades the `websockets` 17.1 shipped with Open WebUI 0.11.4 to the newest 16.x (16.1.1, the version Open WebUI 0.11.3 shipped with the same uvicorn). The downgrade applies to the whole Open WebUI environment. The pipeline reloads the affected modules itself, so Open WebUI does not need a restart after the install. Other tools or functions that imported `websockets` before the downgrade only see a consistent version again after a restart.
 
@@ -749,8 +752,9 @@ Requests to `/api/chat/completions` without a chat pass the client's `tools` to 
 
 ### Grounding together with tools
 
-- Gemini 3 on the Gemini API: Google Search and URL context grounding are sent together with the function declarations (server-side tool invocations).
+- Gemini 3 on the Gemini API: Google Search and URL context grounding are sent together with the function declarations (server-side tool invocations). This needs `google-genai` 1.68.0 or later; with an older SDK grounding takes precedence as below.
 - Gemini 2.x and other models, Vertex AI (including Vertex AI with `VERTEX_AI_RAG_STORE`) and Enterprise Web Search: grounding takes precedence, and the request declares no functions.
+- A round with Gemini's own Search calls is sent back complete (the search calls, their results and the function calls, stored as an extra `reasoning_details` item) only within its turn. Later turns get the round's function calls with their signatures and results, without the search parts, so a later message with web search switched off, or a switch to Vertex AI, still works.
 
 ### Names and schemas
 
