@@ -2,6 +2,11 @@
 
 This document describes the native OpenWebUI citation support in the Azure AI Foundry Pipeline, which enables rich citation cards and source previews in the OpenWebUI frontend.
 
+> [!WARNING]
+> **Azure OpenAI On Your Data is retired on October 14, 2026.** Everything in this document is based on On Your Data: the pipeline sends `data_sources` to Azure OpenAI and builds the citations from the `context` of the answer. Microsoft has deprecated On Your Data and retires the service on **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft does not document what a request with `data_sources` returns after that date: expect it to fail with an error, or to be answered without your search index and without citations. Chats without `data_sources` are not affected. Until then, On Your Data only supports GPT-4o (versions 2024-05-13, 2024-08-06 and 2024-11-20) and GPT-4o-mini (version 2024-07-18).
+>
+> Microsoft recommends migrating to Foundry Agent Service with Foundry IQ; to get started, see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect). The migration of this pipeline is tracked in [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). Since v2.8.1 the pipeline logs this retirement notice as a warning once per process (see [Logging](#logging)).
+
 ## Overview
 
 The Azure AI Foundry Pipeline supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature is **automatically enabled** when you configure Azure AI Search data sources (`AZURE_AI_DATA_SOURCES`). The OpenWebUI frontend will display:
@@ -186,6 +191,8 @@ Citations are filtered to only show documents that are actually referenced in th
 ### Logging
 
 Citation helpers log only counts at `INFO` level. Document content, titles and URLs are logged at `DEBUG` level only.
+
+Since v2.8.1 the first request that uses `data_sources` (from `AZURE_AI_DATA_SOURCES` or sent by the client; an empty list does not count) logs a `WARNING` that Azure OpenAI On Your Data is retired on October 14, 2026, with a link to [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). It is logged once per process (Open WebUI loads the function again when it is saved, for example after its code is changed, which logs it once more) and contains no part of the `data_sources`, so no search key. Background tasks are sent without `data_sources` and do not log it.
 
 ## Index Schema Requirements for Citations
 
@@ -423,18 +430,26 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 **Solution**: The citations of an answer arrive in one SSE event. Up to v2.7.0 the pipeline could only read events of up to 128 KiB, which many or long retrieved documents exceed; since v2.8.0 it reads events of up to 4 MiB. If an event is even larger, retrieve fewer or shorter documents (for example a lower `top_n_documents` in `AZURE_AI_DATA_SOURCES`, or shorter chunks in the index), or set `AZURE_AI_INCLUDE_SEARCH_SCORES=false`, so that `all_retrieved_documents` (which repeats the documents together with their scores) is no longer requested; citation cards then show no relevance percentage.
 
+### Requests With Azure AI Search Fail or Show No Citations After October 14, 2026
+
+**Problem**: Since October 14, 2026, chats that use `AZURE_AI_DATA_SOURCES` (or API requests with `data_sources`) end with an `Error: …` message, or are answered without the search index and without citations, while chats without `data_sources` still work
+
+**Solution**: Microsoft retires Azure OpenAI On Your Data, which this integration is built on, on October 14, 2026 (see the notice at the top of this document). The pipeline has no replacement retrieval path yet; follow [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). Microsoft recommends Foundry Agent Service with Foundry IQ ([Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect)). If the requests fail, clearing `AZURE_AI_DATA_SOURCES` makes the chats work again, without the search index.
+
 ## References
 
 - [OpenWebUI Pipelines Citation Feature Discussion](https://github.com/open-webui/pipelines/issues/229)
 - [OpenWebUI Event Emitter Documentation](https://docs.openwebui.com/features/plugin/development/events)
 - [Azure AI Search Documentation](https://learn.microsoft.com/en-us/azure/search/)
-- [Azure On Your Data API Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data)
-- [Azure Search Fields Mapping Options](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/azure-search#fields-mapping-options)
+- [Azure On Your Data API Reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data)
+- [Azure Search Fields Mapping Options](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/azure-search#fields-mapping-options)
 - [Azure AI Search Indexer Field Mappings](https://learn.microsoft.com/en-us/azure/search/search-indexer-field-mappings)
-- [Azure OpenAI On Your Data - Index Field Mapping](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/use-your-data#index-field-mapping)
+- [Azure OpenAI On Your Data - Index Field Mapping](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#index-field-mapping)
+- [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect) (Microsoft's recommended migration from On Your Data)
 
 ## Version History
 
+- **v2.8.1**: Retirement notice for Azure OpenAI On Your Data (October 14, 2026) in this document, in the `AZURE_AI_DATA_SOURCES` valve description and in the pipeline docstring; the first request with a non-empty `data_sources` (from the valve or sent by the client) logs a warning once per process, without any part of the `data_sources`; background tasks do not log it ([#187](https://github.com/owndev/Open-WebUI-Functions/issues/187))
 - **v2.8.0**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, `[[docX]]` without a link counts as one reference, parentheses in document URLs are percent-encoded and links in the chat history (also older links with parentheses in the URL) are sent back as plain `[docX]`; references to documents that do not exist do not count as references; streamed events of up to 4 MiB (was 128 KiB) are read and a failed stream ends with an `Error: …` message and `data: [DONE]` instead of an empty answer; a non-streamed answer with `content: null` no longer fails with `Error: expected string or bytes-like object`; document content is only logged at `DEBUG` level
 - **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
 - **v2.5.x**: Dual citation modes (OpenWebUI events + markdown/HTML)
