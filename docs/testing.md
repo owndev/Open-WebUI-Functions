@@ -46,28 +46,32 @@ pixi run e2e gemini              # same via pixi (Linux)
 Typical output (abridged):
 
 ```text
-starting owui-e2e-004128-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
-Open WebUI healthy after 25s (http://localhost:49213)
+starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
+Open WebUI healthy after 30s (http://localhost:57765)
 Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
-function versions: google_gemini.py 1.16.1, azure_ai_foundry.py 2.7.0, n8n.py 2.3.0, ...
+function versions: google_gemini.py 1.17.0, azure_ai_foundry.py 2.8.0, n8n.py 2.3.1, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
-[KNOWN] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
-          -> known B1 (no issue filed): Gemini API stream without a websocket session ends
-             with 'Error during streaming' ...; fix pending in PR #185 (not merged yet),
-             fixed in pipelines/google/google_gemini.py 1.17.0
-          HTTP 200 stream=True content=Error during streaming:  usage=None errors=[] upstream=None
+[PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
 ...
---- gemini: 129s
+--- gemini: 152s
 ...
-SUMMARY: 168 PASS, 0 FAIL, 124 KNOWN in 435s
-total runtime: 471s
-output: tests/e2e/out/20261009-004128-owui-e2e-004128-1234
+=== infomaniak ===
+...
+[KNOWN] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names
+          -> known infomaniak-name-prefix (found by tests/e2e, no issue filed): changing the
+             NAME_PREFIX valve does not change the model names (the prefix is read once in
+             __init__); no fix yet
+          name='Infomaniak: Mixtral Mock'
+...
+SUMMARY: 291 PASS, 0 FAIL, 1 KNOWN in 445s
+total runtime: 487s
+output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
 A full run of all suites took 7-9.5 minutes on a shared 8-CPU Docker host (427-565 s,
-depending on the load; with `main`'s files 471 s: 25 s container start-up, then
-gemini 129 s, azure 55 s, n8n 71 s, infomaniak 36 s, filters 143 s). Network downloads
+depending on the load; with `main`'s files 487 s: 30 s container start-up, then
+gemini 152 s, azure 69 s, n8n 76 s, infomaniak 41 s, filters 106 s). Network downloads
 on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -160,20 +164,19 @@ process), so do not rerun it with `--reuse`.
 
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09):
 
-| Suite | Checks | `main` (0e47f2a): PASS / KNOWN | Known bugs seen on `main` | Fixed files of #182-#185: PASS / KNOWN |
-| --- | ---: | ---: | ---: | ---: |
-| `gemini` | 81 | 44 / 37 | 17 | 81 / 0 |
-| `azure` | 71 | 38 / 33 | 14 | 71 / 0 |
-| `n8n` | 51 | 37 / 14 | 10 | 51 / 0 |
-| `infomaniak` | 32 | 15 / 17 | 8 | 31 / 1 |
-| `filters` | 57 | 34 / 23 | 12 | 57 / 0 |
-| **all** | **292** | **168 / 124** | **61** | **291 / 1** |
+| Suite | Checks | `main` (53b8495): PASS / KNOWN |
+| --- | ---: | ---: |
+| `gemini` | 81 | 81 / 0 |
+| `azure` | 71 | 71 / 0 |
+| `n8n` | 51 | 51 / 0 |
+| `infomaniak` | 32 | 31 / 1 |
+| `filters` | 57 | 57 / 0 |
+| **all** | **292** | **291 / 1** |
 
-There is no FAIL in either column. `harness/known_*.py` registers 63 known bugs; two
-Gemini bugs (`gemini-task-details`, `gemini-stream-data-prefix`) are hidden on `main`
-behind B1 / B5 and only show as FAIL when their fix regresses. With the fixed files,
-123 tagged checks are listed as obsolete markers; the one KNOWN left is
-`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`).
+There is no FAIL and no obsolete marker. `harness/known_*.py` registers one known bug,
+`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`):
+the one KNOWN. The markers of the 62 bugs fixed by #182-#185 were dropped after the
+merge; their checks stay and must pass.
 
 ### API path vs. browser path
 
@@ -194,12 +197,12 @@ behind B1 / B5 and only show as FAIL when their fix regresses. With the fixed fi
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known_<area>.py` (`known_gemini.py`, `known_azure.py`,
-  `known_filters.py`, `known_n8n.py` for n8n + Infomaniak; re-exported by `known.py`):
-  key, summary, issue reference, pull request with the pending fix, evidence, and the
-  function `file` plus the version `fixed_in` that fixes it. Printed with the bug, e.g.
-  `known B1 (no issue filed): ...; fix pending in PR #185 (not merged yet), fixed in
-  pipelines/google/google_gemini.py 1.17.0`. KNOWN does not fail the run.
+  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak;
+  re-exported by `known.py`): key, summary, issue reference, pull request with the
+  pending fix, evidence, and the function `file` plus the version `fixed_in` that fixes
+  it. Printed with the bug, e.g. `known infomaniak-name-prefix (found by tests/e2e, no
+  issue filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
+  PR #<n> (not merged yet), fixed in <file> <version>`. KNOWN does not fail the run.
 
 A tagged check only counts as KNOWN when the failure **looks like that bug**: one of the
 bug's `evidence` regexes matches the check's detail text, or (for checks that pass
@@ -235,12 +238,7 @@ purpose (`expect_errors` with the signature of the provoked error) and blocks th
 the narrow log signature of a known bug that reproduced in this suite (function name plus
 error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is not
 callable`). A different error in the same function, or the same error in another
-function, still fails it. One exception: `n8n-stop` ignores `Unclosed client session`
-blocks for the rest of the suite, because aiohttp logs a leaked session without a
-function name when it is garbage-collected, often after the Stop scenario has ended.
-This only applies while the tested `n8n.py` is older than 2.3.1 (the marker is gated
-off from then on), and `n8n.browser.stop.*` itself still fails on a leak inside its
-window.
+function, still fails it.
 
 The driver adds a few checks of its own; they only show up when something is wrong:
 
@@ -377,7 +375,8 @@ async def api(t: Suite, mock) -> None:
         "API stream: answer streamed",
         r.status == 200 and "Hello from mock" in r.content,
         r.brief(),                                # printed for FAIL/KNOWN
-        known=known.GEMINI_B1,                    # only while a known bug breaks it
+        known=known.MY_BUG,                       # KnownIssue from harness/known_*.py,
+                                                  # only while a known bug breaks it
     )
 ```
 
@@ -398,8 +397,9 @@ async def api(t: Suite, mock) -> None:
 - Mock behaviour: mocks pick behaviour from the request (model name, webhook path or a
   trigger word in the last user message, e.g. `force-400`). Add a branch in
   `tests/e2e/mocks/mock_<provider>.py`; requests are recorded automatically.
-- New known bug: add a `KnownIssue` to the area's `harness/known_<area>.py` and pass it
-  as `known=`. Give it `evidence` (regexes that match the failing check's detail and
+- New known bug: add a `KnownIssue` to the area's `harness/known_<area>.py` (a new
+  area module needs its own import at the bottom of `known.py`) and pass it as
+  `known=`. Give it `evidence` (regexes that match the failing check's detail and
   nothing else: include proof that the request itself worked, e.g. `HTTP 200`, so an
   unrelated failure stays FAIL), `log_patterns` when it logs errors (a string or a tuple
   of strings that must all occur in one error block; include the function, e.g.
@@ -448,7 +448,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09: 34 PASS / 200 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

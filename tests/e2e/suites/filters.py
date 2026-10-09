@@ -52,7 +52,7 @@ from urllib.parse import quote
 
 import httpx
 
-from harness import Suite, known, short
+from harness import Suite, short
 from harness.config import VERTEX_RAG_STORE
 
 GROUPS = (
@@ -557,11 +557,6 @@ async def run(t: Suite) -> None:
             info.get("type") == "filter",
             f"type={info.get('type')}",
         )
-    if known.FILTER_TRACKER_NO_EMITTER.fixed_version() is None:
-        # Older tracker: every API request ends in the known outlet TypeError,
-        # also in groups without a check tagged with it (warm-up, group
-        # subsets); the tracker-api checks still report it.
-        t.expect_log(*known.FILTER_TRACKER_NO_EMITTER.log_patterns)
     try:
         await t.owui.upsert_model(PROBE_MODEL, "E2E Probe", list(FILTERS))
         await t.owui.replace_valves(TRACKER, {})  # defaults (--reuse)
@@ -595,7 +590,6 @@ async def run(t: Suite) -> None:
             "time_token_tracker in the server log",
             not warnings,
             f"{len(warnings)} warnings: " + " || ".join(warnings[:3]),
-            known=known.FILTER_TRACKER_CORRELATION,
         )
     t.assert_no_secrets(LA_KEY)
     t.scan_log()
@@ -672,7 +666,6 @@ async def per_model(t: Suite) -> None:
     )
     await feature_mapping(t, "model")
 
-    mark = t.mark()
     r = await t.owui.chat(PROBE_MODEL, "probe without features")
     await t.log.settle()
     t.check(
@@ -680,8 +673,6 @@ async def per_model(t: Suite) -> None:
         "API request without a 'features' key passes the filters",
         r.status == 200 and bool(probe_report(r.content)),
         r.brief(),
-        known=known.FILTER_SEARCH_KEYERROR,
-        since=mark,
     )
 
     for stream in (False, True):
@@ -789,8 +780,6 @@ async def tracker_api(t: Suite, tag: str, stream: bool) -> None:
         r.status == 200 and bool(rep) and exact and not errors,
         f"{r.brief()} outlet={lines} want req={exp['req']} resp={exp['resp']} "
         f"log_errors={errors[:2]}",
-        known=known.FILTER_TRACKER_NO_EMITTER,
-        since=mark,
     )
 
 
@@ -826,7 +815,6 @@ async def spec(t: Suite) -> None:
         "SEND_TO_LOG_ANALYTICS=false in the environment -> valve default False",
         env == "false" and default is False,
         f"default={default!r} env={env!r}",
-        known=known.FILTER_TRACKER_SEND_ENV,
     )
     await t.owui.update_valves(TRACKER, LOG_ANALYTICS_SHARED_KEY=LA_KEY)
     stored = (await t.owui.get_valves(TRACKER)).get("LOG_ANALYTICS_SHARED_KEY")
@@ -914,7 +902,6 @@ async def la_api(
         f"HTTP {r.status} problems={problems} exp={exp} "
         f"outlet_errors={outlet_errors(t, mark)[:1]} "
         f"rec={short(record_of(recs[0]) if recs else None, 300)}",
-        known=known.FILTER_TRACKER_LA_API,
     )
 
 
@@ -947,7 +934,6 @@ async def la_group(t: Suite, la: LogAnalytics) -> None:
         r.status == 200 and len(recs) == 1 and rec.get("requestTokens") == tokens(text),
         f"{r.brief()} posts={len(recs)} requestTokens={rec.get('requestTokens')} "
         f"want {tokens(text)}",
-        known=known.FILTER_TRACKER_SPECIAL_TOKEN,
     )
 
     await la_browser(t, la)
@@ -988,7 +974,6 @@ async def la_browser(t: Suite, la: LogAnalytics) -> None:
         and tracker[0].get("description") == want
         and tracker[0].get("done") is True,
         f"problems={problems} status={tracker} want={want!r}",
-        known=known.FILTER_TRACKER_MESSAGEID,
     )
 
     lines = outlet_lines(t, mark)
@@ -1010,7 +995,6 @@ async def la_browser(t: Suite, la: LogAnalytics) -> None:
         and len(shown) == 1
         and "~" not in (shown[0] or "~"),
         f"{state} status={shown} keys={sorted(rec)}",
-        known=known.FILTER_TRACKER_ESTIMATE_MARKER,
     )
 
 
@@ -1203,7 +1187,6 @@ async def la_slow(t: Suite, la: LogAnalytics) -> None:
         ok,
         f"{detail} timeout_logged={timeout_lines[:1]} "
         f"outlet_errors={outlet_errors(t, mark0)[:1]}",
-        known=known.FILTER_TRACKER_LA_API,
     )
 
 
@@ -1318,7 +1301,6 @@ async def correlation(t: Suite, la: LogAnalytics) -> None:
         and (rec.get("responseTime") or 0) > 0,
         f"HTTP {r.status} trigger_modified={modified} outlet={lines} want={want} "
         f"warn={warn[:1]} rec={short(rec, 200)}",
-        known=known.FILTER_TRACKER_CORRELATION,
     )
 
     # Two identical requests in flight at once (same user, model and text).
@@ -1354,7 +1336,6 @@ async def correlation(t: Suite, la: LogAnalytics) -> None:
         and got == [(want, True), (want, True)],
         f"HTTP {[r.status for r in results]} outlet={lines} want={want} "
         f"warn={warn[:1]} records={got}",
-        known=known.FILTER_TRACKER_CORRELATION,
     )
 
 
@@ -1449,7 +1430,6 @@ async def offline(t: Suite, la: LogAnalytics) -> None:
             f"HTTP {[r.status for r, _ in results]} latencies={latencies} "
             f"health_max={max(health_seen or [None])} got={got} want={want} "
             f"errors={errors}",
-            known=known.FILTER_TRACKER_TIKTOKEN_OFFLINE,
         )
 
         await asyncio.sleep(TARPIT_SECONDS + 1)  # the tarpit closes: load failed
@@ -1476,7 +1456,6 @@ async def offline(t: Suite, la: LogAnalytics) -> None:
             f"HTTP {r.status} latency={latency}s requestTokens="
             f"{rec.get('requestTokens')} want {len(text) // 4} warnings={len(warn)} "
             f"attempts={attempts} errors={short(r.errors, 160)}",
-            known=known.FILTER_TRACKER_TIKTOKEN_OFFLINE,
         )
     finally:
         edit_hosts(TARPIT_LINE, add=False)
@@ -1494,7 +1473,6 @@ async def offline(t: Suite, la: LogAnalytics) -> None:
         and len(logged) == 4
         and all(x == "True" for x in logged),
         state,
-        known=known.FILTER_TRACKER_ESTIMATE_MARKER,
     )
 
 
@@ -1551,7 +1529,6 @@ async def multimodel(t: Suite, la: LogAnalytics) -> None:
         f"create={created} done={[a.done for a in c.answers]} errors={errors} "
         f"google_search_tool={search_flags} plain web_search={plain_web_search} "
         f"records={records} want={want}",
-        known=known.FILTER_SEARCH_MULTIMODEL,
     )
 
 
@@ -1575,7 +1552,6 @@ async def search(t: Suite) -> None:
             and bool(rep)
             and not flags.get("google_search_tool"),
             f"{r.brief()} metadata_features={flags}",
-            known=known.FILTER_SEARCH_KEYERROR,
         )
     r = await t.owui.chat(
         SEARCH_MODEL, "probe", features={"web_search": True, "memory": False}
@@ -1691,7 +1667,6 @@ async def vertex(t: Suite) -> None:
         and "vertex_rag_store" not in (rep.get("body_keys") or []),
         f"HTTP {r.status} store={store!r} want {STORE2!r} features={flags} "
         f"body_keys={rep.get('body_keys')}",
-        known=known.FILTER_VERTEX_REQUEST_STORE,
     )
 
     r = await t.owui.chat(
@@ -1721,5 +1696,4 @@ async def vertex(t: Suite) -> None:
         "features=null passes vertex_ai_search_tool, no vertex flag",
         r.status == 200 and bool(rep) and not flags.get("vertex_ai_search"),
         f"{r.brief()} metadata_features={flags}",
-        known=known.FILTER_VERTEX_FEATURES_NULL,
     )

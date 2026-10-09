@@ -33,7 +33,7 @@ import json
 import time
 import uuid
 
-from harness import Suite, known, short
+from harness import Suite, short
 from harness.known import staged_version, version_tuple
 from harness.owui import completion_text
 
@@ -374,7 +374,6 @@ async def api(t: Suite, mock, base_valves: dict) -> None:
         answered and "stream_options" not in body,
         f"answered={answered} upstream stream_options={body.get('stream_options')} "
         f"upstream keys={sorted(body)}",
-        known=known.AZURE_NONSTREAM_STREAM_OPTIONS,
     )
     t.check(
         "api-version",
@@ -487,7 +486,6 @@ async def dotted(t: Suite, mock, base_valves: dict) -> None:
                     and body_model == name
                     and header == expected_header,
                     f"header={header!r} body.model={body_model!r} {r.brief()}",
-                    known=None if stream else known.AZURE_DOUBLE_STRIP,
                 )
     await t.owui.update_valves(FID, **base_valves)
 
@@ -562,7 +560,6 @@ async def tasks(t: Suite, mock, base_valves: dict) -> None:
         f"answered={answered} task requests={len(requests)} "
         f"with data_sources={len(with_sources)} HTTP {status} "
         f"answer={short(answer)}",
-        known=known.AZURE_123,
     )
     await t.owui.update_valves(FID, **base_valves)
 
@@ -622,11 +619,9 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         "On Your Data stream: dotted model name reaches upstream intact",
         body_model == "gpt-4.1",
         f"body.model={body_model!r} {r.brief()}",
-        known=known.AZURE_DOUBLE_STRIP,
     )
 
     await mock.reset()
-    mark = t.mark()
     r = await t.owui.chat(model, question, stream=True, stream_options=USAGE_OPTIONS)
     req = await mock.last()
     await t.log.settle(0.5)
@@ -638,8 +633,6 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         and r.content == LINKED
         and "stream_options" not in (req.get("body") or {}),
         f"{r.brief()} upstream stream_options={sent_options}",
-        known=known.AZURE_STREAM_OPTIONS,
-        since=mark,
     )
 
     for stream in (True, False):
@@ -659,18 +652,12 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
             and "tool_choice" not in body
             and bool(body.get("data_sources")),
             f"{r.brief()} {_upstream(req)}",
-            known=known.AZURE_TOOLS_DATA_SOURCES,
         )
 
-    for sid, text, expected, issue in (
-        ("oyd.split-tokens.api", "x100 split-tokens", LINKED, known.AZURE_HOLDBACK),
-        ("oyd.split-link.api", "x100 split-link", SPLIT_LINK, known.AZURE_HOLDBACK),
-        (
-            "oyd.no-finish.api",
-            "x100 split-tokens no-finish",
-            LINKED[:-1],
-            known.AZURE_FLUSH_BEFORE_DONE,
-        ),
+    for sid, text, expected in (
+        ("oyd.split-tokens.api", "x100 split-tokens", LINKED),
+        ("oyd.split-link.api", "x100 split-link", SPLIT_LINK),
+        ("oyd.no-finish.api", "x100 split-tokens no-finish", LINKED[:-1]),
     ):
         await mock.reset()
         r = await t.owui.chat(model, text, stream=True)
@@ -680,7 +667,6 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
             "once, [DONE] forwarded",
             r.status == 200 and r.content == expected and r.done,
             f"{r.brief()} done={r.done}",
-            known=issue,
         )
 
     await mock.reset()
@@ -690,13 +676,11 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         "parentheses in citation URLs are percent-encoded in the link",
         r.status == 200 and r.content == PAREN_LINKED,
         r.brief(),
-        known=known.AZURE_PAREN_URL,
     )
 
     # data_sources sent by the client (no AZURE_AI_DATA_SOURCES valve)
     await t.owui.update_valves(FID, **{**oyd_valves, "AZURE_AI_DATA_SOURCES": ""})
     await mock.reset()
-    mark = t.mark()
     r = await t.owui.chat(model, question, stream=True, data_sources=DATA_SOURCES)
     req = await mock.last()
     await t.log.settle(0.5)
@@ -712,8 +696,6 @@ async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         and "stream_options" not in body,
         f"{r.brief()} done={r.done} upstream "
         f"stream_options={body.get('stream_options')} {_upstream(req)}",
-        known=known.AZURE_CLIENT_DATA_SOURCES,
-        since=mark,
     )
     await t.owui.update_valves(FID, **oyd_valves)
 
@@ -752,7 +734,6 @@ async def oyd_history(t: Suite, mock, model: str) -> None:
             title,
             answered and sent == expected,
             f"answered={answered} sent={sent!r} {r.brief()}",
-            known=known.AZURE_HISTORY_UNLINK,
         )
 
     # Any API client can send this history: a long line of unclosed links must
@@ -794,8 +775,6 @@ async def oyd_big(t: Suite, mock, model: str) -> None:
         "a ~300 KB context event (one SSE line) is read: linked answer and [DONE]",
         r.status == 200 and r.content == LINKED and r.done and not too_long,
         f"{r.brief()} done={r.done} line_too_long_log={too_long}",
-        known=known.AZURE_LINETOOLONG,
-        since=mark,
     )
 
     mark = t.mark()
@@ -817,8 +796,6 @@ async def oyd_big(t: Suite, mock, model: str) -> None:
         and not leaked,
         f"{r.brief()} done={r.done} line_too_long_log={too_long} "
         f"document text in log={leaked}",
-        known=known.AZURE_LINETOOLONG,
-        since=mark,
     )
 
 
@@ -826,25 +803,10 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
     """Browser chats without Open WebUI's built-in tools."""
     params = NO_BUILTIN_TOOLS
     async with t.browser() as b:
-        for sid, text, expected, issue in (
-            (
-                "oyd.split-tokens.browser",
-                "x100 split-tokens",
-                LINKED,
-                known.AZURE_HOLDBACK,
-            ),
-            (
-                "oyd.split-link.browser",
-                "x100 split-link",
-                SPLIT_LINK,
-                known.AZURE_HOLDBACK,
-            ),
-            (
-                "oyd.no-finish.browser",
-                "x100 split-tokens no-finish",
-                LINKED[:-1],
-                known.AZURE_FLUSH_BEFORE_DONE,
-            ),
+        for sid, text, expected in (
+            ("oyd.split-tokens.browser", "x100 split-tokens", LINKED),
+            ("oyd.split-link.browser", "x100 split-link", SPLIT_LINK),
+            ("oyd.no-finish.browser", "x100 split-tokens no-finish", LINKED[:-1]),
         ):
             await mock.reset()
             c = await b.chat(model, text, stream=True, params=params)
@@ -855,7 +817,6 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
                 and c.content == expected
                 and c.source_names == REFERENCED_SOURCES,
                 c.brief(),
-                known=issue,
             )
 
         await mock.reset()
@@ -874,7 +835,6 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
             "answer without [docX], show-all valve false -> no sources",
             c.done and c.content == NO_REFS and c.source_names == [],
             c.brief(),
-            known=known.AZURE_SHOW_ALL_VALVE,
         )
 
         for include in (True, False):
@@ -933,8 +893,6 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
             and last.get("description") == "Request completed"
             and last.get("done") is True,
             f"{c.brief()} statuses={_statuses(c.status_history)}",
-            known=known.AZURE_CONTENT_NULL,
-            since=mark,
         )
 
         mark = t.mark()
@@ -957,8 +915,6 @@ async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
         and last.get("done") is True,
         f"{c.brief()} last status={short(description, 120)} done={last.get('done')} "
         f"line_too_long_log={too_long}",
-        known=known.AZURE_LINETOOLONG,
-        since=mark,
     )
 
 
@@ -998,7 +954,6 @@ async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
             and c.content == LINKED
             and "tools" not in (answer_req.get("body") or {}),
             f"{c.brief()} {upstream}",
-            known=known.AZURE_TOOLS_DATA_SOURCES,
         )
         task_requests = await mock.requests(_is_task)
         with_sources = [
@@ -1010,7 +965,6 @@ async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
             task_requests and not with_sources,
             f"answered={_answered(c.content)} task requests={len(task_requests)} "
             f"with data_sources={len(with_sources)} {waited}",
-            known=known.AZURE_123,
         )
         t.check(
             "oyd.browser.sources",
@@ -1018,7 +972,6 @@ async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
             "tasks",
             c.source_names == REFERENCED_SOURCES,
             f"{c.brief()} title={c.title!r} {waited} {upstream}",
-            known=known.AZURE_TOOLS_DATA_SOURCES,
         )
 
         await mock.reset()
@@ -1034,7 +987,6 @@ async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
             and sorted(body) == ["data_sources", "messages", "model", "stream"]
             and _status_sequence(c.status_history, STATUS_STREAM),
             f"{c.brief()} statuses={_statuses(c.status_history)} {_upstream(req)}",
-            known=known.AZURE_TOOLS_DATA_SOURCES,
         )
 
         await mock.reset()
@@ -1050,7 +1002,6 @@ async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
             and (c.usage or {}).get("total_tokens") == 18
             and _status_sequence(c.status_history, STATUS_NONSTREAM),
             f"{c.brief()} statuses={_statuses(c.status_history)} {_upstream(req)}",
-            known=known.AZURE_TOOLS_DATA_SOURCES,
         )
 
 
@@ -1115,7 +1066,6 @@ async def oyd_no_session(t: Suite, mock, model: str) -> None:
         f"with data_sources={len(with_sources)} sources={names} "
         f"statuses={_statuses(history)} content={short(message.get('content'))} "
         f"chat={chat_id} {waited}",
-        known=known.AZURE_123,
     )
 
 
@@ -1127,7 +1077,6 @@ async def oyd_usage_capability(t: Suite, mock, model: str) -> None:
     )
     try:
         async with t.browser() as b:
-            mark = t.mark()
             await mock.reset()
             c = await b.chat(model, "x100 charging?", stream=True)
             req = await mock.last(_is_answer)
@@ -1140,8 +1089,6 @@ async def oyd_usage_capability(t: Suite, mock, model: str) -> None:
             c.done and c.content == LINKED and "stream_options" not in body,
             f"model upsert HTTP {status} {c.brief()} upstream "
             f"stream_options={body.get('stream_options')} {_upstream(req)}",
-            known=known.AZURE_STREAM_OPTIONS,
-            since=mark,
         )
     finally:
         await t.owui.delete_model(model)
@@ -1161,5 +1108,4 @@ def logs(t: Suite) -> None:
         "citation content (document text) is not logged at INFO",
         not logged,
         f"citation text logged {logged}x",
-        known=known.AZURE_CITATION_INFO_LOG,
     )
