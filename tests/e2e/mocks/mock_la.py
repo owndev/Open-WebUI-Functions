@@ -359,8 +359,7 @@ def make_api(workspace: str, key: str) -> web.Application:
         rec["status"] = resp.status
         print(
             f"LA TOKEN {host} tenant={rec['tenant']} client_id={rec['client_id']} "
-            f"auth={rec['auth']} secret_ok={rec['secret_ok']} "
-            f"assertion_ok={rec['assertion_ok']} -> {resp.status} "
+            f"auth={rec['auth']} -> {resp.status} "
             f"token#{rec['token_index']}",
             flush=True,
         )
