@@ -59,6 +59,8 @@ LOOKUP = "lookup.v2"  # operationId of mocks/mock_tools.py that needs mapping
 ASK = {"tool_approval_mode": "ask"}
 LEGACY = {"function_calling": "legacy"}
 CALL_0 = "mock-call-0-0"
+# The mock's source of a tool round with Google Search (final answers: GROUNDING_URI)
+TOOL_ROUND_URI = "https://example.com/tool-round"
 TIMESTAMP = {"name": "get_current_timestamp", "args": {}}
 CALC = {"name": "calculate_timestamp", "args": {"days_ago": 1}}
 REJECTED = "Error: tool call rejected by user."
@@ -102,7 +104,7 @@ _SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 
 
 def gemini_function_name(name: str) -> str:
-    if _SAFE_NAME.match(name):
+    if _SAFE_NAME.fullmatch(name):
         return name
     base = re.sub(r"[^A-Za-z0-9_-]", "_", name)
     if not re.match(r"[A-Za-z_]", base[:1] or "0"):
@@ -170,7 +172,7 @@ def _declared(entry: dict) -> list:
 
 
 def _safe(names: list) -> bool:
-    return all(isinstance(n, str) and _SAFE_NAME.match(n) for n in names) and len(
+    return all(isinstance(n, str) and _SAFE_NAME.fullmatch(n) for n in names) and len(
         set(names)
     ) == len(names)
 
@@ -258,7 +260,10 @@ def _tc(call: dict) -> tuple:
 
 def _adetail(r, reqs: list, extra: str = "") -> str:
     """Stable tokens of an API-path answer."""
-    calls = ",".join(f"{i}:{c}:{n}" for i, c, n, _ in (_tc(x) for x in r.tool_calls))
+    calls = ",".join(
+        f"{i}:{c}:" + str(n).replace("\n", "\\n")  # one line per detail
+        for i, c, n, _ in (_tc(x) for x in r.tool_calls)
+    )
     rd = ",".join(f"{d.get('format')}:{d.get('id')}" for d in r.reasoning_details)
     names = _declared(reqs[0]) if reqs else []
     return (
@@ -325,6 +330,7 @@ async def tools(t: Suite, mock) -> None:
             await text_before(ctx, b)
             await thinking(ctx, b)
             await workspace(ctx, b, ws)
+            await image_result(ctx, b)
             await openapi(ctx, b, tool_mock)
             await mcp(ctx, b)
             await direct(ctx, b)
@@ -335,6 +341,7 @@ async def tools(t: Suite, mock) -> None:
             await task(ctx, b)
             await legacy(ctx, b)
             await nobuiltin(ctx, b)
+            await nostream(ctx, b)
     finally:
         await t.owui.delete_tool(WS_TOOL)
         if previous_servers is not None:
@@ -403,6 +410,8 @@ async def builtin(ctx: Ctx, b, stream: bool):
     )
     if not stream:
         upstream = upstream and actions == ["generateContent", "streamGenerateContent"]
+        # the thoughts of the non-streamed tool round (mock: "Mock thinking.")
+        saved = saved and any("Mock thinking." in x for x, _ in c.reasoning_items)
     name = "builtin" if stream else "builtin-nonstream"
     ctx.check(
         f"tools.{name}",
@@ -415,7 +424,8 @@ async def builtin(ctx: Ctx, b, stream: bool):
             c,
             reqs,
             f"{_req_tokens(second)} actions={actions} no_details={_no_details(c)} "
-            f"statuses_closed={_status_closed(c)}",
+            f"statuses_closed={_status_closed(c)} "
+            f"reasoning={[(short(x, 40), len(d)) for x, d in c.reasoning_items]}",
         ),
         known=known.GEMINI_TOOLS_AFC,
     )
@@ -488,7 +498,10 @@ async def parallel(ctx: Ctx, b) -> None:
             ]
             and len({x.get("i") for x in second.get("fc") or []}) == 1
             and len(user_fr) == 1
-            and len(second.get("fr") or []) == 2
+            # the responses in the order of the calls (without ids, e.g. on
+            # Vertex, the order is all that pairs them)
+            and [(i, n) for i, n, _ in _frs(second)]
+            == [(ids[0], "get_current_timestamp"), (ids[1], "calculate_timestamp")]
             and "get_current_timestamp=" in final
             and "calculate_timestamp=" in final,
             _bdetail(c, reqs, _req_tokens(second)),
@@ -537,10 +550,13 @@ async def rounds(ctx: Ctx, b) -> None:
     ctx.check(
         "tools.rounds-nosig",
         "two rounds on gemini-2.5-flash without thoughts (no signatures): the turn "
-        "completes and the final answer echoes both results",
+        "completes, the final answer echoes both results, no placeholder signature "
+        "(Gemini 2.x does not check them)",
         c.done
         and "get_current_timestamp=" in final
-        and "calculate_timestamp=" in final,
+        and "calculate_timestamp=" in final
+        and len(_fcs(third)) == 2
+        and all(s == "none" for _, _, s in _fcs(third)),
         # informational: Open WebUI merges two rounds without text or reasoning in
         # between into one assistant message (fc_contents=1)
         _bdetail(c, reqs, f"fc_contents={len(contents)} {_req_tokens(third)}"),
@@ -670,6 +686,35 @@ async def workspace(ctx: Ctx, b, ws: tuple) -> None:
         known=known.GEMINI_TOOLS_ANNOTATIONS
         if "isinstance" in responses
         else known.GEMINI_TOOLS_AFC,
+    )
+
+
+async def image_result(ctx: Ctx, b) -> None:
+    """A tool result with an image: Open WebUI passes the image on in a user
+    message after the tool results (F13 of the spec); the request is still a
+    later round of the turn."""
+    await ctx.mock.reset()
+    c = await ctx.chat(
+        b, PRO3, directive([[{"name": "make_image", "args": {}}]]), tool_ids=[WS_TOOL]
+    )
+    reqs = await ctx.requests()
+    second = reqs[1] if len(reqs) > 1 else {}
+    ctx.check(
+        "tools.image-result",
+        "tool result with an image: the continuation sends FC(sig), FR and Open "
+        "WebUI's image message (text + image) and is answered as a later round of "
+        "the turn (no <details> block)",
+        c.done
+        and not c.error
+        and _calls(c) == [("make_image", "completed", CALL_0)]
+        and _answers(reqs) == "[fc,final]"
+        and second.get("kinds")
+        == ["user:text", "model:fc", "user:fr", "user:text+inline"]
+        and _fcs(second) == [(CALL_0, "make_image", "issued")]
+        and _final(c).startswith("MOCK-FINAL make_image=")
+        and _no_details(c),
+        _bdetail(c, reqs, f"no_details={_no_details(c)} {_req_tokens(second)}"),
+        known=known.GEMINI_TOOLS_AFC,
     )
 
 
@@ -946,31 +991,72 @@ async def grounding(ctx: Ctx, b) -> None:
             features={"web_search": True},
         )
         reqs = await ctx.requests()
+        # next turn with web search switched off: no server-side parts upstream
+        await ctx.mock.reset()
+        c2 = None
+        if c.chat_id:
+            c2 = await ctx.chat(
+                b,
+                PRO3,
+                "Next turn without web search.",
+                chat_id=c.chat_id,
+                parent_id=c.message_id,
+            )
+        reqs2 = await ctx.requests()
     finally:
         await t.owui.delete_model(PRO3)
     first, second = (reqs + [{}, {}])[:2]
+    sources = _strings(c.sources)
+    formats = [d.get("format") for d in _rd(c)]
     ctx.check(
         "tools.grounding3",
         "Gemini 3 + web_search: googleSearch, urlContext and functions in one "
-        "request with includeServerSideToolInvocations; the server-side parts are "
-        "echoed back with the call; sources saved, no inline [n] marker in the "
-        "answer after the call (it was already streamed)",
+        "request with includeServerSideToolInvocations; the round keeps its "
+        "signature and its stored content; the server-side parts are echoed back "
+        "with the call; the sources of both rounds saved, no inline [n] marker in "
+        "the answer after the call (it was already streamed)",
         c.done
         and {"googleSearch", "urlContext", "functionDeclarations"}
         <= set(first.get("tool_kinds") or [])
         and first.get("include_flag") is True
+        and formats == ["google-gemini-v1", "google-gemini-v1-content"]
         and second.get("server_echoed") is True
         and _fcs(second) == [(CALL_0, "get_current_timestamp", "issued")]
-        and GROUNDING_URI in _strings(c.sources)
+        and GROUNDING_URI in sources
+        and TOOL_ROUND_URI in sources
         and "[1]" not in _final(c),
         _bdetail(
             c,
             reqs,
             f"tool_kinds={_kinds(first)} include_flag={first.get('include_flag')} "
             f"server_echoed={second.get('server_echoed')} sources="
-            f"{GROUNDING_URI in _strings(c.sources)} {_req_tokens(second)}",
+            f"{GROUNDING_URI in sources}/{TOOL_ROUND_URI in sources} "
+            f"{_req_tokens(second)}",
         ),
         known=known.GEMINI_TOOLS_GROUNDING,
+    )
+    # The stored content (with the server-side toolCall / toolResponse) is only
+    # replayed in its own turn; a later request may have no Search grounding.
+    req = reqs2[-1] if reqs2 else {}
+    kinds = req.get("kinds") or []
+    old = [(x.get("id"), x.get("sig")) for x in req.get("fc") or []]
+    old_fr = len([x for x in req.get("fr") or [] if x.get("id") == CALL_0])
+    ctx.check(
+        "tools.grounding3-next-turn",
+        "next turn without web search after a grounding + tool round: the old "
+        "round is replayed as function call (with its signature) and response, "
+        "without the server-side parts",
+        c2 is not None
+        and c2.done
+        and req.get("status") == 200
+        and not req.get("include_flag")
+        and kinds[:3] == ["user:text", "model:fc", "user:fr"]
+        and not any("toolCall" in k or "toolResponse" in k for k in kinds)
+        and _fcs(req) == [(CALL_0, "get_current_timestamp", "issued")],
+        _bdetail(c2, reqs2, f"old_fc={old} old_fr={old_fr} {_req_tokens(req)}")
+        if c2
+        else "no chat",
+        known=known.GEMINI_TOOLS_AFC,
     )
 
     await t.owui.upsert_model(TEXT, "Gemini 2.5 Flash", [SEARCH_FILTER])
@@ -1073,15 +1159,51 @@ async def nobuiltin(ctx: Ctx, b) -> None:
     )
 
 
+async def nostream(ctx: Ctx, b) -> None:
+    """GOOGLE_STREAMING_ENABLED=false, browser stream=true: Gemini is called
+    without streaming, the turn is saved like a streamed one."""
+    await _set(ctx.t, STREAMING_ENABLED=False)
+    try:
+        await ctx.mock.reset()
+        c = await ctx.chat(b, PRO3, directive([[TIMESTAMP]]), stream=True)
+        reqs = await ctx.requests()
+    finally:
+        await _set(ctx.t, STREAMING_ENABLED=True)
+    actions = [e.get("action") for e in reqs]
+    ctx.check(
+        "tools.nostream",
+        "GOOGLE_STREAMING_ENABLED=false, browser stream=true: two non-streamed "
+        "requests, the call runs, the signed reasoning item and the final answer "
+        "are saved, no <details> block",
+        c.done
+        and not c.error
+        and _calls(c) == [("get_current_timestamp", "completed", CALL_0)]
+        and _rd(c) == [rd_item(CALL_0)]
+        and _final(c).startswith("MOCK-FINAL get_current_timestamp=")
+        and _no_details(c)
+        and actions == ["generateContent", "generateContent"],
+        _bdetail(c, reqs, f"actions={actions} no_details={_no_details(c)}"),
+        known=known.GEMINI_TOOLS_AFC,
+    )
+
+
 # ================================================================== toolsapi
 async def toolsapi(t: Suite, mock) -> None:
     ctx = await preflight(t, mock)
     await api_stream(ctx)
+    await api_stream_text(ctx)
     await api_nonstream(ctx)
+    await api_nostream(ctx)
+    await api_malformed(ctx)
     await api_continuation(ctx)
+    await api_continuation_psf(ctx)
     await api_continuation_nosig(ctx)
+    await api_history_edge(ctx)
+    await api_odd_shapes(ctx)
     await api_tool_choice(ctx)
+    await api_tool_choice_grounding(ctx)
     await api_names(ctx)
+    await api_default_api(ctx)
     await api_schema(ctx)
     await api_noid(ctx)
     await api_unchanged(ctx)
@@ -1100,7 +1222,8 @@ async def api_stream(ctx: Ctx) -> None:
     ctx.check(
         "toolsapi.stream",
         "API stream with client tools: tool_calls + reasoning_details chunks, last "
-        "finish_reason tool_calls (also for the openai SDK), [DONE] last, usage",
+        "finish_reason tool_calls (also for the openai SDK), [DONE] last, usage; "
+        "thinking only in the <details> block (no reasoning_content)",
         r.status == 200
         and bool(r.reasoning_details)
         and all(
@@ -1115,9 +1238,98 @@ async def api_stream(ctx: Ctx) -> None:
         and r.done_last
         and bool(r.usage)
         and r.openai_finish_reason == "tool_calls"
-        and "<details" in r.content,
-        _adetail(r, reqs),
+        and "<details" in r.content
+        and not r.reasoning_content,
+        _adetail(r, reqs, f"reasoning_content={short(r.reasoning_content, 40)}"),
         known=known.GEMINI_TOOLS_API,
+    )
+
+
+async def api_stream_text(ctx: Ctx) -> None:
+    """API stream with client tools that the model answers with text (P3)."""
+    await ctx.mock.reset()
+    r = await ctx.t.owui.chat(TEXT, "Hello Gemini", stream=True, tools=[CLIENT_FN])
+    reqs = await ctx.requests()
+    ctx.check(
+        "toolsapi.stream-text",
+        "API stream with client tools answered with text: the answer, last "
+        "finish_reason stop (also for the openai SDK), [DONE] last, usage, no "
+        "tool_calls",
+        r.status == 200
+        and "Hello from mock (stream)." in r.content
+        and not r.tool_calls
+        and r.finish_reasons[-1:] == ["stop"]
+        and r.openai_finish_reason == "stop"
+        and r.done_last
+        and bool(r.usage),
+        _adetail(r, reqs),
+    )
+
+
+async def api_nostream(ctx: Ctx) -> None:
+    """GOOGLE_STREAMING_ENABLED=false: an API stream still gets SSE."""
+    await _set(ctx.t, STREAMING_ENABLED=False)
+    try:
+        await ctx.mock.reset()
+        r = await ctx.t.owui.chat(
+            PRO3,
+            directive([[{"name": "client_fn", "args": {"x": 1}}]]),
+            stream=True,
+            tools=[CLIENT_FN],
+        )
+        reqs = await ctx.requests()
+    finally:
+        await _set(ctx.t, STREAMING_ENABLED=True)
+    calls = [_tc(x) for x in r.tool_calls]
+    actions = [e.get("action") for e in reqs]
+    ctx.check(
+        "toolsapi.nostream",
+        "GOOGLE_STREAMING_ENABLED=false, API stream with client tools: one "
+        "non-streamed request, answered as SSE with tool_calls and finish_reason "
+        "tool_calls",
+        r.status == 200
+        and [(c, n) for _, c, n, _ in calls] == [(CALL_0, "client_fn")]
+        and r.finish_reasons[-1:] == ["tool_calls"]
+        and r.openai_finish_reason == "tool_calls"
+        and r.done_last
+        and actions == ["generateContent"],
+        _adetail(r, reqs, f"actions={actions}"),
+        known=known.GEMINI_TOOLS_API,
+    )
+
+
+async def api_malformed(ctx: Ctx) -> None:
+    """MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL, streamed and not."""
+    seen, ok, statuses, answers = [], True, set(), []
+    for finish in ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"):
+        for stream in (False, True):
+            await ctx.mock.reset()
+            r = await ctx.t.owui.chat(
+                PRO3,
+                directive(
+                    [[{"name": "client_fn", "args": {"x": 1}}]], malformed=finish
+                ),
+                stream=stream,
+                tools=[CLIENT_FN],
+            )
+            reqs = await ctx.requests()
+            statuses.add(r.status)
+            answers.append(_answers(reqs).strip("[]"))
+            got = (
+                r.status == 200
+                and _answers(reqs) == "[malformed]"
+                and finish in (r.content or "")
+            )
+            seen.append(f"{finish}:{stream}:{got}:{short(r.content, 60)}")
+            ok = ok and got
+    http = ",".join(str(s) for s in sorted(statuses))
+    ctx.check(
+        "toolsapi.malformed",
+        "finishReason MALFORMED_FUNCTION_CALL or UNEXPECTED_TOOL_CALL without a "
+        "call: an error text that names it, streamed and non-streamed",
+        ok,
+        f"http={http} upstream=[{','.join(answers)}] seen={seen}",
+        known=known.GEMINI_TOOLS_MALFORMED,
     )
 
 
@@ -1198,6 +1410,35 @@ async def api_continuation(ctx: Ctx) -> None:
     )
 
 
+async def api_continuation_psf(ctx: Ctx) -> None:
+    """reasoning_details under provider_specific_fields (LiteLLM-style clients)."""
+    text = directive([[{"name": "client_fn", "args": {"x": 1}}]])
+    history = _history(CALL_0)
+    history[0]["provider_specific_fields"] = {
+        "reasoning_details": history[0].pop("reasoning_details")
+    }
+    await ctx.mock.reset()
+    r = await ctx.t.owui.chat(
+        PRO3,
+        [{"role": "user", "content": text}, *history],
+        stream=False,
+        tools=[CLIENT_FN],
+    )
+    reqs = await ctx.requests()
+    req = reqs[-1] if reqs else {}
+    ctx.check(
+        "toolsapi.continuation-psf",
+        "API continuation with reasoning_details under provider_specific_fields: "
+        "the function call carries the issued signature",
+        r.status == 200
+        and req.get("status") == 200
+        and _fcs(req) == [(CALL_0, "client_fn", "issued")]
+        and "MOCK-FINAL client_fn=" in r.content,
+        _adetail(r, reqs, _req_tokens(req)),
+        known=known.GEMINI_TOOLS_HISTORY,
+    )
+
+
 async def api_continuation_nosig(ctx: Ctx) -> None:
     text = directive([[{"name": "client_fn", "args": {"x": 1}}]])
     messages = [
@@ -1224,12 +1465,135 @@ async def api_continuation_nosig(ctx: Ctx) -> None:
     )
 
 
+# The pipe's thinking summary as API clients echo it in the assistant content
+THOUGHT_SUMMARY = (
+    "<details>\n<summary>Thought (0s)</summary>\n\n> old thinking\n\n</details>"
+)
+
+
+async def _api_warned(ctx: Ctx, messages: list, warning: str):
+    """API request with a client history; (result, requests, warning logged)."""
+    mark = ctx.t.mark()
+    await ctx.mock.reset()
+    r = await ctx.t.owui.chat(PRO3, messages, stream=False, tools=[CLIENT_FN])
+    reqs = await ctx.requests()
+    await ctx.t.log.settle(0.5)
+    signature = ("function_gemini", warning)
+    warned = bool(ctx.t.log.warnings(mark, signature))
+    ctx.t.expect_warnings(mark, signature)
+    return r, reqs, warned
+
+
+async def api_history_edge(ctx: Ctx) -> None:
+    """An older turn as API clients send it: the thinking summary before the
+    call, empty (non-JSON) arguments, a tool result in content parts."""
+    text = directive([[{"name": "client_fn", "args": {"x": 1}}]])
+    old_call = {
+        "id": "old-call-1",
+        "type": "function",
+        "function": {"name": "client_fn", "arguments": ""},
+    }
+    parts = [
+        {"type": "text", "text": "part one "},
+        {"type": "text", "text": "part two"},
+    ]
+    messages = [
+        {"role": "user", "content": "An older turn."},
+        {"role": "assistant", "content": THOUGHT_SUMMARY, "tool_calls": [old_call]},
+        {"role": "tool", "tool_call_id": "old-call-1", "content": parts},
+        {"role": "assistant", "content": "Old answer."},
+        {"role": "user", "content": text},
+        *_history(CALL_0),
+    ]
+    r, reqs, warned = await _api_warned(ctx, messages, "Invalid tool call arguments")
+    req = reqs[-1] if reqs else {}
+    old_fc = [x.get("args") for x in req.get("fc") or [] if x.get("id") == "old-call-1"]
+    old_fr = [
+        x.get("response") for x in req.get("fr") or [] if x.get("id") == "old-call-1"
+    ]
+    ctx.check(
+        "toolsapi.history-edge",
+        "older turn with the thinking summary before the call (stripped), empty "
+        "arguments (sent as {} with a WARNING) and a tool result in content parts "
+        "(their text joined)",
+        r.status == 200
+        and req.get("status") == 200
+        and old_fc == [{}]
+        and old_fr == [{"output": "part one part two"}]
+        and warned
+        and req.get("kinds")
+        == [
+            "user:text",
+            "model:fc",
+            "user:fr",
+            "model:text",
+            "user:text",
+            "model:fc",
+            "user:fr",
+        ]
+        and "MOCK-FINAL" in r.content,
+        _adetail(
+            r,
+            reqs,
+            f"warned={warned} old_fc={old_fc} old_fr={old_fr} {_req_tokens(req)}",
+        ),
+        known=known.GEMINI_TOOLS_HISTORY,
+    )
+
+
+async def api_odd_shapes(ctx: Ctx) -> None:
+    """Tool calls that break the OpenAI format (some clients and proxies send
+    them): a numeric id and a "function" that is not an object. The request
+    still works; the call without a function object gets a placeholder name."""
+    text = directive([[{"name": "client_fn", "args": {"x": 1}}]])
+    messages = [
+        {"role": "user", "content": "An older turn."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": 7,
+                    "type": "function",
+                    "function": {"name": "client_fn", "arguments": '{"x": 7}'},
+                },
+                {"id": "odd-call", "type": "function", "function": "client_fn"},
+            ],
+        },
+        {"role": "tool", "tool_call_id": 7, "content": "seven"},
+        {"role": "tool", "tool_call_id": "odd-call", "content": "odd"},
+        {"role": "assistant", "content": "Old answer."},
+        {"role": "user", "content": text},
+        *_history(CALL_0),
+    ]
+    r, reqs, warned = await _api_warned(ctx, messages, "Invalid tool call arguments")
+    req = reqs[-1] if reqs else {}
+    old = [(i, n) for i, n, _ in _fcs(req)][:2]
+    old_fr = [(i, n) for i, n, _ in _frs(req)][:2]
+    ctx.check(
+        "toolsapi.odd-shapes",
+        "older turn with a numeric tool call id and a tool call whose function is "
+        "not an object: the request works (id as text, the odd call with a "
+        "placeholder name and a WARNING)",
+        r.status == 200
+        and req.get("status") == 200
+        and old == [("7", "client_fn"), ("odd-call", gemini_function_name(""))]
+        and old_fr == old
+        and warned
+        and "MOCK-FINAL client_fn=" in r.content,
+        _adetail(r, reqs, f"warned={warned} {_req_tokens(req)}"),
+        known=known.GEMINI_TOOLS_HISTORY,
+    )
+
+
 async def api_tool_choice(ctx: Ctx) -> None:
     named = {"type": "function", "function": {"name": "client_fn"}}
+    undeclared = {"type": "function", "function": {"name": "nope"}}
     cases = (
         ("none", "NONE", None),
         ("required", "ANY", None),
         (named, "ANY", ["client_fn"]),
+        (undeclared, None, None),  # ignored: Gemini rejects undeclared names
         (None, None, None),
     )
     seen, ok, reqs_all = [], True, []
@@ -1253,8 +1617,9 @@ async def api_tool_choice(ctx: Ctx) -> None:
     modes = ",".join(f"{m}:{a}" if a else str(m) for m, a, _ in seen)
     ctx.check(
         "toolsapi.tool-choice",
-        "tool_choice none / required / named function / absent -> "
-        "functionCallingConfig NONE / ANY / ANY + allowed names / none",
+        "tool_choice none / required / named function / undeclared function / "
+        "absent -> functionCallingConfig NONE / ANY / ANY + allowed names / none / "
+        "none",
         ok,
         f"http=200 upstream={_answers(reqs_all)} "
         f"declared_n=[{','.join(str(n) for _, _, n in seen)}] modes=[{modes}]",
@@ -1262,9 +1627,50 @@ async def api_tool_choice(ctx: Ctx) -> None:
     )
 
 
+async def api_tool_choice_grounding(ctx: Ctx) -> None:
+    """tool_choice with Search grounding on Gemini 3 (tool combination)."""
+    t = ctx.t
+    if not await _filter_ready(t):
+        return
+    await t.owui.upsert_model(PRO3, "Gemini 3 Pro Preview", [SEARCH_FILTER])
+    try:
+        await ctx.mock.reset()
+        r = await t.owui.chat(
+            PRO3,
+            "Pick a tool.",
+            stream=False,
+            tools=[CLIENT_FN],
+            tool_choice="required",
+            features={"web_search": True},
+        )
+        reqs = await ctx.requests()
+    finally:
+        await t.owui.delete_model(PRO3)
+    req = reqs[0] if reqs else {}
+    mode = str(req.get("fc_mode")).upper() if req.get("fc_mode") else None
+    ctx.check(
+        "toolsapi.tool-choice-grounding",
+        "tool_choice required with web_search on Gemini 3: googleSearch and the "
+        "functions with includeServerSideToolInvocations and mode ANY",
+        r.status == 200
+        and {"googleSearch", "functionDeclarations"} <= set(req.get("tool_kinds") or [])
+        and req.get("include_flag") is True
+        and mode == "ANY",
+        _adetail(
+            r,
+            reqs,
+            f"tool_kinds={_kinds(req)} include_flag={req.get('include_flag')} "
+            f"mode={mode}",
+        ),
+        known=known.GEMINI_TOOLS_API,
+    )
+
+
 async def api_names(ctx: Ctx) -> None:
     long_name = "x" * 80
-    names = ["ns:tool", "a.b c", long_name]
+    # "trailing_nl\n": a valid name plus a newline (e.g. a YAML block scalar
+    # operationId); "$" alone would let it through unchanged
+    names = ["ns:tool", "a.b c", long_name, "trailing_nl\n"]
     tools = [
         CLIENT_FN,
         *(client_tool(n) for n in names),
@@ -1301,6 +1707,29 @@ async def api_names(ctx: Ctx) -> None:
     )
 
 
+async def api_default_api(ctx: Ctx) -> None:
+    """Gemini sometimes prefixes a call with default_api. (spec section 3.4)."""
+    await ctx.mock.reset()
+    r = await ctx.t.owui.chat(
+        PRO3,
+        directive(
+            [[{"name": "default_api.client_fn", "args": {"x": 1}}]],
+            allow_undeclared=True,
+        ),
+        stream=False,
+        tools=[CLIENT_FN],
+    )
+    reqs = await ctx.requests()
+    names = [n for _, _, n, _ in (_tc(x) for x in r.tool_calls)]
+    ctx.check(
+        "toolsapi.default-api",
+        "a function call named default_api.client_fn is returned as client_fn",
+        r.status == 200 and _answers(reqs) == "[fc]" and names == ["client_fn"],
+        _adetail(r, reqs, f"names={names}"),
+        known=known.GEMINI_TOOLS_API,
+    )
+
+
 SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -1315,8 +1744,13 @@ SCHEMA = {
         "pair": {"type": "array", "items": [{"type": "string"}, {"type": "number"}]},
         "item": {"$ref": "#/$defs/Item"},
         "maybe": {"type": ["string", "null"]},
+        # property names that are also keywords to drop: they stay
+        "examples": {"type": "string"},
+        "x-trace": {"type": "string"},
+        # a numeric exclusiveMinimum stays (only the boolean form is dropped)
+        "ratio": {"type": "number", "exclusiveMinimum": 0},
     },
-    "required": ["count", "ghost"],
+    "required": ["count", "examples", "ghost"],
     "$defs": {
         "Item": {
             "type": "object",
@@ -1348,7 +1782,9 @@ async def api_schema(ctx: Ctx) -> None:
         "bool_exclusive": "exclusiveMinimum" not in count and count.get("minimum") == 0,
         "prefixItems": isinstance(pair.get("prefixItems"), list)
         and "items" not in pair,
-        "required": schema.get("required") == ["count"],
+        "required": schema.get("required") == ["count", "examples"],
+        "keyword_names": "examples" in props and "x-trace" in props,
+        "numeric_exclusive": (props.get("ratio") or {}).get("exclusiveMinimum") == 0,
         "$ref": (props.get("item") or {}).get("$ref") == "#/$defs/Item"
         and "Item" in (schema.get("$defs") or {}),
         "null_type": (props.get("maybe") or {}).get("type") == ["string", "null"],
@@ -1410,7 +1846,8 @@ async def api_noid(ctx: Ctx) -> None:
         and len(ids) == 1
         and str(ids[0]).startswith("owui_")
         and r2.status == 200
-        and [(i, n) for i, n, _ in _fcs(req)] == [(None, "client_fn")]
+        # no placeholder signature: gemini-2.5-flash does not check signatures
+        and _fcs(req) == [(None, "client_fn", "none")]
         and [(i, n) for i, n, _ in _frs(req)] == [(None, "client_fn")]
         and req.get("synthetic_ids_upstream") is False
         and "MOCK-FINAL" in r2.content,

@@ -31,12 +31,15 @@ Groups (``--only gemini.<group>``)
   concurrency  forwarded user headers belong to the requesting user
   streamimg    inline image from a model the pipe does not detect (stream path)
   toolsapi     native tool calling, API path: client tools -> tool_calls (stream,
-               non-stream, finish_reason), continuation with signatures and
-               without, tool_choice, name mapping, schema clean-up, synthetic ids
+               non-stream, finish_reason), text answers, streaming valve off,
+               malformed / unexpected calls, continuation with signatures and
+               without, odd client histories, tool_choice, name mapping,
+               default_api. prefix, schema clean-up, synthetic ids
   tools        native tool calling, browser path (Open WebUI's tool loop):
-               built-in, parallel, rounds, thinking, workspace, OpenAPI, MCP and
-               direct tools, approval, follow-up turns, unknown tool, malformed
-               call, grounding with tools, task / legacy / no built-in tools
+               built-in, parallel, rounds, thinking, workspace, image result,
+               OpenAPI, MCP and direct tools, approval, follow-up turns, unknown
+               tool, malformed call, grounding with tools (and the next turn),
+               task / legacy / no built-in tools, streaming valve off
 
 The browser path sends the web UI's default params, i.e. native function
 calling with Open WebUI's built-in tools (functionDeclarations). The "images"
@@ -414,7 +417,8 @@ async def run(t: Suite) -> None:
         stored.startswith("encrypted:") and KEY not in stored,
         f"stored={short(stored, 40)}",
     )
-    if any(t.selected(g) for g in ("tasks", "imgtools", "grounding", "tools")):
+    groups = ("tasks", "imgtools", "grounding", "tools", "toolsapi")
+    if any(t.selected(g) for g in groups):
         await t.install(
             SEARCH_FILTER,
             "filters/google_search_tool.py",

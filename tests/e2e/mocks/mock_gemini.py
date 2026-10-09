@@ -81,8 +81,12 @@ Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
     toolConfig.includeServerSideToolInvocations), the calls. Streaming: one chunk
     each, the calls in one chunk (one per call with ``split``), then {"text": ""}
     with finishReason STOP and USAGE_TOOL
+  - with googleSearch, a round with calls cites its own source
+    (https://example.com/tool-round, no supports without text_before); the
+    final answer cites https://example.com/a
   - ``malformed``: the first request gets a candidate without content and
-    finishReason MALFORMED_FUNCTION_CALL
+    finishReason MALFORMED_FUNCTION_CALL (or the finish reason given as a
+    string, e.g. ``"malformed": "UNEXPECTED_TOOL_CALL"``)
   HTTP 400 INVALID_ARGUMENT like the real API (every generate request):
   duplicate declaration names, invalid names, ``parameters`` together with
   ``parametersJsonSchema``, a model content with functionCall parts that is not
@@ -148,6 +152,11 @@ GOOGLE_FILES = "https://generativelanguage.googleapis.com/v1beta/files"
 GENERATE = ("generateContent", "streamGenerateContent")
 NO_SEARCH_MODELS = ("gemini-2.5-flash-image", "gemini-3.1-flash-lite-image")
 SLOW_VIDEO_POLLS = 6
+# The source of a tool round (MOCKTOOLS) with Google Search; final answers cite
+# https://example.com/a
+TOOL_ROUND_CHUNK = {
+    "web": {"uri": "https://example.com/tool-round", "title": "Tool round"}
+}
 VERTEX_CHUNK = {
     "retrievedContext": {
         "uri": "gs://e2e-bucket/doc.pdf",
@@ -250,7 +259,7 @@ _GEMINI_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 
 
 def _gemini_function_name(name: str) -> str:
-    if _GEMINI_FUNCTION_NAME_RE.match(name):
+    if _GEMINI_FUNCTION_NAME_RE.fullmatch(name):
         return name
     base = re.sub(r"[^A-Za-z0-9_-]", "_", name)
     if not re.match(r"[A-Za-z_]", base[:1] or "0"):
@@ -371,7 +380,8 @@ def _tool_view(model: str, body) -> dict:
             if name in declared:
                 duplicates.append(name)
             declared.append(name)
-            if not isinstance(name, str) or not DECLARATION_NAME.match(name):
+            # fullmatch: "$" alone would accept a trailing newline
+            if not isinstance(name, str) or not DECLARATION_NAME.fullmatch(name):
                 invalid.append(name)
             schema_key = next(
                 (
@@ -570,7 +580,10 @@ def _tool_plan(model: str, view: dict) -> Optional[dict]:
     rounds = directive.get("rounds") or []
     r = view["round"]
     if directive.get("malformed") and r == 0:
-        return {"answer": "malformed"}
+        finish = directive["malformed"]
+        if not isinstance(finish, str):
+            finish = "MALFORMED_FUNCTION_CALL"
+        return {"answer": "malformed", "finish": finish}
     if r >= len(rounds):
         responses = [x for x in view["fr"] if x["i"] > view["turn_index"]]
         text = "MOCK-FINAL " + "; ".join(
@@ -639,16 +652,18 @@ def _tool_plan(model: str, view: dict) -> Optional[dict]:
     }
 
 
-MALFORMED = {
-    "candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL", "index": 0}],
-    "usageMetadata": USAGE_TEXT,
-}
+def _malformed(plan: dict) -> dict:
+    """A candidate without content and the directive's finishReason."""
+    return {
+        "candidates": [{"finishReason": plan["finish"], "index": 0}],
+        "usageMetadata": USAGE_TEXT,
+    }
 
 
 def _tool_answer(model: str, body, plan: dict) -> dict:
     """generateContent answer of a MOCKTOOLS turn."""
     if plan["answer"] == "malformed":
-        return MALFORMED
+        return _malformed(plan)
     parts = (
         [{"text": "Mock thinking.", "thought": True}] if _thoughts(model, body) else []
     )
@@ -661,18 +676,22 @@ def _tool_answer(model: str, body, plan: dict) -> dict:
 
 
 def _round_grounding(response: dict, plan: dict) -> dict:
-    """A tool round without text has nothing to cite: its grounding metadata
-    keeps the chunks (sources) but no supports."""
-    if not plan["text_before"]:
-        for candidate in response.get("candidates") or []:
-            (candidate.get("groundingMetadata") or {}).pop("groundingSupports", None)
+    """Grounding metadata of a tool round: its own source (TOOL_ROUND_CHUNK, so
+    the sources of each round can be told apart) and, without text, nothing to
+    cite (no supports)."""
+    for candidate in response.get("candidates") or []:
+        metadata = candidate.get("groundingMetadata") or {}
+        if metadata.get("groundingChunks"):
+            metadata["groundingChunks"] = [TOOL_ROUND_CHUNK]
+        if not plan["text_before"]:
+            metadata.pop("groundingSupports", None)
     return response
 
 
 def _tool_stream_chunks(model: str, body, plan: dict) -> list:
     """streamGenerateContent chunks of a MOCKTOOLS turn."""
     if plan["answer"] == "malformed":
-        return [MALFORMED]
+        return [_malformed(plan)]
     chunks = []
     if _thoughts(model, body):
         chunks.append(_chunk([{"text": "Mock pondering.", "thought": True}], body))

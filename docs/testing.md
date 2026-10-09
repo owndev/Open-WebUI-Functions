@@ -49,18 +49,16 @@ Typical output (abridged):
 starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
 Open WebUI healthy after 30s (http://localhost:57765)
 Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
-function versions: google_gemini.py 1.17.0, azure_ai_foundry.py 2.8.0, n8n.py 2.3.1, ...
+function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 2.8.0, n8n.py 2.3.1, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
 ...
-[KNOWN] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
-          -> known gemini-tools-afc (#169): native tool calls are run by google-genai's automatic
-             function calling inside the pipe: ...; fix pending in feature/gemini-native-tool-calling
-             (not merged yet), fixed in pipelines/google/google_gemini.py 1.18.0
-          mock_ok=True http=200 done=True error=None calls=[] outputs=0 rd=[] upstream=[fc,http-400] ...
+[PASS ] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
+          -> known gemini-tools-afc is fixed in pipelines/google/google_gemini.py 1.18.0: drop
+             marker (known= argument and its entry in tests/e2e/harness/known_*.py)
 ...
---- gemini: 263s
+--- gemini: 244s
 ...
 === infomaniak ===
 ...
@@ -70,14 +68,14 @@ function versions: google_gemini.py 1.17.0, azure_ai_foundry.py 2.8.0, n8n.py 2.
              __init__); no fix yet
           name='Infomaniak: Mixtral Mock'
 ...
-SUMMARY: 296 PASS, 0 FAIL, 33 KNOWN in 561s
-total runtime: 615s
+SUMMARY: 339 PASS, 0 FAIL, 1 KNOWN in 544s, 42 obsolete known markers (drop marker)
+total runtime: 587s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
 A full run of all suites took 8-10.5 minutes on a shared 8-CPU Docker host (with
-`main`'s files 615 s: 41 s container start-up, then gemini 263 s, azure 73 s, n8n 76 s,
-infomaniak 36 s, filters 111 s; the gemini suite alone took 199-263 s). Network downloads
+`google_gemini.py` 1.18.0 587 s: 43 s container start-up, then gemini 244 s, azure
+67 s, n8n 78 s, infomaniak 36 s, filters 115 s; the gemini suite alone took 199-263 s). Network downloads
 on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -147,7 +145,7 @@ events), a **background title task** and that the server log has no unexpected
 
 | Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
-| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), continuation with and without signatures, `tool_choice`, name mapping and duplicates, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls, two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)) |
+| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), a text answer to a request with tools (`finish_reason` `stop`), `GOOGLE_STREAMING_ENABLED=false`, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` streamed and non-streamed, continuation with and without signatures and with `reasoning_details` under `provider_specific_fields`, older turns with a thinking summary, empty arguments, content parts, a numeric id and a `function` that is not an object, `tool_choice` (also an undeclared name and with Search grounding on Gemini 3), name mapping (also a trailing newline) and duplicates, the `default_api.` prefix, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls (responses in call order), two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, a tool result with an image, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 (the sources of both rounds, the next turn without web search) and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off, `GOOGLE_STREAMING_ENABLED=false`; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)) |
 | `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; ignores `data_sources` when tools are sent, as Azure does) | `valves`, `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status), `tasks` (title task, also with Azure AI Search valves, #123), `oyd` (Azure AI Search "On Your Data": `[docX]` → links, also split across stream deltas, already linked or with parentheses in the URL; links in the history sent back as `[docX]`; only referenced sources saved and the show-all valve; relevance scores; no `data_sources` for background tasks, also without a websocket session; no tools or `stream_options` together with `data_sources`; a 300 KB and a > 4 MiB context event; `content: null`), `logs` (no API key and no citation text in the log) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
@@ -198,10 +196,12 @@ MOCKTOOLS:{"rounds": [[{"name": "get_current_timestamp", "args": {}}],
 | `text_before` | a text part before the calls |
 | `split` | streaming: one chunk per call (otherwise all calls in one chunk) |
 | `server_side` | with `toolConfig.includeServerSideToolInvocations` in the request: a server-side `toolCall` (signed) + `toolResponse` before the calls |
-| `malformed` | the first request gets a candidate without content and `finishReason: MALFORMED_FUNCTION_CALL` |
+| `malformed` | the first request gets a candidate without content and `finishReason: MALFORMED_FUNCTION_CALL`, or the finish reason given as a string (`"malformed": "UNEXPECTED_TOOL_CALL"`) |
 
 A tool round's usage is `USAGE_TOOL` (21 / 5 / 26 tokens); streaming ends with a
-`{"text": ""}` chunk with `finishReason: STOP`. Like the real API, every generate
+`{"text": ""}` chunk with `finishReason: STOP`. With `googleSearch` in the request a
+tool round cites `https://example.com/tool-round` and the final answer
+`https://example.com/a`, so the sources of each round can be told apart. Like the real API, every generate
 request is rejected with HTTP 400 `INVALID_ARGUMENT` for duplicate declaration names,
 invalid names, `parameters` together with `parametersJsonSchema`, a model content with
 function calls that is not directly followed by a user content with matching function
@@ -223,7 +223,9 @@ and an optional MCP server (FastMCP streamable HTTP from the image's `mcp` packa
 `GET /__requests` on 9111 lists the OpenAPI calls and the MCP tool calls. They are not
 provider mocks: `E2E_MOCK_FAULT` does not touch them. `probe/workspace_tool.py` is the
 workspace Python tool the `tools` group creates (`add_numbers` reports the types it
-got, `whoami` the user, the chat and its event emitter, and emits a status). The group
+got, `whoami` the user, the chat and its event emitter, and emits a status;
+`make_image` returns a PNG data URI, which Open WebUI passes on in a user message
+after the tool results). The group
 deletes the tool, restores the tool server connections and the chat settings and
 deletes its model overrides when it ends.
 
@@ -269,43 +271,46 @@ fail the `server-log` check unless a scenario provokes one (`t.expect_warnings`)
 
 | Key | What `main` does | Checks |
 | --- | --- | --- |
-| `gemini-tools-afc` (#169) | google-genai's automatic function calling runs the tool inside the pipe; Open WebUI saves no function call, nothing waits for approval. On v0.11.4-slim (google-genai 2.x from pip) the SDK's follow-up request (model content split per chunk, responses without ids) gets the mock's 400; on v0.11.3-slim (google-genai 1.66.0 bundled) a streamed AFC round stops after the function calls | `tools.builtin*`, `multiturn`, `multiturn-other-model`, `multiturn-back`, `parallel*`, `rounds*`, `text-before`, `thinking*`, `approval*`, `unknown`, `log`; `workspace` on v0.11.3-slim |
+| `gemini-tools-afc` (#169) | google-genai's automatic function calling runs the tool inside the pipe; Open WebUI saves no function call, nothing waits for approval. On v0.11.4-slim (google-genai 2.x from pip) the SDK's follow-up request (model content split per chunk, responses without ids) gets the mock's 400; on v0.11.3-slim (google-genai 1.66.0 bundled) a streamed AFC round stops after the function calls | `tools.builtin*`, `multiturn`, `multiturn-other-model`, `multiturn-back`, `parallel*`, `rounds*`, `text-before`, `thinking*`, `image-result`, `approval*`, `unknown`, `grounding3-next-turn`, `nostream`, `log`; `workspace` on v0.11.3-slim |
 | `gemini-tools-annotations` (#169) | the workspace tool fails on its string annotations under AFC (`isinstance() arg 2 must be a type` in the function responses; only visible where AFC sends its follow-up) | `tools.workspace` on v0.11.4-slim |
 | `gemini-tools-duplicate` (#169) | OpenAPI tool callables are all named `tool_function`: `Duplicate function declaration found: tool_function` | `tools.openapi` |
 | `gemini-tools-mcp` (#169) | MCP callables have no `__signature__`: the request fails before it is sent | `tools.mcp` |
 | `gemini-tools-direct` (#169) | direct tools have no callable: `KeyError: 'callable'` | `tools.direct` |
-| `gemini-tools-api` | client `tools` of API requests are ignored: nothing declared, no `tool_calls` | `toolsapi.stream`, `nonstream`, `tool-choice`, `names`, `schema`, `noid` |
-| `gemini-tools-history` | tool calls and results in the history are sent as text | `toolsapi.continuation*` |
+| `gemini-tools-api` | client `tools` of API requests are ignored: nothing declared, no `tool_calls` | `toolsapi.stream`, `nonstream`, `nostream`, `tool-choice*`, `names`, `default-api`, `schema`, `noid` |
+| `gemini-tools-history` | tool calls and results in the history are sent as text | `toolsapi.continuation*`, `history-edge`, `odd-shapes` |
 | `gemini-tools-grounding` | Gemini 2.5 + web_search gets functions next to grounding; Gemini 3 gets them without `includeServerSideToolInvocations` | `tools.grounding25`, `tools.grounding3` |
-| `gemini-tools-malformed` | `MALFORMED_FUNCTION_CALL` gives an empty answer | `tools.malformed` |
+| `gemini-tools-malformed` | `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` give an empty or generic answer | `tools.malformed`, `toolsapi.malformed` |
 
-`tools.multiturn-approved`, `tools.task`, `tools.legacy`, `tools.nobuiltin` and
-`toolsapi.unchanged` already pass on `main`. Open WebUI 0.11.4's approval defects (an
+`tools.multiturn-approved`, `tools.task`, `tools.legacy`, `tools.nobuiltin`,
+`toolsapi.stream-text` and `toolsapi.unchanged` already pass on `main`. Open WebUI 0.11.4's approval defects (an
 approved call loses its result in the saved message; with two calls only the first is
 asked and the second is not run) are only recorded in the detail of
 `tools.approval-parallel`, never asserted.
 
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09):
 
-| Suite | Checks | `main` (4d09a55): PASS / KNOWN |
-| --- | ---: | ---: |
-| `gemini` | 118 | 86 / 32 |
-| `azure` | 71 | 71 / 0 |
-| `n8n` | 51 | 51 / 0 |
-| `infomaniak` | 32 | 31 / 1 |
-| `filters` | 57 | 57 / 0 |
-| **all** | **329** | **296 / 33** |
+| Suite | Checks | `google_gemini.py` 1.18.0 (`main` after the merge of `feature/gemini-native-tool-calling`): PASS / KNOWN | 1.17.0 (`main` 4d09a55 before it): PASS / KNOWN |
+| --- | ---: | ---: | ---: |
+| `gemini` | 129 | 129 / 0 | 87 / 42 |
+| `azure` | 71 | 71 / 0 | 71 / 0 |
+| `n8n` | 51 | 51 / 0 | 51 / 0 |
+| `infomaniak` | 32 | 31 / 1 | 31 / 1 |
+| `filters` | 57 | 57 / 0 | 57 / 0 |
+| **all** | **340** | **339 / 1** | **297 / 43** |
 
 There is no FAIL. `harness/known_*.py` registers ten known bugs: the nine
-`gemini-tools-*` bugs of `google_gemini.py` 1.17.0 (the 32 KNOWN of the `tools` and
+`gemini-tools-*` bugs of `google_gemini.py` 1.17.0 (42 tagged checks of the `tools` and
 `toolsapi` groups, gated on 1.18.0, see [Native
 tool calling](#native-tool-calling-geminitools-geminitoolsapi)) and
 `infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`).
-The gemini suite gives the same 86 / 32 on `v0.11.3-slim`. With `google_gemini.py`
-1.18.0 of `feature/gemini-native-tool-calling` (81a3c77) it is 118 PASS / 0 KNOWN on
-both images, and the 32 tool markers are listed as obsolete markers (drop them after
-the merge). The markers of the 62 bugs fixed by #182-#185 were dropped after the
-merge; their checks stay and must pass.
+With 1.18.0 the 42 tagged checks pass on both images (gemini 129 / 0 on `v0.11.3-slim`
+too) and are listed as obsolete markers ("drop marker"); the markers stay until the
+merge, so that `--ref` runs of 1.17.0 report these bugs as KNOWN instead of FAIL, and
+are dropped right after it, together with the 1.17.0 column. The 1.17.0 column was
+measured for the tool groups (`--ref origin/main --only 'gemini.(tools|toolsapi)'`:
+11 PASS / 42 KNOWN); the other groups do not depend on the change. The markers of the
+62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and must
+pass.
 
 ### API path vs. browser path
 
@@ -587,7 +592,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 4d09a55, with the `gemini.tools` / `toolsapi` groups): 39 PASS / 230 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 4d09a55, with the `gemini.tools` / `toolsapi` groups of `feature/gemini-native-tool-calling`): 39 PASS / 241 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

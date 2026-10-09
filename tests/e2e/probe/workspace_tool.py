@@ -1,15 +1,34 @@
 """
 title: E2E Workspace Tool
 author: owndev
-version: 0.1.0
+version: 0.2.0
 license: Apache License 2.0
 description: Test-only workspace tool (Python) for the native tool calling scenarios of tests/e2e (suites/_gemini_tools.py). It reports what Open WebUI passed to it.
 """
 
+import base64
 import json
+import struct
+import zlib
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+
+def _png_base64() -> str:
+    """Base64 of a 1x1 red PNG."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode()
 
 
 class Tools:
@@ -58,3 +77,11 @@ class Tools:
             "chat_id": (__metadata__ or {}).get("chat_id"),
             "has_event_emitter": __event_emitter__ is not None,
         }
+
+    def make_image(self, color: str = "red") -> str:
+        """
+        Draw a tiny image. Open WebUI passes the images of tool results to the
+        model in a user message after the tool results.
+        :param color: any text
+        """
+        return "data:image/png;base64," + _png_base64()

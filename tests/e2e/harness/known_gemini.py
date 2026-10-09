@@ -108,6 +108,9 @@ GEMINI_TOOLS_API = KnownIssue(
     evidence=(
         r"mock_ok=True http=200 .*upstream=\[(mock-error|text)(,text)*\] "
         r"declared_n=\[?0",
+        # the mock called an undeclared name anyway (allow_undeclared): the pipe
+        # returned no tool_calls
+        r"mock_ok=True http=200 tool_calls=\[\] .*upstream=\[fc\] declared_n=0 ",
     ),
     file=GEMINI_FILE,
     fixed_in=GEMINI_TOOLS_FIXED_IN,
@@ -142,11 +145,15 @@ GEMINI_TOOLS_GROUNDING = KnownIssue(
 
 GEMINI_TOOLS_MALFORMED = KnownIssue(
     "gemini-tools-malformed",
-    "a MALFORMED_FUNCTION_CALL finish is answered with an empty or generic "
-    "answer instead of an error message that names it",
+    "a MALFORMED_FUNCTION_CALL (or UNEXPECTED_TOOL_CALL) finish is answered "
+    "with an empty or generic answer instead of an error message that names it",
     GEMINI_TOOLS_FIX,
     ref=FOUND_BY_E2E,
-    evidence=(r"mock_ok=True http=200 done=True .*upstream=\[malformed\]",),
+    evidence=(
+        r"mock_ok=True http=200 done=True .*upstream=\[malformed\]",
+        # API path, every case answered by the mock with the finish reason
+        r"mock_ok=True http=200 upstream=\[malformed(,malformed)*\] seen=",
+    ),
     log_patterns=(("function_gemini", "Failed to access content parts"),),
     file=GEMINI_FILE,
     fixed_in=GEMINI_TOOLS_FIXED_IN,
