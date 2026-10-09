@@ -323,7 +323,7 @@ tests/e2e/run.sh --image v0.11.3-slim gemini  # one suite on another Open WebUI 
 tests/e2e/check_owui_api.sh latest            # static check of the Open WebUI APIs the functions use
 ```
 
-The five suites (gemini, azure, n8n, infomaniak, filters) run 292 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
+The five suites (gemini, azure, n8n, infomaniak, filters) run about 300 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
 
 ## 💪 Contributing
 
