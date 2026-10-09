@@ -185,7 +185,7 @@ smoke_vertex_secrets() {
   local keys='"(private_key|private_key_id|client_secret|refresh_token)"'
   grep -oE "$keys"'[[:space:]]*:[[:space:]]*"[^"]*"' "$1" \
     | sed -E 's/^"[a-z_]+"[[:space:]]*:[[:space:]]*"//; s/"$//' \
-    | awk '{ gsub(/\\n/, "\n"); gsub(/\\\//, "/"); print }' \
+    | awk '{ gsub(/\\r/, ""); gsub(/\\n/, "\n"); gsub(/\\\//, "/"); print }' \
     | awk 'length($0) >= 16 && $0 !~ /^-----/' || true
 }
 

@@ -1418,6 +1418,36 @@ class Smoke:
         return f"{self.budget_note()}; risks not run: {skipped}"
 
     def write(self) -> None:
+        before = self.redact.count
+        files, lines = self._render()
+        if self.redact.count > before:
+            # a secret reached the runner's own output: the SECRETS row has to
+            # say so before the files are written
+            self._output_leak(self.redact.count - before)
+            files, lines = self._render()
+        os.makedirs(self.args.out, exist_ok=True)
+        for name, text in files.items():
+            with open(os.path.join(self.args.out, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        for line in lines:
+            self.say(line)
+
+    def _output_leak(self, count: int) -> None:
+        """Marks SECRETS as FAIL for secrets found in the runner's output."""
+        note = f"a secret was redacted from the runner's output files ({count}x)"
+        report = self.reports.get("SECRETS")
+        if report is None:
+            self.reports["SECRETS"] = Report(
+                "SECRETS", "no secret in the runner output", FAIL, [note], 1, 0, []
+            )
+            return
+        report.status = FAIL
+        report.evidence = [
+            e for e in report.evidence if not e.startswith("no secret found")
+        ] + [note]
+
+    def _render(self) -> tuple:
+        """The redacted output files and the summary lines for stdout."""
         upstream = forwarded(self.proxy.records)
         generate = gen(self.proxy.records)
         usage = Counter()
@@ -1459,27 +1489,23 @@ class Smoke:
                 meta[name] = value
         keys = ORDER + ["TIMEOUT", "BUDGET", "LOG", "SECRETS"]
         rows = [self.reports[k] for k in keys if k in self.reports]
-        os.makedirs(self.args.out, exist_ok=True)
         data = {"meta": meta, "results": [asdict(r) for r in rows]}
-        self._dump("smoke.json", json.dumps(data, indent=1))
-        self._dump(
-            "upstream.jsonl", "".join(json.dumps(r) + "\n" for r in self.proxy.records)
-        )
-        self._dump("summary.md", self.markdown(meta, rows))
-        self.say(
+        files = {
+            "smoke.json": json.dumps(data, indent=1),
+            "upstream.jsonl": "".join(json.dumps(r) + "\n" for r in self.proxy.records),
+            "summary.md": self.markdown(meta, rows),
+        }
+        lines = [
             f"\nSMOKE SUMMARY ({meta['mode']}): {counts.get(PASS, 0)} PASS, "
             f"{counts.get(FAIL, 0)} FAIL, {counts.get(SKIP, 0)} SKIP; "
             f"{len(upstream)} generate requests upstream (estimate about "
             f"{meta['requests']['estimate']}, cap {self.max_requests}"
             + (f", {self.proxy.blocked} blocked" if self.proxy.blocked else "")
             + f"), tokens {dict(usage)}, {meta['duration_s']}s"
-        )
+        ]
         if meta.get("budget_hit"):
-            self.say(f"BUDGET HIT: {meta['budget_hit']}")
-
-    def _dump(self, name: str, text: str) -> None:
-        with open(os.path.join(self.args.out, name), "w", encoding="utf-8") as fh:
-            fh.write(self.redact(text))
+            lines.append(f"BUDGET HIT: {meta['budget_hit']}")
+        return {name: self.redact(text) for name, text in files.items()}, lines
 
     def markdown(self, meta: dict, rows: list) -> str:
         lines = [

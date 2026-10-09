@@ -609,7 +609,9 @@ How it works:
   defaults) caps the generate requests the proxy forwards. Beyond it the proxy answers
   HTTP 429 itself, without forwarding; the scenario is not retried, the remaining risks
   are SKIP, and `summary.md` / `smoke.json` report `budget_hit` plus a `BUDGET` FAIL row
-  (exit 1). The model listing is not capped (not billed); R9's Vertex requests do not
+  (exit 1). The `LOG` row fails as well, because the pipe logs the proxy's 429 as an
+  ERROR (a bad key likewise fails the server-log check with the model listing's 400s).
+  The model listing is not capped (not billed); R9's Vertex requests do not
   pass through the proxy and are not capped either.
 - Results: `PASS`, `FAIL` or `SKIP` per risk, with the evidence lines (one `upstream #n`
   line per request), plus `LOG` (the server log scan of the suites, which also fails on the
@@ -679,7 +681,8 @@ generate requests (the mock received the same 38), 90-120 s including the contai
 start. The mock always follows the directive, so no retry happens. Its answers prove
 only the mechanics: real results can differ. With `--max-requests 5` the proxy forwarded
 the two preflight requests and three of R1, answered R1's fourth with HTTP 429 (the mock
-received 5), R1 was FAIL, the other risks SKIP, `BUDGET` FAIL, exit 1. A fake key gave
+received 5), R1 was FAIL, the other risks SKIP, `BUDGET` and `LOG` FAIL (the pipe logs
+the 429 as an ERROR), exit 1. A fake key gave
 exit 2 with the `API key not valid` setup error above, and the key was in no output.
 
 ## CI
