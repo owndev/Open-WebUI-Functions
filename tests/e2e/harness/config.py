@@ -13,12 +13,22 @@ ADMIN_PASSWORD = "Passw0rd!e2e"
 
 # Provider mocks (tests/e2e/mocks/serve_all.py), reachable from the pipes.
 MOCK_HOST = "127.0.0.1"
-MOCK_PORTS = {"gemini": 9101, "azure": 9102, "n8n": 9103, "infomaniak": 9104}
+MOCK_PORTS = {
+    "gemini": 9101,
+    "azure": 9102,
+    "n8n": 9103,
+    "infomaniak": 9104,
+    "tools": 9111,  # OpenAPI tool server (mocks/mock_tools.py), not a provider mock
+}
+# MCP tool server of mocks/mock_tools.py (optional, streamable HTTP on /mcp).
+MCP_PORT = 9112
 
 # Layout inside the container (run.sh copies tests/e2e/ to E2E_ROOT).
 E2E_ROOT = os.environ.get("E2E_ROOT", "/e2e")
 FUNCTIONS_DIR = os.path.join(E2E_ROOT, "functions")  # staged function files
 PROBE_FILE = os.path.join(E2E_ROOT, "probe", "probe_pipe.py")
+# test-only workspace tool (Python) for the native tool calling scenarios
+WORKSPACE_TOOL_FILE = os.path.join(E2E_ROOT, "probe", "workspace_tool.py")
 SERVER_LOG = os.environ.get("E2E_SERVER_LOG", "/tmp/e2e/server.log")
 # Output of the provider mocks (run.sh starts serve_all.py with it).
 MOCKS_LOG = os.environ.get("E2E_MOCKS_LOG", os.path.join(E2E_ROOT, "out", "mocks.txt"))

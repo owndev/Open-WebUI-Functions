@@ -1,10 +1,10 @@
 """
 Registry of known bugs that make scenarios fail on ``main`` today.
 
-The entries live in one module per area, ``known_<area>.py`` (today only
-``known_n8n.py`` for n8n + Infomaniak), and are re-exported here, so suites write
-``known.INFOMANIAK_NAME_PREFIX``. A new area module needs its own import at the
-bottom of this file.
+The entries live in one module per area, ``known_<area>.py`` (today
+``known_gemini.py`` and ``known_n8n.py`` for n8n + Infomaniak), and are
+re-exported here, so suites write ``known.INFOMANIAK_NAME_PREFIX``. A new area
+module needs its own import at the bottom of this file.
 
 A failing scenario that carries a ``KnownIssue`` is reported as KNOWN and does
 not fail the run, but only when the failure looks like that bug:
@@ -17,9 +17,10 @@ not fail the run, but only when the failure looks like that bug:
   function (``function_<id>:``, ``outlet filter <id>``) together with the error
   so that nothing else matches. When the check passes ``since=mark``, a matching
   block logged since ``mark`` also counts as evidence. Once the bug has
-  reproduced, the suite's ``server-log`` check ignores blocks that match these
-  signatures (background tasks and later requests hit the same bug outside the
-  check); every other error still fails it.
+  reproduced, the suite's ``server-log`` check ignores ERROR and failing
+  WARNING blocks that match these signatures (background tasks and later
+  requests hit the same bug outside the check); every other error still fails
+  it.
 
 Version gating (``file`` + ``fixed_in``): a marker only applies while the staged
 copy of ``file`` (``FUNCTIONS_DIR/<file>``, the file under test) has a docstring
@@ -127,6 +128,7 @@ FOUND_BY_E2E = "found by tests/e2e, no issue filed"
 
 # The entries, one module per area. They import the names above, so these
 # imports stay at the bottom; every KnownIssue they define is re-exported.
+from .known_gemini import *  # noqa: E402, F403
 from .known_n8n import *  # noqa: E402, F403
 
 

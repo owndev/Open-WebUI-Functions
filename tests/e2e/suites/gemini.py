@@ -30,12 +30,20 @@ Groups (``--only gemini.<group>``)
                system prompt, user headers, API version, params, valve names
   concurrency  forwarded user headers belong to the requesting user
   streamimg    inline image from a model the pipe does not detect (stream path)
+  toolsapi     native tool calling, API path: client tools -> tool_calls (stream,
+               non-stream, finish_reason), continuation with signatures and
+               without, tool_choice, name mapping, schema clean-up, synthetic ids
+  tools        native tool calling, browser path (Open WebUI's tool loop):
+               built-in, parallel, rounds, thinking, workspace, OpenAPI, MCP and
+               direct tools, approval, follow-up turns, unknown tool, malformed
+               call, grounding with tools, task / legacy / no built-in tools
 
 The browser path sends the web UI's default params, i.e. native function
 calling with Open WebUI's built-in tools (functionDeclarations). The "images"
 group and the image error status use ``function_calling=legacy`` so they test
 the image handling itself; the tools sent to image models are checked by
-"image", "nano" and "imgtools".
+"image", "nano" and "imgtools". The tool groups live in suites/_gemini_tools.py
+(the mock answers its ``MOCKTOOLS:`` directive with function calls).
 """
 
 import asyncio
@@ -69,6 +77,8 @@ GROUPS = (
     "valves",
     "concurrency",
     "streamimg",
+    "toolsapi",
+    "tools",
 )
 FID = "gemini"
 PATH = "pipelines/google/google_gemini.py"
@@ -124,8 +134,9 @@ DEFAULTS = dict(
     RETRY_COUNT=2,
     VIDEO_GENERATION_NEGATIVE_PROMPT="",
 )
-# WARNING lines of the pipe that mean a lost event, image, video or answer part
-# (the pipe swallows these failures, so they never show as ERROR).
+# WARNING lines of the pipe that mean a lost event, image, video, answer part or
+# tool data (the pipe swallows these failures, so they never show as ERROR); a
+# scenario that provokes one on purpose uses t.expect_warnings.
 WARNINGS = tuple(
     ("function_gemini", text)
     for text in (
@@ -138,6 +149,12 @@ WARNINGS = tuple(
         "could not obtain video bytes",
         "Polling error",
         "Skipping image (parse failure)",
+        # native tool calling (1.18.0)
+        "Skipping duplicate tool declaration",
+        "Dropping unmatched function call",
+        "Dropping unmatched tool result",
+        "Could not restore stored model content",
+        "Invalid tool call arguments",
     )
 )
 # Valves and UserValves of google_gemini.py 1.16.1 with their defaults (valve
@@ -397,7 +414,7 @@ async def run(t: Suite) -> None:
         stored.startswith("encrypted:") and KEY not in stored,
         f"stored={short(stored, 40)}",
     )
-    if any(t.selected(g) for g in ("tasks", "imgtools", "grounding")):
+    if any(t.selected(g) for g in ("tasks", "imgtools", "grounding", "tools")):
         await t.install(
             SEARCH_FILTER,
             "filters/google_search_tool.py",
@@ -429,6 +446,8 @@ async def run(t: Suite) -> None:
         ("valves", valves),
         ("concurrency", concurrency),
         ("streamimg", streamimg),
+        ("toolsapi", toolsapi_group),
+        ("tools", tools_group),
     ):
         if t.selected(group):
             try:
@@ -1639,3 +1658,18 @@ async def streamimg(t: Suite, mock) -> None:
         and "![" not in c.content,
         c.brief() + f" upstream={_actions(reqs)} {report}",
     )
+
+
+# ------------------------------------------------------ native tool calling
+# The scenarios live in suites/_gemini_tools.py (imported here, after this
+# module is complete, because it uses the helpers above).
+async def toolsapi_group(t: Suite, mock) -> None:
+    from . import _gemini_tools
+
+    await _gemini_tools.toolsapi(t, mock)
+
+
+async def tools_group(t: Suite, mock) -> None:
+    from . import _gemini_tools
+
+    await _gemini_tools.tools(t, mock)
