@@ -1,7 +1,7 @@
 """
 Mock of Azure AI Search (Documents - Search Post) and of an App Service
 managed identity token endpoint, for the pipeline-side retrieval of
-pipelines/azure/azure_ai_foundry.py (AZURE_AI_SEARCH_MODE=pipeline, 2.9.0+).
+pipelines/azure/azure_ai_foundry.py (3.0.0+).
 
 Routes
   POST /indexes/{index}/docs/search?api-version=...
@@ -35,8 +35,8 @@ Indexes
                 titleVector[8]; has a vectorizer (vector queries of kind
                 "text" work)
   x100-custom   id, body, doc_title, source_url, source_file; no vector field
-  client-index  the x100-docs documents; must never be queried (pipeline
-                mode refuses data_sources sent by the client)
+  client-index  the x100-docs documents; must never be queried (the pipe
+                refuses data_sources sent by the client)
 
 Hits: the 3 documents of mock_azure.CITATIONS (doc 1, 2, 3) in that order,
 except for the generated queries of mock_azure's query generation (exact

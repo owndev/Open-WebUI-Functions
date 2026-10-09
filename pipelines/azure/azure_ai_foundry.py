@@ -4,10 +4,10 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.9.0
+version: 3.0.0
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
-description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) works with every chat endpoint and model: the pipeline queries the search index itself (AZURE_AI_SEARCH_MODE=pipeline, the default) and adds the documents to the prompt. The legacy mode AZURE_AI_SEARCH_MODE=on_your_data sends them as Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026 (see https://github.com/owndev/Open-WebUI-Functions/issues/187).
+description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) works with every chat endpoint and model: the pipeline queries the search index itself and adds the documents to the prompt. Since 3.0.0 it no longer uses Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026 (see https://github.com/owndev/Open-WebUI-Functions/issues/187).
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
@@ -16,18 +16,19 @@ features:
   - Compatible with Azure OpenAI and other Azure AI models.
   - Predefined models for easy access.
   - Encrypted storage of sensitive API keys
-  - Azure AI Search / RAG with native OpenWebUI citations for any chat endpoint and model - the pipeline queries Azure AI Search itself (AZURE_AI_SEARCH_MODE=pipeline, default; simple, semantic, vector and hybrid queries, filter, fields_mapping, strictness, top_n_documents, in_scope, role_information from AZURE_AI_DATA_SOURCES); AZURE_AI_SEARCH_MODE=on_your_data keeps the legacy Azure OpenAI On Your Data (data_sources) path
+  - Azure AI Search / RAG with native OpenWebUI citations for any chat endpoint and model - the pipeline queries Azure AI Search itself (simple, semantic, vector and hybrid queries, filter, fields_mapping, strictness, top_n_documents, in_scope, role_information from AZURE_AI_DATA_SOURCES) and adds the documents to the prompt
   - Search queries for follow-up turns written by the model from the conversation (AZURE_AI_SEARCH_QUERY_GENERATION, falls back to the user message)
-  - Tools, function calling and token usage keep working in chats with Azure AI Search (pipeline mode)
+  - Tools, function calling and token usage keep working in chats with Azure AI Search
   - Encrypted Azure AI Search key valve (AZURE_AI_SEARCH_KEY); API key, access token or the managed identity of the Open WebUI host
   - Automatic [docX] to markdown link conversion for clickable citations (also when streamed in pieces)
   - Relevance scores from Azure AI Search displayed in citation cards
   - Answers with [docX] references show only the referenced documents; answers without any show all retrieved documents (default) or none (AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false)
   - Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no citations
   - A failed search ends the request with "Error: Azure AI Search: ..." instead of an answer without the documents
-  - With on_your_data, requests omit tools and stream_options, which On Your Data ignores or rejects
-  - Streamed events of up to 4 MiB (large Azure AI Search contexts with on_your_data); a stream that fails ends with an "Error: ..." message instead of an empty or cut off answer
-  - Logs a warning once per process when a request uses Azure OpenAI On Your Data (data_sources, on_your_data mode), which Microsoft retires on October 14, 2026
+  - A request with data_sources (Azure OpenAI On Your Data) ends with an error that names its removal instead of being forwarded
+  - Streamed events of up to 4 MiB are read; a stream that fails ends with an "Error: ..." message instead of an empty or cut off answer
+changelog:
+  - 3.0.0 - BREAKING: Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026, is no longer used. The pipeline queries Azure AI Search itself (Search REST API, default api-version 2026-04-01) with the azure_search configuration in AZURE_AI_DATA_SOURCES and adds the documents to the prompt as [doc1]..[docN], for every chat endpoint and model (Azure OpenAI deployments, Foundry /models, serverless, non-OpenAI models). Citations, [docX] links, relevance scores and the history unlinking work as before; API clients get the citations as context (first SSE event or message.context). Breaking: data_sources sent by a client or an inlet filter end the request with "Error: Azure AI Search: data_sources in the request is not supported ..." and are never forwarded; data source types other than azure_search, and an AZURE_AI_DATA_SOURCES that is not valid JSON, are configuration errors (fail closed, no answer without the documents); with a managed identity the Open WebUI host's identity calls Azure AI Search and needs the Search Index Data Reader role; the Open WebUI host must reach the search service over the network; vector query types need embedding_dependency or an index vectorizer; strictness, in_scope and role_information are applied by the pipeline (approximations of On Your Data); tools, tool_choice and stream_options are forwarded in chats with Azure AI Search; the On Your Data retirement warning of 2.8.1 is gone. New valves AZURE_AI_SEARCH_KEY (encrypted), AZURE_AI_SEARCH_API_VERSION, AZURE_AI_SEARCH_QUERY_GENERATION and AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS; every existing valve keeps its name. To keep On Your Data until Microsoft turns it off, stay on 2.8.1 (https://github.com/owndev/Open-WebUI-Functions/blob/3ff6cf9/pipelines/azure/azure_ai_foundry.py).
 """
 
 from typing import (
@@ -181,7 +182,7 @@ def _env_int(name: str, default: int) -> int:
 
 class AzureSearchError(Exception):
     """
-    A configuration or Azure AI Search error of pipeline mode. The request
+    A configuration or Azure AI Search error of the retrieval. The request
     ends with "Error: <message>". The message is shown to every chat user,
     so it never contains keys, tokens, request headers or the
     AZURE_AI_DATA_SOURCES JSON.
@@ -196,36 +197,6 @@ class AzureSearchError(Exception):
 # expires_on). One lock per key, so concurrent chats mint a token only once.
 _ENTRA_TOKENS: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
 _ENTRA_LOCKS: Dict[Tuple[str, str, str], asyncio.Lock] = {}
-
-
-# Azure OpenAI On Your Data (the data_sources API behind the legacy Azure AI
-# Search mode AZURE_AI_SEARCH_MODE=on_your_data) is retired by Microsoft on
-# October 14, 2026. pipe() logs this notice once per process (per loaded copy
-# of this function) for the first request that sends a non-empty
-# data_sources; pipeline mode never sends any. The data_sources themselves
-# are never logged: they can contain a search key.
-ON_YOUR_DATA_RETIREMENT_NOTICE = (
-    "Azure AI Search: this request uses Azure OpenAI On Your Data (data_sources), "
-    "which Microsoft retires on October 14, 2026. From that date on, requests "
-    "with data_sources are expected to fail or to be answered without your "
-    "search index and without citations. Set AZURE_AI_SEARCH_MODE=pipeline to "
-    "use the pipeline's own Azure AI Search retrieval (any chat endpoint and "
-    "model). Migration: "
-    "https://github.com/owndev/Open-WebUI-Functions/issues/187 (Microsoft "
-    "recommends Foundry Agent Service with Foundry IQ: "
-    "https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect). "
-    "This warning is logged once per process."
-)
-_on_your_data_notice_logged = False
-
-
-def _first_on_your_data_request() -> bool:
-    """True on the first call in this process, False on every later call."""
-    global _on_your_data_notice_logged
-    if _on_your_data_notice_logged:
-        return False
-    _on_your_data_notice_logged = True
-    return True
 
 
 class Pipe:
@@ -266,14 +237,13 @@ class Pipe:
     # Read buffer of the HTTP session. aiohttp reads a streamed response line
     # by line and fails (LineTooLong) on a line longer than twice this size;
     # its default of 64 KiB allows only 128 KiB. One SSE event is one line,
-    # and the context event of an Azure AI Search answer (citations plus
-    # all_retrieved_documents) can be larger, so lines up to 4 MiB are read.
+    # so events up to 4 MiB are read; a longer one ends the stream with an
+    # error message.
     STREAM_READ_BUFSIZE = 2 * 1024 * 1024
 
-    # --- Azure AI Search in pipeline mode (AZURE_AI_SEARCH_MODE=pipeline) ---
-    SEARCH_MODES = ("pipeline", "on_your_data")
+    # --- Azure AI Search retrieval (AZURE_AI_DATA_SOURCES) -------------------
     QUERY_GENERATION_MODES = ("auto", "always", "off")
-    # OYD query_type values (case and "_" do not matter) -> internal names
+    # query_type values (case and "_" do not matter) -> internal names
     QUERY_TYPES = {
         "simple": "simple",
         "semantic": "semantic",
@@ -283,7 +253,8 @@ class Pipe:
     }
     VECTOR_QUERY_TYPES = ("vector", "vector_simple_hybrid", "vector_semantic_hybrid")
     SEMANTIC_QUERY_TYPES = ("semantic", "vector_semantic_hybrid")
-    # Keys of an OYD azure_search data source that pipeline mode reads
+    # Keys of an azure_search data source that the retrieval reads
+    # (include_contexts only mattered for On Your Data and is ignored)
     SEARCH_PARAMETER_KEYS = {
         "endpoint",
         "index_name",
@@ -355,13 +326,9 @@ class Pipe:
         "<documents>\nNo documents were found for this question.\n</documents>"
     )
     CLIENT_DATA_SOURCES_ERROR = (
-        "data_sources in the request is not supported in pipeline mode; remove it "
-        "(the search is configured by AZURE_AI_DATA_SOURCES) or set "
-        "AZURE_AI_SEARCH_MODE=on_your_data"
-    )
-    ON_YOUR_DATA_RETIRED_HINT = (
-        " (Azure OpenAI On Your Data was retired on 2026-10-14; set "
-        "AZURE_AI_SEARCH_MODE=pipeline)"
+        "data_sources in the request is not supported: this pipeline no longer "
+        "uses Azure OpenAI On Your Data (removed in 3.0.0); remove data_sources, "
+        "the search is configured by AZURE_AI_DATA_SOURCES"
     )
 
     # Environment variables for API key, endpoint, and optional model
@@ -421,49 +388,39 @@ class Pipe:
             description="Set to True to use Authorization header with Bearer token instead of api-key header.",
         )
 
-        # Azure AI Data Sources Configuration (for Azure AI Search / RAG), in the
-        # Azure OpenAI On Your Data data_sources format. Pipeline mode (default)
-        # reads it as the search configuration and works with every chat
-        # endpoint; on_your_data mode sends it to Azure OpenAI (retired by
-        # Microsoft on October 14, 2026, #187).
+        # Azure AI Search configuration (for RAG), in the azure_search format of
+        # the former Azure OpenAI On Your Data data_sources. The pipeline reads
+        # it and queries Azure AI Search itself (any chat endpoint and model).
         AZURE_AI_DATA_SOURCES: str = Field(
             default=os.getenv("AZURE_AI_DATA_SOURCES", ""),
-            description='JSON configuration of the Azure AI Search index (Azure OpenAI On Your Data data_sources format). With AZURE_AI_SEARCH_MODE=pipeline (default) the pipeline queries Azure AI Search itself and adds the documents to the prompt, for any chat endpoint and model. With AZURE_AI_SEARCH_MODE=on_your_data it is sent to Azure OpenAI as data_sources (On Your Data, retired by Microsoft on October 14, 2026; see https://github.com/owndev/Open-WebUI-Functions/issues/187). Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key"}}}]\' with the key in AZURE_AI_SEARCH_KEY',
-        )
-
-        # Engine for AZURE_AI_DATA_SOURCES: the pipeline's own Azure AI Search
-        # retrieval or the legacy Azure OpenAI On Your Data (data_sources).
-        AZURE_AI_SEARCH_MODE: str = Field(
-            default=os.getenv("AZURE_AI_SEARCH_MODE", "pipeline"),
-            description="How AZURE_AI_DATA_SOURCES is used. 'pipeline' (default): the pipeline queries Azure AI Search itself and adds the documents to the prompt; works with every chat endpoint and model, keeps tools and token usage. 'on_your_data': legacy Azure OpenAI On Your Data (data_sources), retired by Microsoft on October 14, 2026. data_sources sent in the request by an API client or an inlet filter are an error in pipeline mode (also without AZURE_AI_DATA_SOURCES); on_your_data forwards them.",
-            json_schema_extra={"enum": ["pipeline", "on_your_data"]},
+            description='JSON configuration of the Azure AI Search index, in the azure_search data source format of Azure OpenAI On Your Data (which this pipeline no longer calls since 3.0.0). The pipeline queries Azure AI Search itself and adds the documents to the prompt, for any chat endpoint and model. data_sources sent in the request by an API client or an inlet filter are an error. Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key"}}}]\' with the key in AZURE_AI_SEARCH_KEY',
         )
 
         # Azure AI Search API key (a query key is enough). Wins over
-        # authentication.key in AZURE_AI_DATA_SOURCES, in both modes.
+        # authentication.key in AZURE_AI_DATA_SOURCES.
         AZURE_AI_SEARCH_KEY: EncryptedStr = Field(
             default=os.getenv("AZURE_AI_SEARCH_KEY", ""),
             description="Azure AI Search API key (a read-only query key is enough), stored encrypted. Used when the authentication in AZURE_AI_DATA_SOURCES is missing or of type api_key, and wins over authentication.key there; then the plaintext key can be removed from AZURE_AI_DATA_SOURCES.",
             json_schema_extra={"input": {"type": "password"}},
         )
 
-        # Azure AI Search REST API version (pipeline mode)
+        # Azure AI Search REST API version
         AZURE_AI_SEARCH_API_VERSION: str = Field(
             default=os.getenv("AZURE_AI_SEARCH_API_VERSION", "2026-04-01"),
-            description="Azure AI Search REST API version used by pipeline mode (any GA version from 2024-07-01 on works).",
+            description="Azure AI Search REST API version of the search requests (any GA version from 2024-07-01 on works).",
         )
 
-        # Search queries written by the model for follow-up turns (pipeline mode)
+        # Search queries written by the model for follow-up turns
         AZURE_AI_SEARCH_QUERY_GENERATION: str = Field(
             default=os.getenv("AZURE_AI_SEARCH_QUERY_GENERATION", "auto"),
-            description="Pipeline mode: let the chat model turn the conversation into search queries before the search. 'auto' (default): only on follow-up turns; 'always': on every turn; 'off': always search with the user's message. Any failure falls back to the user's message.",
+            description="Let the chat model turn the conversation into search queries before the search. 'auto' (default): only on follow-up turns; 'always': on every turn; 'off': always search with the user's message. Any failure falls back to the user's message.",
             json_schema_extra={"enum": ["auto", "always", "off"]},
         )
 
-        # Token budget for the document text in the prompt (pipeline mode)
+        # Token budget for the document text in the prompt
         AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS: int = Field(
             default=_env_int("AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS", -1),
-            description="Pipeline mode: tokens of document text added to the prompt, estimated as characters / 4. -1 (default): automatic, min(32000, 1600 x top_n_documents); 0: no limit; a positive number: that many tokens. Longer documents are cut.",
+            description="Tokens of document text added to the prompt, estimated as characters / 4. -1 (default): automatic, min(32000, 1600 x top_n_documents); 0: no limit; a positive number: that many tokens. Longer documents are cut.",
         )
 
         # Enable relevance scores from Azure AI Search
@@ -471,7 +428,7 @@ class Pipe:
             default=bool(
                 os.getenv("AZURE_AI_INCLUDE_SEARCH_SCORES", "true").lower() == "true"
             ),
-            description="If True, citation cards show relevance percentages. Pipeline mode: the citations carry the scores of the search hits (original_search_score, rerank_score, relevance). on_your_data mode: 'include_contexts' with 'all_retrieved_documents' is added to the data_sources to get the scores.",
+            description="If True, citation cards show relevance percentages: the citations carry the scores of the search hits (original_search_score, rerank_score, relevance).",
         )
 
         # Citations for answers that reference no [docX] at all
@@ -508,7 +465,7 @@ class Pipe:
         self.name: str = f"{self.valves.AZURE_AI_PIPELINE_PREFIX}:"
         # Extract model name from Azure OpenAI URL if available
         self._extracted_model_name = self._extract_model_from_url()
-        # Pipeline mode state of this loaded copy of the function: warnings
+        # Azure AI Search state of this loaded copy of the function: warnings
         # already logged, documents per chat message for tool rounds, query
         # generation timeouts per model
         self._warned: Set[str] = set()
@@ -620,87 +577,12 @@ class Pipe:
         if "messages" not in body or not isinstance(body["messages"], list):
             raise ValueError("The 'messages' field is required and must be a list.")
 
-    def get_azure_ai_data_sources(self) -> Optional[List[Dict[str, Any]]]:
-        """
-        Builds Azure AI data sources configuration from the AZURE_AI_DATA_SOURCES environment variable.
-        Used by AZURE_AI_SEARCH_MODE=on_your_data only, which works only with Azure OpenAI endpoints: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview
-
-        If AZURE_AI_INCLUDE_SEARCH_SCORES is enabled, automatically adds 'include_contexts'
-        with 'all_retrieved_documents' to get relevance scores from Azure AI Search.
-
-        Returns:
-            List containing Azure AI data source configuration, or None if not configured.
-        """
-        if not self.valves.AZURE_AI_DATA_SOURCES:
-            return None
-
-        log = logging.getLogger("azure_ai.get_azure_ai_data_sources")
-
-        try:
-            data_sources = json.loads(self.valves.AZURE_AI_DATA_SOURCES)
-            if not isinstance(data_sources, list):
-                # If it's a single object, wrap it in a list
-                data_sources = [data_sources]
-
-            # If AZURE_AI_INCLUDE_SEARCH_SCORES is enabled, add include_contexts
-            if self.valves.AZURE_AI_INCLUDE_SEARCH_SCORES:
-                for source in data_sources:
-                    if (
-                        isinstance(source, dict)
-                        and source.get("type") == "azure_search"
-                        and "parameters" in source
-                    ):
-                        params = source["parameters"]
-                        # Get or create include_contexts list
-                        include_contexts = params.get("include_contexts", [])
-                        if not isinstance(include_contexts, list):
-                            include_contexts = [include_contexts]
-
-                        # Add 'citations' and 'all_retrieved_documents' if not present
-                        if "citations" not in include_contexts:
-                            include_contexts.append("citations")
-                        if "all_retrieved_documents" not in include_contexts:
-                            include_contexts.append("all_retrieved_documents")
-
-                        params["include_contexts"] = include_contexts
-                        log.debug(
-                            f"Added include_contexts to Azure Search: {include_contexts}"
-                        )
-
-            return data_sources
-        except json.JSONDecodeError as e:
-            # Log error and return None if JSON parsing fails
-            log.error(f"Error parsing AZURE_AI_DATA_SOURCES: {e}")
-            return None
-
     def _warn_once(self, key: str, message: str) -> None:
         """Log a WARNING once per loaded copy of the function and key."""
         if key in self._warned:
             return
         self._warned.add(key)
         logging.getLogger("azure_ai.search").warning(message)
-
-    def _search_mode(self) -> str:
-        """
-        AZURE_AI_SEARCH_MODE as "pipeline" or "on_your_data". Case, spaces and
-        "-" for "_" do not matter (on-your-data from an env file works); an
-        empty value is the default "pipeline" (e.g.
-        AZURE_AI_SEARCH_MODE=${AZURE_AI_SEARCH_MODE} in docker compose with
-        the variable unset); any other value counts as "pipeline" with a
-        warning.
-        """
-        raw = str(self.valves.AZURE_AI_SEARCH_MODE or "")
-        mode = raw.strip().lower().replace("-", "_")
-        if mode in self.SEARCH_MODES:
-            return mode
-        if not mode:
-            return "pipeline"
-        self._warn_once(
-            f"search-mode:{mode}",
-            f"Azure AI Search: AZURE_AI_SEARCH_MODE={raw.strip()[:40]!r} is not "
-            "'pipeline' or 'on_your_data'; using pipeline",
-        )
-        return "pipeline"
 
     def _query_generation_mode(self) -> str:
         """AZURE_AI_SEARCH_QUERY_GENERATION as "auto", "always" or "off"."""
@@ -714,53 +596,6 @@ class Pipe:
             "is not 'auto', 'always' or 'off'; using auto",
         )
         return "auto"
-
-    def _with_search_key(self, data_sources: List[Any]) -> List[Any]:
-        """
-        on_your_data mode: put the decrypted AZURE_AI_SEARCH_KEY into a copy of
-        every azure_search data source from AZURE_AI_DATA_SOURCES whose
-        authentication is missing or of type api_key, so the plaintext key can
-        be removed from the JSON. Never used for data_sources from the client
-        (that would send the key to an endpoint the client chose).
-        """
-        if not self.valves.AZURE_AI_SEARCH_KEY:
-            return data_sources
-        result = []
-        for source in data_sources:
-            params = source.get("parameters") if isinstance(source, dict) else None
-            auth = params.get("authentication") if isinstance(params, dict) else None
-            if (
-                isinstance(params, dict)
-                and source.get("type") == "azure_search"
-                and (
-                    auth is None
-                    or (
-                        isinstance(auth, dict)
-                        and auth.get("type") in (None, "", "api_key")
-                    )
-                )
-            ):
-                if isinstance(auth, dict) and auth.get("key"):
-                    self._warn_once(
-                        "search-key-twice",
-                        "Azure AI Search: AZURE_AI_SEARCH_KEY is set and wins over "
-                        "authentication.key; remove the plaintext key from "
-                        "AZURE_AI_DATA_SOURCES",
-                    )
-                key = EncryptedStr.decrypt(self.valves.AZURE_AI_SEARCH_KEY)
-                source = {
-                    **source,
-                    "parameters": {
-                        **params,
-                        "authentication": {
-                            **(auth or {}),
-                            "type": "api_key",
-                            "key": key,
-                        },
-                    },
-                }
-            result.append(source)
-        return result
 
     @staticmethod
     def _config_int(
@@ -837,10 +672,10 @@ class Pipe:
         except ValueError:
             return "", "", None
 
-    def _get_search_config(self, mode: str) -> Optional[Dict[str, Any]]:
+    def _get_search_config(self) -> Optional[Dict[str, Any]]:
         """
-        Read AZURE_AI_DATA_SOURCES (On Your Data azure_search format) as the
-        search configuration of pipeline mode.
+        Read AZURE_AI_DATA_SOURCES (the azure_search data source format of On
+        Your Data) as the search configuration.
 
         Returns:
             The normalized configuration, or None when the valve is not set
@@ -877,9 +712,9 @@ class Pipe:
             ]
             if types:
                 raise AzureSearchError(
-                    f"data source type '{types[0]}' is only supported with "
-                    "AZURE_AI_SEARCH_MODE=on_your_data; pipeline mode supports "
-                    "type azure_search"
+                    f"data source type '{types[0]}' is not supported; use type "
+                    "azure_search (other types needed Azure OpenAI On Your Data, "
+                    "which this pipeline no longer uses since 3.0.0)"
                 )
             raise AzureSearchError(
                 "AZURE_AI_DATA_SOURCES has no data source with type azure_search"
@@ -888,7 +723,7 @@ class Pipe:
             self._warn_once(
                 "several-sources",
                 "Azure AI Search: AZURE_AI_DATA_SOURCES has several data sources; "
-                "pipeline mode uses only the first azure_search entry",
+                "only the first azure_search entry is used",
             )
         source = search_sources[0]
         params = source.get("parameters")
@@ -912,8 +747,8 @@ class Pipe:
             names = ", ".join(name[:60] for name in sorted(unknown))
             self._warn_once(
                 f"unknown-keys:{names}",
-                f"Azure AI Search: pipeline mode ignores these keys of "
-                f"AZURE_AI_DATA_SOURCES: {names}",
+                f"Azure AI Search: these keys of AZURE_AI_DATA_SOURCES are "
+                f"ignored: {names}",
             )
 
         endpoint = self._http_url(params.get("endpoint"))
@@ -973,7 +808,6 @@ class Pipe:
             json.dumps(
                 [
                     raw,
-                    mode,
                     self.valves.AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS,
                     self.valves.AZURE_AI_SEARCH_API_VERSION,
                     self.valves.AZURE_AI_SEARCH_QUERY_GENERATION,
@@ -1078,8 +912,7 @@ class Pipe:
         if fields_mapping.get("image_vector_fields"):
             self._warn_once(
                 "image-vector-fields",
-                "Azure AI Search: pipeline mode ignores "
-                "fields_mapping.image_vector_fields",
+                "Azure AI Search: fields_mapping.image_vector_fields is ignored",
             )
 
         if fields_mapping:
@@ -1231,11 +1064,8 @@ class Pipe:
         self, response_data: Dict[str, Any]
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        Extract citations from an Azure AI response (streaming or non-streaming).
-
-        Supports both 'citations' and 'all_retrieved_documents' response structures.
-        When include_contexts includes 'all_retrieved_documents', the response contains
-        additional score fields like 'original_search_score' and 'rerank_score'.
+        Extract the citations of an answer (the context.citations the pipeline
+        added to a streamed delta or a non-streamed message).
 
         Args:
             response_data: Response data from Azure AI (can be a delta or full message)
@@ -1264,30 +1094,11 @@ class Pipe:
                 context = choice["message"].get("context")
 
             if context and isinstance(context, dict):
-                # Try citations first
                 if "citations" in context:
                     citations = context["citations"]
                     log.info(
                         f"Found {len(citations) if citations else 0} citations in context.citations"
                     )
-
-                # If all_retrieved_documents is present, merge score data into citations
-                if "all_retrieved_documents" in context:
-                    all_docs = context["all_retrieved_documents"]
-                    log.debug(
-                        f"Found {len(all_docs) if all_docs else 0} all_retrieved_documents"
-                    )
-
-                    # If we have both citations and all_retrieved_documents,
-                    # try to merge score data from all_retrieved_documents into citations
-                    if citations and all_docs:
-                        self._merge_score_data(citations, all_docs, log)
-                    elif all_docs and not citations:
-                        # Use all_retrieved_documents as citations if no citations found
-                        citations = all_docs
-                        log.info(
-                            f"Using {len(citations)} all_retrieved_documents as citations"
-                        )
             else:
                 log.debug(
                     f"No context found in response. Choice keys: {choice.keys() if isinstance(choice, dict) else 'not a dict'}"
@@ -1308,160 +1119,18 @@ class Pipe:
         log.debug("No valid citations found in response")
         return None
 
-    def _merge_score_data(
-        self,
-        citations: List[Dict[str, Any]],
-        all_docs: List[Dict[str, Any]],
-        log: logging.Logger,
-    ) -> None:
-        """
-        Merge score data from all_retrieved_documents into citations.
-
-        When include_contexts includes 'all_retrieved_documents', Azure returns
-        additional documents with score fields. This method attempts to match
-        them with citations and copy over the score data.
-
-        Copies:
-        - original_search_score: BM25/keyword search score
-        - rerank_score: Semantic reranker score (if enabled)
-        - filter_reason: Indicates which score is relevant ("score" or "rerank")
-
-        Args:
-            citations: List of citation objects to update (modified in place)
-            all_docs: List of all_retrieved_documents with score data
-            log: Logger instance
-        """
-        # Build multiple lookup maps to maximize matching chances
-        # all_retrieved_documents may have different keys than citations
-        doc_data_by_title = {}
-        doc_data_by_filepath = {}
-        doc_data_by_content = {}
-        doc_data_by_chunk_id = {}
-
-        for doc in all_docs:
-            doc_data = {
-                "original_search_score": doc.get("original_search_score"),
-                "rerank_score": doc.get("rerank_score"),
-                "filter_reason": doc.get("filter_reason"),
-            }
-
-            log.debug(
-                f"Processing all_retrieved_document: title='{doc.get('title')}', "
-                f"chunk_id='{doc.get('chunk_id')}', "
-                f"original_search_score={doc_data['original_search_score']}, "
-                f"rerank_score={doc_data['rerank_score']}, "
-                f"filter_reason={doc_data['filter_reason']}"
-            )
-
-            # Only store if we have at least one score
-            if (
-                doc_data["original_search_score"] is None
-                and doc_data["rerank_score"] is None
-            ):
-                log.debug(f"Skipping doc with no scores: {doc.get('title')}")
-                continue
-
-            # Index by title
-            if doc.get("title"):
-                doc_data_by_title[doc["title"]] = doc_data
-
-            # Index by filepath
-            if doc.get("filepath"):
-                doc_data_by_filepath[doc["filepath"]] = doc_data
-
-            # Index by chunk_id (may include title as prefix for uniqueness)
-            if doc.get("chunk_id") is not None:
-                # Store by plain chunk_id
-                doc_data_by_chunk_id[str(doc["chunk_id"])] = doc_data
-                # Also store by title-prefixed chunk_id for uniqueness
-                if doc.get("title"):
-                    chunk_key_with_title = f"{doc['title']}_{doc['chunk_id']}"
-                    doc_data_by_chunk_id[chunk_key_with_title] = doc_data
-
-            # Index by content prefix (first 100 chars)
-            if doc.get("content"):
-                content_key = (
-                    doc["content"][:100]
-                    if len(doc.get("content", "")) > 100
-                    else doc.get("content")
-                )
-                doc_data_by_content[content_key] = doc_data
-
-        log.debug(
-            f"Built score lookup: by_title={len(doc_data_by_title)}, "
-            f"by_filepath={len(doc_data_by_filepath)}, "
-            f"by_chunk_id={len(doc_data_by_chunk_id)}, "
-            f"by_content={len(doc_data_by_content)}"
-        )
-
-        # Match citations with score data using multiple strategies
-        matched = 0
-        for citation in citations:
-            doc_data = None
-
-            # Try matching by title first (most reliable)
-            if not doc_data and citation.get("title"):
-                doc_data = doc_data_by_title.get(citation["title"])
-                if doc_data:
-                    log.debug(f"Matched citation by title: {citation['title']}")
-
-            # Try matching by filepath
-            if not doc_data and citation.get("filepath"):
-                doc_data = doc_data_by_filepath.get(citation["filepath"])
-                if doc_data:
-                    log.debug(f"Matched citation by filepath: {citation['filepath']}")
-
-            # Try matching by chunk_id with title prefix
-            if not doc_data and citation.get("chunk_id") is not None:
-                chunk_key = str(citation["chunk_id"])
-                if citation.get("title"):
-                    chunk_key_with_title = f"{citation['title']}_{citation['chunk_id']}"
-                    doc_data = doc_data_by_chunk_id.get(chunk_key_with_title)
-                if not doc_data:
-                    doc_data = doc_data_by_chunk_id.get(chunk_key)
-                if doc_data:
-                    log.debug(f"Matched citation by chunk_id: {citation['chunk_id']}")
-
-            # Try matching by content prefix
-            if not doc_data and citation.get("content"):
-                content_key = (
-                    citation["content"][:100]
-                    if len(citation.get("content", "")) > 100
-                    else citation.get("content")
-                )
-                doc_data = doc_data_by_content.get(content_key)
-                if doc_data:
-                    log.debug("Matched citation by content prefix")
-
-            if doc_data:
-                if doc_data.get("original_search_score") is not None:
-                    citation["original_search_score"] = doc_data[
-                        "original_search_score"
-                    ]
-                if doc_data.get("rerank_score") is not None:
-                    citation["rerank_score"] = doc_data["rerank_score"]
-                if doc_data.get("filter_reason") is not None:
-                    citation["filter_reason"] = doc_data["filter_reason"]
-                matched += 1
-                log.debug(
-                    f"Citation scores: original={doc_data.get('original_search_score')}, "
-                    f"rerank={doc_data.get('rerank_score')}, "
-                    f"filter_reason={doc_data.get('filter_reason')}"
-                )
-
-        log.info(f"Merged score data for {matched}/{len(citations)} citations")
-
     def _normalize_citation_for_openwebui(
         self, citation: Dict[str, Any], index: int
     ) -> Dict[str, Any]:
         """
-        Normalize an Azure citation object to OpenWebUI citation event format.
+        Normalize a citation (built by _search_citation) to OpenWebUI citation
+        event format.
 
         The format follows OpenWebUI's official citation event structure:
         https://docs.openwebui.com/features/plugin/development/events#source-or-citation-and-code-execution
 
         Args:
-            citation: Azure citation object
+            citation: Citation of a document in the prompt
             index: Citation index (1-based)
 
         Returns:
@@ -1491,8 +1160,6 @@ class Pipe:
         # Use title with [docX] prefix as metadata source for OpenWebUI display
         # The UI may extract display name from metadata.source rather than source.name
         metadata_entry = {"source": title, "url": source_url}
-        if citation.get("metadata"):
-            metadata_entry.update(citation.get("metadata", {}))
 
         # Get document content (handle None values)
         content = citation.get("content") or ""
@@ -1508,87 +1175,15 @@ class Pipe:
         if source_url:
             citation_data["source"]["url"] = source_url
 
-        # Add distances array for relevance score (OpenWebUI uses this for percentage display)
-        # Azure AI Search returns filter_reason to indicate which score type is relevant:
-        # - filter_reason not present or "score": use original_search_score (BM25/keyword)
-        # - filter_reason "rerank": use rerank_score (semantic reranker)
-        # Reference: https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data
-        filter_reason = citation.get("filter_reason")
-        rerank_score = citation.get("rerank_score")
-        original_search_score = citation.get("original_search_score")
-        legacy_score = citation.get("score")
+        # Add distances array for relevance score (OpenWebUI uses this for
+        # percentage display): the relevance (0-1) computed from the search
+        # hit for its score type (semantic, BM25, vector, RRF; see
+        # _relevance). Without AZURE_AI_INCLUDE_SEARCH_SCORES it is missing
+        # and the card shows 0.
         relevance = citation.get("relevance")
-
-        normalized_score = 0.0
-
-        # Select score based on filter_reason as per Azure documentation:
-        # - filter_reason="rerank": Document filtered by rerank score threshold, use rerank_score
-        # - filter_reason="score" or not present: Document filtered by/passed original search score, use original_search_score
-        if relevance is not None:
-            # Pipeline mode: relevance (0-1) computed from the search hit for
-            # its score type (semantic, BM25, vector, RRF). On Your Data
-            # citations never carry it.
-            normalized_score = min(max(float(relevance), 0.0), 1.0)
-            log.debug(f"Using relevance (pipeline mode): {normalized_score}")
-        elif filter_reason == "rerank" and rerank_score is not None:
-            # Document filtered by rerank score - use rerank_score
-            # Cohere rerankers via Azure AI return scores in 0-4 range (source: Azure AI Search documentation)
-            # Most semantic rerankers return 0-1, so we normalize 0-4 range down to 0-1 for consistency.
-            # Reference: https://learn.microsoft.com/en-us/azure/search/semantic-ranking
-            score_val = float(rerank_score)
-            if score_val > 1.0:
-                normalized_score = min(score_val / self.valves.RERANK_SCORE_MAX, 1.0)
-            else:
-                normalized_score = score_val
-            log.debug(
-                f"Using rerank_score (filter_reason=rerank): {rerank_score} -> {normalized_score} "
-                f"(normalized via {self.valves.RERANK_SCORE_MAX})"
-            )
-        elif (
-            filter_reason is None or filter_reason == "score"
-        ) and original_search_score is not None:
-            # filter_reason is "score" or not present - use original_search_score
-            # BM25 scores are unbounded and vary by collection size and term distribution.
-            # We normalize by dividing by BM25_SCORE_MAX to produce a value in 0-1 range.
-            # This preserves relative ranking without hard-capping high-relevance documents.
-            # Reference: https://learn.microsoft.com/en-us/azure/search/index-ranking-similarity
-            score_val = float(original_search_score)
-            if score_val > 1.0:
-                normalized_score = min(score_val / self.valves.BM25_SCORE_MAX, 1.0)
-            else:
-                normalized_score = score_val
-            log.debug(
-                f"Using original_search_score (filter_reason={filter_reason}): {original_search_score} -> {normalized_score} "
-                f"(normalized via {self.valves.BM25_SCORE_MAX})"
-            )
-        elif original_search_score is not None:
-            # Fallback for unknown filter_reason values - use original_search_score
-            score_val = float(original_search_score)
-            if score_val > 1.0:
-                normalized_score = min(score_val / self.valves.BM25_SCORE_MAX, 1.0)
-            else:
-                normalized_score = score_val
-            log.debug(
-                f"Using original_search_score (fallback, filter_reason={filter_reason}): {original_search_score} -> {normalized_score} "
-                f"(normalized via {self.valves.BM25_SCORE_MAX})"
-            )
-        elif rerank_score is not None:
-            # Fallback to rerank_score if available but filter_reason doesn't match
-            score_val = float(rerank_score)
-            if score_val > 1.0:
-                normalized_score = min(score_val / self.valves.RERANK_SCORE_MAX, 1.0)
-            else:
-                normalized_score = score_val
-            log.debug(
-                f"Using rerank_score (fallback): {rerank_score} -> {normalized_score} "
-                f"(normalized via {self.valves.RERANK_SCORE_MAX})"
-            )
-        elif legacy_score is not None:
-            normalized_score = float(legacy_score)
-            log.debug(f"Using legacy score: {legacy_score}")
-        else:
-            log.debug("No score available, using default 0.0")
-
+        normalized_score = (
+            min(max(float(relevance), 0.0), 1.0) if relevance is not None else 0.0
+        )
         citation_data["distances"] = [normalized_score]
 
         # Build complete citation event structure
@@ -1604,8 +1199,7 @@ class Pipe:
                 f"Normalized citation {index}: title='{title}', "
                 f"content_length={len(content)}, "
                 f"url='{source_url}', "
-                f"filter_reason={filter_reason}, "
-                f"rerank_score={rerank_score}, original_search_score={original_search_score}, "
+                f"relevance={relevance}, "
                 f"distances={citation_data['distances']}, "
                 f"event={json.dumps(citation_event, default=str)[:500]}"
             )
@@ -1955,7 +1549,7 @@ class Pipe:
         do not exist, such as [doc9] with 3 citations, do not count), all
         citations are emitted, or none when
         AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES is off or
-        allow_fallback is False (a tool call round of pipeline mode).
+        allow_fallback is False (a tool call round).
 
         Args:
             citations: List of Azure citation objects
@@ -2065,7 +1659,7 @@ class Pipe:
         tool_round: bool,
     ) -> None:
         """
-        Emit the citations of a pipeline mode answer. Open WebUI calls the
+        Emit the citations of an Azure AI Search answer. Open WebUI calls the
         pipe again for every tool round of the same message, so a round that
         ends in tool calls emits only the documents it references, the "no
         references" fallback runs only when no round referenced anything, and
@@ -2314,11 +1908,11 @@ class Pipe:
         Enhanced stream processor that can handle Azure AI Search citations in streaming responses.
 
         Args:
-            content: The streaming content from the response
+            content: The streaming content from the response, starting with
+                the context event of the citations (_prepend_context_event)
             __event_emitter__: Optional event emitter for status updates
-            citation_state: Pipeline mode only: retrieval state of the chat
-                message, shared by its tool rounds (see
-                _emit_search_citation_events). None for On Your Data.
+            citation_state: Retrieval state of the chat message, shared by
+                its tool rounds (see _emit_search_citation_events)
 
         Yields:
             Bytes from the streaming content with enhanced citations
@@ -2333,8 +1927,10 @@ class Pipe:
         stream_meta: Dict[str, Any] = {}
         # Whether "data: [DONE]" was passed on
         done_sent = False
-        # Whether the answer asked for tool calls (pipeline mode)
+        # Whether the answer asked for tool calls
         tool_round = False
+        if citation_state is None:
+            citation_state = {}
 
         try:
             full_response_buffer = ""
@@ -2349,21 +1945,12 @@ class Pipe:
 
                 # Extract content from delta messages to build the full response content
                 response_content += self._read_sse_chunk(chunk_str, stream_meta)
-                if (
-                    citation_state is not None
-                    and not tool_round
-                    and "tool_calls" in chunk_str
-                ):
+                if not tool_round and "tool_calls" in chunk_str:
                     tool_round = self._sse_has_tool_calls(chunk_str)
 
-                # Look for citations or all_retrieved_documents in any part of the response
-                if (
-                    "citations" in chunk_str.lower()
-                    or "all_retrieved_documents" in chunk_str.lower()
-                ) and not citations_data:
-                    log.debug(
-                        "Found 'citations' or 'all_retrieved_documents' in chunk, attempting to parse..."
-                    )
+                # Look for the citations (the first event of the stream)
+                if "citations" in chunk_str.lower() and not citations_data:
+                    log.debug("Found 'citations' in chunk, attempting to parse...")
 
                     # Try to extract citation data from the current buffer
                     try:
@@ -2381,7 +1968,6 @@ class Pipe:
 
                                         # Check multiple possible locations for citations
                                         citations_found = None
-                                        all_docs_found = None
 
                                         if (
                                             isinstance(response_data, dict)
@@ -2414,26 +2000,8 @@ class Pipe:
                                                         log.debug(
                                                             f"Found citations in context: {len(citations_found)} citations"
                                                         )
-                                                    # Check for all_retrieved_documents
-                                                    if (
-                                                        "all_retrieved_documents"
-                                                        in context
-                                                    ):
-                                                        all_docs_found = context[
-                                                            "all_retrieved_documents"
-                                                        ]
-                                                        log.debug(
-                                                            f"Found all_retrieved_documents in context: {len(all_docs_found)} docs"
-                                                        )
                                                     break
 
-                                        # Merge score data if we have both
-                                        if citations_found and all_docs_found:
-                                            self._merge_score_data(
-                                                citations_found, all_docs_found, log
-                                            )
-
-                                        # Use citations if found, otherwise use all_retrieved_documents
                                         if citations_found and not citations_data:
                                             citations_data = citations_found
                                             # Build citation URLs map once when citations are found
@@ -2444,17 +2012,6 @@ class Pipe:
                                             )
                                             log.info(
                                                 f"Successfully extracted {len(citations_data)} citations from stream"
-                                            )
-                                        elif all_docs_found and not citations_data:
-                                            citations_data = all_docs_found
-                                            # Build citation URLs map once when citations are found
-                                            citation_urls = (
-                                                self._build_citation_urls_map(
-                                                    citations_data
-                                                )
-                                            )
-                                            log.info(
-                                                f"Using {len(citations_data)} all_retrieved_documents as citations"
                                             )
                                             # Note: OpenWebUI citation events are emitted after the stream ends
                                             # to filter only citations referenced in the response content
@@ -2509,18 +2066,13 @@ class Pipe:
             if citations_data and __event_emitter__:
                 log.info("Emitting OpenWebUI citation events at end of stream...")
                 # Filter to only citations referenced in the response content
-                if citation_state is None:
-                    await self._emit_openwebui_citation_events(
-                        citations_data, __event_emitter__, response_content
-                    )
-                else:
-                    await self._emit_search_citation_events(
-                        citations_data,
-                        __event_emitter__,
-                        response_content,
-                        citation_state,
-                        tool_round,
-                    )
+                await self._emit_search_citation_events(
+                    citations_data,
+                    __event_emitter__,
+                    response_content,
+                    citation_state,
+                    tool_round,
+                )
 
             # Send completion status update when streaming is done
             if __event_emitter__:
@@ -2555,8 +2107,8 @@ class Pipe:
                 ):
                     yield item
         finally:
-            # A wrapped stream (pipeline mode: context event first) is closed
-            # here instead of being left to the garbage collector
+            # The wrapped stream (context event first) is closed here instead
+            # of being left to the garbage collector
             try:
                 aclose = getattr(content, "aclose", None)
                 if aclose:
@@ -2634,7 +2186,7 @@ class Pipe:
         Describe an error that ended a stream.
 
         The message of aiohttp's LineTooLong contains the start of the line,
-        which can be document content, so it is replaced by the limit.
+        which can be answer or document text, so it is replaced by the limit.
 
         Args:
             error: The exception raised while the stream was processed
@@ -2646,9 +2198,7 @@ class Pipe:
             limit_mib = 2 * self.STREAM_READ_BUFSIZE // (1024 * 1024)
             return (
                 f"Azure AI sent a stream event larger than {limit_mib} MiB, which "
-                "cannot be read. With Azure AI Search, retrieve fewer or shorter "
-                "documents (for example a lower top_n_documents) or set "
-                "AZURE_AI_INCLUDE_SEARCH_SCORES=false."
+                "cannot be read."
             )
         return str(error) or type(error).__name__
 
@@ -2798,7 +2348,7 @@ class Pipe:
                 # Suppress close-time errors (e.g., SSL shutdown timeouts)
                 pass
 
-    # --- Azure AI Search in pipeline mode: query text -------------------------
+    # --- Azure AI Search: query text ------------------------------------------
 
     @staticmethod
     def _message_text(message: Any) -> str:
@@ -2886,7 +2436,7 @@ class Pipe:
             for message in messages[: current or 0]
         )
 
-    # --- Azure AI Search in pipeline mode: query generation -------------------
+    # --- Azure AI Search: query generation ------------------------------------
 
     def _query_generation_model(
         self, filtered_body: Dict[str, Any], headers: Dict[str, str]
@@ -3093,7 +2643,7 @@ class Pipe:
             return None
         return queries
 
-    # --- Azure AI Search in pipeline mode: HTTP, auth, embeddings, search ----
+    # --- Azure AI Search: HTTP, auth, embeddings, search ---------------------
 
     async def _post_json(
         self,
@@ -3556,7 +3106,7 @@ class Pipe:
             )
         raise self._search_error(config, status, data, request_id, log)
 
-    # --- Azure AI Search in pipeline mode: hits, selection, budget ------------
+    # --- Azure AI Search: hits, selection, budget -----------------------------
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
@@ -3831,7 +3381,7 @@ class Pipe:
                 citation["relevance"] = relevance
         return citation
 
-    # --- Azure AI Search in pipeline mode: retrieval ---------------------------
+    # --- Azure AI Search: retrieval --------------------------------------------
 
     @staticmethod
     def _retrieval_cache_key(
@@ -3921,7 +3471,7 @@ class Pipe:
         log: logging.Logger,
     ) -> Optional[Dict[str, Any]]:
         """
-        Pipeline mode retrieval: query text, optional query generation,
+        Azure AI Search retrieval: query text, optional query generation,
         embeddings, the searches, strictness, merge, top_n_documents and the
         token budget. A tool round of a message reuses the result of its
         first round.
@@ -4073,7 +3623,7 @@ class Pipe:
             "referenced_any": False,
         }
         log.info(
-            f"Azure AI Search (pipeline mode): {len(queries)} "
+            f"Azure AI Search: {len(queries)} "
             f"{'query' if len(queries) == 1 else 'queries'}, hits per query "
             f"{hits_per_query}, {len(citations)} documents kept, "
             f"{sum(len(text) for text in texts)} characters injected, query "
@@ -4095,7 +3645,7 @@ class Pipe:
             )
         return retrieval
 
-    # --- Azure AI Search in pipeline mode: prompt and context -----------------
+    # --- Azure AI Search: prompt and context ----------------------------------
 
     def _documents_block(self, citations: List[Dict[str, Any]]) -> str:
         """The <documents> block with the numbered documents ([docN])."""
@@ -4247,7 +3797,7 @@ class Pipe:
             __task__: Open WebUI background task (e.g. "title_generation"),
                 None for regular chat requests
             __metadata__: Open WebUI request metadata (user_prompt, chat and
-                message id), used by Azure AI Search in pipeline mode
+                message id), used by Azure AI Search
 
         Returns:
             Response from Azure AI API, which could be a string, dictionary or streaming response
@@ -4295,7 +3845,6 @@ class Pipe:
             "tool_choice",
             "tools",
             "top_p",
-            "data_sources",
             "stream_options",
         }
         filtered_body = {k: v for k, v in body.items() if k in allowed_params}
@@ -4321,57 +3870,14 @@ class Pipe:
                 else filtered_body["model"]
             )
 
-        # Azure AI Search: "pipeline" queries the index itself (below, inside
-        # the try), "on_your_data" sends data_sources to Azure OpenAI.
-        search_mode = self._search_mode()
-        client_data_sources = None
-        if __task__:
-            # Background tasks (title, tags, follow-up generation, ...) are
-            # answered by the model itself: grounding them in Azure AI Search
-            # only costs a search and returns citations nobody asked for.
-            filtered_body.pop("data_sources", None)
-        elif search_mode == "on_your_data":
-            if "data_sources" not in filtered_body:
-                # Add Azure AI data sources if configured and not already present in request
-                azure_ai_data_sources = self.get_azure_ai_data_sources()
-                if azure_ai_data_sources:
-                    filtered_body["data_sources"] = self._with_search_key(
-                        azure_ai_data_sources
-                    )
-        else:
-            # Pipeline mode never fetches or forwards data_sources of the
-            # client (endpoint, key and filter chosen by the client); a
-            # request with them ends with an error below.
-            client_data_sources = filtered_body.pop("data_sources", None)
+        # data_sources (Azure OpenAI On Your Data, removed in 3.0.0) are never
+        # forwarded (they are not in allowed_params) nor fetched: endpoint,
+        # key and filter would be chosen by the client. A chat request with
+        # them ends with an error below; background tasks (title, tags,
+        # follow-up generation, ...) ignore them, as they skip the search.
+        client_data_sources = None if __task__ else body.get("data_sources")
 
-        uses_data_sources = "data_sources" in filtered_body
-        sent_data_sources = bool(filtered_body.get("data_sources"))
-
-        if uses_data_sources:
-            # From the valve or from the client; background tasks never get
-            # here with data_sources (removed above). An empty list from the
-            # client uses no data source and must not use up the notice.
-            if filtered_body.get("data_sources") and _first_on_your_data_request():
-                log.warning(ON_YOUR_DATA_RETIREMENT_NOTICE)
-
-            # Azure OpenAI "On Your Data" does not support `stream_options`
-            # (the request fails with "Extra inputs are not permitted"). Open
-            # WebUI 0.11.1+ adds it to streaming requests of models with the
-            # usage capability, so remove it here.
-            filtered_body.pop("stream_options", None)
-
-            # With `tools` in the request, Azure ignores `data_sources` unless
-            # `tool_choice` is "none". Open WebUI's native function calling
-            # adds its built-in tools to every chat, which would silently
-            # switch off Azure AI Search, so tools are not sent along with it.
-            dropped_tools = filtered_body.pop("tools", None)
-            filtered_body.pop("tool_choice", None)
-            if dropped_tools:
-                log.info(
-                    f"Not forwarding {len(dropped_tools)} tool definitions: "
-                    "Azure OpenAI On Your Data ignores data_sources when tools are present"
-                )
-        elif filtered_body.get("stream"):
+        if filtered_body.get("stream"):
             # Request usage data in streaming responses so the middleware can extract it.
             filtered_body["stream_options"] = {"include_usage": True}
         else:
@@ -4398,11 +3904,10 @@ class Pipe:
             # terminal "Error: ..." status and the session cleanup.
             if client_data_sources:
                 raise AzureSearchError(self.CLIENT_DATA_SOURCES_ERROR)
-            search_config = (
-                self._get_search_config(search_mode)
-                if search_mode == "pipeline" and not __task__
-                else None
-            )
+            # Background tasks are answered by the model itself: grounding
+            # them in Azure AI Search only costs a search and returns
+            # citations nobody asked for.
+            search_config = None if __task__ else self._get_search_config()
 
             session = aiohttp.ClientSession(
                 trust_env=True,
@@ -4429,7 +3934,6 @@ class Pipe:
                         bool(filtered_body.get("tools")),
                     )
             search_citations = retrieval["citations"] if retrieval else []
-            uses_search = uses_data_sources or bool(search_citations)
 
             # Convert the modified body back to JSON
             payload = json.dumps(filtered_body)
@@ -4498,7 +4002,7 @@ class Pipe:
 
                 # Use enhanced stream processor if Azure AI Search is used for this request
                 if search_citations:
-                    # Pipeline mode: the citations go first, as delta.context
+                    # The citations go first, as delta.context
                     stream = self.stream_processor_with_citations(
                         self._prepend_context_event(
                             request.content,
@@ -4509,13 +4013,6 @@ class Pipe:
                         response=request,
                         session=session,
                         citation_state=retrieval,
-                    )
-                elif uses_data_sources:
-                    stream = self.stream_processor_with_citations(
-                        request.content,
-                        __event_emitter__=__event_emitter__,
-                        response=request,
-                        session=session,
                     )
                 else:
                     stream = self.stream_processor(
@@ -4545,8 +4042,8 @@ class Pipe:
 
                 request.raise_for_status()
 
-                # Pipeline mode: the citations as message.context, as On Your
-                # Data returned them (API clients read them there)
+                # The citations as message.context, as On Your Data returned
+                # them (API clients read them there)
                 tool_round = False
                 if search_citations and isinstance(response, dict):
                     choices = response.get("choices")
@@ -4563,7 +4060,7 @@ class Pipe:
                         )
 
                 # Enhance Azure Search responses with citation linking and emit citation events
-                if isinstance(response, dict) and uses_search:
+                if isinstance(response, dict) and search_citations:
                     response = self.enhance_azure_search_response(response)
 
                     # Emit OpenWebUI citation events for non-streaming responses
@@ -4580,18 +4077,13 @@ class Pipe:
                                 message = response["choices"][0].get("message") or {}
                                 # "content" is null e.g. for a filtered answer
                                 response_content = message.get("content") or ""
-                            if search_citations:
-                                await self._emit_search_citation_events(
-                                    citations,
-                                    __event_emitter__,
-                                    response_content,
-                                    retrieval,
-                                    tool_round,
-                                )
-                            else:
-                                await self._emit_openwebui_citation_events(
-                                    citations, __event_emitter__, response_content
-                                )
+                            await self._emit_search_citation_events(
+                                citations,
+                                __event_emitter__,
+                                response_content,
+                                retrieval,
+                                tool_round,
+                            )
 
                 # Send completion status update
                 if __event_emitter__:
@@ -4635,10 +4127,6 @@ class Pipe:
                 elif isinstance(response, str):
                     detail = response
 
-                status = request.status if request is not None else None
-                if sent_data_sources and status in (400, 404):
-                    # On Your Data after its retirement (or a broken request)
-                    detail += self.ON_YOUR_DATA_RETIRED_HINT
                 error = response.get("error") if isinstance(response, dict) else None
                 if (
                     retrieval

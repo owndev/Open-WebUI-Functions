@@ -1,23 +1,21 @@
 """
-Group ``rag`` of the azure suite (suites/azure.py): the pipeline-side Azure AI
-Search retrieval of pipelines/azure/azure_ai_foundry.py 2.9.0 (#187,
-``AZURE_AI_SEARCH_MODE=pipeline``) against mocks/mock_search.py (Azure AI
-Search, managed identity tokens) and mocks/mock_azure.py (chat, query
-generation, embeddings, emulated On Your Data retirement).
+Group ``rag`` of the azure suite (suites/azure.py): the Azure AI Search
+retrieval of pipelines/azure/azure_ai_foundry.py (3.0.0, #187) against
+mocks/mock_search.py (Azure AI Search, managed identity tokens) and
+mocks/mock_azure.py (chat, query generation, embeddings, tool calls).
 
-The rag valves use the deployment gpt-5-mini, for which mock_azure rejects
-``data_sources`` ("On Your Data is retired (mock)"). Files older than 2.9.0
-send ``data_sources``, so every behaviour check fails with that answer and is
-KNOWN ``azure-oyd-retired``; from 2.9.0 on the marker is off and every check
-must pass (a failure is a regression, a pass an obsolete marker). Checks that
-would not fail with that evidence on older files (no ``data_sources`` sent,
-``on_your_data`` mode on purpose) only run from 2.9.0 on and are not tagged.
+The pipe no longer uses Azure OpenAI On Your Data: it never sends
+``data_sources``, and a request that carries them ends with an error that
+names the removal (``client-data-sources.*``). The checks of the former
+``oyd`` group whose behaviour still exists (``[docX]`` links, history
+unlinking, sources and the show-all valve, scores, large and too large stream
+events, ``content: null``, background tasks also without a websocket session)
+run here against the pipe's own retrieval.
 
-Order: all pipeline-mode checks, then ``rag.notice.none`` (pipeline mode never
-logs the On Your Data notice), then the ``on_your_data`` sub-checks, which log
-it legitimately (the notice is logged once per loaded copy of the module), and
-last ``rag.log.debug``, which runs the staged file in the driver process with
-every logger at DEBUG.
+Order: every check that uses the function as installed, then ``mode.*``
+(saves the function again, first with the AZURE_AI_SEARCH_MODE valve of a
+2.9.0 pre-release) and last ``rag.log.debug``, which runs the staged file in
+the driver process with every logger at DEBUG.
 
 Loaded by suites/azure.py when the group runs (modules starting with ``_`` are
 not suites).
@@ -32,15 +30,18 @@ import re
 import sys
 import time
 import types
+import uuid
 from typing import Optional
 
-from harness import Suite, known, short
+from harness import Suite, short
 from harness.config import FUNCTIONS_DIR
-from harness.known import staged_version, version_tuple
+from harness.owui import completion_text
 from suites.azure import (
     ALL_SOURCES,
     FID,
+    FILLER,
     KEY,
+    LINE_TOO_LONG,
     LINKED,
     NO_REFS,
     PAREN_LINKED,
@@ -51,28 +52,26 @@ from suites.azure import (
     RAG_SEARCH_KEY,
     RAG_SEARCH_TOKEN,
     REFERENCED_SOURCES,
-    RETIRED_HINT,
-    SEARCH_SINCE,
+    SEARCH_MODE,
     SHOW_ALL,
     SPLIT_LINK,
+    STREAM_ERROR,
     TASKS,
     TOOLS,
     UNLINKED,
     _answered,
     _is_task,
     _last_status,
-    _oyd_notices,
     _status_sequence,
     _statuses,
     _wait_tasks,
 )
 
-KNOWN = known.AZURE_OYD_RETIRED
 DEPLOYMENT = "gpt-5-mini"
 MODEL = f"{FID}.{DEPLOYMENT}"
 PAUSE_DEPLOYMENT = "gpt-5-pause"  # query generation pause (per model)
 RESET_DEPLOYMENT = "gpt-5-reset"  # timeouts that are not in a row
-OYD_DEPLOYMENT = "gpt-4.1"  # still accepted with data_sources by the mock
+DOTTED_DEPLOYMENT = "gpt-4.1"  # a model name with a dot
 QUESTION = "x100 charging and warranty?"
 AGAIN = "x100 charging and warranty again?"
 INDEX = "x100-docs"
@@ -108,8 +107,8 @@ STATUS_RAG_STREAM = [
 STATUS_RAG_NONSTREAM = [STATUS_SEARCH, STATUS_SENDING, "Request completed"]
 ERROR_PREFIX = "Error: Azure AI Search:"
 CLIENT_DS_ERROR = (
-    "Error: Azure AI Search: data_sources in the request is not supported in "
-    "pipeline mode"
+    "Error: Azure AI Search: data_sources in the request is not supported: this "
+    "pipeline no longer uses Azure OpenAI On Your Data (removed in 3.0.0)"
 )
 CONTEXT_HINT = (
     "lower AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS or top_n_documents, or start a new chat"
@@ -117,11 +116,9 @@ CONTEXT_HINT = (
 # Server-log signatures of provoked errors.
 SEARCH_ERROR = ("function_azure:pipe", "Azure AI Search")
 CHAT_ERROR = ("function_azure:pipe", "Error in Azure AI request")
-OLD_FOUNDRY_ERROR = (
-    "function_azure:pipe",
-    "Error in Azure AI request: 400",
-    "/models/chat/completions",
-)
+# A valve of the 2.9.0 pre-releases (stored in Open WebUI's database or set
+# as an environment variable) that 3.0.0 no longer has
+STALE_MODE_VALVE = f'        {SEARCH_MODE}: str = Field(default="pipeline")\n'
 MI_RESOURCE_ID = (
     "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/e2e/"
     "providers/Microsoft.ManagedIdentity/userAssignedIdentities/e2e-uami"
@@ -275,7 +272,7 @@ def _search_brief(entries: list) -> str:
 
 
 def _answer(content) -> str:
-    """The answer first (the KNOWN evidence of older files is in it)."""
+    """The answer first (an error text shows at once)."""
     return f"answer={short(content or '', 120)}"
 
 
@@ -363,11 +360,6 @@ class Rag:
     def __init__(self, t: Suite, mock, search, base_valves: dict):
         self.t, self.mock, self.search, self.base = t, mock, search, base_valves
 
-    @property
-    def fixed(self) -> bool:
-        """The staged file has the pipeline mode (2.9.0+)."""
-        return version_tuple(staged_version(PATH)) >= version_tuple(SEARCH_SINCE)
-
     def ds(self, auth="key", **parameters) -> dict:
         """One azure_search data source on the Search mock (endpoint with a
         trailing "/", which the pipe has to strip)."""
@@ -393,7 +385,6 @@ class Rag:
             "AZURE_AI_INCLUDE_SEARCH_SCORES": True,
             SHOW_ALL: True,
             "AZURE_AI_DATA_SOURCES": ds if isinstance(ds, str) else json.dumps(ds),
-            "AZURE_AI_SEARCH_MODE": "pipeline",
             "AZURE_AI_SEARCH_KEY": "",
             "AZURE_AI_SEARCH_API_VERSION": API_VERSION,
             "AZURE_AI_SEARCH_QUERY_GENERATION": "auto",
@@ -441,10 +432,8 @@ class Rag:
     async def tokens(self) -> list:
         return await self.search.requests(lambda e: bool(e.get("msi")))
 
-    def check(self, sid: str, title: str, ok, detail: str, tagged: bool = True):
-        return self.t.check(
-            f"rag.{sid}", title, ok, detail, known=KNOWN if tagged else None
-        )
+    def check(self, sid: str, title: str, ok, detail: str):
+        return self.t.check(f"rag.{sid}", title, ok, detail)
 
     async def settle_errors(self, mark: int, *signatures) -> None:
         """Errors the scenario provoked on purpose (after a short settle)."""
@@ -455,16 +444,18 @@ class Rag:
 # -------------------------------------------------------------------- group
 async def rag(t: Suite, mock, base_valves: dict) -> None:
     r = Rag(t, mock, t.mock("search"), base_valves)
-    notice_before = bool(_oyd_notices(t, t.log_start))
-    group_mark = t.mark()
     await rag_api(r)
     await rag_browser(r)
     await rag_tool_round(r)
     await rag_cache(r)
     await rag_links(r)
+    await rag_links_browser(r)
+    await rag_history(r)
     await rag_query_text(r)
     await rag_no_refs(r)
     await rag_scores(r)
+    await rag_events(r)
+    await rag_content_null(r)
     await rag_query_types(r)
     await rag_vector(r)
     await rag_fields(r)
@@ -478,15 +469,14 @@ async def rag(t: Suite, mock, base_valves: dict) -> None:
     await rag_config(r)
     await rag_not_configured(r)
     await rag_tasks(r)
+    await rag_no_session(r)
     await rag_client_data_sources(r)
     await rag_qgen(r)
     await rag_auth(r)
-    await rag_mode_unknown(r)
     await rag_context_length(r)
     await rag_stop(r)
-    await rag_notice_none(r, notice_before, group_mark)
-    # on_your_data on purpose: these log the On Your Data notice
-    await rag_oyd_mode(r)
+    # saves the function again (a fresh module)
+    await rag_mode_removed(r)
     await rag_debug_log(r)
     await t.owui.update_valves(FID, **base_valves)
 
@@ -521,21 +511,28 @@ async def rag_api(r: Rag) -> None:
         )
         and s.get("body") == {"search": QUESTION, "queryType": "simple", "top": 10}
     )
+    chat_ok = (
+        chat.get("path") == f"/openai/deployments/{DEPLOYMENT}/chat/completions"
+        and chat.get("api_version") == "2025-04-01-preview"
+    )
     r.check(
         "api.nonstream",
-        "API non-stream (pipeline mode): [docX] links; chat request without "
-        "data_sources, documents [doc1]-[doc3] in a <documents> block (title / "
-        "file, no URL) before the user text, rules in the one system message; "
-        "one search (path, api-version 2026-04-01, api-key, body {search, "
-        "queryType simple, top 10}); message.context citations and intent",
+        "API non-stream: [docX] links; chat request to the path and api-version "
+        "of AZURE_AI_ENDPOINT (Azure OpenAI deployment) without data_sources, "
+        "documents [doc1]-[doc3] in a <documents> block (title / file, no URL) "
+        "before the user text, rules in the one system message; one search "
+        "(path, api-version 2026-04-01, api-key, body {search, queryType "
+        "simple, top 10}); message.context citations and intent",
         res.status == 200
         and res.content == LINKED
         and "stream_options" not in body
+        and chat_ok
         and prompt_ok
         and search_ok
         and _titles(citations) == TITLES
         and _intent(context) == [QUESTION],
         f"{_answer(res.content)} HTTP {res.status} {_chat_brief(chat)} "
+        f"api_version={chat.get('api_version')} "
         f"block_format={DOC1_BLOCK in block and DOC2_BLOCK in block} "
         f"url_in_block={'http' in block} {_search_brief(searches)} "
         f"search_body={short(s.get('body'), 120)} citations={_titles(citations)} "
@@ -549,7 +546,7 @@ async def rag_api(r: Rag) -> None:
     ctx_index, content_index, context = _stream_context(res.raw)
     r.check(
         "api.stream",
-        "API stream (pipeline mode): [docX] links and [DONE]; a first event with "
+        "API stream: [docX] links and [DONE]; a first event with "
         "delta.context (3 citations) before any content; stream_options."
         "include_usage forwarded, usage 18",
         res.status == 200
@@ -575,10 +572,8 @@ async def rag_api(r: Rag) -> None:
         AZURE_AI_ENDPOINT=f"{r.mock.url}/models/chat/completions"
         "?api-version=2024-05-01-preview"
     )
-    mark = await r.reset()
+    await r.reset()
     res = await t.owui.chat(MODEL, QUESTION, stream=True)
-    if not r.fixed:
-        await r.settle_errors(mark, OLD_FOUNDRY_ERROR)
     chat, searches = await r.chat(), await r.searches()
     r.check(
         "api.foundry",
@@ -607,7 +602,7 @@ async def rag_api(r: Rag) -> None:
         r.check(
             f"tools.api.{kind}",
             "client tools / tool_choice are forwarded together with the "
-            f"retrieval (pipeline mode; stream={stream})",
+            f"retrieval (stream={stream})",
             res.status == 200
             and res.content == LINKED
             and body.get("tools") == TOOLS
@@ -805,14 +800,43 @@ async def rag_links(r: Rag) -> None:
         chat = await r.chat()
         r.check(
             sid,
-            f"API stream '{text}' (pipeline mode): references linked once, "
-            "[DONE] forwarded",
+            f"API stream '{text}': references linked once, [DONE] forwarded",
             res.status == 200
             and res.content == expected
             and res.done
             and _grounded(chat),
             f"{_answer(res.content)} done={res.done} {_chat_brief(chat)}",
         )
+
+    await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION + " paren-url", stream=False)
+    chat = await r.chat()
+    r.check(
+        "paren-url.nonstream",
+        "API non-stream: parentheses in a citation URL are percent-encoded in the link",
+        res.status == 200 and res.content == PAREN_LINKED and _grounded(chat),
+        f"{_answer(res.content)} {_chat_brief(chat)}",
+    )
+
+    await r.set(AZURE_AI_MODEL=f"{DEPLOYMENT};{DOTTED_DEPLOYMENT}")
+    await r.reset()
+    res = await t.owui.chat(f"{FID}.{DOTTED_DEPLOYMENT}", QUESTION, stream=True)
+    chat, searches = await r.chat(), await r.searches()
+    body_model = (chat.get("body") or {}).get("model")
+    r.check(
+        "dotted.stream",
+        f"API stream with a dotted model name ({DOTTED_DEPLOYMENT}): the name "
+        "reaches upstream intact (header and body), linked answer, [DONE]",
+        res.status == 200
+        and res.content == LINKED
+        and res.done
+        and chat.get("model_header") == DOTTED_DEPLOYMENT
+        and body_model == DOTTED_DEPLOYMENT
+        and _grounded(chat)
+        and len(searches) == 1,
+        f"{_answer(res.content)} header={chat.get('model_header')!r} "
+        f"body.model={body_model!r} {_chat_brief(chat)} {_search_brief(searches)}",
+    )
 
     await r.set(AZURE_AI_SEARCH_QUERY_GENERATION="off")
     await r.reset()
@@ -833,6 +857,87 @@ async def rag_links(r: Rag) -> None:
         and _grounded(chat)
         and chat.get("current_user_index") == len(messages) - 1,
         f"{_answer(res.content)} sent={sent!r} {_chat_brief(chat)}",
+    )
+
+
+async def rag_links_browser(r: Rag) -> None:
+    """[docX] references split across stream deltas in the browser path (as
+    the web UI sends it, Open WebUI's built-in tools on)."""
+    t = r.t
+    await r.set()
+    async with t.browser() as b:
+        for sid, text, expected in (
+            ("split-tokens.browser", QUESTION + " split-tokens", LINKED),
+            ("split-link.browser", QUESTION + " split-link", SPLIT_LINK),
+            ("no-finish.browser", QUESTION + " split-tokens no-finish", LINKED[:-1]),
+        ):
+            await r.reset()
+            c = await b.chat(MODEL, text, stream=True)
+            chat = await r.chat()
+            r.check(
+                sid,
+                f"browser stream '{text}': linked answer saved, only the "
+                "referenced sources",
+                c.done
+                and c.content == expected
+                and c.source_names == REFERENCED_SOURCES
+                and _grounded(chat),
+                f"{c.brief()} {_chat_brief(chat)}",
+            )
+
+
+def _sent_assistant(entry: dict):
+    """Text of the first assistant message of a recorded chat request."""
+    return next(
+        (
+            _text(m.get("content"))
+            for m in _messages(entry)
+            if m.get("role") == "assistant"
+        ),
+        None,
+    )
+
+
+async def rag_history(r: Rag) -> None:
+    """Links of earlier answers saved before 2.8.0 (unencoded parentheses in
+    the URL) go back as plain [docX]; a hostile history line stays linear."""
+    t = r.t
+    await r.set(AZURE_AI_SEARCH_QUERY_GENERATION="off")
+    earlier = "y [[doc1]](https://docs.example.com/a_(b).pdf) z"
+    await r.reset()
+    res = await t.owui.chat(MODEL, _followup(AGAIN, earlier), stream=False)
+    chat = await r.chat()
+    sent = _sent_assistant(chat)
+    r.check(
+        "legacy-history-paren",
+        "links saved before 2.8.0 with ')' in the URL go back as plain [docX]",
+        res.status == 200
+        and res.content == LINKED
+        and sent == "y [doc1] z"
+        and _grounded(chat),
+        f"{_answer(res.content)} sent={sent!r} {_chat_brief(chat)}",
+    )
+
+    # Any API client can send this history: a long line of unclosed links must
+    # not make the unlinking quadratic (it runs in the event loop).
+    hostile = "[[doc1]](" * 9000 + "x"
+    await r.reset()
+    started = time.monotonic()
+    res = await t.owui.chat(MODEL, _followup(AGAIN, hostile), stream=False)
+    elapsed = time.monotonic() - started
+    chat = await r.chat()
+    sent = _sent_assistant(chat)
+    r.check(
+        "history-hostile",
+        "81 KB history line of unclosed [[docX]]( links: passed through "
+        "unchanged in under 3 s (unlinking stays linear)",
+        res.status == 200
+        and res.content == LINKED
+        and sent == hostile
+        and elapsed < 3.0
+        and _grounded(chat),
+        f"{_answer(res.content)} elapsed={elapsed:.2f}s "
+        f"sent_unchanged={sent == hostile} {_chat_brief(chat)}",
     )
 
 
@@ -941,7 +1046,7 @@ async def rag_no_refs(r: Rag) -> None:
             r.check(
                 sid,
                 f"answer without [docX], show-all valve {show_all} -> "
-                f"{len(expected)} sources (pipeline mode)",
+                f"{len(expected)} sources",
                 c.done
                 and c.content == NO_REFS
                 and c.source_names == expected
@@ -1036,8 +1141,7 @@ async def rag_scores(r: Rag) -> None:
     first = citations[0] if citations else {}
     r.check(
         "scores.on.api",
-        "API citations carry original_search_score and relevance, no "
-        "filter_reason (pipeline mode)",
+        "API citations carry original_search_score and relevance, no filter_reason",
         res.content == LINKED
         and len(citations) == 3
         and all("relevance" in c and "filter_reason" not in c for c in citations)
@@ -1046,6 +1150,137 @@ async def rag_scores(r: Rag) -> None:
         f"{_answer(res.content)} first citation keys={sorted(first)} "
         f"relevance={first.get('relevance')} "
         f"score={first.get('original_search_score')}",
+    )
+
+
+def _context_event(raw: str) -> tuple:
+    """(bytes of the SSE line with delta.context, that context)."""
+    for line in (raw or "").splitlines():
+        if not line.startswith("data:") or '"context"' not in line:
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        for choice in (event.get("choices") if isinstance(event, dict) else None) or []:
+            context = (choice.get("delta") or {}).get("context")
+            if isinstance(context, dict):
+                return len(line.encode("utf-8")), context
+    return 0, {}
+
+
+async def rag_events(r: Rag) -> None:
+    """Large stream events: the context event of 3 long documents (no budget)
+    is larger than aiohttp's default line of 128 KiB and reaches API clients,
+    and an upstream event of ~300 KB (as On Your Data's context event of 2.8.x)
+    is read; an upstream event larger than the 4 MiB the pipe reads ends the
+    stream with an error message, without its text in the answer or the log."""
+    t = r.t
+    await r.set(AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS=0)
+    mark = await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION + " big-context big-event", stream=True)
+    await t.log.settle(0.5)
+    too_long = len(t.log.lines(mark, LINE_TOO_LONG))
+    size, context = _context_event(res.raw)
+    lengths = [len(str(c.get("content") or "")) for c in context.get("citations") or []]
+    padded = max(
+        (
+            len(line.encode("utf-8"))
+            for line in (res.raw or "").splitlines()
+            if "x_mock_padding" in line
+        ),
+        default=0,
+    )
+    chat = await r.chat()
+    r.check(
+        "big-context",
+        "a context event of more than 128 KiB (one SSE line: 3 documents of "
+        "50,000 characters, AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS=0) reaches the API "
+        "client, and an upstream event of ~300 KB (one SSE line) is read and "
+        "passed on: linked answer and [DONE], the citations with the full text",
+        res.status == 200
+        and res.content == LINKED
+        and res.done
+        and size > 128 * 1024
+        and lengths == [50000, 50000, 50000]
+        and padded > 256 * 1024
+        and not too_long
+        and _grounded(chat),
+        f"{_answer(res.content)} done={res.done} context_event_bytes={size} "
+        f"citation_lengths={lengths} upstream_event_bytes={padded} "
+        f"line_too_long_log={too_long} {_chat_brief(chat)}",
+    )
+
+    await r.set()
+    mark = await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION + " huge-event", stream=True)
+    await t.log.settle(0.5)
+    leaked = FILLER in t.log.since(mark)
+    # the stream fails on purpose (an event larger than the pipe reads)
+    t.expect_errors(mark, STREAM_ERROR)
+    chat = await r.chat()
+    r.check(
+        "huge-event.api",
+        "an upstream event over 4 MiB (one SSE line) ends the stream with an "
+        "'Error: ... larger than 4 MiB ...' delta and [DONE], without its text "
+        "in the answer or the log",
+        res.status == 200
+        and res.content.startswith("Error:")
+        and "larger than 4 MiB" in res.content
+        and FILLER not in res.content
+        and res.done
+        and not leaked
+        and _grounded(chat),
+        f"{_answer(res.content)} done={res.done} event text in log={leaked} "
+        f"{_chat_brief(chat)}",
+    )
+
+    async with t.browser() as b:
+        mark = await r.reset()
+        c = await b.chat(MODEL, QUESTION + " huge-event", stream=True)
+        await t.log.settle(0.5)
+        t.expect_errors(mark, STREAM_ERROR)
+    last = _last_status(c.status_history)
+    description = str(last.get("description", ""))
+    leaked = FILLER in t.log.since(mark)
+    r.check(
+        "huge-event.browser",
+        "browser: an upstream event over 4 MiB -> 'Error: ...' saved and a final "
+        "'Error: ...' status done, without its text",
+        c.done
+        and c.content.startswith("Error:")
+        and FILLER not in c.content
+        and description.startswith("Error:")
+        and FILLER not in description
+        and last.get("done") is True
+        and not leaked,
+        f"{c.brief()} last status={short(description, 120)} done={last.get('done')} "
+        f"event text in log={leaked}",
+    )
+
+
+async def rag_content_null(r: Rag) -> None:
+    """A non-stream answer whose content is null (e.g. a content filter)."""
+    t = r.t
+    await r.set()
+    async with t.browser() as b:
+        await r.reset()
+        # Open WebUI 0.11 never marks a non-stream answer without content as
+        # done (non_streaming_chat_response_handler), so do not wait for it.
+        c = await b.chat(MODEL, QUESTION + " content-null", stream=False, wait=10)
+    chat = await r.chat()
+    last = _last_status(c.status_history)
+    r.check(
+        "content-null",
+        "browser non-stream answer with content null (content filter): Azure's "
+        "response, no pipe error, final status 'Request completed'",
+        not c.content.startswith("Error")
+        and not c.error
+        and last.get("description") == "Request completed"
+        and last.get("done") is True
+        and _grounded(chat),
+        f"{c.brief()} statuses={_statuses(c.status_history)} "
+        f"sources={c.source_names} {_chat_brief(chat)}",
     )
 
 
@@ -1174,7 +1409,6 @@ async def rag_vector(r: Rag) -> None:
             {},
             "/openai/v1/embeddings",
             "api-key",
-            None,
         ),
         (
             "vector.deployment.prefix",
@@ -1186,7 +1420,6 @@ async def rag_vector(r: Rag) -> None:
             },
             "/aoai/openai/v1/embeddings",
             "api-key",
-            None,
         ),
         (
             "vector.deployment.foundry",
@@ -1198,7 +1431,6 @@ async def rag_vector(r: Rag) -> None:
             },
             "/openai/v1/embeddings",
             "api-key",
-            OLD_FOUNDRY_ERROR,
         ),
         (
             "vector.deployment.bearer",
@@ -1207,15 +1439,12 @@ async def rag_vector(r: Rag) -> None:
             {"USE_AUTHORIZATION_HEADER": True},
             "/openai/v1/embeddings",
             "bearer",
-            None,
         ),
     )
-    for sid, title, changes, path, auth, old_error in cases:
+    for sid, title, changes, path, auth in cases:
         await r.set(r.ds(**hybrid), **changes)
-        mark = await r.reset()
+        await r.reset()
         res = await t.owui.chat(MODEL, QUESTION, stream=False)
-        if old_error and not r.fixed:
-            await r.settle_errors(mark, old_error)
         embeds, searches = await r.embeds(), await r.searches()
         e = embeds[0] if embeds else {}
         s = searches[0] if searches else {}
@@ -1911,7 +2140,6 @@ async def _error_case(
     needles: tuple = (),
     absent: tuple = (),
     searches_expected: Optional[int] = None,
-    tagged: bool = True,
     log_absent: tuple = (),
     max_seconds: Optional[float] = None,
 ) -> tuple:
@@ -1950,7 +2178,6 @@ async def _error_case(
         ok,
         f"{_answer(res.content)} chats={len(chats)} {_search_brief(searches)} "
         f"elapsed={elapsed:.1f}s traceback={traceback} logged={len(logged)}",
-        tagged=tagged,
     )
     return res, searches, mark
 
@@ -2113,11 +2340,22 @@ async def rag_config(r: Rag) -> None:
     search_url = r.search.url
     cases = [
         (
+            "config-error.invalid-json",
+            "AZURE_AI_DATA_SOURCES that is not valid JSON: error with line and "
+            "column, the JSON (and its key) not echoed",
+            '{"type": "azure_search", "parameters": {"endpoint": '
+            f'"{search_url}", "authentication": {{"type": "api_key", "key": '
+            f'"{RAG_SEARCH_KEY}"}}',
+            "not valid JSON",
+            {},
+        ),
+        (
             "config-error.elasticsearch",
-            "data source type elasticsearch: error pointing to "
-            "AZURE_AI_SEARCH_MODE=on_your_data",
+            "data source type elasticsearch: error naming type azure_search and "
+            "the removal of On Your Data in 3.0.0",
             {"type": "elasticsearch", "parameters": {"endpoint": search_url}},
-            "AZURE_AI_SEARCH_MODE=on_your_data",
+            "not supported; use type azure_search (other types needed Azure "
+            "OpenAI On Your Data, which this pipeline no longer uses since 3.0.0)",
             {},
         ),
         (
@@ -2150,20 +2388,6 @@ async def rag_config(r: Rag) -> None:
             {},
         ),
     ]
-    if r.fixed:  # older files ignore invalid JSON silently (plain chat)
-        cases.insert(
-            0,
-            (
-                "config-error.invalid-json",
-                "AZURE_AI_DATA_SOURCES that is not valid JSON: error with line and "
-                "column, the JSON (and its key) not echoed",
-                '{"type": "azure_search", "parameters": {"endpoint": '
-                f'"{search_url}", "authentication": {{"type": "api_key", "key": '
-                f'"{RAG_SEARCH_KEY}"}}',
-                "not valid JSON",
-                {},
-            ),
-        )
     for sid, title, ds, needle, changes in cases:
         await r.set(ds, **changes)
         await _error_case(
@@ -2173,7 +2397,6 @@ async def rag_config(r: Rag) -> None:
             needles=(needle,),
             absent=(RAG_SEARCH_KEY, '"azure_search"'),
             searches_expected=0,
-            tagged=sid != "config-error.invalid-json",
         )
 
     await r.set({"type": "elasticsearch", "parameters": {"endpoint": search_url}})
@@ -2227,9 +2450,7 @@ async def rag_config(r: Rag) -> None:
 
 async def rag_not_configured(r: Rag) -> None:
     """Whitespace, [] and null count as 'not configured': plain chat as
-    before (gated: passes on older files too)."""
-    if not r.fixed:
-        return
+    before."""
     t = r.t
     results = []
     for value in ("   ", "[]", "null"):
@@ -2258,7 +2479,6 @@ async def rag_not_configured(r: Rag) -> None:
         "no <documents>, no ERROR",
         all(ok for ok, _ in results),
         " | ".join(detail for _, detail in results),
-        tagged=False,
     )
 
 
@@ -2272,19 +2492,21 @@ async def rag_tasks(r: Rag) -> None:
     )
     searches, tasks = await r.searches(), await r.tasks()
     grounded_tasks = [e for e in tasks if e.get("documents_blocks")]
+    with_ds = [e for e in tasks if "data_sources" in (e.get("body") or {})]
     r.check(
         "tasks.api",
-        "title task with the rag valves: answered without retrieval (the chat "
-        "answer before it: grounded, one search)",
+        "title task with the rag valves (#123): answered without retrieval and "
+        "without data_sources (the chat answer before it: grounded, one search)",
         res.content == LINKED
         and status == 200
         and "Mock Title" in str(answer)
         and len(searches) == 1
         and tasks
-        and not grounded_tasks,
+        and not grounded_tasks
+        and not with_ds,
         f"{_answer(res.content)} task HTTP {status} answer={short(answer, 60)} "
         f"searches={len(searches)} task requests={len(tasks)} "
-        f"grounded tasks={len(grounded_tasks)}",
+        f"grounded tasks={len(grounded_tasks)} with data_sources={len(with_ds)}",
     )
 
     async with t.browser() as b:
@@ -2296,26 +2518,99 @@ async def rag_tasks(r: Rag) -> None:
         c = await b.reload(c)
     searches, tasks = await r.searches(), await r.tasks()
     grounded_tasks = [e for e in tasks if e.get("documents_blocks")]
+    with_ds = [e for e in tasks if "data_sources" in (e.get("body") or {})]
     r.check(
         "tasks.browser",
-        "browser chat with background tasks: one search (the answer), task "
-        "prompts without <documents>, only the referenced sources and the "
-        "answer's statuses",
+        "browser chat with background tasks (#123): one search (the answer), "
+        "task prompts without <documents> and data_sources, only the "
+        "referenced sources and the answer's statuses, also after the tasks",
         c.done
         and c.content == LINKED
         and c.source_names == REFERENCED_SOURCES
         and _status_sequence(c.status_history, STATUS_RAG_STREAM)
         and len(searches) == 1
         and len(tasks) >= len(TASKS)
-        and not grounded_tasks,
+        and not grounded_tasks
+        and not with_ds,
         f"{c.brief()} searches={len(searches)} task requests={len(tasks)} "
-        f"grounded tasks={len(grounded_tasks)} {waited}",
+        f"grounded tasks={len(grounded_tasks)} with data_sources={len(with_ds)} "
+        f"{waited}",
+    )
+
+
+async def rag_no_session(r: Rag) -> None:
+    """Saved chat without a websocket session (no built-in tools): background
+    tasks run with the message's metadata, so their events must not reach it
+    (#123: 9 sources and 7 statuses on 2.7.0)."""
+    t = r.t
+    await r.set()
+    aid, uid = str(uuid.uuid4()), str(uuid.uuid4())
+    body = {
+        "model": MODEL,
+        "stream": False,
+        "messages": [{"role": "user", "content": QUESTION}],
+        "id": aid,
+        "parent_id": None,
+        "user_message": {
+            "id": uid,
+            "parentId": None,
+            "childrenIds": [aid],
+            "role": "user",
+            "content": QUESTION,
+            "timestamp": int(time.time()),
+            "models": [MODEL],
+        },
+        "background_tasks": TASKS,
+    }
+    await r.reset()
+    status, data = await t.owui.api("POST", "/api/chat/completions", body)
+    answer = completion_text(data) or ""
+    chat_id = data.get("chat_id") if isinstance(data, dict) else None
+    if not chat_id:
+        _, chats = await t.owui.api("GET", "/api/v1/chats/?page=1")
+        for item in (chats if isinstance(chats, list) else [])[:10]:
+            saved = await t.owui.get_chat(item["id"])
+            messages = ((saved.get("chat") or {}).get("history") or {}).get(
+                "messages"
+            ) or {}
+            if aid in messages:
+                chat_id = item["id"]
+                break
+    waited = await _wait_tasks(t, r.mock, chat_id)
+    saved = await t.owui.get_chat(chat_id) if chat_id else {}
+    messages = ((saved.get("chat") or {}).get("history") or {}).get("messages") or {}
+    message = messages.get(aid) or {}
+    names = [(s.get("source") or {}).get("name") for s in message.get("sources") or []]
+    history = message.get("statusHistory") or []
+    searches, tasks = await r.searches(), await r.tasks()
+    grounded_tasks = [e for e in tasks if e.get("documents_blocks")]
+    with_ds = [e for e in tasks if "data_sources" in (e.get("body") or {})]
+    answered = status == 200 and answer == LINKED
+    r.check(
+        "no-session.sources",
+        "saved chat without websocket session + background tasks: linked "
+        "answer, only the referenced sources and the answer's statuses, one "
+        "search, task prompts without <documents> and data_sources (#123)",
+        answered
+        and message.get("content") == LINKED
+        and names == REFERENCED_SOURCES
+        and _status_sequence(history, STATUS_RAG_NONSTREAM)
+        and len(searches) == 1
+        and bool(tasks)
+        and not grounded_tasks
+        and not with_ds,
+        f"answered={answered} task requests={len(tasks)} "
+        f"grounded tasks={len(grounded_tasks)} with data_sources={len(with_ds)} "
+        f"searches={len(searches)} sources={names} "
+        f"statuses={_statuses(history)} content={short(message.get('content'))} "
+        f"chat={chat_id} {waited}",
     )
 
 
 async def rag_client_data_sources(r: Rag) -> None:
-    """data_sources sent by the client are refused in pipeline mode (never
-    fetched, never forwarded), with or without the valve."""
+    """data_sources sent by the client (On Your Data, removed in 3.0.0) are
+    refused (never fetched, never forwarded), with or without the valve; an
+    empty list is ignored."""
     t = r.t
     client = [
         {
@@ -2339,17 +2634,33 @@ async def rag_client_data_sources(r: Rag) -> None:
         chats, recorded = await r.chats(), await r.search.requests()
         r.check(
             sid,
-            "client data_sources in pipeline mode "
+            "client data_sources "
             f"({'valve set' if ds is None else 'no valve'}): 'data_sources in the "
-            "request is not supported in pipeline mode', nothing searched, no "
-            "chat request",
+            "request is not supported: this pipeline no longer uses Azure OpenAI "
+            "On Your Data (removed in 3.0.0)', nothing searched, nothing sent "
+            "upstream",
             res.content.startswith(CLIENT_DS_ERROR)
-            and "AZURE_AI_SEARCH_MODE=on_your_data" in res.content
+            and "AZURE_AI_DATA_SOURCES" in res.content
             and not recorded
             and not chats,
             f"{_answer(res.content)} search mock requests={len(recorded)} "
             f"chats={len(chats)}",
         )
+
+    await r.set()
+    mark = await r.reset()
+    res = await t.owui.chat(MODEL, QUESTION, stream=False, data_sources=[])
+    await t.log.settle(0.3)
+    chat, searches = await r.chat(), await r.searches()
+    errors = t.log.errors(mark)
+    r.check(
+        "client-data-sources.empty",
+        "an empty data_sources list from the client is ignored: grounded answer "
+        "from the valve's search, no data_sources upstream, no ERROR",
+        res.content == LINKED and _grounded(chat) and len(searches) == 1 and not errors,
+        f"{_answer(res.content)} {_chat_brief(chat)} {_search_brief(searches)} "
+        f"log_errors={errors[:1]}",
+    )
 
 
 # --------------------------------------------------------- query generation
@@ -2437,10 +2748,8 @@ async def rag_qgen(r: Rag) -> None:
         "?api-version=2024-05-01-preview",
         AZURE_AI_MODEL_IN_BODY=True,
     )
-    mark = await r.reset()
+    await r.reset()
     res = await t.owui.chat(MODEL, _followup("and the warranty?"), stream=False)
-    if not r.fixed:
-        await r.settle_errors(mark, OLD_FOUNDRY_ERROR)
     qgens, searches = await r.qgens(), await r.searches()
     q = qgens[0] if qgens else {}
     r.check(
@@ -2944,47 +3253,6 @@ async def rag_auth(r: Rag) -> None:
     )
 
 
-async def rag_mode_unknown(r: Rag) -> None:
-    t = r.t
-    # empty (e.g. AZURE_AI_SEARCH_MODE=${AZURE_AI_SEARCH_MODE} in docker
-    # compose with the variable unset): the default, no warning. Runs before
-    # the other mode values, so a warning could not have been logged earlier.
-    mark = t.mark()
-    await r.set(AZURE_AI_SEARCH_MODE="")
-    await r.reset()
-    res = await t.owui.chat(MODEL, QUESTION, stream=False)
-    await t.log.settle(0.5)
-    chat, searches = await r.chat(), await r.searches()
-    warned = _warnings(t, mark, "AZURE_AI_SEARCH_MODE")
-    r.check(
-        "mode.empty",
-        "AZURE_AI_SEARCH_MODE empty: pipeline mode without a warning",
-        res.content == LINKED and _grounded(chat) and len(searches) == 1 and not warned,
-        f"{_answer(res.content)} searches={len(searches)} warnings={len(warned)} "
-        f"{_chat_brief(chat)}",
-    )
-
-    mark = t.mark()
-    await r.set(AZURE_AI_SEARCH_MODE="bogus")
-    await r.reset()
-    res = await t.owui.chat(MODEL, QUESTION, stream=False)
-    res2 = await t.owui.chat(MODEL, QUESTION, stream=False)
-    await t.log.settle(0.5)
-    chat, searches = await r.chat(), await r.searches()
-    warned = _warnings(t, mark, "AZURE_AI_SEARCH_MODE")
-    r.check(
-        "mode.unknown",
-        "AZURE_AI_SEARCH_MODE=bogus: pipeline mode, one warning per process",
-        res.content == LINKED
-        and res2.content == LINKED
-        and _grounded(chat)
-        and len(searches) == 2
-        and len(warned) == 1,
-        f"{_answer(res.content)} searches={len(searches)} warnings={len(warned)} "
-        f"{_chat_brief(chat)}",
-    )
-
-
 async def rag_context_length(r: Rag) -> None:
     t = r.t
     await r.set()
@@ -2995,12 +3263,10 @@ async def rag_context_length(r: Rag) -> None:
     r.check(
         "context-length",
         "chat HTTP 400 context_length_exceeded on a request with documents: "
-        "Azure's message plus the budget / new chat hint, no On Your Data "
-        "retirement hint (pipeline mode sends no data_sources)",
+        "Azure's message plus the budget / new chat hint",
         res.content.startswith("Error:")
         and "maximum context length" in res.content
         and CONTEXT_HINT in res.content
-        and RETIRED_HINT not in res.content
         and _grounded(chat),
         f"{_answer(res.content)} {_chat_brief(chat)}",
     )
@@ -3077,147 +3343,93 @@ async def rag_stop(r: Rag) -> None:
     )
 
 
-async def rag_notice_none(r: Rag, notice_before: bool, group_mark: int) -> None:
-    """Pipeline mode never logs the On Your Data notice. Provable only when
-    no notice was logged before the group (oyd not selected): the notice is
-    logged once per loaded copy of the module."""
-    if not r.fixed or notice_before:
-        return
-    notices = _oyd_notices(r.t, group_mark)
-    r.check(
-        "notice.none",
-        "pipeline mode never logs the On Your Data retirement notice",
-        not notices,
-        f"notices={len(notices)} first={short(notices[:1], 200)}",
-        tagged=False,
-    )
-
-
-async def rag_oyd_mode(r: Rag) -> None:
-    """on_your_data sub-checks (2.9.0+, untagged): key valve injection, the
-    mode alias and the retirement hint."""
-    if not r.fixed:
-        return
+# ------------------------------------------------------- removed mode valve
+async def rag_mode_removed(r: Rag) -> None:
+    """AZURE_AI_SEARCH_MODE existed only in 2.9.0 pre-releases (pipeline /
+    on_your_data). A value stored by such a pre-release, or set in the
+    environment, is ignored by 3.0.0 without an error."""
     t = r.t
-    oyd = {
-        "AZURE_AI_SEARCH_MODE": "on_your_data",
-        "AZURE_AI_ENDPOINT": f"{r.mock.url}/openai/deployments/{OYD_DEPLOYMENT}"
-        "/chat/completions?api-version=2025-01-01-preview",
-        "AZURE_AI_MODEL": OYD_DEPLOYMENT,
-    }
-    model = f"{FID}.{OYD_DEPLOYMENT}"
-    await r.set(r.ds(auth=None), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY, **oyd)
-    await r.reset()
-    res = await t.owui.chat(model, QUESTION, stream=False)
-    chat, searches = await r.chat(), await r.searches()
-    sources = (chat.get("body") or {}).get("data_sources") or [{}]
-    auth = (sources[0].get("parameters") or {}).get("authentication")
-    stored = (await t.owui.get_valves(FID)).get("AZURE_AI_DATA_SOURCES", "")
-    r.check(
-        "auth.key-valve.oyd",
-        "on_your_data mode: AZURE_AI_SEARCH_KEY goes into (a copy of) the "
-        "data source sent to Azure; the stored JSON keeps no key",
-        res.content == LINKED
-        and auth == {"type": "api_key", "key": RAG_SEARCH_KEY}
-        and RAG_SEARCH_KEY not in str(stored)
-        and not searches,
-        f"{_answer(res.content)} auth={'key' if auth else auth} "
-        f"stored_has_key={RAG_SEARCH_KEY in str(stored)} searches={len(searches)}",
-        tagged=False,
-    )
-
-    # data_sources of the client (endpoint and auth chosen by the client):
-    # forwarded as sent, AZURE_AI_SEARCH_KEY never goes into them.
-    client_auth = {"type": "api_key", "key": "client-key-e2e"}
-    results = []
-    for label, auth_value in (("own key", client_auth), ("no authentication", None)):
-        parameters = {"endpoint": r.search.url, "index_name": "client-index"}
-        if auth_value is not None:
-            parameters["authentication"] = auth_value
-        client = [{"type": "azure_search", "parameters": parameters}]
-        await r.reset()
-        res = await t.owui.chat(model, QUESTION, stream=False, data_sources=client)
-        chat = await r.chat()
-        body = chat.get("body") or {}
-        sent = ((body.get("data_sources") or [{}])[0].get("parameters")) or {}
-        ok = (
-            res.content == LINKED
-            and sent.get("index_name") == "client-index"
-            and sent.get("authentication") == auth_value
-            and RAG_SEARCH_KEY not in json.dumps(body)
-        )
-        results.append(
-            (
-                ok,
-                f"{label}: {_answer(res.content)} index={sent.get('index_name')} "
-                f"auth_as_sent={sent.get('authentication') == auth_value} "
-                f"valve_key_in_body={RAG_SEARCH_KEY in json.dumps(body)}",
-            )
-        )
-    r.check(
-        "auth.key-valve.oyd-client",
-        "on_your_data mode with AZURE_AI_SEARCH_KEY: data_sources sent by the "
-        "client (with their own key and without authentication) are forwarded "
-        "as sent; the valve's key is never put into them",
-        all(ok for ok, _ in results),
-        " | ".join(detail for _, detail in results),
-        tagged=False,
-    )
-
-    await r.set(**{**oyd, "AZURE_AI_SEARCH_MODE": "On-Your-Data"})
-    await r.reset()
-    res = await t.owui.chat(model, QUESTION, stream=False)
-    chat, searches = await r.chat(), await r.searches()
-    r.check(
-        "mode.alias",
-        "AZURE_AI_SEARCH_MODE=On-Your-Data (case, '-'): the legacy mode "
-        "(data_sources sent, no search by the pipe)",
-        res.content == LINKED
-        and bool((chat.get("body") or {}).get("data_sources"))
-        and not searches,
-        f"{_answer(res.content)} data_sources={bool((chat.get('body') or {}).get('data_sources'))} "
-        f"searches={len(searches)}",
-        tagged=False,
-    )
-
-    await r.set('{"type": "azure_search", "parameters": {', **oyd)
-    mark = await r.reset()
-    res = await t.owui.chat(model, QUESTION, stream=False)
-    await r.settle_errors(
-        mark, ("function_azure", "Error parsing AZURE_AI_DATA_SOURCES")
-    )
-    chat, searches = await r.chat(), await r.searches()
-    r.check(
-        "oyd.invalid-json",
-        "on_your_data mode: AZURE_AI_DATA_SOURCES that is not valid JSON stays "
-        "a plain chat (as 2.8.x), no 'Error: Azure AI Search'",
-        res.content == f"Hello from mock Azure ({OYD_DEPLOYMENT})."
-        and not (chat.get("body") or {}).get("data_sources")
-        and not searches,
-        f"{_answer(res.content)} {_chat_brief(chat)} searches={len(searches)}",
-        tagged=False,
-    )
-
-    await r.set(AZURE_AI_SEARCH_MODE="on_your_data")
+    source = t.source(PATH)
+    marker = "    class Valves(BaseModel):\n"
+    patched = source.replace(marker, marker + STALE_MODE_VALVE, 1)
+    installed, stored = 0, None
+    try:
+        installed, _ = await t.owui.install_function(FID, "Azure AI Foundry", patched)
+        await r.set(**{SEARCH_MODE: "on_your_data"})
+        stored = (await t.owui.get_valves(FID)).get(SEARCH_MODE)
+    finally:
+        # the real 3.0.0 file again, also when the steps above failed
+        reinstalled, _ = await t.owui.install_function(FID, "Azure AI Foundry", source)
+    await t.owui.models(refresh=True)
+    kept = (await t.owui.get_valves(FID)).get(SEARCH_MODE)
+    spec = (await t.owui.valves_spec(FID)).get("properties", {})
     mark = await r.reset()
     res = await t.owui.chat(MODEL, QUESTION, stream=False)
-    await r.settle_errors(mark, CHAT_ERROR)
-    await r.set(AZURE_AI_SEARCH_MODE="on_your_data", AZURE_AI_API_KEY="wrong-key-e2e")
-    mark = await r.reset()
-    res401 = await t.owui.chat(MODEL, QUESTION, stream=False)
-    await r.settle_errors(mark, CHAT_ERROR)
+    await t.log.settle(0.5)
+    chat, searches = await r.chat(), await r.searches()
+    errors = t.log.errors(mark)
     r.check(
-        "oyd-retired-hint",
-        "on_your_data mode, Azure answers 400 to data_sources: the retirement "
-        "hint is appended; a 401 (wrong chat key) gets no hint",
-        res.content.startswith("Error:")
-        and "On Your Data is retired (mock)" in res.content
-        and RETIRED_HINT in res.content
-        and res401.content.startswith("Error:")
-        and "Access denied" in res401.content
-        and RETIRED_HINT not in res401.content,
-        f"400: {short(res.content, 200)} 401: {short(res401.content, 160)}",
-        tagged=False,
+        "mode.stored",
+        f"{SEARCH_MODE}=on_your_data stored by a 2.9.0 pre-release (the staged "
+        "file with that valve added), then the 3.0.0 file saved again: no such "
+        "valve in the spec, the stored value is ignored (grounded answer from "
+        "the pipe's own search, no data_sources, no ERROR)",
+        marker in source
+        and installed == 200
+        and stored == "on_your_data"
+        and reinstalled == 200
+        and kept == "on_your_data"
+        and SEARCH_MODE not in spec
+        and res.content == LINKED
+        and _grounded(chat)
+        and len(searches) == 1
+        and not errors,
+        f"{_answer(res.content)} valve added={marker in source} install HTTP "
+        f"{installed} / {reinstalled} stored={stored!r} stored after the "
+        f"update={kept!r} in spec={SEARCH_MODE in spec} {_chat_brief(chat)} "
+        f"{_search_brief(searches)} log_errors={errors[:1]}",
+    )
+
+    # The environment: the staged file in this process (as rag.log.debug)
+    failure, text, fields, attribute = "", "", [], True
+    os.environ[SEARCH_MODE] = "on_your_data"
+    await r.reset()
+    try:
+        module = _load_staged_pipe()
+        fields = sorted(getattr(module.Pipe.Valves, "model_fields", {}) or {})
+        pipe = module.Pipe()
+        text = await asyncio.wait_for(
+            _pipe_in_process(
+                pipe,
+                {**r.valves(), SEARCH_MODE: "on_your_data"},
+                MODEL,
+                [{"role": "user", "content": QUESTION}],
+                0,
+            ),
+            120,
+        )
+        attribute = hasattr(pipe.valves, SEARCH_MODE)
+    except Exception as exc:  # the check reports it
+        failure = f"{type(exc).__name__}: {short(str(exc), 200)}"
+    finally:
+        os.environ.pop(SEARCH_MODE, None)
+        logging.getLogger("azure_ai.pipe").setLevel(logging.NOTSET)
+    chat, searches = await r.chat(), await r.searches()
+    r.check(
+        "mode.env",
+        f"{SEARCH_MODE}=on_your_data in the environment (and passed as a "
+        "valve): the staged file (run in the driver process) has no such valve "
+        "and answers from its own search",
+        not failure
+        and bool(fields)
+        and SEARCH_MODE not in fields
+        and not attribute
+        and text == LINKED
+        and _grounded(chat)
+        and len(searches) == 1,
+        f"{failure or 'ran'} {_answer(text)} valve fields={len(fields)} "
+        f"{SEARCH_MODE} in fields={SEARCH_MODE in fields} attribute={attribute} "
+        f"{_chat_brief(chat)} {_search_brief(searches)}",
     )
 
 
@@ -3271,8 +3483,11 @@ def _load_staged_pipe():
                 sys.modules[name] = old
 
 
-async def _pipe_in_process(pipe, valves: dict, model: str, messages, n: int) -> str:
-    """One pipe() call in this process: the answer text or the SSE stream."""
+async def _pipe_in_process(
+    pipe, valves: dict, model: str, messages, n: int, extra: Optional[dict] = None
+) -> str:
+    """One pipe() call in this process: the answer text or the SSE stream
+    (``extra``: more keys of the request body)."""
     pipe.valves = pipe.Valves(**valves)
     stream = isinstance(messages, tuple)  # a tuple: stream=True
 
@@ -3280,7 +3495,7 @@ async def _pipe_in_process(pipe, valves: dict, model: str, messages, n: int) -> 
         pass
 
     result = await pipe.pipe(
-        {"model": model, "stream": stream, "messages": list(messages)},
+        {"model": model, "stream": stream, "messages": list(messages), **(extra or {})},
         __event_emitter__=emit,
         __metadata__={
             "user_id": "debug-user",
@@ -3305,9 +3520,7 @@ async def _pipe_in_process(pipe, valves: dict, model: str, messages, n: int) -> 
 
 
 async def rag_debug_log(r: Rag) -> None:
-    """The pipe at DEBUG logs no key or token (2.9.0+, untagged)."""
-    if not r.fixed:
-        return
+    """The pipe at DEBUG logs no key or token."""
     secrets = {
         KEY: "AZURE_AI_API_KEY",
         RAG_SEARCH_KEY: "AZURE_AI_SEARCH_KEY",
@@ -3332,15 +3545,20 @@ async def rag_debug_log(r: Rag) -> None:
         }
 
     question = [{"role": "user", "content": QUESTION}]
-    oyd = {
-        "AZURE_AI_SEARCH_MODE": "on_your_data",
-        "AZURE_AI_ENDPOINT": f"{r.mock.url}/openai/deployments/{OYD_DEPLOYMENT}"
-        "/chat/completions?api-version=2025-01-01-preview",
-        "AZURE_AI_MODEL": OYD_DEPLOYMENT,
-    }
     json_key = {"type": "api_key", "key": RAG_JSON_KEY}
     token = {"type": "access_token", "access_token": RAG_SEARCH_TOKEN}
-    # (label, valves, model, messages (a tuple streams), error expected)
+    client = [
+        {
+            "type": "azure_search",
+            "parameters": {
+                "endpoint": r.search.url,
+                "index_name": "client-index",
+                "authentication": json_key,
+            },
+        }
+    ]
+    # (label, valves, model, messages (a tuple streams), error expected[,
+    # more body keys])
     cases = (
         (
             "valve key over the JSON key, stream",
@@ -3406,11 +3624,12 @@ async def rag_debug_log(r: Rag) -> None:
             True,
         ),
         (
-            "on_your_data, the valve key in data_sources",
-            r.valves(r.ds(auth=None), AZURE_AI_SEARCH_KEY=RAG_SEARCH_KEY, **oyd),
-            f"{FID}.{OYD_DEPLOYMENT}",
+            "client data_sources with a key (refused)",
+            r.valves(),
+            MODEL,
             question,
-            False,
+            True,
+            {"data_sources": client},
         ),
     )
     capture = _LogCapture()
@@ -3423,9 +3642,12 @@ async def rag_debug_log(r: Rag) -> None:
     try:
         module = _load_staged_pipe()
         pipe = module.Pipe()
-        for n, (label, valves, model, messages, error) in enumerate(cases):
+        for n, (label, valves, model, messages, error, *extra) in enumerate(cases):
             text = await asyncio.wait_for(
-                _pipe_in_process(pipe, valves, model, messages, n), 120
+                _pipe_in_process(
+                    pipe, valves, model, messages, n, extra[0] if extra else None
+                ),
+                120,
             )
             results.append((label, bool(text) and text.startswith("Error:") == error))
     except Exception as exc:  # the check reports it
@@ -3435,7 +3657,7 @@ async def rag_debug_log(r: Rag) -> None:
         root.setLevel(level)
         logging.getLogger("azure_ai.pipe").setLevel(logging.NOTSET)
     embeds, tokens, chats = await r.embeds(), await r.tokens(), await r.chats()
-    oyd_chat = [c for c in chats if (c.get("body") or {}).get("data_sources")]
+    with_ds = [c for c in chats if "data_sources" in (c.get("body") or {})]
     debug = sum(
         1
         for name, levelno, _ in capture.records
@@ -3455,18 +3677,18 @@ async def rag_debug_log(r: Rag) -> None:
         "server logs at INFO): the API key, the search key of the valve and the "
         "JSON, the search and embedding tokens and the embedding key are in no "
         "log record (keys, tokens, managed identity, query generation, errors, "
-        "on_your_data)",
+        "client data_sources with a key)",
         not failure
         and len(results) == len(cases)
         and all(ok for _, ok in results)
         and len(embeds) == 2
         and len(tokens) >= 3
-        and len(oyd_chat) == 1
+        and not with_ds
         and debug > 0
         and not leaks,
         f"{failure or 'ran'} cases_ok={[label for label, ok in results if ok]} "
         f"failed={[label for label, ok in results if not ok]} "
-        f"embeds={len(embeds)} tokens={len(tokens)} oyd_chats={len(oyd_chat)} "
+        f"embeds={len(embeds)} tokens={len(tokens)} "
+        f"chats with data_sources={len(with_ds)} "
         f"records={len(capture.records)} azure_ai_debug={debug} leaks={leaks}",
-        tagged=False,
     )

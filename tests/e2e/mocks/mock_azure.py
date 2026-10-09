@@ -16,27 +16,15 @@ Behaviour
   - streaming: like Azure, a first chunk with ``choices: []`` and
     ``prompt_filter_results``; a final usage chunk when
     ``stream_options.include_usage`` is set
-  - ``data_sources`` in the body -> "On Your Data" (Azure AI Search) answer with
-    ``context.citations`` (3 documents, the answer references [doc1] and [doc2]),
-    ``context.all_retrieved_documents`` when requested via include_contexts.
-    ``stream_options`` together with ``data_sources`` -> HTTP 400 (Azure rejects
-    that combination)
-  - ``data_sources`` together with ``tools`` (``tool_choice`` not "none") -> the
-    data sources are ignored and the plain answer comes back without context.
-    Azure documents this for On Your Data function calling, and Open WebUI
-    0.10+ adds its built-in tools to every browser chat
-  - On Your Data retirement (emulated): ``data_sources`` for a model outside
-    OYD_MODELS (gpt-4o, gpt-4o-mini, gpt-4.1) -> HTTP 400 "Azure OpenAI On
-    Your Data is retired (mock): data_sources rejected for model <model>"
-    (the real text after 2026-10-14 is unknown; this is only a marker)
   - Foundry ``/models/...`` path without the model header and without body
     ``model`` -> HTTP 400 "model is required"
-  - grounded prompt of the pipeline mode (AZURE_AI_SEARCH_MODE=pipeline, no
-    ``data_sources``): the current turn's user message starts with a
-    ``<documents>`` block -> the On Your Data answer tokens (trigger words are
-    read from the user text after the block) WITHOUT ``context`` (a plain
-    model returns none, so the pipe has to add the citations itself); the
-    "No documents were found" block -> the no-references answer
+  - grounded prompt (the pipe's Azure AI Search retrieval): the current turn's
+    user message starts with a ``<documents>`` block -> an answer that
+    references [doc1] and [doc2] (trigger words are read from the user text
+    after the block) WITHOUT ``context`` (a plain model returns none, so the
+    pipe has to add the citations itself); the "No documents were found"
+    block -> the no-references answer. ``data_sources`` in the body get no
+    special treatment (the pipe never sends them since 3.0.0)
   - query generation: a first system message starting with "Write search
     queries for Azure AI Search." -> non-stream JSON answer
     {"queries": ["x100 charging", "x100 warranty"]}; trigger words in the
@@ -62,29 +50,33 @@ Behaviour
     ``mock-embed-key-321`` or Bearer ``mock-embed-token-e2e`` (auth_mode
     embed-key / embed-bearer); one 8-float vector per input (``dimensions``
     floats when given); an input containing ``embed-fail`` -> HTTP 500
-  - Open WebUI task prompts (title/tags/follow-ups) get the JSON they expect;
-    with ``data_sources`` the citations context is still attached
-  - trigger words in the last user message:
+  - Open WebUI task prompts (title/tags/follow-ups) get the JSON they expect
+  - trigger words in the last user message (of a grounded prompt: in the user
+    text after the documents block):
       ``force-400``      HTTP 400 JSON (content filter)
       ``force-500-text`` HTTP 500 text/plain
-      ``split-tokens``   (On Your Data) citation markers split across deltas
+      ``split-tokens``   (grounded) citation markers split across deltas
                          ("[", "doc", "1", "]" and "[doc", "2]")
-      ``split-link``     (On Your Data) an already linked reference split
+      ``split-link``     (grounded) an already linked reference split
                          across deltas ("[[", "doc", "1", "]](", url, ")")
       ``no-finish``      stream without a finish_reason chunk that ends on a
                          reference ("... [doc2]" without the final ".")
-      ``no-refs``        (On Your Data) answer without any [docX] reference
-      ``paren-url``      (On Your Data) doc1's URL contains "(v2)"
-      ``big-context``    (On Your Data) context event of ~300 KB (one SSE line)
-      ``huge-context``   (On Your Data) context event of ~9 MB (one SSE line)
-      ``content-null``   (On Your Data, non-stream) ``content: null`` with
-                         finish_reason content_filter and the citations context
+      ``no-refs``        (grounded) answer without any [docX] reference
+      ``big-event``      (grounded, stream) the first event (choices [],
+                         prompt_filter_results) padded to ~300 KB: more than
+                         aiohttp's default line of 128 KiB, less than the
+                         4 MiB the pipe reads (key ``x_mock_padding``)
+      ``huge-event``     (grounded, stream) a first event of ~4.5 MB (one SSE
+                         line, a content delta of filler words), more than the
+                         4 MiB the pipe reads
+      ``content-null``   (grounded, non-stream) ``content: null`` with
+                         finish_reason content_filter
       ``context-too-long`` HTTP 400 context_length_exceeded
 
 Recorded entries carry ``auth_mode``, ``model_header``, ``resolved_model``,
-``api_version``, ``data_sources_ignored`` and ``message_problems`` (Azure-style
-validation of the ``messages`` list); chat entries also carry what the
-pipeline mode injected: ``grounded``, ``prompt_docs`` (the [docN] labels of
+``api_version`` and ``message_problems`` (Azure-style validation of the
+``messages`` list); chat entries also carry what the pipe's retrieval
+injected: ``grounded``, ``prompt_docs`` (the [docN] labels of
 the block), ``documents_blocks`` (``<documents>`` blocks outside the
 system / developer messages, whose rules mention the tag),
 ``docs_indices`` / ``current_user_index`` (messages with a block / the current
@@ -114,9 +106,7 @@ API_KEY = "mock-key-123"
 EMBED_KEY = "mock-embed-key-321"  # embedding_dependency.authentication.key
 EMBED_TOKEN = "mock-embed-token-e2e"  # embedding_dependency access_token
 EMBED_DIMS = 8  # vector length of the Search mock's vector fields
-# Models Azure OpenAI On Your Data still accepts (emulated retirement).
-OYD_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4.1"}
-# Pipeline mode (2.9.0): first line of the query-generation system message,
+# The pipe's retrieval: first line of the query-generation system message,
 # the system rules and the empty documents block.
 QG_MARKER = "Write search queries for Azure AI Search."
 QG_QUERIES = ["x100 charging", "x100 warranty"]
@@ -172,12 +162,7 @@ CITATIONS = [
         "chunk_id": "2",
     },
 ]
-SCORES = [
-    {"original_search_score": 42.5, "rerank_score": 3.2, "filter_reason": "rerank"},
-    {"original_search_score": 12.0, "filter_reason": "score"},
-    {"original_search_score": 3.1, "rerank_score": 0.4, "filter_reason": "rerank"},
-]
-OYD_TOKENS = [
+GROUNDED_TOKENS = [
     "The X100 ",
     "charges via USB-C ",
     "[doc1]",
@@ -186,7 +171,7 @@ OYD_TOKENS = [
     "[doc2]",
     ".",
 ]
-OYD_TOKENS_SPLIT = [
+GROUNDED_TOKENS_SPLIT = [
     "The X100 ",
     "charges via USB-C ",
     "[",
@@ -199,7 +184,7 @@ OYD_TOKENS_SPLIT = [
     "2]",
     ".",
 ]
-OYD_TOKENS_SPLIT_LINK = [
+GROUNDED_TOKENS_SPLIT_LINK = [
     "See ",
     "[[",
     "doc",
@@ -213,21 +198,24 @@ OYD_TOKENS_SPLIT_LINK = [
     "]",
     ".",
 ]
-OYD_TOKENS_NO_REFS = [
+GROUNDED_TOKENS_NO_REFS = [
     "The requested information ",
     "is not available ",
     "in the retrieved data.",
 ]
+# doc 1's URL of the Search mock's paren-url trigger
 PAREN_URL = "https://docs.example.com/x100/manual_(v2).pdf"
-# Filler of the big/huge context documents. Each of the 3 citations carries it
-# in "citations" and, when include_contexts asks for them, again in
-# "all_retrieved_documents". The citations alone already exceed the limits, so
-# the scenarios do not depend on AZURE_AI_INCLUDE_SEARCH_SCORES.
+# Filler words of large documents (mock_search big-context) and events
 FILLER_WORD = "bigdoc "
-# 150 KB of citations (> aiohttp's default 128 KiB line), ~300 KB event
+# Document text of mock_search's big-context: 3 x 50,000 characters are more
+# than aiohttp's default line of 128 KiB in the pipe's context event
 BIG_DOC_CHARS = 50_000
-# 4.5 MB of citations (> the 4 MiB the 2.8.0 pipe reads), ~9 MB event
-HUGE_DOC_CHARS = 1_500_000
+# big-event: one event line of ~300 KB, between aiohttp's default line of
+# 128 KiB and the 4 MiB the pipe reads (the On Your Data context event of
+# 2.8.x had that size)
+BIG_EVENT_CHARS = 300_000
+# huge-event: one event line larger than the 4 MiB the pipe reads
+HUGE_EVENT_CHARS = 4_500_000
 VALID_ROLES = {"system", "developer", "user", "assistant", "tool"}
 VALID_PART_TYPES = {"text", "image_url", "input_audio", "refusal", "file"}
 
@@ -292,7 +280,7 @@ def _current_user_index(messages: list):
 
 
 def grounding(body: dict) -> dict:
-    """What the pipeline mode injected into the chat request (annotations)."""
+    """What the pipe's retrieval injected into the chat request (annotations)."""
     messages = [m for m in body.get("messages") or [] if isinstance(m, dict)]
     texts = [_text(m.get("content")) for m in messages]
     current = _current_user_index(messages)
@@ -381,38 +369,14 @@ def _filler(chars: int) -> str:
     return (FILLER_WORD * (chars // len(FILLER_WORD) + 1))[:chars]
 
 
-def _citations(text: str) -> list:
-    """The 3 citations, changed by the trigger words of the question."""
-    if "paren-url" in text:
-        return [{**CITATIONS[0], "url": PAREN_URL}, *CITATIONS[1:]]
-    if "huge-context" in text:
-        return [{**c, "content": _filler(HUGE_DOC_CHARS)} for c in CITATIONS]
-    if "big-context" in text:
-        return [{**c, "content": _filler(BIG_DOC_CHARS)} for c in CITATIONS]
-    return CITATIONS
-
-
-def _context(body: dict, text: str) -> dict:
-    citations = _citations(text)
-    context = {"citations": citations, "intent": '["x100 charging warranty"]'}
-    for source in body.get("data_sources") or []:
-        include = (source.get("parameters") or {}).get("include_contexts") or []
-        if "all_retrieved_documents" in include:
-            context["all_retrieved_documents"] = [
-                {**doc, **score, "search_queries": ["x100"], "data_source_index": 0}
-                for doc, score in zip(citations, SCORES)
-            ]
-    return context
-
-
-def _oyd_tokens(text: str) -> list:
+def _grounded_tokens(text: str) -> list:
     if "split-tokens" in text:
-        return OYD_TOKENS_SPLIT
+        return GROUNDED_TOKENS_SPLIT
     if "split-link" in text:
-        return OYD_TOKENS_SPLIT_LINK
+        return GROUNDED_TOKENS_SPLIT_LINK
     if "no-refs" in text:
-        return OYD_TOKENS_NO_REFS
-    return OYD_TOKENS
+        return GROUNDED_TOKENS_NO_REFS
+    return GROUNDED_TOKENS
 
 
 def _completion(model, message: dict, finish: str = "stop") -> web.Response:
@@ -501,13 +465,6 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             "model is required (mock: no x-ms-model-mesh-model-name header and no "
             "model in the body)",
         )
-    if body.get("data_sources") and model not in OYD_MODELS:
-        return _error(
-            400,
-            "BadRequest",
-            "Azure OpenAI On Your Data is retired (mock): data_sources rejected for "
-            f"model {model}",
-        )
     if query_generation:
         return await _query_generation(request, body, model)
     grounded = info.get("grounded")
@@ -517,7 +474,6 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         messages = [m for m in body.get("messages") or [] if isinstance(m, dict)]
         current = _text(messages[info["current_user_index"]].get("content"))
         text = current[current.rfind("</documents>") + len("</documents>") :]
-    oyd = bool(body.get("data_sources"))
     if "force-400" in text:
         return _error(
             400,
@@ -537,17 +493,6 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         return web.Response(status=500, text="upstream exploded (mock)")
     if problems:
         return _error(400, "BadRequest", "Invalid messages: " + "; ".join(problems))
-    if oyd and "stream_options" in body:
-        return _error(
-            400,
-            "400",
-            "Validation error at #/stream_options: Extra inputs are not permitted",
-        )
-    if oyd and body.get("tools") and body.get("tool_choice") != "none":
-        # Azure OpenAI On Your Data: with tools (tool_choice not "none") the
-        # data sources are ignored and the model answers on its own.
-        oyd = False
-        annotate(request, data_sources_ignored=True)
 
     tool = None
     if "use-tool" in text and not any(
@@ -558,17 +503,17 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     task = task_answer(text)
     if task:
         tokens = [task]
-    elif oyd:
-        tokens = _oyd_tokens(text)
     elif info.get("no_docs_block"):
-        tokens = OYD_TOKENS_NO_REFS
+        tokens = GROUNDED_TOKENS_NO_REFS
     elif grounded:
-        tokens = _oyd_tokens(text)
+        tokens = _grounded_tokens(text)
     else:
         tokens = ["Hello ", "from ", "mock ", "Azure ", f"({model})", "."]
 
     if body.get("stream"):
-        return await _stream(request, body, model, tokens, oyd, text, tool)
+        huge = bool(grounded) and "huge-event" in text
+        big = bool(grounded) and "big-event" in text
+        return await _stream(request, body, model, tokens, text, tool, huge, big)
 
     if tool:
         call = {
@@ -580,16 +525,14 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         return _completion(model, message, "tool_calls")
     message = {"role": "assistant", "content": "".join(tokens)}
     finish = "stop"
-    if oyd:
-        message["context"] = _context(body, text)
-        if "content-null" in text:
-            message["content"] = None  # e.g. a filtered completion
-            finish = "content_filter"
+    if grounded and "content-null" in text:
+        message["content"] = None  # e.g. a filtered completion
+        finish = "content_filter"
     return _completion(model, message, finish)
 
 
 async def _stream(
-    request, body, model, tokens, oyd, text, tool=None
+    request, body, model, tokens, text, tool=None, huge=False, big=False
 ) -> web.StreamResponse:
     resp = web.StreamResponse(
         headers={"Content-Type": "text/event-stream", "apim-request-id": "mock-apim"}
@@ -610,41 +553,48 @@ async def _stream(
     def delta(d, finish=None) -> dict:
         return {**base, "choices": [{"index": 0, "finish_reason": finish, "delta": d}]}
 
-    if oyd:
-        await send(delta({"role": "assistant", "context": _context(body, text)}))
-    else:
-        filter_results = [
-            {
-                "prompt_index": 0,
-                "content_filter_results": {
-                    "hate": {"filtered": False, "severity": "safe"}
-                },
-            }
-        ]
-        await send({**base, "choices": [], "prompt_filter_results": filter_results})
-        if tool:
-            call = {
-                "index": 0,
-                "id": TOOL_CALL_ID,
-                "type": "function",
-                "function": {"name": tool, "arguments": ""},
-            }
-            if "use-tool-ref" in text:
-                await send(delta({"role": "assistant", "content": TOOL_REF_TEXT}))
-                await send(delta({"tool_calls": [call]}))
-            else:
-                await send(
-                    delta({"role": "assistant", "content": None, "tool_calls": [call]})
-                )
-            arguments = {"index": 0, "function": {"arguments": "{}"}}
-            await send(delta({"tool_calls": [arguments]}))
-            await send(delta({}, "tool_calls"))
-            if (body.get("stream_options") or {}).get("include_usage"):
-                await send({**base, "choices": [], "usage": USAGE})
-            await send("[DONE]")
-            await resp.write_eof()
-            return resp
-        await send(delta({"role": "assistant", "content": ""}))
+    filter_results = [
+        {
+            "prompt_index": 0,
+            "content_filter_results": {"hate": {"filtered": False, "severity": "safe"}},
+        }
+    ]
+    first = {**base, "choices": [], "prompt_filter_results": filter_results}
+    if big:
+        first["x_mock_padding"] = _filler(BIG_EVENT_CHARS)
+    await send(first)
+    if tool:
+        call = {
+            "index": 0,
+            "id": TOOL_CALL_ID,
+            "type": "function",
+            "function": {"name": tool, "arguments": ""},
+        }
+        if "use-tool-ref" in text:
+            await send(delta({"role": "assistant", "content": TOOL_REF_TEXT}))
+            await send(delta({"tool_calls": [call]}))
+        else:
+            await send(
+                delta({"role": "assistant", "content": None, "tool_calls": [call]})
+            )
+        arguments = {"index": 0, "function": {"arguments": "{}"}}
+        await send(delta({"tool_calls": [arguments]}))
+        await send(delta({}, "tool_calls"))
+        if (body.get("stream_options") or {}).get("include_usage"):
+            await send({**base, "choices": [], "usage": USAGE})
+        await send("[DONE]")
+        await resp.write_eof()
+        return resp
+    if huge:
+        # one event line the pipe cannot read; if it could, the filler
+        # would show up in the answer
+        try:
+            await send(
+                delta({"role": "assistant", "content": _filler(HUGE_EVENT_CHARS)})
+            )
+        except (ConnectionError, RuntimeError):
+            return resp  # the pipe stopped reading (expected)
+    await send(delta({"role": "assistant", "content": ""}))
     no_finish = "no-finish" in text
     if no_finish and tokens and tokens[-1] == ".":
         tokens = tokens[:-1]  # end on a reference that is held back until [DONE]
