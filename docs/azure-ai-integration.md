@@ -58,6 +58,7 @@ AZURE_AI_ENDPOINT="https://<deployment>.openai.azure.com/openai/deployments/<mod
 
 # Azure AI Data Sources / RAG Configuration
 # Complete JSON configuration for Azure Search - copy exactly and replace placeholder values
+# Uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026 (see the warning below)
 AZURE_AI_DATA_SOURCES='[{"type":"azure_search","parameters":{"endpoint":"https://<your-search-service>.search.windows.net","index_name":"<your-index-name>","authentication":{"type":"api_key","key":"<your-search-api-key>"}}}]'
 
 # Enable relevance score extraction from Azure Search (default: true)
@@ -74,9 +75,16 @@ AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=true
 
 The pipeline supports **Azure AI Search** integration for **Retrieval-Augmented Generation (RAG)**. When configured, the pipeline automatically includes a `data_sources` field in requests to Azure AI, enabling document-based AI responses that can cite and reference your indexed content.
 
+> [!WARNING]
+> **Azure OpenAI On Your Data is retired on October 14, 2026.** This integration is built on On Your Data (the `data_sources` API). Microsoft has deprecated it and retires the service on **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft does not document what a request with `data_sources` returns after that date: expect it to fail with an error, or to be answered without your search index and without citations. Chats without `data_sources` (no `AZURE_AI_DATA_SOURCES` and no `data_sources` sent by the client) are not affected. Microsoft has also stopped onboarding new models: On Your Data only supports GPT-4o (versions 2024-05-13, 2024-08-06 and 2024-11-20) and GPT-4o-mini (version 2024-07-18).
+>
+> Microsoft recommends migrating to Foundry Agent Service with Foundry IQ; to get started, see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect). The migration of this pipeline is tracked in [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). Since v2.8.1 the pipeline logs this retirement notice as a warning once per process, for the first request that uses `data_sources` (background tasks are sent without `data_sources` and do not log it).
+
 > [!IMPORTANT]
 > **Azure AI Search integration only works with Azure OpenAI endpoints** in this specific format:
 > `https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview`
+
+The examples use `api-version=2025-01-01-preview`. The On Your Data API reference lists `2024-02-01`, `2024-02-15-preview` and `2024-05-01-preview` (the latest there) as its supported versions; `2025-01-01-preview` is not on that list. It is a later preview version of the Azure OpenAI inference API whose specification still contains `data_sources`, but no longer `role_information` (removed in `2024-08-01-preview` according to the [API version changelog](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle#api-version-changelog)). `role_information` therefore only works with an API version that still has it, such as `2024-05-01-preview`; with `2025-01-01-preview`, put these instructions in the system prompt instead.
 
 #### Behavior with `data_sources`
 
@@ -92,12 +100,9 @@ When a request uses Azure AI Search, the pipeline adapts it to what Azure OpenAI
 
 For detailed information about Azure AI Search configuration, please refer to:
 
-- 📚 [Azure AI Search with Azure OpenAI - Official Guide](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/use-your-data-quickstart?tabs=api-key%2Ctypescript-keyless%2Cpython-new&pivots=rest-api)
-- 🔧 [Data Sources API Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data?tabs=rest#data-source)
-- 🔍 [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/azure-search?tabs=rest)
-
-> [!WARNING]
-> Microsoft has deprecated Azure OpenAI On Your Data (the `data_sources` API used here) and announced its retirement for **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft recommends migrating to Foundry Agent Service with Foundry IQ; to get started, see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect).
+- 📚 [Azure OpenAI On Your Data - Concepts and Setup](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data)
+- 🔧 [Data Sources API Reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data?tabs=rest#data-source)
+- 🔍 [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/azure-search?tabs=rest)
 
 #### ⚙️ Configuration
 
@@ -149,15 +154,20 @@ For advanced use cases, you can include additional parameters:
         "type": "api_key",
         "key": "YOUR-SEARCH-API-KEY"
       },
-      "query_type": "vectorSimpleHybrid",
+      "query_type": "vector_semantic_hybrid",
       "semantic_configuration": "default",
+      "embedding_dependency": {
+        "type": "deployment_name",
+        "deployment_name": "YOUR-EMBEDDING-DEPLOYMENT"
+      },
       "top_n_documents": 20,
-      "strictness": 3,
-      "role_information": "You are an AI assistant that helps with questions based on the provided documents."
+      "strictness": 3
     }
   }
 ]
 ```
+
+Property keys and enum values are snake case (`vector_semantic_hybrid`, not `vectorSemanticHybrid`). `vector`, `vector_simple_hybrid` and `vector_semantic_hybrid` require `embedding_dependency` (here an embedding model deployment in the same Azure OpenAI resource), `semantic` and `vector_semantic_hybrid` require `semantic_configuration` (the name of a semantic configuration of your index); without vector fields or a semantic configuration, omit `query_type` (default `simple`). See the [Azure Search Parameters Reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/azure-search?tabs=rest#parameters) for all parameters.
 
 #### Index Schema and Field Mapping for Citations
 
