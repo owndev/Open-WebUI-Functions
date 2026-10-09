@@ -14,9 +14,10 @@
 #           known-tagged check that passes while its marker applies is a FAIL).
 # - meta:   main's function files with every mock answering HTTP 500 must give
 #           no KNOWN. A KNOWN there means the evidence of a known bug also matches
-#           unrelated failures and would hide them. Exceptions: bugs that show in
-#           the request the pipe sends upstream (REQUEST_SIDE_KNOWN), and the
-#           filters suite, which uses no provider mock (its bugs reproduce for real).
+#           unrelated failures and would hide them. Exceptions: bugs that can only
+#           show in the request the pipe sends upstream (REQUEST_SIDE_KNOWN, empty
+#           today), and the filters suite, which uses no provider mock (its bugs
+#           reproduce for real).
 # - api:    tests/e2e/check_owui_api.sh latest (static open_webui API check).
 
 name: 🧪 E2E
@@ -134,10 +135,12 @@ jobs:
     timeout-minutes: 40
     env:
       E2E_TIMEOUT: "1200"
-      # Known bugs that show in the request the pipe sends upstream (checked via the
+      # Known bugs that can only show in the request the pipe sends upstream (the
       # mock's request record): they reproduce whatever the mock answers, so KNOWN
-      # is correct for them here. Space-separated KnownIssue keys.
-      REQUEST_SIDE_KNOWN: "azure-double-strip azure-stream-options #123"
+      # would be correct for them here. Space-separated KnownIssue keys. Empty: the
+      # evidence of every registered bug also needs proof that the upstream answered
+      # (e.g. HTTP 200 and the mock's answer), so the meta-test expects 0 KNOWN.
+      REQUEST_SIDE_KNOWN: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -170,7 +173,7 @@ jobs:
             printf '%s\n' "$hidden"
             exit 1
           fi
-          echo "$failed FAIL and no KNOWN except request-side bugs ($REQUEST_SIDE_KNOWN) with every mock answering HTTP 500"
+          echo "$failed FAIL and no KNOWN except request-side bugs (${REQUEST_SIDE_KNOWN:-none}) with every mock answering HTTP 500"
 
       - name: Job summary
         if: always()
