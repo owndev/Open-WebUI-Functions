@@ -3,13 +3,11 @@
 This document describes the native OpenWebUI citation support in the Azure AI Foundry Pipeline, which enables rich citation cards and source previews in the OpenWebUI frontend.
 
 > [!WARNING]
-> **Azure OpenAI On Your Data is retired on October 14, 2026.** Everything in this document is based on On Your Data: the pipeline sends `data_sources` to Azure OpenAI and builds the citations from the `context` of the answer. Microsoft has deprecated On Your Data and retires the service on **October 14, 2026**; see the [On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data). Microsoft does not document what a request with `data_sources` returns after that date: expect it to fail with an error, or to be answered without your search index and without citations. Chats without `data_sources` are not affected. Until then, On Your Data only supports GPT-4o (versions 2024-05-13, 2024-08-06 and 2024-11-20) and GPT-4o-mini (version 2024-07-18).
->
-> Microsoft recommends migrating to Foundry Agent Service with Foundry IQ; to get started, see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect). The migration of this pipeline is tracked in [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). Since v2.8.1 the pipeline logs this retirement notice as a warning once per process (see [Logging](#logging)).
+> **Azure OpenAI On Your Data is retired on October 14, 2026.** This affects only the legacy mode `AZURE_AI_SEARCH_MODE=on_your_data`, in which the pipeline sends `data_sources` to Azure OpenAI and builds the citations from the `context` of the answer. Microsoft retires On Your Data on **October 14, 2026** ([On Your Data API reference](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data)) and, until then, supports it only for GPT-4o and GPT-4o-mini. Since v2.9.0 the default `AZURE_AI_SEARCH_MODE=pipeline` queries Azure AI Search itself, works with every chat endpoint and model and does not use On Your Data ([#187](https://github.com/owndev/Open-WebUI-Functions/issues/187)). In `on_your_data` mode the pipeline logs the retirement notice as a warning once per process (see [Logging](#logging)).
 
 ## Overview
 
-The Azure AI Foundry Pipeline supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature is **automatically enabled** when you configure Azure AI Search data sources (`AZURE_AI_DATA_SOURCES`). The OpenWebUI frontend will display:
+The Azure AI Foundry Pipeline supports **native OpenWebUI citations** for Azure AI Search (RAG) responses. This feature is **automatically enabled** when you configure Azure AI Search (`AZURE_AI_DATA_SOURCES`). In the default pipeline mode the citations come from the pipeline's own search; in `on_your_data` mode from Azure OpenAI's answer. Both run through the same citation code. The OpenWebUI frontend will display:
 
 - **Citation cards** with source information and relevance scores
 - **Source previews** with content snippets
@@ -28,36 +26,54 @@ When Azure AI Search is configured, the pipeline automatically:
 3. Filters citations to only show documents actually referenced in the response
 4. Extracts relevance scores from Azure Search when available
 
-Azure AI Search is only used for chat answers. Open WebUI background tasks (title, tags and follow-up generation) are sent **without** `data_sources` and never emit citation or status events, so they cannot add sources to a chat message (see [Background Tasks](#background-tasks-titles-tags-follow-ups)).
+Azure AI Search is only used for chat answers. Open WebUI background tasks (title, tags and follow-up generation) run **without** a search (and without `data_sources`) and never emit citation or status events, so they cannot add sources to a chat message (see [Background Tasks](#background-tasks-titles-tags-follow-ups)).
 
 ### Configuration Options
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `AZURE_AI_DATA_SOURCES` | `""` | JSON configuration for Azure AI Search (required for citations) |
-| `AZURE_AI_INCLUDE_SEARCH_SCORES` | `true` | Enable relevance score extraction from Azure Search |
-| `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` | `true` | Sources for an answer that contains no `[docX]` reference: `true` shows all documents returned by Azure, `false` shows none (see [Citation Filtering](#citation-filtering)) |
+| `AZURE_AI_SEARCH_MODE` | `pipeline` | `pipeline`: the pipeline queries Azure AI Search itself (any chat endpoint and model); `on_your_data`: legacy Azure OpenAI On Your Data |
+| `AZURE_AI_SEARCH_KEY` | `""` | Azure AI Search key, stored encrypted; wins over `authentication.key` in the JSON |
+| `AZURE_AI_SEARCH_API_VERSION` | `2026-04-01` | Search REST API version (pipeline mode) |
+| `AZURE_AI_SEARCH_QUERY_GENERATION` | `auto` | Search queries written by the model: `auto` (follow-up turns), `always`, `off` (pipeline mode) |
+| `AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS` | `-1` | Tokens of document text in the prompt (characters / 4); `-1` auto = `min(32000, 1600 × top_n_documents)`, `0` no limit (pipeline mode) |
+| `AZURE_AI_INCLUDE_SEARCH_SCORES` | `true` | Relevance percentages on citation cards (pipeline mode: scores of the search hits; `on_your_data`: adds `include_contexts`) |
+| `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` | `true` | Sources for an answer that contains no `[docX]` reference: `true` shows all documents of the answer, `false` shows none (see [Citation Filtering](#citation-filtering)) |
+
+See the [Azure AI integration guide](azure-ai-integration.md#azure-ai-search--rag-integration) for the search itself (query types, query generation, strictness, token budget, authentication, errors).
 
 ### How It Works
 
+In **pipeline mode** the pipeline searches the index, adds the documents to the prompt as `[doc1]` … `[docN]` and builds one citation per document in On Your Data's format (`context.citations` plus `context.intent`, the JSON list of the search queries). It hands this `context` to the same code that handles On Your Data answers:
+
+- **streamed answers**: a first SSE event `{"id": "chatcmpl-azure-search", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "context": {...}}, "finish_reason": null}]}` before Azure's chunks, so `[docX]` links work from the first delta and API clients get the citations as with On Your Data. Answers with no document found have no such event.
+- **non-streamed answers**: `choices[0].message.context` is added to Azure's response.
+
+In **`on_your_data` mode** Azure OpenAI returns the `context` itself.
+
 #### Streaming Responses
 
-When Azure AI Search returns citations in a streaming response:
+When a streamed answer has citations:
 
 1. The pipeline detects citations in the SSE (Server-Sent Events) stream
 2. `[docX]` references in each chunk are converted to markdown links with document URLs. Models usually stream a reference in pieces (`[`, `doc`, `1`, `]`), so the end of a chunk that may still become a reference or a link around one (`[`, `[[`, `[d` … `[doc1`, `[doc1]`, `[[doc1]]`, `[[doc1]](https://…` up to the closing `)`) is held back and sent together with the next chunk. Text that is still held back when the stream ends is sent as a separate event before `data: [DONE]`, so nothing is lost, also in the saved chat message
 3. After the stream ends, citation events are emitted via `__event_emitter__`
 4. Citations are filtered to only include documents referenced in the response
 
-Azure sends the citations (and, with `AZURE_AI_INCLUDE_SEARCH_SCORES=true`, `all_retrieved_documents`) in one SSE event, which grows with the number and length of the retrieved documents. The pipeline reads events of up to 4 MiB. If the stream fails anyway (a larger event, a dropped connection, a timeout), the text received so far is kept, an `Error: …` message is added to the answer and the stream is ended with `data: [DONE]`, so API clients do not get an empty or silently cut off answer; the chat UI also shows the error as the final status. See [Streamed Answer Ends With an Error](#streamed-answer-ends-with-an-error).
+In `on_your_data` mode Azure sends the citations (and, with `AZURE_AI_INCLUDE_SEARCH_SCORES=true`, `all_retrieved_documents`) in one SSE event, which grows with the number and length of the retrieved documents. The pipeline reads events of up to 4 MiB. If the stream fails anyway (a larger event, a dropped connection, a timeout), the text received so far is kept, an `Error: …` message is added to the answer and the stream is ended with `data: [DONE]`, so API clients do not get an empty or silently cut off answer; the chat UI also shows the error as the final status. See [Streamed Answer Ends With an Error](#streamed-answer-ends-with-an-error).
 
 #### Non-Streaming Responses
 
-When Azure AI Search returns citations in a non-streaming response:
+When a non-streamed answer has citations:
 
 1. The pipeline extracts citations from the response context
 2. `[docX]` references in the content are converted to markdown links
 3. Individual citation events are emitted via `__event_emitter__` for each referenced source
+
+#### Tool Rounds (Pipeline Mode)
+
+With native function calling Open WebUI calls the pipeline again for every tool round of an answer, with the same message. The pipeline reuses the documents of the first round (same numbering, no new search), a round that ends in tool calls emits only the documents it references (never the "show all" fallback), and every document is emitted at most once per answer. The fallback for an answer without references applies only when no round referenced a document. The documents are kept per Open WebUI worker process, so with several workers a tool round on another process searches again and can add a source twice.
 
 ## Citation Format
 
@@ -88,7 +104,7 @@ Key points:
 
 ### Azure Citation Format (Input)
 
-Azure AI Search returns citations in this format:
+In `on_your_data` mode Azure returns citations in this format:
 
 ```python
 {
@@ -102,7 +118,20 @@ Azure AI Search returns citations in this format:
 }
 ```
 
-The pipeline automatically converts Azure citations to OpenWebUI format.
+In pipeline mode the pipeline builds the same shape from each search hit it puts into the prompt (list order = `[docN]`):
+
+| Citation key | From the search hit |
+|---|---|
+| `title`, `url`, `filepath` | the fields named by `fields_mapping` (`title_field`, `url_field`, `filepath_field`; default `title`, `url`, `filepath`); lists joined with `, `, `null` when empty |
+| `content` | the `content_fields` (default `content`) joined with `content_fields_separator`, after removing `<documents>` tags and turning `[doc` into `[ doc`, cut to the token budget: exactly the text the model received |
+| `chunk_id` | the hit's `chunk_id` field, else the document number (informative only) |
+| `original_search_score` | `@search.score` (only with `AZURE_AI_INCLUDE_SEARCH_SCORES=true`) |
+| `rerank_score` | `@search.rerankerScore` of semantic queries (only with scores on, left out when absent) |
+| `relevance` | 0-1 value shown on the card, computed for the score type (see [Relevance Scores](#relevance-scores); only with scores on) |
+
+Pipeline citations have no `metadata` (a `source` key there would replace the `[docX] - title` card name) and no `filter_reason` (On Your Data used it to mark dropped documents). The `context` is "On Your Data shaped", not identical: there is no `all_retrieved_documents`.
+
+The pipeline automatically converts these citations to OpenWebUI format.
 
 ## Usage
 
@@ -112,7 +141,10 @@ Configure Azure AI Search to enable citation support:
 
 ```bash
 # Azure AI Search configuration (required for citations)
-AZURE_AI_DATA_SOURCES='[{"type":"azure_search","parameters":{"endpoint":"https://YOUR-SEARCH-SERVICE.search.windows.net","index_name":"YOUR-INDEX-NAME","authentication":{"type":"api_key","key":"YOUR-SEARCH-API-KEY"}}}]'
+AZURE_AI_DATA_SOURCES='[{"type":"azure_search","parameters":{"endpoint":"https://YOUR-SEARCH-SERVICE.search.windows.net","index_name":"YOUR-INDEX-NAME","authentication":{"type":"api_key"}}}]'
+
+# Azure AI Search key, stored encrypted
+AZURE_AI_SEARCH_KEY="YOUR-SEARCH-QUERY-KEY"
 
 # Enable relevance scores (default: true)
 AZURE_AI_INCLUDE_SEARCH_SCORES=true
@@ -138,27 +170,42 @@ References that are already links (`[[doc1]](url)` or `[doc1](url)`) are left as
 
 Open WebUI uses the chat model for background tasks such as title, tag and follow-up generation. For these requests (`__task__` is set) the pipeline:
 
-- does **not** send `data_sources` (no Azure AI Search query, no citations in the result)
+- does **not** search (pipeline mode: no Azure AI Search query and no `<documents>` in the prompt; `on_your_data` mode: no `data_sources`), so there are no citations in the result
 - does **not** emit citation or status events, so nothing is added to the chat message the task belongs to
 
 This fixes the "too many sources" problem ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)): a task answer such as a title contains no `[docX]` reference, so the "no references → show all citations" fallback emitted every retrieved document once per task. Where Open WebUI passes the chat message's event emitter to background tasks, these citations were added to the message shortly after the answer was finished. Open WebUI 0.6.41 (current when #123 was reported) does this for saved chats; Open WebUI 0.11.4 does it for saved-chat requests without a websocket session, but not for chats in the browser, where the change saves one Azure AI Search query per task.
 
 ### Tools and `stream_options` with Azure AI Search
 
-When `data_sources` is used for a request, the pipeline does not forward:
+In **pipeline mode** (default since v2.9.0) `tools`, `tool_choice` and `stream_options` are forwarded as in chats without Azure AI Search: function calling works (see [Tool Rounds](#tool-rounds-pipeline-mode)) and streamed answers report token usage.
 
-- **`tools` / `tool_choice`** (behavior change in v2.8.0, up to v2.7.0 they were forwarded): with tools in the request, Azure OpenAI On Your Data [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`. Open WebUI 0.10+ adds its built-in tools to chats in the web UI (native function calling), which would silently turn off the search. The tools are always dropped, also tools you selected yourself, so function calling is not available in chats that use Azure AI Search; use a second instance of the pipeline without `AZURE_AI_DATA_SOURCES` for tools.
-- **`stream_options`**: On Your Data rejects it (`Validation error at #/stream_options: Extra inputs are not permitted`). Open WebUI 0.11.1+ adds `stream_options.include_usage` to streaming requests of models with the usage capability. Streaming answers with Azure AI Search therefore contain no token usage.
+In **`on_your_data` mode**, when `data_sources` is used for a request, the pipeline does not forward:
+
+- **`tools` / `tool_choice`** (behavior change in v2.8.0, up to v2.7.0 they were forwarded): with tools in the request, Azure OpenAI On Your Data [ignores the data sources](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/concepts/use-your-data#function-calling) unless `tool_choice` is `none`. Open WebUI 0.10+ adds its built-in tools to chats in the web UI (native function calling), which would silently turn off the search. The tools are always dropped, also tools you selected yourself.
+- **`stream_options`**: On Your Data rejects it (`Validation error at #/stream_options: Extra inputs are not permitted`). Open WebUI 0.11.1+ adds `stream_options.include_usage` to streaming requests of models with the usage capability. Streaming answers with `data_sources` therefore contain no token usage.
 
 ### Relevance Scores
 
-When `AZURE_AI_INCLUDE_SEARCH_SCORES=true` (default), the pipeline:
+When `AZURE_AI_INCLUDE_SEARCH_SCORES=true` (default), citation cards show a relevance percentage.
+
+**Pipeline mode**: each citation carries `relevance` (0-1), which the card shows:
+
+| Query type | Score | `relevance` |
+|---|---|---|
+| `semantic`, `vector_semantic_hybrid` | `@search.rerankerScore` (0-4) | score / `RERANK_SCORE_MAX` (default 4.0) |
+| `simple`, `semantic` without reranker score (partial result) | `@search.score` (BM25, unbounded) | score / `BM25_SCORE_MAX` (default 100), at most 1 |
+| `vector` over one field | `@search.score` (0.333-1 for cosine) | as is |
+| `vector_simple_hybrid`, `vector` over several fields, `vector_semantic_hybrid` without reranker scores | `@search.score` (reciprocal rank fusion, about 1/60 per fused list) | score × 60 / number of fused lists (text query + vector fields), at most 1 |
+
+Unlike the On Your Data path, a BM25 or reranker score below 1 is divided as well, so the percentages grow with the score. With `AZURE_AI_INCLUDE_SEARCH_SCORES=false` the citations have no score keys and the cards show 0 %.
+
+**`on_your_data` mode**: the pipeline
 
 1. Automatically adds `include_contexts: ["citations", "all_retrieved_documents"]` to Azure Search requests
 2. Extracts scores based on the `filter_reason` field:
    - `filter_reason="rerank"` → uses `rerank_score`
    - `filter_reason="score"` or not present → uses `original_search_score`
-3. Displays the score as a percentage on citation cards
+3. Displays the score as a percentage on citation cards (a score of at most 1.0 is shown as is)
 
 ## Implementation Details
 
@@ -167,12 +214,20 @@ When `AZURE_AI_INCLUDE_SEARCH_SCORES=true` (default), the pipeline:
 The pipeline includes these helper functions for citation processing:
 
 1. **`_extract_citations_from_response()`**: Extracts citations from Azure responses
-2. **`_normalize_citation_for_openwebui()`**: Converts Azure citations to OpenWebUI format
-3. **`_emit_openwebui_citation_events()`**: Emits citation events via `__event_emitter__`
-4. **`_merge_score_data()`**: Matches citations with score data from `all_retrieved_documents`
+2. **`_normalize_citation_for_openwebui()`**: Converts Azure citations to OpenWebUI format (uses `relevance` first when a citation has it)
+3. **`_emit_openwebui_citation_events()`**: Emits citation events via `__event_emitter__` and returns the emitted indices
+4. **`_merge_score_data()`**: Matches citations with score data from `all_retrieved_documents` (`on_your_data` mode)
 5. **`_build_citation_urls_map()`**: Builds mapping of citation indices to URLs
 6. **`_format_citation_link()`**: Creates markdown links for `[docX]` references
 7. **`_convert_doc_refs_to_links()`**: Converts all `[docX]` references in content to markdown links
+
+Pipeline mode adds:
+
+1. **`_get_search_config()`**: Reads `AZURE_AI_DATA_SOURCES` as the search configuration (configuration errors raise `AzureSearchError`)
+2. **`_retrieve()`**: Query text, query generation (`_generate_queries()`), embeddings (`_embed()`), the searches (`_search_once()`), `strictness` (`_apply_strictness()`), merge (`_merge_search_results()`), token budget (`_fit_documents_to_budget()`) and the citations (`_search_citation()`); reuses the result in tool rounds
+3. **`_inject_sources()`**: Adds the `<documents>` block to the current user message and the rules to the system message (new message objects)
+4. **`_prepend_context_event()`**: The first SSE event with `delta.context` of a streamed answer
+5. **`_emit_search_citation_events()`**: Citation events per tool round, every document at most once per answer
 
 ### Title Fallback Logic
 
@@ -192,7 +247,9 @@ Citations are filtered to only show documents that are actually referenced in th
 
 Citation helpers log only counts at `INFO` level. Document content, titles and URLs are logged at `DEBUG` level only.
 
-Since v2.8.1 the first request that uses `data_sources` (from `AZURE_AI_DATA_SOURCES` or sent by the client; an empty list does not count) logs a `WARNING` that Azure OpenAI On Your Data is retired on October 14, 2026, with a link to [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). It is logged once per process (Open WebUI loads the function again when it is saved, for example after its code is changed, which logs it once more) and contains no part of the `data_sources`, so no search key. Background tasks are sent without `data_sources` and do not log it.
+In pipeline mode each search logs one `INFO` line with the number of queries, hits per query, documents kept, characters added to the prompt and the time of query generation, embeddings and search (no query text, no content). Search errors are logged as `ERROR` (`Error in Azure AI request: Azure AI Search: …`, without traceback) with Search's `request-id` at `INFO`. The query text, the generated queries and the document titles are logged at `DEBUG` only. Keys, tokens, request headers and the `AZURE_AI_DATA_SOURCES` JSON are never logged. Warnings (once per process): unknown `AZURE_AI_SEARCH_MODE`, unknown keys in the JSON (names only), several data sources, the key in both `AZURE_AI_SEARCH_KEY` and the JSON, missing `vector_fields` / `content_fields`, query generation paused for a model.
+
+In `on_your_data` mode (since v2.8.1) the first request that uses `data_sources` (from `AZURE_AI_DATA_SOURCES` or sent by the client; an empty list does not count) logs a `WARNING` that Azure OpenAI On Your Data is retired on October 14, 2026, with a link to [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187) and the hint to set `AZURE_AI_SEARCH_MODE=pipeline`. It is logged once per process (Open WebUI loads the function again when it is saved, for example after its code is changed, which logs it once more) and contains no part of the `data_sources`, so no search key. Background tasks are sent without `data_sources` and do not log it; pipeline mode never logs it.
 
 ## Index Schema Requirements for Citations
 
@@ -209,7 +266,7 @@ For citations to work correctly, your Azure AI Search index must contain the rig
 | `chunk_id` | `Edm.String` | Optional | Yes | Helps match citations with relevance scores |
 | `contentVector` | `Collection(Edm.Single)` | For vector search | N/A | Enables vector/hybrid search |
 
-> **Key point**: The `title`, `filepath`, and `url` fields must be marked as **retrievable** in your index schema. If they are not retrievable, Azure will not include them in the citation response, and the pipeline cannot display them.
+> **Key point**: The `title`, `filepath`, and `url` fields must be marked as **retrievable** in your index schema. If they are not retrievable, the search does not return them, and the pipeline cannot display them.
 
 ### Title Fallback Chain
 
@@ -224,7 +281,7 @@ To avoid seeing "Unknown Document", ensure at least one of `title`, `filepath`, 
 
 ### Custom Field Names and `fields_mapping`
 
-If your index uses different field names (e.g., `body` instead of `content`, or `doc_title` instead of `title`), you must tell Azure OpenAI how to map them using the `fields_mapping` parameter in your `AZURE_AI_DATA_SOURCES` configuration.
+If your index uses different field names (e.g., `body` instead of `content`, or `doc_title` instead of `title`), you must tell the pipeline (or Azure OpenAI in `on_your_data` mode) how to map them using the `fields_mapping` parameter in your `AZURE_AI_DATA_SOURCES` configuration. In pipeline mode a mapping also limits the fields the search returns (`select`); a role it leaves out stays empty (see [How the Index Fields Are Used](azure-ai-integration.md#how-the-index-fields-are-used)).
 
 **`fields_mapping` properties:**
 
@@ -247,8 +304,7 @@ If your index uses different field names (e.g., `body` instead of `content`, or 
       "endpoint": "https://my-search.search.windows.net",
       "index_name": "my-custom-index",
       "authentication": {
-        "type": "api_key",
-        "key": "YOUR-SEARCH-API-KEY"
+        "type": "api_key"
       },
       "fields_mapping": {
         "content_fields": ["body", "summary"],
@@ -335,7 +391,22 @@ If you index documents from Azure Blob Storage using an indexer, you need to map
 
 ### How the Pipeline Reads Citation Fields
 
-When Azure OpenAI returns a response with citations, each citation object looks like this:
+In pipeline mode a citation built from a semantic search hit looks like this:
+
+```json
+{
+  "title": "Architecture Overview",
+  "content": "The system uses a microservices architecture...",
+  "url": "https://storageaccount.blob.core.windows.net/docs/architecture.pdf",
+  "filepath": "architecture.pdf",
+  "chunk_id": "0",
+  "original_search_score": 12.5,
+  "rerank_score": 3.2,
+  "relevance": 0.8
+}
+```
+
+When Azure OpenAI returns a response with citations (`on_your_data` mode), each citation object looks like this:
 
 ```json
 {
@@ -357,7 +428,7 @@ The pipeline maps these fields to the OpenWebUI citation event:
 | `title` | `source.name` | `[doc1] - Architecture Overview` |
 | `content` | `document[0]` | Preview text in citation card |
 | `url` / `filepath` | `source.url` | Clickable link |
-| `rerank_score` / `original_search_score` | `distances[0]` | Relevance percentage |
+| `relevance` (pipeline mode), else `rerank_score` / `original_search_score` | `distances[0]` | Relevance percentage |
 
 ## Troubleshooting
 
@@ -368,9 +439,10 @@ The pipeline maps these fields to the OpenWebUI citation event:
 **Solutions**:
 
 1. Check that Azure AI Search is properly configured (`AZURE_AI_DATA_SOURCES`)
-2. Ensure you're using an Azure OpenAI endpoint (not a generic Azure AI endpoint)
-3. Verify the response contains `[docX]` references
-4. Check browser console and server logs for errors
+2. In pipeline mode, check the status lines: `No documents found in Azure AI Search` means the search returned nothing that passed `strictness` (try a lower `strictness`); an `Error: Azure AI Search: …` answer names the problem (see [Troubleshooting Pipeline Mode](azure-ai-integration.md#troubleshooting-pipeline-mode))
+3. Only in `on_your_data` mode: ensure you're using an Azure OpenAI endpoint (not a generic Azure AI endpoint)
+4. Verify the response contains `[docX]` references
+5. Check browser console and server logs for errors
 
 ### Citations Showing "Unknown Document"
 
@@ -401,6 +473,7 @@ The pipeline maps these fields to the OpenWebUI citation event:
 1. Verify `AZURE_AI_INCLUDE_SEARCH_SCORES=true` is set
 2. Check that your Azure Search index supports scoring
 3. Enable DEBUG logging to see the raw score values from Azure
+4. In pipeline mode, low percentages with `simple` queries mean that BM25 scores are small compared with `BM25_SCORE_MAX` (default 100): lower it to match your index
 
 ### Links Not Working
 
@@ -422,19 +495,19 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 **Problem**: With `AZURE_AI_DATA_SOURCES` configured, answers in the chat UI are not grounded and show no citations, or streaming fails with `Extra inputs are not permitted`
 
-**Solution**: Update to v2.8.0 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources.
+**Solution**: Update to v2.8.0 or later. Earlier versions forwarded Open WebUI's built-in `tools` (Azure then ignores `data_sources`) and `stream_options` (rejected by On Your Data) together with the data sources. Since v2.9.0 the default pipeline mode does not depend on On Your Data at all.
 
 ### Streamed Answer Ends With an Error
 
-**Problem**: A streamed answer with Azure AI Search ends with `Error: Azure AI sent a stream event larger than 4 MiB, which cannot be read. …`, or (before v2.8.0) stays empty while the server log shows `Got more than 131072 bytes when reading`
+**Problem**: A streamed answer with Azure AI Search (`on_your_data` mode) ends with `Error: Azure AI sent a stream event larger than 4 MiB, which cannot be read. …`, or (before v2.8.0) stays empty while the server log shows `Got more than 131072 bytes when reading`
 
-**Solution**: The citations of an answer arrive in one SSE event. Up to v2.7.0 the pipeline could only read events of up to 128 KiB, which many or long retrieved documents exceed; since v2.8.0 it reads events of up to 4 MiB. If an event is even larger, retrieve fewer or shorter documents (for example a lower `top_n_documents` in `AZURE_AI_DATA_SOURCES`, or shorter chunks in the index), or set `AZURE_AI_INCLUDE_SEARCH_SCORES=false`, so that `all_retrieved_documents` (which repeats the documents together with their scores) is no longer requested; citation cards then show no relevance percentage.
+**Solution**: In pipeline mode the document text is limited by `AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS`, so this does not happen; switch to `AZURE_AI_SEARCH_MODE=pipeline`. In `on_your_data` mode the citations of an answer arrive in one SSE event. Up to v2.7.0 the pipeline could only read events of up to 128 KiB, which many or long retrieved documents exceed; since v2.8.0 it reads events of up to 4 MiB. If an event is even larger, retrieve fewer or shorter documents (for example a lower `top_n_documents` in `AZURE_AI_DATA_SOURCES`, or shorter chunks in the index), or set `AZURE_AI_INCLUDE_SEARCH_SCORES=false`, so that `all_retrieved_documents` (which repeats the documents together with their scores) is no longer requested; citation cards then show no relevance percentage.
 
 ### Requests With Azure AI Search Fail or Show No Citations After October 14, 2026
 
-**Problem**: Since October 14, 2026, chats that use `AZURE_AI_DATA_SOURCES` (or API requests with `data_sources`) end with an `Error: …` message, or are answered without the search index and without citations, while chats without `data_sources` still work
+**Problem**: Since October 14, 2026, chats that use `AZURE_AI_DATA_SOURCES` in `on_your_data` mode (or API requests with `data_sources`) end with an `Error: …` message (for HTTP 400 / 404 with `(Azure OpenAI On Your Data was retired on 2026-10-14; set AZURE_AI_SEARCH_MODE=pipeline)`), or are answered without the search index and without citations
 
-**Solution**: Microsoft retires Azure OpenAI On Your Data, which this integration is built on, on October 14, 2026 (see the notice at the top of this document). The pipeline has no replacement retrieval path yet; follow [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187). Microsoft recommends Foundry Agent Service with Foundry IQ ([Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect)). If the requests fail, clearing `AZURE_AI_DATA_SOURCES` makes the chats work again, without the search index.
+**Solution**: Microsoft retires Azure OpenAI On Your Data, which the legacy mode is built on, on October 14, 2026 (see the notice at the top of this document). Set `AZURE_AI_SEARCH_MODE=pipeline` (the default since v2.9.0): the pipeline then queries Azure AI Search itself with the same `AZURE_AI_DATA_SOURCES`. Check the [authentication](azure-ai-integration.md#authentication-of-the-search) (a managed identity is now the Open WebUI host's) and, for vector query types, `embedding_dependency`. API clients that send `data_sources` themselves must stop doing so in pipeline mode ([#187](https://github.com/owndev/Open-WebUI-Functions/issues/187)).
 
 ## References
 
@@ -449,6 +522,7 @@ The pipeline maps these fields to the OpenWebUI citation event:
 
 ## Version History
 
+- **v2.9.0**: New default `AZURE_AI_SEARCH_MODE=pipeline`: the pipeline queries Azure AI Search itself (Search REST API `2026-04-01`; simple, semantic, vector and hybrid queries; `filter`, `fields_mapping`, `top_n_documents`, approximated `strictness`, `in_scope`, `role_information`, `embedding_dependency` with `deployment_name`, `endpoint` or the index vectorizer), works with every chat endpoint and model, writes search queries for follow-up turns (`AZURE_AI_SEARCH_QUERY_GENERATION`), adds the documents to the prompt within a token budget (`AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS`) and synthesizes On Your Data's `context` for the existing citation code (first SSE event / `message.context`); tools and token usage are kept; citations carry `relevance` (reranker, BM25, vector and rank-based RRF scores); tool rounds reuse the documents and emit every source once; search and configuration errors end with `Error: Azure AI Search: …` (fail closed, also for invalid JSON); client `data_sources` are an error in pipeline mode; new encrypted `AZURE_AI_SEARCH_KEY` (both modes) and `AZURE_AI_SEARCH_API_VERSION`; managed identity now means the Open WebUI host's identity. `AZURE_AI_SEARCH_MODE=on_your_data` keeps the v2.8.1 behavior, plus the key valve and a retirement hint on HTTP 400 / 404 ([#187](https://github.com/owndev/Open-WebUI-Functions/issues/187))
 - **v2.8.1**: Retirement notice for Azure OpenAI On Your Data (October 14, 2026) in this document, in the `AZURE_AI_DATA_SOURCES` valve description and in the pipeline docstring; the first request with a non-empty `data_sources` (from the valve or sent by the client) logs a warning once per process, without any part of the `data_sources`; background tasks do not log it ([#187](https://github.com/owndev/Open-WebUI-Functions/issues/187))
 - **v2.8.0**: Background tasks (title, tags, follow-ups) are sent without `data_sources` and emit no citation/status events ([#123](https://github.com/owndev/Open-WebUI-Functions/issues/123)); new valve `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES` (default `true`) to show no sources for answers without `[docX]` references; `tools` and `tool_choice` are dropped (behavior change) and `stream_options` is not forwarded together with `data_sources`; `[docX]` references and links split across streamed chunks are linked once, held back text at the end of a stream reaches the saved message; already linked references are not wrapped again, `[[docX]]` without a link counts as one reference, parentheses in document URLs are percent-encoded and links in the chat history (also older links with parentheses in the URL) are sent back as plain `[docX]`; references to documents that do not exist do not count as references; streamed events of up to 4 MiB (was 128 KiB) are read and a failed stream ends with an `Error: …` message and `data: [DONE]` instead of an empty answer; a non-streamed answer with `content: null` no longer fails with `Error: expected string or bytes-like object`; document content is only logged at `DEBUG` level
 - **v2.6.0**: Major refactor - removed `AZURE_AI_ENHANCE_CITATIONS` and `AZURE_AI_OPENWEBUI_CITATIONS` valves; citation support is now always enabled when `AZURE_AI_DATA_SOURCES` is configured; added clickable `[docX]` markdown links; improved score extraction using `filter_reason` field
