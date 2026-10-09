@@ -3,8 +3,9 @@
 The functions in this repo only run inside Open WebUI, so they are tested end-to-end
 against a **real Open WebUI container**: `tests/e2e/run.sh` starts a throw-away
 container, installs the function files through the Open WebUI API, points them at
-**mock provider APIs** (Gemini, Azure OpenAI / AI Foundry, n8n, Infomaniak) and runs
-scenario suites that chat with them the way an API client and the browser UI do.
+**mock provider APIs** (Gemini, Azure OpenAI / AI Foundry, n8n, Infomaniak, Azure Log
+Analytics) and runs scenario suites that chat with them the way an API client and the
+browser UI do.
 Container and volume are removed afterwards.
 
 - [Prerequisites](#prerequisites)
@@ -24,7 +25,9 @@ Container and volume are removed afterwards.
 - **Docker** (Docker Desktop on Windows/macOS, Docker Engine on Linux).
 - **bash**: Linux/macOS shell, or **Git Bash** on Windows.
 - Network access for the first image pull (`ghcr.io/open-webui/open-webui:v0.11.4-slim`,
-  ~1 GB) and for `pip install google-genai` when the Gemini pipe is installed.
+  ~1 GB), for `pip install google-genai` when the Gemini pipe is installed and, in the
+  `filters` suite, for the tiktoken encodings (`cl100k_base`, `o200k_base`) the driver
+  downloads into the container's `TIKTOKEN_CACHE_DIR` (without them the suite fails).
 
 No Python on the host: the mocks, the probe pipe and the test driver run **inside** the
 Open WebUI container, whose Python already ships `aiohttp`, `httpx` and
@@ -43,24 +46,32 @@ pixi run e2e gemini              # same via pixi (Linux)
 Typical output (abridged):
 
 ```text
-starting owui-e2e-142233-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
-Open WebUI healthy after 67s (http://localhost:49213)
+starting owui-e2e-004128-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
+Open WebUI healthy after 25s (http://localhost:49213)
+Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
+function versions: google_gemini.py 1.16.1, azure_ai_foundry.py 2.7.0, n8n.py 2.3.0, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
-[KNOWN] gemini.api.stream  API stream without websocket session: answer streamed
+[KNOWN] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
           -> known B1 (no issue filed): Gemini API stream without a websocket session ends
-             with 'Error during streaming' ...; fix pending in PR #185 (not
-             merged yet)
+             with 'Error during streaming' ...; fix pending in PR #185 (not merged yet),
+             fixed in pipelines/google/google_gemini.py 1.17.0
+          HTTP 200 stream=True content=Error during streaming:  usage=None errors=[] upstream=None
 ...
-SUMMARY: 98 PASS, 0 FAIL, 27 KNOWN in 258s
-total runtime: 368s
-output: tests/e2e/out/20261008-142233-owui-e2e-142233-1234
+--- gemini: 129s
+...
+SUMMARY: 167 PASS, 0 FAIL, 124 KNOWN in 435s
+total runtime: 471s
+output: tests/e2e/out/20261009-004128-owui-e2e-004128-1234
 ```
 
-A full run took 2.5-6 minutes on a laptop with Docker Desktop: 40-70 s container
-start-up, then 1.5-4 minutes of scenarios, most of it network downloads on first use
-(`pip install google-genai` when the Gemini function is created, the tiktoken encoding
-on the first `time_token_tracker` call). Without those the suites run in seconds.
+A full run of all suites took 7-9.5 minutes on a shared 8-CPU Docker host (427-565 s,
+depending on the load; with `main`'s files 471 s: 25 s container start-up, then
+gemini 129 s, azure 55 s, n8n 71 s, infomaniak 36 s, filters 143 s). Network downloads
+on first use come on top
+(`pip install google-genai` when the Gemini function is created, the tiktoken encodings
+the `filters` suite caches before its first scenario). How many checks each suite has
+and how many are KNOWN today is listed under [What is tested](#what-is-tested).
 
 The exit code is `0` when there is no FAIL (KNOWN results are fine), `1` when at least
 one scenario FAILs and `2` for setup errors: Docker missing, `docker run` failing (port
@@ -117,22 +128,52 @@ worktrees, several agents) safe. The harness never removes images.
 ## What is tested
 
 Every suite installs its function(s) through `POST /api/v1/functions/create`, sets the
-valves to the mock, and checks at least: the file **loads** (import + activate),
-secrets are **stored encrypted**, the **model list**, the **API path** (non-stream and
-stream), the **browser path** (saved answer and usage), a **background title task**
-and that the **server log** has no unexpected `ERROR` / `Traceback` lines.
+valves to the mock, and checks at least: the file **loads** (import + activate), the
+**valve names** are still there (they are public API), secrets are **stored encrypted**
+and never show up in the **server log** (at any level), the **model list**, the **API
+path** (non-stream and stream), the **browser path** (saved answer, usage and status
+events), a **background title task** and that the server log has no unexpected
+`ERROR` / `Traceback` / `ResourceWarning` block.
 
-| Suite | Function(s) | Mock | File-specific scenarios |
+| Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
-| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | thinking wrapped in `<details>` and stripped from replayed history (#176), image models forced non-stream with IMAGE modality and the image saved to the chat (`gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`), Veo long-running operation with the video saved to the chat, Search grounding through the `google_search_tool` filter (googleSearch tool, sources, `[1]` citations) |
-| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` | `AZURE_AI_MODEL` lists, model header vs. body, dotted model names (`gpt-4.1`, `Phi-3.5-mini-instruct`), allow-listed body (extra client keys such as `user` are dropped, `temperature` is kept), upstream errors, Azure AI Search "On Your Data": `[docX]` → links, only referenced sources saved, no `data_sources` for background tasks, `stream_options` with `data_sources` |
-| `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | bearer/Cloudflare headers, `usage`, `intermediateSteps` tool display (list and dict form), `<think>` blocks, n8n NDJSON streaming, SSE streams (separate and coalesced writes), webhook error |
-| `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | llm-only model list, product id / bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON, upstream error |
-| `filters` | `filters/*.py` + probe pipe | – | per-model (`meta.filterIds`) and global filters, `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path and its status in the browser path, background task sees `__task__` and no `__event_emitter__` |
+| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream) |
+| `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; ignores `data_sources` when tools are sent, as Azure does) | `valves`, `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status), `tasks` (title task, also with Azure AI Search valves, #123), `oyd` (Azure AI Search "On Your Data": `[docX]` → links, also split across stream deltas, already linked or with parentheses in the URL; links in the history sent back as `[docX]`; only referenced sources saved and the show-all valve; relevance scores; no `data_sources` for background tasks, also without a websocket session; no tools or `stream_options` together with `data_sources`; a 300 KB and a > 4 MiB context event; `content: null`), `logs` (no API key and no citation text in the log) |
+| `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
+| `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
+| `filters` | `filters/*.py` + probe pipe | `mock_la.py` (Azure Log Analytics Data Collector API; the suite starts it, see below) | `model` / `global` (filters attached per model via `meta.filterIds` and as global filters: `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path with exact token counts, its status in the browser path, background task without `__event_emitter__`), `spec` (`SEND_TO_LOG_ANALYTICS` env parsing, encrypted shared key, valve names), `la` (Log Analytics records: signature, headers, payload and exact counts on the API and browser path, special tokens, multi-turn averages, sending switched off, HTTP errors, a slow and a hanging endpoint do not delay the answer, estimate marker), `valves` (compact status), `correlation` (inlet/outlet correlation when Open WebUI rewrites the last user message, concurrent identical requests), `encoding` (model-specific encoding, `gpt-4o` → `o200k_base`), `offline` (the tiktoken download hangs: estimates, one load at a time, retry, server not blocked), `multimodel` (multi-model chat and the features dict the models share), `search` (`google_search_tool` with features `{}`, `null` or without web_search, other feature keys kept, no per-user permission check), `vertex` (per-request data store, store only with the feature, `features: null`) |
 
 The **probe pipe** (`tests/e2e/probe/probe_pipe.py`) answers with a JSON report of what
-Open WebUI handed it (`__metadata__` features/params, `__task__`, whether an
-`__event_emitter__` exists), so filter → pipe coupling is tested without a provider.
+Open WebUI handed it (body keys, model and messages, `__metadata__` features / params /
+model id, `__task__`, whether an `__event_emitter__` exists), so filter → pipe coupling
+is tested without a provider. `PROBE_SLEEP=<s>` in the last user message delays its
+answer (overlapping requests), `PROBE_SLEEP[<model>]=<s>` only that model's answer
+(multi-model chats).
+
+The `filters` suite sets up the Log Analytics mock itself: it maps the workspace host
+`<id>.ods.opinsights.azure.com` to 127.0.0.1 in the container's `/etc/hosts`, installs
+a throw-away test CA into the container's trust store and starts `mocks/mock_la.py`
+(HTTPS on 127.0.0.1:443, control routes on :9105). It also creates the user
+`filters-user@example.com`; the `gemini` suite creates `e2e-gemini-user@example.com`.
+The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
+process), so do not rerun it with `--reuse`.
+
+Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09):
+
+| Suite | Checks | `main` (0e47f2a): PASS / KNOWN | Known bugs seen on `main` | Fixed files of #182-#185: PASS / KNOWN |
+| --- | ---: | ---: | ---: | ---: |
+| `gemini` | 81 | 44 / 37 | 17 | 81 / 0 |
+| `azure` | 70 | 37 / 33 | 14 | 70 / 0 |
+| `n8n` | 51 | 37 / 14 | 10 | 51 / 0 |
+| `infomaniak` | 32 | 15 / 17 | 8 | 31 / 1 |
+| `filters` | 57 | 34 / 23 | 12 | 57 / 0 |
+| **all** | **291** | **167 / 124** | **61** | **290 / 1** |
+
+There is no FAIL in either column. `harness/known_*.py` registers 63 known bugs; two
+Gemini bugs (`gemini-task-details`, `gemini-stream-data-prefix`) are hidden on `main`
+behind B1 / B5 and only show as FAIL when their fix regresses. With the fixed files,
+123 tagged checks are listed as obsolete markers; the one KNOWN left is
+`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`).
 
 ### API path vs. browser path
 
@@ -244,8 +285,9 @@ export each file (`git show my-fix-branch:pipelines/azure/azure_ai_foundry.py >
 directory records where each tested file came from.
 
 Function files are staged with LF line endings whatever their source: a Windows checkout
-(`core.autocrlf=true`) has CRLF, `--ref` and the Open WebUI editor give LF.
-`SOURCES.txt` says `CRLF converted to LF` for a converted file.
+(`core.autocrlf=true`) has CRLF, `--ref` gives the file as stored in git (`n8n.py`,
+`infomaniak.py` and `google_search_tool.py` are stored with CRLF) and the Open WebUI
+editor gives LF. `SOURCES.txt` says `CRLF converted to LF` for a converted file.
 
 ## Debugging a failure
 
@@ -310,9 +352,11 @@ check_owui_api.sh    static Open WebUI API compatibility check
 e2e.py               in-container driver entry point
 harness/             driver library: owui.py (REST client, API-path chat, valves, models),
                      browser.py (socket.io + saved chats), logs.py (server log),
-                     mocks.py, results.py, known.py (known bugs), suite.py, config.py
+                     mocks.py, results.py, known.py + known_<area>.py (known bugs),
+                     suite.py, config.py
 suites/              one module per suite: GROUPS + async def run(t: Suite)
-mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container)
+mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container);
+                     mock_la.py (Log Analytics) is started by the filters suite (:443, :9105)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 ```
 
@@ -357,8 +401,8 @@ async def api(t: Suite, mock) -> None:
   `function_gemini:pipe`), `file` and `fixed_in` (the function file and the version that
   fixes it, `""` while no fix exists), the fixing branch (or `""`) and an issue `ref`.
   The CI meta-test fails when the evidence also matches a failing upstream (see
-  [CI](#ci)); a bug that shows in the request sent upstream goes into
-  `REQUEST_SIDE_KNOWN` in `.github/workflows/e2e.yml` instead.
+  [CI](#ci)). Only a bug that can show nothing but the request sent upstream goes
+  into `REQUEST_SIDE_KNOWN` in `.github/workflows/e2e.yml` (empty today).
 - New suite: add `tests/e2e/suites/<name>.py` (with `GROUPS` and `async def run(t)`);
   `run.sh` and the driver discover every module there (names starting with `_` are
   skipped), `all` runs new suites after the existing ones in alphabetical order. For a
@@ -399,7 +443,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. Exceptions are the bugs listed in `REQUEST_SIDE_KNOWN` in the workflow, which show in the request the pipe sends upstream and therefore reproduce whatever the mock answers (e.g. `azure-double-strip`: the mock records `body.model='1'`). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09: 34 PASS / 200 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario
@@ -445,8 +489,11 @@ ends as a `<suite>.timeout` FAIL with results instead of a cancelled job. The jo
   `RAG_EMBEDDING_ENGINE=openai`: no download, and `v0.11.3-slim` became healthy after
   158 s on a busy machine, with the same results as `v0.11.4-slim`. A container you
   start by hand needs the same variable.
-- **First `time_token_tracker` call is slow:** tiktoken downloads its `cl100k_base`
-  encoding on first use (needs network); the first filters scenario took 50-120 s here.
+- **tiktoken encodings:** `time_token_tracker` loads its tiktoken encoding on first use
+  (a download from `openaipublic.blob.core.windows.net`). The `filters` suite loads
+  `cl100k_base` and `o200k_base` in the driver first, which fills the container's
+  `TIKTOKEN_CACHE_DIR`, so the tracker reads them from the cache and its first counts
+  are exact. Without network access the suite fails.
 - **`WEBUI_SECRET_KEY`** is set by the harness; without it Open WebUI generates one and
   `EncryptedStr` valves are still encrypted, but a manual container without a stable key
   cannot decrypt valves after a restart.
