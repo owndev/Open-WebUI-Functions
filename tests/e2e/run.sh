@@ -206,11 +206,13 @@ validate() {
 }
 
 # ---------------------------------------------------------------- stage files
-# Windows checkouts (core.autocrlf) have CRLF line endings, while --ref stages
-# LF and users paste LF: every staged file is converted to LF. Returns 0 when
-# the file had CRLF line endings.
+# Windows checkouts (core.autocrlf) have CRLF line endings, --ref stages the
+# blob as stored (some files are stored with CRLF) and users paste LF: every
+# staged file is converted to LF. Returns 0 when the file had CRLF line endings.
+# -U: Git for Windows' grep strips the CR of CRLF lines unless it reads the file
+# as binary, so a plain grep never finds one there.
 to_lf() {
-  grep -q $'\r' "$1" || return 1
+  grep -qU $'\r' "$1" || return 1
   awk '{ sub(/\r$/, ""); print }' "$1" >"$1.lf" && mv "$1.lf" "$1"
 }
 
