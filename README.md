@@ -260,11 +260,35 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports tracking of **total token usage** and **per-message token counts**.
 - Can calculate token usage for all messages or only a subset.
 - Uses OpenAI's `tiktoken` library for token counting (accurate only for OpenAI models).
-- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview).
+- Falls back to an estimate (about 4 characters per token) while no `tiktoken` encoding is loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through. The encoding is downloaded in the background; requests do not wait for it (the very first one at most 5 seconds). Estimated counts are marked: `tokensEstimated` in the Log Analytics record and the log line, `~` in the status message.
+- Also works for API requests. Since Open WebUI 0.10, the filter's outlet step runs for them too. There is no chat window to show a status message, but the metrics are still logged and sent to Log Analytics.
+- On Open WebUI 0.11, response time and request tokens stay correct when Open WebUI adds RAG context or a code interpreter prompt to the user message after the filter's inlet step.
+- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`). The record is sent in the background with a 10 second timeout, so responses do not wait for Log Analytics.
+
+> [!WARNING]
+> The filter uses the Azure Monitor HTTP Data Collector API. Microsoft ended support for it on September 14, 2026; ingestion still works, but not for workspaces behind Azure Monitor Private Link (AMPLS). The [Logs ingestion API](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/custom-logs-migrate) that replaces it is not supported yet. See [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md).
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 
 🔗 [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md)
+
+### 2. [Google Search Tool](./filters/google_search_tool.py)
+
+- Companion filter for the [Google Gemini pipeline](./pipelines/google/google_gemini.py). Requires Open WebUI 0.9.0 or newer.
+- When **Web Search** is switched on for a chat, it replaces Open WebUI's own web search with Google Search grounding and the URL context tool.
+- Attach it to your Gemini models only. As a global filter it would switch off Open WebUI's web search for all other models too.
+- Requests without a `features` object (API clients, channel replies, automations) pass through unchanged.
+- Does not check Open WebUI's per-user web search permission, see the [limitations](./docs/google-gemini-integration.md#web-search-and-access).
+
+🔗 [Web search with Gemini](./docs/google-gemini-integration.md#web-search-and-access)
+
+### 3. [Vertex AI Search Tool](./filters/vertex_ai_search_tool.py)
+
+- Companion filter for the [Google Gemini pipeline](./pipelines/google/google_gemini.py) in Vertex AI mode. Requires Open WebUI 0.9.0 or newer.
+- Turns on Vertex AI Search grounding when a request asks for the `vertex_ai_search` feature.
+- Gets the data store from the request's `params.vertex_rag_store` or, if that is not set, from the `VERTEX_AI_RAG_STORE` environment variable.
+
+🔗 [Grounding with Vertex AI Search](./docs/google-gemini-integration.md#grounding-with-vertex-ai-search)
 
 ## 🤝 Integrations
 

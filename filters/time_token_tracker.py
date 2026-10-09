@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.1
+version: 2.6.2
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
@@ -13,14 +13,17 @@ features:
   - Tracks Token Usage.
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
-  - Sends metrics to Azure Log Analytics.
+  - Sends metrics to Azure Log Analytics in the background (10 s timeout), so responses do not wait for it.
+  - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests. Estimates are marked (tokensEstimated in the record and the log line, "~" in the status).
 changelog:
+  - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). Open WebUI awaits outlet() before it returns an API response, so the Log Analytics send now runs in a background task with its own timeout (10 s, 5 s to connect) instead of AIOHTTP_CLIENT_TIMEOUT (no timeout by default); a slow or unreachable Log Analytics endpoint no longer delays or stalls responses. The record timestamp is UTC with a "Z" suffix, and the new boolean record field tokensEstimated tells estimated token counts from exact ones. SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
 
 import time
 import json
 import uuid
+import asyncio
 import hmac
 import base64
 import hashlib
@@ -29,7 +32,7 @@ import os
 import logging
 import aiohttp
 from typing import Optional, Any
-from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
+from open_webui.env import SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import tiktoken
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -44,6 +47,39 @@ _request_data: dict[str, dict] = {}
 # when outlet() is never reached (e.g. cancelled requests, crashes).
 _STALE_ENTRY_TIMEOUT = 600
 
+# inlet() also puts its entry into __metadata__ under this key. Open WebUI
+# 0.11 passes the same metadata dict to inlet() and outlet() of a request (API
+# and UI chats), so outlet() finds the entry even when Open WebUI changed the
+# last user message after the inlet (RAG context, legacy code interpreter
+# prompt) and the fingerprint no longer matches. The fingerprint stays the
+# fallback, e.g. for the legacy /api/chat/completed endpoint, which builds a
+# new metadata dict.
+_METADATA_KEY = "time_token_tracker"
+
+# tiktoken downloads an encoding's BPE file on first use, without a timeout
+# and while holding a global lock. The load runs in a worker thread, at most
+# one per encoding at a time. Requests that arrive while it runs estimate
+# token counts as len(text) // 4 instead of queueing behind it. A failed load
+# (offline, no TIKTOKEN_CACHE_DIR cache) is retried in the background at most
+# once per _ENCODING_RETRY_INTERVAL seconds. Only the request that starts the
+# first load of an encoding waits for it, for at most _ENCODING_FIRST_LOAD_WAIT
+# seconds.
+_ENCODING_RETRY_INTERVAL = 300
+_ENCODING_FIRST_LOAD_WAIT = 5
+_encodings: dict[str, Any] = {}
+_encoding_loads: dict[str, asyncio.Task] = {}
+_encoding_failures: dict[str, float] = {}
+
+# Open WebUI awaits outlet() before it returns the response of an API request,
+# so outlet() hands the Log Analytics send to a background task instead of
+# waiting for the round trip. The event loop keeps only weak references to
+# tasks; this set keeps each send alive until it is done.
+_log_analytics_sends: set[asyncio.Task] = set()
+
+# Own timeout for the send. Open WebUI's AIOHTTP_CLIENT_TIMEOUT is unset by
+# default, which means no timeout at all.
+_LOG_ANALYTICS_TIMEOUT = aiohttp.ClientTimeout(total=10, sock_connect=5)
+
 
 def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
     """
@@ -53,7 +89,9 @@ def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
     Open WebUI reconstructs the body dict between inlet and outlet and only
     exposes chat_id in outlet, so we cannot rely on a single ID field.
     Instead we hash (user_id, model, number_of_user_messages,
-    last_user_message_content) — all of which are identical in both stages.
+    last_user_message_content). Open WebUI can change the last user message
+    after the inlet (RAG context, legacy code interpreter prompt), so outlet()
+    uses this key only when it finds no inlet entry in __metadata__.
 
     Collisions are only possible if the same user sends the exact same
     message at the exact same conversation depth to the same model
@@ -76,6 +114,11 @@ def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
 
     raw = f"{user_id}:{model}:{num_user_messages}:{last_user_content}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _metadata_key(filter_id: Optional[str]) -> str:
+    """Key of the inlet entry in __metadata__, per installed copy of the filter."""
+    return f"{_METADATA_KEY}:{filter_id}" if filter_id else _METADATA_KEY
 
 
 def _prune_stale_entries(self) -> None:
@@ -137,10 +180,10 @@ class EncryptedStr(str):
 
         key = cls._get_encryption_key()
         if not key:  # No decryption if no key
-            return value[len("encrypted:"):]  # Return without prefix
+            return value[len("encrypted:") :]  # Return without prefix
 
         try:
-            encrypted_part = value[len("encrypted:"):]
+            encrypted_part = value[len("encrypted:") :]
             f = Fernet(key)
             decrypted = f.decrypt(encrypted_part.encode())
             return decrypted.decode()
@@ -211,7 +254,8 @@ class Filter:
             default=True, description="Show tokens per second for the response."
         )
         SEND_TO_LOG_ANALYTICS: bool = Field(
-            default=bool(os.getenv("SEND_TO_LOG_ANALYTICS", False)),
+            default=os.getenv("SEND_TO_LOG_ANALYTICS", "false").strip().lower()
+            in ("1", "true", "yes", "on"),
             description="Send logs to Azure Log Analytics workspace",
         )
         LOG_ANALYTICS_WORKSPACE_ID: str = Field(
@@ -259,8 +303,15 @@ class Filter:
         )
         return authorization
 
-    async def _send_to_log_analytics_async(self, data):
-        """Send data to Azure Log Analytics asynchronously using aiohttp."""
+    def _send_to_log_analytics(self, data, chat_id: str, message_id: str) -> bool:
+        """
+        Sign the request now and send it to Azure Log Analytics in a
+        background task. Returns False when sending is not configured.
+
+        The request is built here, before outlet() returns, so the background
+        task gets the valve values of this request and only the signature,
+        never the decrypted key.
+        """
         if (
             not self.valves.SEND_TO_LOG_ANALYTICS
             or not self.valves.LOG_ANALYTICS_WORKSPACE_ID
@@ -296,13 +347,23 @@ class Filter:
             "time-generated-field": "timestamp",
         }
 
+        task = asyncio.create_task(
+            self._post_to_log_analytics(uri, headers, data, chat_id, message_id)
+        )
+        _log_analytics_sends.add(task)
+        task.add_done_callback(_log_analytics_sends.discard)
+        return True
+
+    async def _post_to_log_analytics(
+        self, uri: str, headers: dict, data, chat_id: str, message_id: str
+    ) -> bool:
+        """POST a signed record to Azure Log Analytics (runs as a background task)."""
         session = None
         response = None
 
         try:
             session = aiohttp.ClientSession(
-                trust_env=True,
-                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+                trust_env=True, timeout=_LOG_ANALYTICS_TIMEOUT
             )
 
             response = await session.request(
@@ -313,22 +374,31 @@ class Filter:
             )
 
             if response.status == 200:
-                self.log.debug("Log Analytics accepted the payload (HTTP 200)")
+                self.log.info(
+                    f"Log Analytics data sent successfully "
+                    f"(chat={chat_id}, message={message_id})"
+                )
                 return True
             else:
                 response_text = await response.text()
                 self.log.error(
                     f"Error sending to Log Analytics: {response.status} - {response_text}"
                 )
-                return False
 
         except Exception as e:
+            # str() of a timeout is empty: name the exception type.
             self.log.error(
-                f"Exception when sending to Log Analytics asynchronously: {str(e)}"
+                f"Exception when sending to Log Analytics asynchronously: "
+                f"{type(e).__name__}: {e}"
             )
-            return False
         finally:
             await cleanup_response(response, session)
+
+        self.log.warning(
+            f"Failed to send data to Log Analytics "
+            f"(chat={chat_id}, message={message_id})"
+        )
+        return False
 
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""
@@ -372,8 +442,97 @@ class Filter:
         except:  # noqa: E722
             return ""
 
+    async def _load_encoding(self, name: str):
+        """Load a tiktoken encoding in a worker thread (it may download it)."""
+        try:
+            encoding = await asyncio.to_thread(tiktoken.get_encoding, name)
+        except Exception as e:
+            _encoding_failures[name] = time.time()
+            self.log.warning(
+                f"tiktoken encoding '{name}' could not be loaded ({e}); "
+                f"estimating token counts as len(text) // 4, "
+                f"retrying in {_ENCODING_RETRY_INTERVAL}s"
+            )
+            return None
+        _encoding_failures.pop(name, None)
+        _encodings[name] = encoding
+        self.log.debug(f"tiktoken encoding '{name}' loaded")
+        return encoding
+
+    async def _get_encoding(self, model: str):
+        """
+        Return the tiktoken encoding for the model (cl100k_base for unknown
+        models), or None while it is not loaded. Exceptions raised in inlet()
+        abort the chat, so a missing encoding must not raise, and a slow or
+        hanging download must not hold up the request.
+        """
+        try:
+            name = tiktoken.encoding_name_for_model(model)
+        except Exception:  # KeyError: model unknown to tiktoken
+            name = "cl100k_base"
+
+        encoding = _encodings.get(name)
+        if encoding is not None:
+            return encoding
+
+        load = _encoding_loads.get(name)
+        if load is not None and not load.done():
+            self.log.debug(f"tiktoken encoding '{name}' is still loading, estimating")
+            return None
+
+        failed_at = _encoding_failures.get(name)
+        if failed_at and time.time() - failed_at < _ENCODING_RETRY_INTERVAL:
+            return None
+
+        load = asyncio.create_task(self._load_encoding(name))
+        _encoding_loads[name] = load
+        if failed_at:
+            # Retry in the background; this request estimates.
+            return None
+
+        try:
+            # shield(): the load keeps running if the wait times out or the
+            # request is cancelled; later requests pick up the result.
+            return await asyncio.wait_for(
+                asyncio.shield(load), timeout=_ENCODING_FIRST_LOAD_WAIT
+            )
+        except asyncio.TimeoutError:
+            self.log.info(
+                f"tiktoken encoding '{name}' not loaded within "
+                f"{_ENCODING_FIRST_LOAD_WAIT}s, estimating while it loads"
+            )
+            return None
+
+    def _count_tokens(self, encoding, text: str) -> tuple[int, bool]:
+        """
+        Count tokens with tiktoken, or estimate them as len(text) // 4.
+        Returns (count, estimated).
+        """
+        if encoding is not None:
+            try:
+                # disallowed_special=(): text such as "<|endoftext|>" in a
+                # message is counted as plain text instead of raising.
+                return len(encoding.encode(text, disallowed_special=())), False
+            except Exception as e:
+                self.log.warning(f"tiktoken could not encode text ({e}), estimating")
+        return len(text) // 4, True
+
+    def _count_messages(self, encoding, messages) -> tuple[int, bool]:
+        """Sum the token counts of messages; True if any count is an estimate."""
+        counts = [
+            self._count_tokens(encoding, self._get_message_content(m))
+            for m in messages
+            if m
+        ]
+        return sum(n for n, _ in counts), any(e for _, e in counts)
+
     async def inlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
     ) -> dict:
         user_id = __user__.get("id", "unknown") if __user__ else "unknown"
         model = body.get("model", "default-model")
@@ -389,14 +548,11 @@ class Filter:
             f"Request key={storage_key}, active_entries={len(_request_data)}"
         )
 
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-            self.log.debug(f"Using model-specific tiktoken encoding for '{model}'")
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-            self.log.debug(
-                f"Model '{model}' not found in tiktoken, using cl100k_base fallback"
-            )
+        encoding = await self._get_encoding(model)
+        self.log.debug(
+            f"tiktoken encoding for '{model}': "
+            f"{encoding.name if encoding else 'unavailable, estimating'}"
+        )
 
         # If CALCULATE_ALL_MESSAGES is true, use all "user" and "system" messages
         if self.valves.CALCULATE_ALL_MESSAGES:
@@ -424,27 +580,36 @@ class Filter:
                 )
                 request_messages = [last_user_system] if last_user_system else []
 
-        request_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
-            for m in request_messages
-            if m
+        request_token_count, tokens_estimated = self._count_messages(
+            encoding, request_messages
         )
 
-        _request_data[storage_key] = {
+        entry = {
+            "key": storage_key,
             "start_time": time.time(),
             "request_token_count": request_token_count,
+            "tokens_estimated": tokens_estimated,
         }
+        _request_data[storage_key] = entry
+        if isinstance(__metadata__, dict):
+            __metadata__[_metadata_key(__id__)] = entry
 
         self.log.info(
             f"Inlet complete: key={storage_key}, model={model}, "
             f"request_tokens={request_token_count}, "
-            f"counted_messages={len(request_messages)}"
+            f"counted_messages={len(request_messages)}, "
+            f"tokens_estimated={tokens_estimated}"
         )
 
         return body
 
     async def outlet(
-        self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
     ) -> dict:
         model = body.get("model", "default-model")
         all_messages = body.get("messages", [])
@@ -454,8 +619,22 @@ class Filter:
             f"messages={len(all_messages)}, body_keys={list(body.keys())}"
         )
 
-        storage_key = _build_request_key(body, __user__)
-        request_data = _request_data.pop(storage_key, {})
+        # Prefer the entry inlet() left in this request's metadata; fall back
+        # to the fingerprint when outlet() gets another metadata dict.
+        request_data = None
+        if isinstance(__metadata__, dict):
+            request_data = __metadata__.pop(_metadata_key(__id__), None)
+        if isinstance(request_data, dict):
+            storage_key = request_data.get("key", "")
+            matched_by = "metadata"
+            # A concurrent identical request may have replaced the entry
+            # under the same fingerprint: only drop our own.
+            if _request_data.get(storage_key) is request_data:
+                _request_data.pop(storage_key, None)
+        else:
+            storage_key = _build_request_key(body, __user__)
+            matched_by = "fingerprint"
+            request_data = _request_data.pop(storage_key, {})
 
         if not request_data:
             self.log.warning(
@@ -465,18 +644,16 @@ class Filter:
             )
         else:
             self.log.debug(
-                f"Matched inlet data for key={storage_key}, "
+                f"Matched inlet data for key={storage_key} by {matched_by}, "
                 f"remaining_entries={len(_request_data)}"
             )
 
         end_time = time.time()
         response_time = end_time - request_data.get("start_time", end_time)
         request_token_count = request_data.get("request_token_count", 0)
+        tokens_estimated = bool(request_data.get("tokens_estimated", False))
 
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
+        encoding = await self._get_encoding(model)
 
         reversed_messages = list(
             reversed(all_messages)
@@ -494,20 +671,18 @@ class Filter:
 
         # response_token_count is a local variable here; unlike the original
         # global, it does not need to persist beyond this method.
-        response_token_count = sum(
-            len(encoding.encode(self._get_message_content(m)))
-            for m in assistant_messages
-            if m
-        )  # Calculate tokens per second (only for the last assistant response)
+        response_token_count, response_estimated = self._count_messages(
+            encoding, assistant_messages
+        )
+        tokens_estimated = tokens_estimated or response_estimated
+        # Calculate tokens per second (only for the last assistant response)
         resp_tokens_per_sec = 0
         if self.valves.SHOW_TOKENS_PER_SECOND:
             last_assistant_msg = next(
                 (m for m in reversed_messages if m.get("role") == "assistant"), None
             )
-            last_assistant_tokens = (
-                len(encoding.encode(self._get_message_content(last_assistant_msg)))
-                if last_assistant_msg
-                else 0
+            last_assistant_tokens, _ = self._count_messages(
+                encoding, [last_assistant_msg]
             )
             resp_tokens_per_sec = (
                 0 if response_time == 0 else last_assistant_tokens / response_time
@@ -524,6 +699,8 @@ class Filter:
             avg_response_tokens = response_token_count / resp_count if resp_count else 0
 
         # Shorter style, e.g.: "10.90s | Req: 175 (Ø 87.50) | Resp: 439 (Ø 219.50) | 40.18 T/s"
+        # Estimated token numbers get a "~", e.g. "Req: ~175 (Ø ~87.50)".
+        est = "~" if tokens_estimated else ""
         description_parts = []
         if self.valves.SHOW_RESPONSE_TIME:
             description_parts.append(f"{response_time:.2f}s")
@@ -531,44 +708,58 @@ class Filter:
             if self.valves.SHOW_AVERAGE_TOKENS and self.valves.CALCULATE_ALL_MESSAGES:
                 # Add averages (Ø) into short output
                 short_str = (
-                    f"Req: {request_token_count} (Ø {avg_request_tokens:.2f}) | "
-                    f"Resp: {response_token_count} (Ø {avg_response_tokens:.2f})"
+                    f"Req: {est}{request_token_count} (Ø {est}{avg_request_tokens:.2f}) | "
+                    f"Resp: {est}{response_token_count} (Ø {est}{avg_response_tokens:.2f})"
                 )
             else:
-                short_str = f"Req: {request_token_count} | Resp: {response_token_count}"
+                short_str = (
+                    f"Req: {est}{request_token_count} | "
+                    f"Resp: {est}{response_token_count}"
+                )
             description_parts.append(short_str)
         if self.valves.SHOW_TOKENS_PER_SECOND:
-            description_parts.append(f"{resp_tokens_per_sec:.2f} T/s")
+            description_parts.append(f"{est}{resp_tokens_per_sec:.2f} T/s")
         description = " | ".join(description_parts)
 
         self.log.info(
             f"Outlet complete: key={storage_key}, model={model}, "
             f"response_time={response_time:.2f}s, "
             f"req_tokens={request_token_count}, resp_tokens={response_token_count}, "
-            f"tokens_per_sec={resp_tokens_per_sec:.2f}"
+            f"tokens_per_sec={resp_tokens_per_sec:.2f}, "
+            f"tokens_estimated={tokens_estimated}"
         )
         self.log.debug(f"Status event: {description}")
 
-        # Send event with description
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {"description": description, "done": True},
-            }
-        )
+        # Send event with description. Since Open WebUI 0.10 outlet filters also
+        # run for API requests, where there is no event emitter (None).
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": description, "done": True},
+                    }
+                )
+            except Exception as e:
+                self.log.warning(f"Could not emit status event: {e}")
+        else:
+            self.log.debug("No event emitter (e.g. API request): status skipped")
 
         # If Log Analytics integration is enabled, send the data
         if self.valves.SEND_TO_LOG_ANALYTICS:
-            # Create chat and message IDs for tracking
-            chat_id = body.get("chat_id", str(uuid.uuid4()))
-            message_id = str(uuid.uuid4())
+            # Chat and message IDs for tracking; API requests have no chat id
+            chat_id = body.get("chat_id") or str(uuid.uuid4())
+            message_id = body.get("id") or str(uuid.uuid4())
             # User ID if available
             user_id = __user__.get("id", "unknown") if __user__ else "unknown"
 
             # Create log data for Log Analytics
             log_data = [
                 {
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                    # ISO 8601 in UTC with "Z", as time-generated-field expects
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "chatId": chat_id,
                     "messageId": message_id,
                     "model": model,
@@ -577,6 +768,7 @@ class Filter:
                     "requestTokens": request_token_count,
                     "responseTokens": response_token_count,
                     "tokensPerSecond": resp_tokens_per_sec,
+                    "tokensEstimated": tokens_estimated,
                 }
             ]
 
@@ -585,17 +777,13 @@ class Filter:
                 log_data[0]["avgRequestTokens"] = avg_request_tokens
                 log_data[0]["avgResponseTokens"] = avg_response_tokens
 
-            # Send to Log Analytics asynchronously (non-blocking)
+            # Sent in a background task: outlet() returns without waiting for
+            # Log Analytics, the task logs the outcome.
             try:
-                result = await self._send_to_log_analytics_async(log_data)
-                if result:
-                    self.log.info(
-                        f"Log Analytics data sent successfully "
-                        f"(chat={chat_id}, message={message_id})"
-                    )
-                else:
+                if not self._send_to_log_analytics(log_data, chat_id, message_id):
                     self.log.warning(
-                        f"Failed to send data to Log Analytics " f"(chat={chat_id})"
+                        f"Failed to send data to Log Analytics "
+                        f"(chat={chat_id}, message={message_id})"
                     )
             except Exception as e:
                 self.log.error(f"Error sending to Log Analytics: {e}")
