@@ -16,7 +16,9 @@
 # e2e Gemini mock instead. Container and volume are removed on exit (also after
 # Ctrl-C); images are never removed. The key is read from the environment only,
 # stored in the encrypted valve, never printed, and every output file is scanned
-# for it (a hit is redacted and fails the run).
+# for it and for the secret values of the Vertex credentials file (a hit is
+# redacted and fails the run). The proxy forwards at most --max-requests generate
+# requests and answers any further one with HTTP 429 itself.
 #
 # Docs: docs/testing.md, "Real-API smoke test (manual, needs a key)"
 set -euo pipefail
@@ -53,6 +55,10 @@ options:
                            (default 2)
       --turns N            tool turns of R13 (default 4)
       --max-tokens N       max_tokens of every request (default 2048)
+      --max-requests N     hard cap of generate requests sent upstream; the
+                           proxy answers any further one with HTTP 429 without
+                           forwarding it (default: 2x the estimated maximum the
+                           runner prints)
       --api-version V      API_VERSION valve (default: the pipe's default)
       --dry-run-mock       no key: the proxy forwards to the e2e Gemini mock
                            (checks the runner; results differ from the real API)
@@ -66,7 +72,9 @@ options:
   -n, --name NAME          container name (default owui-smoke-<time>-<random>)
   -p, --port PORT          host port of the UI on 127.0.0.1 (default: free port)
   -o, --out DIR            output directory (default tests/e2e/out/<time>-<name>)
-  -k, --keep               keep container + volume (they hold the key, encrypted)
+  -k, --keep               keep container + volume (they hold the key, encrypted,
+                           and with --vertex-credentials the credentials file
+                           in plain text)
       --force              delete a volume NAME-data left over from a kept run
   -h, --help               this help
 
@@ -114,6 +122,10 @@ smoke_parse_args() {
         RUNNER_ARGS+=("$1" "$2"); shift 2 ;;
       --model|--model-25|--retries|--turns|--max-tokens|--api-version|--vertex-location)
         need "$@"; RUNNER_ARGS+=("$1" "$2"); shift 2 ;;
+      --max-requests)
+        need "$@"
+        is_seconds "$2" || die "--max-requests needs a number > 0, got '$2'"
+        RUNNER_ARGS+=("$1" "$2"); shift 2 ;;
       --model-latest)
         [ $# -ge 2 ] || die "option $1 needs a value (see --help)"
         RUNNER_ARGS+=("$1=$2"); shift 2 ;;
@@ -152,12 +164,29 @@ smoke_validate() {
   fi
   if [ -n "$VERTEX_CRED" ]; then
     [ -f "$VERTEX_CRED" ] || die "Vertex credentials $VERTEX_CRED not found"
+    local secret
+    while IFS= read -r secret; do
+      VERTEX_SECRETS+=("$secret")
+    done < <(smoke_vertex_secrets "$VERTEX_CRED")
   fi
   NAME=${NAME:-owui-smoke-$(date +%H%M%S)-$RANDOM}
   VOLUME="$NAME-data"
   OUT=${OUT:-$HERE/out/$(date +%Y%m%d-%H%M%S)-$NAME}
   mkdir -p "$OUT"
   OUT=$(cd "$OUT" && pwd)
+}
+
+# Secret values of a Vertex credentials file, one per line, as the runner's
+# vertex_secrets() takes them: refresh_token, client_secret, private_key_id and
+# the base64 lines of the PEM private_key (JSON-escaped in the file and in a log
+# line); values under 16 characters and the BEGIN / END lines are left out. No
+# JSON parser on the host: these values never contain a quote.
+smoke_vertex_secrets() {
+  local keys='"(private_key|private_key_id|client_secret|refresh_token)"'
+  grep -oE "$keys"'[[:space:]]*:[[:space:]]*"[^"]*"' "$1" \
+    | sed -E 's/^"[a-z_]+"[[:space:]]*:[[:space:]]*"//; s/"$//' \
+    | awk '{ gsub(/\\n/, "\n"); gsub(/\\\//, "/"); print }' \
+    | awk 'length($0) >= 16 && $0 !~ /^-----/' || true
 }
 
 # ------------------------------------------------------------------- files
@@ -198,6 +227,7 @@ smoke_vertex() {
   local home adc
   home=$(dk exec "$NAME" sh -c 'printf %s "$HOME"') || return 1
   adc="${home:-/root}/.config/gcloud/application_default_credentials.json"
+  VERTEX_ADC=$adc
   # shellcheck disable=SC2016 # $1 belongs to the sh -c script
   dk exec -i "$NAME" sh -c 'mkdir -p "${1%/*}" && umask 077 && cat >"$1"' sh "$adc" \
     <"$VERTEX_CRED" || return 1
@@ -211,6 +241,8 @@ smoke_vertex() {
 RUNNER_PID=""
 RUNNER_STARTED=0
 FETCHED=0
+VERTEX_ADC=""  # set once the credentials file is copied into the container
+VERTEX_SECRETS=()
 
 # Runs the runner; sets RC. In the background, so Ctrl-C reaches the traps at once.
 smoke_run() {
@@ -276,27 +308,42 @@ smoke_fetch() {
   dk exec "$NAME" bash -c "$PACK_OUTPUT" | tar -C "$OUT" -xf - || true
 }
 
-# Every output file is scanned for the key (also the server log and the mocks'
-# output); a hit is redacted in place and fails the run.
+# Every output file is scanned for the key and the Vertex secret values (also
+# the server log and the mocks' output); a hit is redacted in place and fails
+# the run.
 smoke_scan_secrets() {
-  local leaked=() file
-  [ "${#SMOKE_KEY}" -ge 6 ] || return 0
+  local leaked=() secrets=() file secret what="the key"
+  [ "${#SMOKE_KEY}" -lt 6 ] || secrets+=("$SMOKE_KEY")
+  for secret in "${VERTEX_SECRETS[@]+"${VERTEX_SECRETS[@]}"}"; do
+    [ "${#secret}" -lt 6 ] || secrets+=("$secret")
+  done
+  [ ${#secrets[@]} -gt 0 ] || return 0
+  [ ${#VERTEX_SECRETS[@]} -eq 0 ] ||
+    what="the key and the ${#VERTEX_SECRETS[@]} Vertex secret values"
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     leaked+=("${file#"$OUT"/}")
-    SMOKE_SECRET="$SMOKE_KEY" awk '{
-        s = ENVIRON["SMOKE_SECRET"]; out = ""
-        while ((i = index($0, s)) > 0) {
-          out = out substr($0, 1, i - 1) "***"; $0 = substr($0, i + length(s))
+    SMOKE_SECRETS=$(printf '%s\n' "${secrets[@]}") awk '
+      BEGIN { n = split(ENVIRON["SMOKE_SECRETS"], s, "\n") }
+      {
+        line = $0
+        for (k = 1; k <= n; k++) {
+          if (s[k] == "") continue
+          out = ""
+          while ((i = index(line, s[k])) > 0) {
+            out = out substr(line, 1, i - 1) "***"
+            line = substr(line, i + length(s[k]))
+          }
+          line = out line
         }
-        print out $0
+        print line
       }' "$file" >"$file.redacted" && mv "$file.redacted" "$file"
-  done < <(printf '%s\n' "$SMOKE_KEY" | grep -rlF -f - "$OUT" 2>/dev/null)
+  done < <(printf '%s\n' "${secrets[@]}" | grep -rlF -f - "$OUT" 2>/dev/null)
   if [ ${#leaked[@]} -gt 0 ]; then
-    echo "FAIL secret scan: the key was in ${leaked[*]} (redacted there now)" >&2
+    echo "FAIL secret scan: $what: found in ${leaked[*]} (redacted there now)" >&2
     return 1
   fi
-  echo "secret scan: the key is in none of the $(find "$OUT" -type f | wc -l)" \
+  echo "secret scan: $what: in none of the $(find "$OUT" -type f | wc -l)" \
     "output files"
 }
 
@@ -316,6 +363,9 @@ smoke_cleanup() {
     if [ "$KEEP" = 1 ]; then
       echo "kept container $NAME (volume $VOLUME; it holds the key, encrypted):" \
         "http://localhost:$(host_port) login admin@example.com / Passw0rd!e2e"
+      [ -z "$VERTEX_ADC" ] ||
+        echo "  it also holds the Vertex credentials file in plain text:" \
+          "$VERTEX_ADC (removed with the container)"
       echo "  cleanup: docker rm -f $NAME && docker volume rm $VOLUME"
     else
       dk rm -f "$NAME" >/dev/null

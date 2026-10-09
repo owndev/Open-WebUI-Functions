@@ -19,6 +19,11 @@ summary is recorded, the evidence of the smoke scenarios:
 
 Never recorded: headers (the API key travels in ``x-goog-api-key``), the query
 string (a ``key=`` parameter would carry it), signature values, request texts.
+
+Hard request budget: with ``max_requests`` set, a generate request beyond that
+many forwarded ones is not forwarded; the proxy answers it with HTTP 429 itself
+(recorded with ``blocked: true``) and ``exhausted`` turns true. Other requests
+(the model listing) are not billed and not capped.
 """
 
 import json
@@ -299,13 +304,27 @@ def parse_sse(text: str) -> list:
 class RecordingProxy:
     """``await start()``, point the pipe at ``url``, read ``records``."""
 
-    def __init__(self, target_url: str, port: int, host: str = "127.0.0.1"):
+    def __init__(
+        self,
+        target_url: str,
+        port: int,
+        host: str = "127.0.0.1",
+        max_requests: int = 0,
+    ):
         self.target = target_url.rstrip("/")
         self.host = host
         self.port = port
+        self.max_requests = max_requests  # forwarded generate requests, 0 = no cap
+        self.forwarded = 0  # generate requests forwarded upstream
+        self.blocked = 0  # generate requests answered 429 by the proxy itself
         self.records: list = []
         self._runner: Optional[web.AppRunner] = None
         self._session: Optional[aiohttp.ClientSession] = None
+
+    @property
+    def exhausted(self) -> bool:
+        """The budget is used up: the next generate request gets a local 429."""
+        return bool(self.max_requests) and self.forwarded >= self.max_requests
 
     @property
     def url(self) -> str:
@@ -354,6 +373,10 @@ class RecordingProxy:
             body = None
         if action in GENERATE and isinstance(body, dict):
             entry["req"] = summarize_request(body)
+        if action in GENERATE:
+            if self.exhausted:
+                return self._over_budget(entry)
+            self.forwarded += 1
         headers = {
             k: v for k, v in request.headers.items() if k.lower() not in REQUEST_DROP
         }
@@ -414,3 +437,16 @@ class RecordingProxy:
             return resp
         finally:
             upstream.release()
+
+    def _over_budget(self, entry: dict) -> web.Response:
+        """Answers a generate request beyond ``max_requests`` without
+        forwarding it (HTTP 429, the status of an exhausted quota)."""
+        self.blocked += 1
+        message = (
+            f"smoke proxy: request budget of {self.max_requests} generate "
+            "requests used up (--max-requests), not forwarded"
+        )
+        error = {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}
+        entry.update(status=429, blocked=True, ms=0)
+        entry["resp"] = summarize_answer([{"error": error}])
+        return web.json_response({"error": error}, status=429)

@@ -602,26 +602,43 @@ How it works:
   Every request carries `max_tokens` (default 2048; on the browser path Open WebUI
   keeps it for the continuations). The valves are `THINKING_LEVEL=low` (Gemini 3) and
   `THINKING_BUDGET=512` (Gemini 2.5, whose thinking counts against `maxOutputTokens`).
-  The runner prints the planned number of requests at the start, and the actual count
-  and token usage at the end.
+  The runner prints an estimate at the start (about 39 generate requests with the
+  defaults, about 117 if every scenario used all its retries) and the hard cap, and the
+  actual count and token usage at the end.
+- Request budget: `--max-requests N` (default twice the printed maximum, 234 with the
+  defaults) caps the generate requests the proxy forwards. Beyond it the proxy answers
+  HTTP 429 itself, without forwarding; the scenario is not retried, the remaining risks
+  are SKIP, and `summary.md` / `smoke.json` report `budget_hit` plus a `BUDGET` FAIL row
+  (exit 1). The model listing is not capped (not billed); R9's Vertex requests do not
+  pass through the proxy and are not capped either.
 - Results: `PASS`, `FAIL` or `SKIP` per risk, with the evidence lines (one `upstream #n`
   line per request), plus `LOG` (the server log scan of the suites, which also fails on the
   pipe's WARNINGs for lost tool data) and `SECRETS`. Exit code 0 = no FAIL, 1 = a FAIL, 2 =
-  setup error (install, or the preflight: one plain request per model, which catches a
-  bad key or an unavailable model). A model that the API does not list is added with
-  `MODEL_ADDITIONAL`.
-- The key is never printed. The runner redacts its stdout, stderr and output files, and
-  `SECRETS` fails when the key shows up in the server log, the mocks' output or the
-  runner's output. After the run the script scans every output file for the key,
-  redacts any hit in place and exits 1.
+  setup error (install, the model list, or the preflight: one plain request per model,
+  which catches an unavailable model). A model that the API does not list is added with
+  `MODEL_ADDITIONAL`. A bad key already fails the model listing, so neither model shows
+  up: the setup error, in the output and in `summary.md`, then names the failing
+  upstream requests, e.g. `gemini: models [...] missing from Open WebUI; failing upstream
+  requests: GET /v1alpha/models http=400 x4: API key not valid. Please pass a valid API
+  key.`
+- The key is never printed. The secrets are the key and, with `--vertex-credentials`,
+  the secret values of that file (`refresh_token`, `client_secret`, `private_key_id`
+  and each base64 line of `private_key`; values under 16 characters are left out). The
+  runner redacts them from its stdout, stderr and output files, and `SECRETS` fails when
+  one shows up in the server log, the mocks' output or the runner's output. After the
+  run the script scans every output file for the same values, redacts any hit in place
+  and exits 1.
 - Container and volume are removed on exit, also after Ctrl-C (the runner writes partial
-  results). Images are never removed. Output: `tests/e2e/out/<time>-<name>/` with
-  `driver.txt`, `summary.md`, `smoke.json`, `upstream.jsonl` (the proxy record),
-  `server.log`, `mocks.txt` and the staged `functions/`.
+  results). `--keep` keeps them: the volume holds the key (encrypted), and with
+  `--vertex-credentials` the container holds the credentials file in plain text; the
+  script says so and prints the cleanup command. Images are never removed. Output:
+  `tests/e2e/out/<time>-<name>/` with `driver.txt`, `summary.md`, `smoke.json`,
+  `upstream.jsonl` (the proxy record), `server.log`, `mocks.txt` and the staged
+  `functions/`.
 
 | Risk | Scenario | PASS when |
 | --- | --- | --- |
-| R1 | Browser turn on both models with the workspace tool and the OpenAPI and MCP servers (27 built-ins + 7 tools declared). API request on both models with client tools in the schema styles of pydantic (`title`, `default`, `anyOf` + `null`), OpenAPI (`format`, integer `enum`) and MCP (`$defs`, `$ref`, `additionalProperties: false`), plus `oneOf` / `const`, type arrays and a tool without parameters | Every request gets HTTP 200. Built-ins that another Open WebUI version lacks are listed |
+| R1 | Browser turn on both models with the workspace tool and the OpenAPI and MCP servers (27 built-ins + 8 tools declared). API request on both models with client tools in the schema styles of pydantic (`title`, `default`, `anyOf` + `null`), OpenAPI (`format`, integer `enum`) and MCP (`$defs`, `$ref`, `additionalProperties: false`), plus `oneOf` / `const`, type arrays and a tool without parameters | Every request gets HTTP 200. Built-ins that another Open WebUI version lacks are listed |
 | R2 | Browser, `stream=false`, Gemini 3: `get_current_timestamp` | The tool is declared without a schema and called, the continuation gets 200, the answer is saved |
 | R3 | Gemini 3 with `google_search_tool` and web search: Search and `get_current_timestamp` in one round, continued; the next turn with web search off; API `tool_choice` `required` and `none` with web search | `googleSearch` + functions + `includeServerSideToolInvocations` accepted, the call made, the server-side parts sent back within the turn and not in the next one, mode `ANY` gives a call and `NONE` none. If Gemini still did not search in the tool round after the retries, the result is PASS with a note that the replay was not exercised |
 | R4 | API continuation without `reasoning_details` on Gemini 3 (placeholder signature), Gemini 2.5 (no signature) and `--model-latest` (default `gemini-flash-latest`) when the API lists it | 200 and an answer |
@@ -646,18 +663,24 @@ when no functions are declared.
 `gcloud auth application-default login`; default `$GOOGLE_APPLICATION_CREDENTIALS`) and
 `--vertex-project ID` (default `$GOOGLE_CLOUD_PROJECT`, else the file's `project_id`),
 plus `--vertex-location` (default `global`). The file is streamed into the container as
-its Application Default Credentials file (never into the output directory), and a
+its Application Default Credentials file (never into the output directory; it stays
+there in plain text until the container is removed), and a
 second copy of the pipe, `gemini_vertex`, runs with `USE_VERTEX_AI=true`. Its requests do
 not go through the proxy, so the evidence is what Open WebUI saved plus the server log.
-This path has not run yet: no Vertex project was available.
+This path has not run yet: no Vertex project was available. A run with a fake service
+account file and a fake key (it stops at the model list) checked the secret scan: the
+runner and the script both took 10 values from the file and found none in the output.
 
 **Dry run.** `--dry-run-mock` checks the runner itself without a key: every scenario runs
 end to end against the e2e Gemini mock, which answers the `MOCKTOOLS:` directive instead
 of following the prompt. Observed 2026-10-09 on v0.11.4-slim: 15 PASS (R1-R8, R10, R12-R15,
 `LOG`, `SECRETS`), 0 FAIL, 2 SKIP (R9 without Vertex credentials, R11 note), 38
-generate requests (the mock received the same 38), 90-100 s including the container
+generate requests (the mock received the same 38), 90-120 s including the container
 start. The mock always follows the directive, so no retry happens. Its answers prove
-only the mechanics: real results can differ.
+only the mechanics: real results can differ. With `--max-requests 5` the proxy forwarded
+the two preflight requests and three of R1, answered R1's fourth with HTTP 429 (the mock
+received 5), R1 was FAIL, the other risks SKIP, `BUDGET` FAIL, exit 1. A fake key gave
+exit 2 with the `API key not valid` setup error above, and the key was in no output.
 
 ## CI
 
@@ -668,7 +691,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 3ff6cf9, with the `gemini.tools` / `toolsapi` groups of `feature/gemini-native-tool-calling`): 39 PASS / 241 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 3ff6cf9 with the suites of `feature/gemini-native-tool-calling` after merging `main`, so with the `gemini.tools` / `toolsapi` groups and the `azure` `oyd.notice.*` checks): 42 PASS / 242 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

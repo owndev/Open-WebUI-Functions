@@ -300,6 +300,30 @@ def gen(records: list) -> list:
     return [r for r in records if r.get("action") in GENERATE]
 
 
+def forwarded(records: list) -> list:
+    """Generate requests that reached the upstream (not blocked by the budget)."""
+    return [r for r in gen(records) if not r.get("blocked")]
+
+
+def upstream_failures(records: list) -> list:
+    """Failed requests other than generate ones (the model listing), grouped:
+    ``GET /v1beta/models http=400 x4: API key not valid. ...``."""
+    groups = Counter(
+        (
+            r.get("method"),
+            r.get("path"),
+            r.get("status"),
+            resp(r).get("error") or r.get("error") or "no error message",
+        )
+        for r in records
+        if r.get("action") not in GENERATE and (r.get("status") or 0) >= 400
+    )
+    return [
+        f"{method} {path} http={status}{f' x{n}' if n > 1 else ''}: {short(error, 200)}"
+        for (method, path, status, error), n in groups.items()
+    ]
+
+
 def http(records: list) -> str:
     return "[" + ",".join(str(r.get("status")) for r in records) + "]"
 
@@ -431,7 +455,14 @@ class Smoke:
         self.redact = redact
         self.dry = args.dry_run_mock
         self.m3, self.m25 = args.model, args.model_25
-        self.proxy = RecordingProxy(MOCK_API if self.dry else REAL_API, PROXY_PORT)
+        self.only = {r.strip().upper() for r in args.only.split(",") if r.strip()}
+        # hard cap of forwarded generate requests: default 2x the estimated maximum
+        self.max_requests = args.max_requests or 2 * self.estimate()[1]
+        self.proxy = RecordingProxy(
+            MOCK_API if self.dry else REAL_API,
+            PROXY_PORT,
+            max_requests=self.max_requests,
+        )
         self.owui = OWUI()
         self.results = Results(verbose=False)
         self.log = ServerLog()
@@ -446,7 +477,7 @@ class Smoke:
         self.driver_error = ""
         self.timed_out = False
         self.final_attempt = True
-        self.only = {r.strip().upper() for r in args.only.split(",") if r.strip()}
+        self.budget_skipped: list = []  # risks not run: the budget was used up
 
     # ---------------------------------------------------------------- output
     def say(self, text: str = "") -> None:
@@ -552,7 +583,15 @@ class Smoke:
             ids = await self.owui.model_ids(f"{fid}.")
         still = [m for m in (self.m3, self.m25) if self.model(m, fid) not in ids]
         if still:
-            raise SetupError(f"{fid}: models {still} missing from Open WebUI")
+            # name the cause: a bad key fails the model listing (HTTP 400 "API
+            # key not valid"), and the pipe then lists no model at all
+            failures = upstream_failures(self.proxy.records)
+            cause = (
+                "; failing upstream requests: " + " || ".join(failures[-3:])
+                if failures
+                else "; no failing upstream request recorded (see server.log)"
+            )
+            raise SetupError(f"{fid}: models {still} missing from Open WebUI{cause}")
         if fid == FID:
             latest = self.args.model_latest
             self.latest_listed = bool(latest) and self.model(latest) in ids
@@ -595,10 +634,23 @@ class Smoke:
             await self.b.stop(c)
         return c
 
+    def budget_note(self) -> str:
+        return (
+            f"request budget used up: {self.max_requests} generate requests "
+            f"forwarded (--max-requests), {self.proxy.blocked} more answered "
+            "HTTP 429 by the proxy without forwarding"
+        )
+
     async def risk(self, risk: str, fn) -> None:
         if not self.selected(risk):
             return
         self.say(f"\n--- {risk}: {RISKS[risk]}")
+        if self.proxy.exhausted and risk != "R11":  # R11 makes no request
+            self.budget_skipped.append(risk)
+            note = f"not run: {self.budget_note()}"
+            self.reports[risk] = Report(risk, RISKS[risk], SKIP, [note], 0, 0, [])
+            self.say(f"[{SKIP}] {risk}  {RISKS[risk]}\n       {note}")
+            return
         attempts, notes, requests = 0, [], 0
         while True:
             attempts += 1
@@ -610,11 +662,18 @@ class Smoke:
                 lines = traceback.format_exc().strip().splitlines()
                 out = Outcome(FAIL, [f"runner error: {exc!r}", *lines[-4:]])
             records = gen(self.proxy.since(mark))
-            requests += len(records)
+            requests += len(forwarded(records))
             if out.status == FAIL and not out.retry:
                 if any(r.get("status") in TRANSIENT for r in records):
                     out.retry = "temporary upstream error"
             out.evidence += ["upstream " + upstream_line(r) for r in records]
+            if self.proxy.exhausted:  # another attempt would only be blocked
+                if any(r.get("blocked") for r in records):
+                    notes.append(self.budget_note())
+                elif out.status == FAIL and out.retry:
+                    notes.append(f"no retry ({out.retry}): {self.budget_note()}")
+                out.retry = ""
+                break
             if out.status != FAIL or not out.retry or attempts > self.args.retries:
                 break
             notes.append(f"attempt {attempts}: {out.retry}")
@@ -642,7 +701,9 @@ class Smoke:
             declared = req(records[0] if records else None).get("declared") or []
             builtins = [n for n in BUILTINS if n in declared]
             groups = {
-                "workspace": [n for n in declared if n in ("add_numbers", "whoami")],
+                "workspace": [
+                    n for n in declared if n in ("add_numbers", "whoami", "make_image")
+                ],
                 "openapi": [
                     n for n in declared if n in ("get_weather", "convert_units")
                 ]
@@ -1259,14 +1320,19 @@ class Smoke:
         planned += sum(n for r, n in ESTIMATE.items() if self.selected(r))
         return planned, planned * (1 + self.args.retries)
 
-    async def run(self) -> None:
+    def plan(self) -> None:
         planned, most = self.estimate()
+        cap = "--max-requests" if self.args.max_requests else "2x the estimated maximum"
         self.say(
-            f"\nplanned: about {planned} generate requests upstream (at most about "
-            f"{most} with --retries {self.args.retries}); max_tokens "
-            f"{self.args.max_tokens} per request, THINKING_LEVEL=low (Gemini 3), "
-            f"THINKING_BUDGET={THINKING_BUDGET} (Gemini 2.5)"
+            f"estimate: about {planned} generate requests upstream, about {most} "
+            f"if every scenario used its --retries {self.args.retries}; hard cap "
+            f"{self.max_requests} ({cap}): beyond it the proxy answers HTTP 429 "
+            f"without forwarding. max_tokens {self.args.max_tokens} per request, "
+            f"THINKING_LEVEL=low (Gemini 3), THINKING_BUDGET={THINKING_BUDGET} "
+            "(Gemini 2.5)"
         )
+
+    async def run(self) -> None:
         steps = (
             ("R11", self.r11),
             ("R1", self.r1),
@@ -1288,6 +1354,7 @@ class Smoke:
             await self.risk(risk, fn)
 
     async def execute(self) -> None:
+        self.plan()
         await self.setup()
         await self.run()
 
@@ -1306,20 +1373,31 @@ class Smoke:
                 0,
                 [],
             )
-        leaks = self.t.secret_leaks(self.key)
+        # the key plus the secret values of the Vertex credentials file
+        secrets = self.redact.secrets
+        leaks = self.t.secret_leaks(*secrets)
         mocks = os.path.join(self.args.out, "mocks.txt")
         with contextlib.suppress(OSError), open(mocks, encoding="utf-8") as fh:
-            if self.key in fh.read():
+            text = fh.read()
+            if self.key in text:
                 leaks.append("mocks.txt contains the key")
+            if any(s in text for s in secrets if s != self.key):
+                leaks.append("mocks.txt contains a Vertex credential")
         if self.redact.count:
             leaks.append(
-                f"the key was redacted from {self.redact.count} output text(s)"
+                f"a secret was redacted from {self.redact.count} output text(s)"
             )
+        vertex = len(secrets) - (self.key in secrets)
+        what = (
+            f"the key and the {vertex} Vertex secret values appear"
+            if vertex
+            else "the key appears"
+        )
         self.reports["SECRETS"] = Report(
             "SECRETS",
-            "the key appears nowhere: server log, mocks output, runner output",
+            f"{what} nowhere: server log, mocks output, runner output",
             FAIL if leaks else PASS,
-            leaks or ["key not found"],
+            leaks or [f"no secret found ({len(secrets)} values checked)"],
             1,
             0,
             [],
@@ -1332,8 +1410,16 @@ class Smoke:
             return 2
         return 1 if any(r.status == FAIL for r in self.reports.values()) else 0
 
+    def budget_hit(self) -> str:
+        """Why the run hit the request budget ("" when it did not)."""
+        if not (self.proxy.blocked or self.budget_skipped):
+            return ""
+        skipped = ",".join(self.budget_skipped) or "none"
+        return f"{self.budget_note()}; risks not run: {skipped}"
+
     def write(self) -> None:
-        upstream = gen(self.proxy.records)
+        upstream = forwarded(self.proxy.records)
+        generate = gen(self.proxy.records)
         usage = Counter()
         for r in upstream:
             for k, v in (resp(r).get("usage") or {}).items():
@@ -1353,8 +1439,10 @@ class Smoke:
             "only": sorted(self.only),
             "requests": {
                 "generate": len(upstream),
-                "other": len(self.proxy.records) - len(upstream),
-                "planned": self.estimate()[0],
+                "blocked": self.proxy.blocked,
+                "other": len(self.proxy.records) - len(generate),
+                "estimate": self.estimate()[0],
+                "max": self.max_requests,
             },
             "tokens": dict(usage),
             "duration_s": round(time.time() - self.started),
@@ -1365,10 +1453,11 @@ class Smoke:
             ("setup_error", self.setup_error),
             ("driver_error", self.driver_error[-2000:]),
             ("timed_out", self.timed_out),
+            ("budget_hit", self.budget_hit()),
         ):
             if value:
                 meta[name] = value
-        keys = ORDER + ["TIMEOUT", "LOG", "SECRETS"]
+        keys = ORDER + ["TIMEOUT", "BUDGET", "LOG", "SECRETS"]
         rows = [self.reports[k] for k in keys if k in self.reports]
         os.makedirs(self.args.out, exist_ok=True)
         data = {"meta": meta, "results": [asdict(r) for r in rows]}
@@ -1380,10 +1469,13 @@ class Smoke:
         self.say(
             f"\nSMOKE SUMMARY ({meta['mode']}): {counts.get(PASS, 0)} PASS, "
             f"{counts.get(FAIL, 0)} FAIL, {counts.get(SKIP, 0)} SKIP; "
-            f"{len(upstream)} generate requests upstream (planned about "
-            f"{meta['requests']['planned']}), tokens {dict(usage)}, "
-            f"{meta['duration_s']}s"
+            f"{len(upstream)} generate requests upstream (estimate about "
+            f"{meta['requests']['estimate']}, cap {self.max_requests}"
+            + (f", {self.proxy.blocked} blocked" if self.proxy.blocked else "")
+            + f"), tokens {dict(usage)}, {meta['duration_s']}s"
         )
+        if meta.get("budget_hit"):
+            self.say(f"BUDGET HIT: {meta['budget_hit']}")
 
     def _dump(self, name: str, text: str) -> None:
         with open(os.path.join(self.args.out, name), "w", encoding="utf-8") as fh:
@@ -1402,7 +1494,14 @@ class Smoke:
             f"max_tokens {meta['max_tokens']}); tokens {meta['tokens']}",
             f"- result: {meta['counts']} in {meta['duration_s']}s",
         ]
-        for name in ("interrupted", "setup_error", "driver_error", "timed_out"):
+        names = (
+            "interrupted",
+            "setup_error",
+            "driver_error",
+            "timed_out",
+            "budget_hit",
+        )
+        for name in names:
             if meta.get(name):
                 lines.append(f"- **{name}**: {short(meta[name], 600)}")
         lines += [
@@ -1423,6 +1522,17 @@ class Smoke:
         if self.timed_out:
             self.reports["TIMEOUT"] = Report(
                 "TIMEOUT", "the run finished in --timeout", FAIL, [], 1, 0, []
+            )
+        if self.budget_hit():
+            self.reports["BUDGET"] = Report(
+                "BUDGET",
+                f"the run stayed within the request budget ({self.max_requests} "
+                "generate requests, --max-requests)",
+                FAIL,
+                [self.budget_hit()],
+                1,
+                0,
+                [],
             )
         if self.dry:
             mock = Mock("gemini")
@@ -1453,6 +1563,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--turns", type=int, default=4, help="R13 tool turns")
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=0,
+        help="hard cap of generate requests forwarded upstream (default: 2x the "
+        "estimated maximum)",
+    )
     parser.add_argument("--wait", type=float, default=180, help="per browser turn")
     parser.add_argument("--timeout", type=float, default=2400)
     parser.add_argument("--api-version", default="")
@@ -1469,12 +1586,21 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--only: unknown risks {unknown} (R1 ... R15)")
     if args.retries < 0 or args.turns < 0 or args.max_tokens < 1:
         parser.error("--retries / --turns must be >= 0, --max-tokens >= 1")
+    if args.max_requests < 0:
+        parser.error("--max-requests must be >= 1 (0 = the default)")
     return args
 
 
+VERTEX_SECRET_KEYS = ("private_key", "private_key_id", "client_secret", "refresh_token")
+
+
 def vertex_secrets(args: argparse.Namespace) -> list:
-    """Secret values of the Vertex credentials file (scanned like the key);
-    its project_id is the default project."""
+    """Secret values of the Vertex credentials file, scanned and redacted like
+    the key; its project_id is the default project. One line each: the PEM
+    private key gives its base64 lines (a log line holds it JSON-escaped, so the
+    whole value would never match), the other values themselves; values under
+    16 characters and the BEGIN / END lines are left out (gemini-tools.sh scans
+    the same values on the host)."""
     if not args.vertex_adc:
         return []
     try:
@@ -1486,8 +1612,11 @@ def vertex_secrets(args: argparse.Namespace) -> list:
         args.vertex_project = str(
             data.get("project_id") or data.get("quota_project_id") or ""
         )
-    keys = ("private_key", "private_key_id", "client_secret", "refresh_token")
-    return [str(data[k]) for k in keys if data.get(k)]
+    lines = []
+    for key in VERTEX_SECRET_KEYS:
+        if isinstance(data.get(key), str):
+            lines += data[key].splitlines()
+    return [s for s in lines if len(s) >= 16 and not s.startswith("-----")]
 
 
 async def main() -> int:
