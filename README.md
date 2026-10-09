@@ -26,6 +26,7 @@
 - [🧩 Pipelines](#-pipelines)
 - [🔍 Filters](#-filters)
 - [🤝 Integrations](#-integrations)
+- [🧪 Testing](#-testing)
 - [💪 Contributing](#-contributing)
 - [📜 License](#-license)
 - [💬 Support](#-support)
@@ -68,16 +69,19 @@ This repository focuses on reusable Python functions for Open WebUI. It includes
 │   ├── infomaniak-integration.md
 │   ├── n8n-integration.md
 │   ├── n8n-tool-usage-display.md
-│   └── setup-azure-log-analytics.md
+│   ├── setup-azure-log-analytics.md
+│   └── testing.md
 ├── filters/
 │   ├── google_search_tool.py
 │   ├── time_token_tracker.py
 │   └── vertex_ai_search_tool.py
-└── pipelines/
-    ├── azure/
-    ├── google/
-    ├── infomaniak/
-    └── n8n/
+├── pipelines/
+│   ├── azure/
+│   ├── google/
+│   ├── infomaniak/
+│   └── n8n/
+└── tests/
+    └── e2e/          # Docker-based end-to-end tests (run.sh)
 ```
 
 ## 🔗 Prerequisites
@@ -300,6 +304,18 @@ See the [Infomaniak integration guide](./docs/infomaniak-integration.md).
 ### Google
 
 See the [Google Gemini integration guide](./docs/google-gemini-integration.md).
+
+## 🧪 Testing
+
+Every function is tested end-to-end against a real Open WebUI container with mocked provider APIs (Gemini, Azure OpenAI / AI Foundry, n8n, Infomaniak, Azure Log Analytics). Only Docker and bash are needed (Git Bash works on Windows):
+
+```bash
+tests/e2e/run.sh                              # all suites on the pinned Open WebUI image
+tests/e2e/run.sh --image v0.11.3-slim gemini  # one suite on another Open WebUI release
+tests/e2e/check_owui_api.sh latest            # static check of the Open WebUI APIs the functions use
+```
+
+The five suites (gemini, azure, n8n, infomaniak, filters) run 292 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
 
 ## 💪 Contributing
 

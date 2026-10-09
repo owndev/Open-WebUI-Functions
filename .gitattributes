@@ -1,2 +1,5 @@
 # SCM syntax highlighting & preventing 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true
+
+# Shell scripts keep LF line endings (bash in Git Bash / Docker), also with core.autocrlf=true
+*.sh text eol=lf
