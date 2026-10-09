@@ -4,10 +4,10 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.8.0
+version: 2.8.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
-description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints.
+description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) integration is only supported with Azure OpenAI endpoints. It uses Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026 (see https://github.com/owndev/Open-WebUI-Functions/issues/187).
 features:
   - Supports dynamic model specification via headers.
   - Filters valid parameters to ensure clean requests.
@@ -23,6 +23,7 @@ features:
   - Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no citations
   - Requests with Azure AI Search omit tools and stream_options, which On Your Data ignores or rejects
   - Streamed events of up to 4 MiB (large Azure AI Search contexts); a stream that fails ends with an "Error: ..." message instead of an empty or cut off answer
+  - Logs a warning once per process when a request uses Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026
 """
 
 from typing import (
@@ -152,6 +153,33 @@ async def cleanup_response(
         await session.close()
 
 
+# Azure OpenAI On Your Data (the data_sources API behind the Azure AI Search
+# integration) is retired by Microsoft on October 14, 2026. pipe() logs this
+# notice once per process (per loaded copy of this function) for the first
+# request that sends data_sources. The data_sources themselves are never
+# logged: they can contain a search key.
+ON_YOUR_DATA_RETIREMENT_NOTICE = (
+    "Azure AI Search: this request uses Azure OpenAI On Your Data (data_sources), "
+    "which Microsoft retires on October 14, 2026. From that date on, requests "
+    "with data_sources are expected to fail or to be answered without your "
+    "search index and without citations. Migration: "
+    "https://github.com/owndev/Open-WebUI-Functions/issues/187 (Microsoft "
+    "recommends Foundry Agent Service with Foundry IQ: "
+    "https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect). "
+    "This warning is logged once per process."
+)
+_on_your_data_notice_logged = False
+
+
+def _first_on_your_data_request() -> bool:
+    """True on the first call in this process, False on every later call."""
+    global _on_your_data_notice_logged
+    if _on_your_data_notice_logged:
+        return False
+    _on_your_data_notice_logged = True
+    return True
+
+
 class Pipe:
     # Regex pattern for matching [docX] citation references
     DOC_REF_PATTERN = re.compile(r"\[doc(\d+)\]")
@@ -253,9 +281,10 @@ class Pipe:
 
         # Azure AI Data Sources Configuration (for Azure AI Search / RAG)
         # Only works with Azure OpenAI endpoints: https://<deployment>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2025-01-01-preview
+        # Uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026 (#187).
         AZURE_AI_DATA_SOURCES: str = Field(
             default=os.getenv("AZURE_AI_DATA_SOURCES", ""),
-            description='JSON configuration for data_sources field (for Azure AI Search / RAG). Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key","key":"your-key"}}}]\'',
+            description='JSON configuration for data_sources field (for Azure AI Search / RAG). Uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026: from that date on, requests with data_sources are expected to fail or to be answered without the search index; see https://github.com/owndev/Open-WebUI-Functions/issues/187. Example: \'[{"type":"azure_search","parameters":{"endpoint":"https://xxx.search.windows.net","index_name":"your-index","authentication":{"type":"api_key","key":"your-key"}}}]\'',
         )
 
         # Enable relevance scores from Azure AI Search
@@ -741,7 +770,7 @@ class Pipe:
         # Azure AI Search returns filter_reason to indicate which score type is relevant:
         # - filter_reason not present or "score": use original_search_score (BM25/keyword)
         # - filter_reason "rerank": use rerank_score (semantic reranker)
-        # Reference: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/references/on-your-data
+        # Reference: https://learn.microsoft.com/en-us/azure/foundry-classic/openai/references/on-your-data
         filter_reason = citation.get("filter_reason")
         rerank_score = citation.get("rerank_score")
         original_search_score = citation.get("original_search_score")
@@ -2015,6 +2044,11 @@ class Pipe:
         uses_data_sources = "data_sources" in filtered_body
 
         if uses_data_sources:
+            # From the valve or from the client; background tasks never get
+            # here with data_sources (removed above).
+            if _first_on_your_data_request():
+                log.warning(ON_YOUR_DATA_RETIREMENT_NOTICE)
+
             # Azure OpenAI "On Your Data" does not support `stream_options`
             # (the request fails with "Extra inputs are not permitted"). Open
             # WebUI 0.11.1+ adds it to streaming requests of models with the

@@ -18,7 +18,9 @@ Groups (``--only azure.<group>``)
            history sent back as [docX], only referenced sources saved (show-all
            valve), relevance scores, no data_sources for background tasks (#123,
            also without a websocket session), no tools / stream_options with
-           data_sources, large context events, content null
+           data_sources, large context events, content null; the On Your Data
+           retirement warning: none for requests without data_sources, exactly
+           one for all data_sources requests, never with the search key
   logs     no API key and no citation text in the server log
 
 Browser chats of the oyd group that test the stream / citation handling send
@@ -92,16 +94,24 @@ TOOLS = [
         },
     }
 ]
+SEARCH_ENDPOINT = "https://mock-search.search.windows.net"
+SEARCH_INDEX = "x100-docs"
+SEARCH_KEY = "e2e-search-key-4711"  # in DATA_SOURCES; must never be logged
 DATA_SOURCES = [
     {
         "type": "azure_search",
         "parameters": {
-            "endpoint": "https://mock-search.search.windows.net",
-            "index_name": "x100-docs",
-            "authentication": {"type": "api_key", "key": "search-key"},
+            "endpoint": SEARCH_ENDPOINT,
+            "index_name": SEARCH_INDEX,
+            "authentication": {"type": "api_key", "key": SEARCH_KEY},
         },
     }
 ]
+# The On Your Data retirement warning (since 2.8.1): logged once per process
+# for the first request that sends data_sources. Lines with all of
+# OYD_NOTICE count as the notice, whatever their level.
+OYD_NOTICE = ("On Your Data", "October 14, 2026")
+OYD_NOTICE_SINCE = "2.8.1"
 MANUAL_URL = "https://docs.example.com/x100/manual.pdf"
 LINKED = (
     f"The X100 charges via USB-C [[doc1]]({MANUAL_URL}). "
@@ -175,6 +185,16 @@ def _upstream(entry: dict) -> str:
         f"upstream keys={sorted(body)} "
         f"data_sources_ignored={bool(entry.get('data_sources_ignored'))}"
     )
+
+
+def _oyd_notices(t: Suite) -> list:
+    """Full server-log lines of the On Your Data retirement notice since the
+    suite started (before the function was installed)."""
+    return [
+        line
+        for line in t.log.since(t.log_start).splitlines()
+        if all(part in line for part in OYD_NOTICE)
+    ]
 
 
 def _allow_listed(body: dict) -> bool:
@@ -566,6 +586,7 @@ async def tasks(t: Suite, mock, base_valves: dict) -> None:
 
 async def oyd(t: Suite, mock, base_valves: dict) -> None:
     oyd_valves = _oyd_valves(mock, base_valves)
+    await oyd_notice_none(t, mock, base_valves, oyd_valves)
     await t.owui.update_valves(FID, **oyd_valves)
     model = f"{FID}.gpt-4.1"
     await oyd_api(t, mock, model, oyd_valves)
@@ -575,6 +596,83 @@ async def oyd(t: Suite, mock, base_valves: dict) -> None:
     await oyd_browser_tools(t, mock, model)
     await oyd_no_session(t, mock, model)
     await oyd_usage_capability(t, mock, model)
+    await oyd_notice_once(t)
+
+
+async def oyd_notice_none(t: Suite, mock, base_valves: dict, oyd_valves: dict) -> None:
+    """Requests without data_sources log no retirement notice: a chat without
+    AZURE_AI_DATA_SOURCES and a title task with it (tasks drop data_sources).
+    Runs before the first data_sources request of the suite, because the
+    notice is logged only once per process."""
+    await t.owui.update_valves(FID, **base_valves)
+    await mock.reset()
+    r = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=True)
+    await t.owui.update_valves(FID, **oyd_valves)
+    status, answer, _ = await t.owui.title_task(
+        model=f"{FID}.gpt-4.1",
+        messages=[{"role": "user", "content": "x100 charging?"}],
+    )
+    requests = await mock.requests()
+    tasks = [e for e in requests if _is_task(e)]
+    with_sources = [e for e in requests if "data_sources" in (e.get("body") or {})]
+    await t.log.settle(0.5)
+    notices = _oyd_notices(t)
+    t.check(
+        "oyd.notice.none",
+        "requests without data_sources (no AZURE_AI_DATA_SOURCES; title task "
+        "with it) log no On Your Data retirement notice",
+        r.status == 200
+        and _answered(r.content)
+        and status == 200
+        and bool(answer)
+        and len(requests) > len(tasks) > 0
+        and not with_sources
+        and not notices,
+        f"{r.brief()} task HTTP {status} answer={short(answer)} "
+        f"upstream requests={len(requests)} (tasks {len(tasks)}) "
+        f"with data_sources={len(with_sources)} "
+        f"notices={len(notices)} "
+        f"{short([n.replace(SEARCH_KEY, '***') for n in notices[:1]], 300)}",
+    )
+
+
+async def oyd_notice_once(t: Suite) -> None:
+    """After all data_sources requests of the group (valve and client, API and
+    browser path, stream and non-stream): exactly one retirement notice, a
+    WARNING of the pipe with the issue link, without any part of the
+    data_sources; the search key appears nowhere in the server log."""
+    await t.log.settle(0.5)
+    version = staged_version(PATH)
+    expected = 1 if version_tuple(version) >= version_tuple(OYD_NOTICE_SINCE) else 0
+    notices = _oyd_notices(t)
+    line = notices[0] if len(notices) == 1 else ""
+    leaked = [
+        name
+        for name, value in (
+            ("search key", SEARCH_KEY),
+            ("endpoint", SEARCH_ENDPOINT),
+            ("index", SEARCH_INDEX),
+        )
+        if any(value in notice for notice in notices)
+    ]
+    key_logged = t.log.since(t.log_start).count(SEARCH_KEY)
+    shape = expected == 0 or (
+        "| WARNING" in line
+        and "function_azure:pipe" in line
+        and "issues/187" in line
+        and "once per process" in line
+    )
+    t.check(
+        "oyd.notice.once",
+        "On Your Data retirement notice: exactly one WARNING of the pipe (link "
+        "to #187) for all data_sources requests, without any part of the "
+        f"data_sources; search key never logged (since {OYD_NOTICE_SINCE})",
+        len(notices) == expected and shape and not leaked and not key_logged,
+        f"version={version} notices={len(notices)} expected={expected} "
+        f"data_sources parts in the notice={leaked} "
+        f"search key logged {key_logged}x "
+        f"line={short(line.replace(SEARCH_KEY, '***'), 400)}",
+    )
 
 
 async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
