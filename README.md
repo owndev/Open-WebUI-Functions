@@ -158,7 +158,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 > This pipeline provides seamless integration with Azure OpenAI and other Azure AI models, with advanced features such as Azure Search integration and multiple model support.
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
-- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only). It uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026; see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect) for the recommended migration.
+- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only). It uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026; see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect) for the recommended migration. Migration of this pipeline is tracked in [#187](https://github.com/owndev/Open-WebUI-Functions/issues/187); since v2.8.1 the first request with `data_sources` logs a warning once per process.
 - **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only). Answers with `[docX]` references show only the referenced documents; answers without any show all retrieved documents (default) or none with `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false`.
 - **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; `tools`/`tool_choice` (including Open WebUI's built-in tools) and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject, so function calling is not available in chats that use Azure AI Search.
 - **Relevance scores**: BM25 keyword and semantic rerank scores from Azure AI Search are displayed as a relevance percentage on citation cards, with independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
@@ -323,7 +323,7 @@ tests/e2e/run.sh --image v0.11.3-slim gemini  # one suite on another Open WebUI 
 tests/e2e/check_owui_api.sh latest            # static check of the Open WebUI APIs the functions use
 ```
 
-The five suites (gemini, azure, n8n, infomaniak, filters) run 292 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
+The five suites (gemini, azure, n8n, infomaniak, filters) run about 300 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
 
 ## 💪 Contributing
 
