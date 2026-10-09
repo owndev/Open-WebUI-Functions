@@ -65,6 +65,7 @@ class Suite:
         self.ignored_log_patterns: list = []
         self.ignored_log_ranges: list = []
         self.warning_signatures: list = []
+        self.ignored_warning_ranges: list = []
         self._mocks: dict = {}
 
     # -------------------------------------------------------------- selection
@@ -155,6 +156,15 @@ class Suite:
         ``('function_time_token_tracker', 'No inlet data found')``."""
         self.warning_signatures.extend(signatures)
 
+    def expect_warnings(self, since: int, *signatures) -> None:
+        """WARNING blocks logged since ``since`` that match one of
+        ``signatures`` were provoked on purpose: they do not fail the
+        ``server-log`` check even when ``fail_on_warnings`` registered them.
+        Matching blocks outside the window still fail it."""
+        if not signatures:
+            raise ValueError("expect_warnings(mark, *signatures) needs signatures")
+        self.ignored_warning_ranges.append((since, self.log.mark(), tuple(signatures)))
+
     def secret_leaks(self, *values: str) -> list:
         """Plaintext secrets in the server log since the suite started (any
         level): ``values`` plus every password valve written through
@@ -192,7 +202,12 @@ class Suite:
             tuple(self.ignored_log_ranges),
         )
         warnings = (
-            self.log.warnings(self.log_start, *self.warning_signatures)
+            self.log.warnings(
+                self.log_start,
+                *self.warning_signatures,
+                ignore=tuple(self.ignored_log_patterns),
+                ranges=tuple(self.ignored_warning_ranges),
+            )
             if self.warning_signatures
             else []
         )

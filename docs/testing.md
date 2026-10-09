@@ -30,8 +30,8 @@ Container and volume are removed afterwards.
   downloads into the container's `TIKTOKEN_CACHE_DIR` (without them the suite fails).
 
 No Python on the host: the mocks, the probe pipe and the test driver run **inside** the
-Open WebUI container, whose Python already ships `aiohttp`, `httpx` and
-`python-socketio`.
+Open WebUI container, whose Python already ships `aiohttp`, `httpx`,
+`python-socketio`, `openai` and `mcp` (the last two for the tool calling scenarios).
 
 ## Quick start
 
@@ -54,7 +54,13 @@ function versions: google_gemini.py 1.17.0, azure_ai_foundry.py 2.8.0, n8n.py 2.
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
 ...
---- gemini: 152s
+[KNOWN] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
+          -> known gemini-tools-afc (#169): native tool calls are run by google-genai's automatic
+             function calling inside the pipe: ...; fix pending in feature/gemini-native-tool-calling
+             (not merged yet), fixed in pipelines/google/google_gemini.py 1.18.0
+          mock_ok=True http=200 done=True error=None calls=[] outputs=0 rd=[] upstream=[fc,http-400] ...
+...
+--- gemini: 263s
 ...
 === infomaniak ===
 ...
@@ -64,14 +70,14 @@ function versions: google_gemini.py 1.17.0, azure_ai_foundry.py 2.8.0, n8n.py 2.
              __init__); no fix yet
           name='Infomaniak: Mixtral Mock'
 ...
-SUMMARY: 291 PASS, 0 FAIL, 1 KNOWN in 445s
-total runtime: 487s
+SUMMARY: 296 PASS, 0 FAIL, 33 KNOWN in 561s
+total runtime: 615s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
-A full run of all suites took 7-9.5 minutes on a shared 8-CPU Docker host (427-565 s,
-depending on the load; with `main`'s files 487 s: 30 s container start-up, then
-gemini 152 s, azure 69 s, n8n 76 s, infomaniak 41 s, filters 106 s). Network downloads
+A full run of all suites took 8-10.5 minutes on a shared 8-CPU Docker host (with
+`main`'s files 615 s: 41 s container start-up, then gemini 263 s, azure 73 s, n8n 76 s,
+infomaniak 36 s, filters 111 s; the gemini suite alone took 199-263 s). Network downloads
 on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -141,7 +147,7 @@ events), a **background title task** and that the server log has no unexpected
 
 | Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
-| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream) |
+| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in `<details>`, full usage), `thinking` (summaries not replayed #176; budget, level, include and strip valves), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations; no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), continuation with and without signatures, `tool_choice`, name mapping and duplicates, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls, two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)) |
 | `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; ignores `data_sources` when tools are sent, as Azure does) | `valves`, `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status), `tasks` (title task, also with Azure AI Search valves, #123), `oyd` (Azure AI Search "On Your Data": `[docX]` → links, also split across stream deltas, already linked or with parentheses in the URL; links in the history sent back as `[docX]`; only referenced sources saved and the show-all valve; relevance scores; no `data_sources` for background tasks, also without a websocket session; no tools or `stream_options` together with `data_sources`; a 300 KB and a > 4 MiB context event; `content: null`), `logs` (no API key and no citation text in the log) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
@@ -162,20 +168,143 @@ a throw-away test CA into the container's trust store and starts `mocks/mock_la.
 The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
 process), so do not rerun it with `--reuse`.
 
+### Native tool calling (`gemini.tools`, `gemini.toolsapi`)
+
+The two groups live in `tests/e2e/suites/_gemini_tools.py` (run by `suites/gemini.py`;
+the leading underscore keeps the module out of the suite discovery); `--only
+'gemini.tools'` runs both, `--only 'gemini.tools$'` the browser group only. The Gemini mock
+answers with function calls, Open WebUI runs the tools (browser path) or hands the
+`tool_calls` to the client (API path), and the scenarios check the saved `output`
+items, what the client got and what the pipe sent upstream (the mock's record).
+
+**The `MOCKTOOLS:` directive.** A JSON object after `MOCKTOOLS:` in the turn's user
+message (the last user content with text that is not Open WebUI's tool-image message)
+makes `mock_gemini.py` answer with function calls:
+
+```text
+MOCKTOOLS:{"rounds": [[{"name": "get_current_timestamp", "args": {}}],
+                      [{"name": "calculate_timestamp", "args": {"days_ago": 1}}]],
+           "text_before": "Let me check.", "split": false, "noid": false, "nosig": false,
+           "server_side": false, "malformed": false, "allow_undeclared": false}
+```
+
+| Option | Effect |
+| --- | --- |
+| `rounds` | round `r` (the number of user contents with function responses after the turn's message, at least 1 + the highest `<r>` of a response id `mock-call-<r>-<k>`, because Open WebUI merges rounds without text or reasoning in between) answers with the calls of `rounds[r]`; after the last round the answer is `MOCK-FINAL <name>=<json response>; ...` over every function response of the turn |
+| names | Open WebUI names; the call uses the pipe's mapped name (`_gemini_function_name`, copied into the mock) and must be declared, else the answer is `MOCK-ERROR undeclared function <name>; declared=[...]` (HTTP 200) |
+| `allow_undeclared` | call an undeclared tool anyway (under its own name) |
+| `noid` | calls without `id` (otherwise `mock-call-<r>-<k>`) |
+| `nosig` | no thought signature (otherwise `gemini-3*` models sign the first call of a round with `base64("mock-sig\|<model>\|<id or name>")`) |
+| `text_before` | a text part before the calls |
+| `split` | streaming: one chunk per call (otherwise all calls in one chunk) |
+| `server_side` | with `toolConfig.includeServerSideToolInvocations` in the request: a server-side `toolCall` (signed) + `toolResponse` before the calls |
+| `malformed` | the first request gets a candidate without content and `finishReason: MALFORMED_FUNCTION_CALL` |
+
+A tool round's usage is `USAGE_TOOL` (21 / 5 / 26 tokens); streaming ends with a
+`{"text": ""}` chunk with `finishReason: STOP`. Like the real API, every generate
+request is rejected with HTTP 400 `INVALID_ARGUMENT` for duplicate declaration names,
+invalid names, `parameters` together with `parametersJsonSchema`, a model content with
+function calls that is not directly followed by a user content with matching function
+responses (count, names, ids) and, for `gemini-3*`, a first function call of a model
+content of the current turn without the issued signature or
+`skip_thought_signature_validator`. Each generate request records `declared`, `decl`
+(the raw schema of every declaration, before any key normalisation), `tool_config`,
+`fc_mode`, `allowed_names`, `include_flag`, `kinds` (role and part kinds per content),
+`fc` / `fr` (calls with id, name, args and signature state `none` / `skip` / `issued` /
+`bad`; responses with id, name and response), `round`, `directive`, `answer` (`fc`,
+`final`, `text`, `malformed`, `mock-error`, `http-<status>`), `issued`,
+`server_echoed`, `synthetic_ids_upstream` and `orphan_fr`.
+
+**Tool mocks.** `mocks/mock_tools.py`, started by `serve_all.py`, is an OpenAPI tool
+server on 127.0.0.1:9111 (`get_weather` with a query parameter, `convert_units` with a
+JSON body, and `lookup.v2`, an operationId Gemini does not accept as a function name)
+and an optional MCP server (FastMCP streamable HTTP from the image's `mcp` package) on
+127.0.0.1:9112 (`mcp_echo`, `mcp_sum`; Open WebUI names them `<server id>_mcp_echo`).
+`GET /__requests` on 9111 lists the OpenAPI calls and the MCP tool calls. They are not
+provider mocks: `E2E_MOCK_FAULT` does not touch them. `probe/workspace_tool.py` is the
+workspace Python tool the `tools` group creates (`add_numbers` reports the types it
+got, `whoami` the user, the chat and its event emitter, and emits a status). The group
+deletes the tool, restores the tool server connections and the chat settings and
+deletes its model overrides when it ends.
+
+**Browser harness.** `BrowserSession` sends the Socket.IO namespace sid as
+`session_id` (`sio.get_sid()`, what the web UI sends as `socket.id`; the engine.io sid
+`sio.sid` it sent before is unknown to Open WebUI, so every server → client call
+failed with "Client session disconnected.") and a `heartbeat` event every 20 s like
+the web UI (Open WebUI reaps a session that sent none for 120 s). It answers Open
+WebUI's `execute:tool` calls (direct tools) with `direct_tool_answer(data)` as the
+socket.io ack, e.g. `[{"value": "client:k1"}, {"content-type": "application/json"}]`
+(result, headers) and records them in `execute_calls`. `chat()` takes `tool_ids`,
+`tool_servers`, `extra_body` and `until` (a predicate on the saved message that ends
+the wait, e.g. a call waiting for approval); `wait()` waits again after
+`owui.resolve_tool_call(...)`. `BrowserChat` adds `output`, `function_calls`
+(`[(name, status, call_id, arguments)]`), `function_outputs` (`{call_id: text}`),
+`reasoning_items` (`[(text, reasoning_details)]`) and `output_text`; `content` falls
+back to the output text because Open WebUI's final save of a tool turn leaves
+`content` empty. `owui.py` adds `create_tool` / `delete_tool`, `set_tool_servers`,
+`chat_config` / `set_chat_config`, `resolve_tool_call`, and `parse_sse` collects
+`tool_calls` (merged by index), `reasoning_details`, `reasoning_content`,
+`finish_reasons`, `done_last` and `openai_finish_reason` (the openai SDK's
+`ChatCompletionStreamState`, which ships with the image).
+
+**Preflight and `mock_ok`.** Both groups start with a plain API request to
+`gemini-2.5-flash`; every detail line starts with `mock_ok=<bool>` (the request got
+`Hello from mock`). The evidence of every `gemini-tools-*` known bug requires
+`mock_ok=True` plus a token that the request itself got the provider's answer
+(`upstream=[fc,...]`, `upstream=[mock-error]`, `answered=<n>`, ...), so with
+`E2E_MOCK_FAULT` none of them can be KNOWN. The detail tokens are stable (the evidence
+matches them): `http=`, `done=`, `calls=[name:status,...]`, `outputs=<n>`,
+`rd=[format:id,...]`, `upstream=[answers in order]`, `declared_n=`, `safe_names=`,
+`sig_echoed=[id:sig,...]`, `fr=[id:name:keys,...]`, `kinds=`, `tool_kinds=`,
+`include_flag=`, `server_echoed=`, `finish=[...]`, `openai_finish=`, `usage=` and
+`final=` (last). WARNING lines of the pipe that mean lost tool data (`Skipping
+duplicate tool declaration`, `Dropping unmatched function call`, `Dropping unmatched
+tool result`, `Could not restore stored model content`, `Invalid tool call arguments`)
+fail the `server-log` check unless a scenario provokes one (`t.expect_warnings`);
+`tools.log` fails on `'callable'`, `__signature__`, `Duplicate function declaration` or
+`AFC is enabled` anywhere in the server log of the group.
+
+**Known bugs of `google_gemini.py` 1.17.0** (`harness/known_gemini.py`, all gated on
+`fixed_in="1.18.0"`, fixed by `feature/gemini-native-tool-calling`):
+
+| Key | What `main` does | Checks |
+| --- | --- | --- |
+| `gemini-tools-afc` (#169) | google-genai's automatic function calling runs the tool inside the pipe; Open WebUI saves no function call, nothing waits for approval. On v0.11.4-slim (google-genai 2.x from pip) the SDK's follow-up request (model content split per chunk, responses without ids) gets the mock's 400; on v0.11.3-slim (google-genai 1.66.0 bundled) a streamed AFC round stops after the function calls | `tools.builtin*`, `multiturn`, `multiturn-other-model`, `multiturn-back`, `parallel*`, `rounds*`, `text-before`, `thinking*`, `approval*`, `unknown`, `log`; `workspace` on v0.11.3-slim |
+| `gemini-tools-annotations` (#169) | the workspace tool fails on its string annotations under AFC (`isinstance() arg 2 must be a type` in the function responses; only visible where AFC sends its follow-up) | `tools.workspace` on v0.11.4-slim |
+| `gemini-tools-duplicate` (#169) | OpenAPI tool callables are all named `tool_function`: `Duplicate function declaration found: tool_function` | `tools.openapi` |
+| `gemini-tools-mcp` (#169) | MCP callables have no `__signature__`: the request fails before it is sent | `tools.mcp` |
+| `gemini-tools-direct` (#169) | direct tools have no callable: `KeyError: 'callable'` | `tools.direct` |
+| `gemini-tools-api` | client `tools` of API requests are ignored: nothing declared, no `tool_calls` | `toolsapi.stream`, `nonstream`, `tool-choice`, `names`, `schema`, `noid` |
+| `gemini-tools-history` | tool calls and results in the history are sent as text | `toolsapi.continuation*` |
+| `gemini-tools-grounding` | Gemini 2.5 + web_search gets functions next to grounding; Gemini 3 gets them without `includeServerSideToolInvocations` | `tools.grounding25`, `tools.grounding3` |
+| `gemini-tools-malformed` | `MALFORMED_FUNCTION_CALL` gives an empty answer | `tools.malformed` |
+
+`tools.multiturn-approved`, `tools.task`, `tools.legacy`, `tools.nobuiltin` and
+`toolsapi.unchanged` already pass on `main`. Open WebUI 0.11.4's approval defects (an
+approved call loses its result in the saved message; with two calls only the first is
+asked and the second is not run) are only recorded in the detail of
+`tools.approval-parallel`, never asserted.
+
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-09):
 
-| Suite | Checks | `main` (53b8495): PASS / KNOWN |
+| Suite | Checks | `main` (4d09a55): PASS / KNOWN |
 | --- | ---: | ---: |
-| `gemini` | 81 | 81 / 0 |
+| `gemini` | 118 | 86 / 32 |
 | `azure` | 71 | 71 / 0 |
 | `n8n` | 51 | 51 / 0 |
 | `infomaniak` | 32 | 31 / 1 |
 | `filters` | 57 | 57 / 0 |
-| **all** | **292** | **291 / 1** |
+| **all** | **329** | **296 / 33** |
 
-There is no FAIL and no obsolete marker. `harness/known_*.py` registers one known bug,
-`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`):
-the one KNOWN. The markers of the 62 bugs fixed by #182-#185 were dropped after the
+There is no FAIL. `harness/known_*.py` registers ten known bugs: the nine
+`gemini-tools-*` bugs of `google_gemini.py` 1.17.0 (the 32 KNOWN of the `tools` and
+`toolsapi` groups, gated on 1.18.0, see [Native
+tool calling](#native-tool-calling-geminitools-geminitoolsapi)) and
+`infomaniak-name-prefix` (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`).
+The gemini suite gives the same 86 / 32 on `v0.11.3-slim`. With `google_gemini.py`
+1.18.0 of `feature/gemini-native-tool-calling` (81a3c77) it is 118 PASS / 0 KNOWN on
+both images, and the 32 tool markers are listed as obsolete markers (drop them after
+the merge). The markers of the 62 bugs fixed by #182-#185 were dropped after the
 merge; their checks stay and must pass.
 
 ### API path vs. browser path
@@ -197,8 +326,9 @@ merge; their checks stay and must pass.
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak;
-  re-exported by `known.py`): key, summary, issue reference, pull request with the
+  `tests/e2e/harness/known_<area>.py` (today `known_gemini.py` and `known_n8n.py` for
+  n8n + Infomaniak; re-exported by `known.py`): key, summary, issue reference, pull
+  request with the
   pending fix, evidence, and the function `file` plus the version `fixed_in` that fixes
   it. Printed with the bug, e.g. `known infomaniak-name-prefix (found by tests/e2e, no
   issue filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
@@ -234,11 +364,11 @@ stable reference.
 The `server-log` check fails on every ERROR / Traceback / `ResourceWarning` block logged
 while the suite ran, on plaintext values of password valves (any log level), and on
 WARNING blocks a suite registered with `fail_on_warnings`, except blocks provoked on
-purpose (`expect_errors` with the signature of the provoked error) and blocks that match
-the narrow log signature of a known bug that reproduced in this suite (function name plus
-error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is not
-callable`). A different error in the same function, or the same error in another
-function, still fails it.
+purpose (`expect_errors` / `expect_warnings` with the signature of the provoked error or
+warning) and ERROR or WARNING blocks that match the narrow log signature of a known bug
+that reproduced in this suite (function name plus error, e.g. `Error in outlet filter
+time_token_tracker` + `'NoneType' object is not callable`). A different error in the
+same function, or the same error in another function, still fails it.
 
 The driver adds a few checks of its own; they only show up when something is wrong:
 
@@ -310,7 +440,7 @@ editor gives LF. `SOURCES.txt` says `CRLF converted to LF` for a converted file.
 4. Look at what reached a mock (Git Bash: prefix with `MSYS_NO_PATHCONV=1`):
 
    ```bash
-   docker exec owui-dbg curl -s http://127.0.0.1:9102/__requests   # 9101 gemini, 9102 azure, 9103 n8n, 9104 infomaniak
+   docker exec owui-dbg curl -s http://127.0.0.1:9102/__requests   # 9101 gemini, 9102 azure, 9103 n8n, 9104 infomaniak, 9111 tools
    docker exec owui-dbg tail -n 100 /tmp/e2e/server.log
    ```
 
@@ -357,10 +487,13 @@ harness/             driver library: owui.py (REST client, API-path chat, valves
                      browser.py (socket.io + saved chats), logs.py (server log),
                      mocks.py, results.py, known.py + known_<area>.py (known bugs),
                      suite.py, config.py
-suites/              one module per suite: GROUPS + async def run(t: Suite)
-mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container);
+suites/              one module per suite: GROUPS + async def run(t: Suite); _*.py are
+                     helpers of a suite (_gemini_tools.py: gemini.tools / toolsapi)
+mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 in the container),
+                     tool servers mock_tools.py (OpenAPI :9111, MCP :9112, no E2E_MOCK_FAULT);
                      mock_la.py (Log Analytics) is started by the filters suite (:443, :9105)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
+probe/workspace_tool.py  test-only workspace Python tool (gemini.tools)
 ```
 
 A scenario is a few lines in a suite module:
@@ -382,27 +515,33 @@ async def api(t: Suite, mock) -> None:
 
 - Browser path: `async with t.browser() as b: c = await b.chat(model, "text", stream=True)`
   then assert on `c.content`, `c.usage`, `c.sources`, `c.files`, `c.status_history`,
-  `c.events`, `c.title`.
+  `c.events`, `c.title`; for tool turns `c.function_calls`, `c.function_outputs`,
+  `c.reasoning_items`, `c.output_text` (`b.chat(..., tool_ids=[...],
+  tool_servers=[...], until=...)`, see [Native tool
+  calling](#native-tool-calling-geminitools-geminitoolsapi)).
 - Valves: use `t.owui.update_valves(fid, NAME=value)` (merges, see gotchas).
 - Server log: `mark = t.mark()` before, `t.log.errors(mark)` after;
   `t.expect_errors(mark, signature)` for an error you provoke on purpose (only blocks
   matching the signature, e.g. `("function_azure:pipe", "request: 400")`, are
   ignored; anything else in the window still fails `server-log`).
-  `t.fail_on_warnings(signature)` makes matching WARNING blocks fail `server-log`, and
+  `t.fail_on_warnings(signature)` makes matching WARNING blocks fail `server-log`
+  (`t.expect_warnings(mark, signature)` for one you provoke on purpose), and
   `t.assert_no_secrets(value)` checks that a secret never shows up in the log. Pass
   `since=mark` to a check tagged `known=` when the bug shows in the server log rather
   than in the detail text (e.g. a failing background task).
 - Groups: wrap related scenarios in `if t.selected("group"):` so `--only` can select
   them, and list the group in the module's `GROUPS` (an unlisted group raises).
 - Mock behaviour: mocks pick behaviour from the request (model name, webhook path or a
-  trigger word in the last user message, e.g. `force-400`). Add a branch in
-  `tests/e2e/mocks/mock_<provider>.py`; requests are recorded automatically.
+  trigger word in the last user message, e.g. `force-400`, or the Gemini mock's
+  `MOCKTOOLS:` directive). Add a branch in `tests/e2e/mocks/mock_<provider>.py`;
+  requests are recorded automatically.
 - New known bug: add a `KnownIssue` to the area's `harness/known_<area>.py` (a new
   area module needs its own import at the bottom of `known.py`) and pass it as
   `known=`. Give it `evidence` (regexes that match the failing check's detail and
-  nothing else: include proof that the request itself worked, e.g. `HTTP 200`, so an
-  unrelated failure stays FAIL), `log_patterns` when it logs errors (a string or a tuple
-  of strings that must all occur in one error block; include the function, e.g.
+  nothing else: include proof that the request itself worked, e.g. `HTTP 200`, or in the
+  tool groups `mock_ok=True` plus the mock's answer, so an unrelated failure stays
+  FAIL), `log_patterns` when it logs errors or failing warnings (a string or a tuple
+  of strings that must all occur in one block; include the function, e.g.
   `function_gemini:pipe`), `file` and `fixed_in` (the function file and the version that
   fixes it, `""` while no fix exists), the fixing branch (or `""`) and an issue `ref`.
   The CI meta-test fails when the evidence also matches a failing upstream (see
@@ -448,7 +587,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 4d09a55, with the `gemini.tools` / `toolsapi` groups): 39 PASS / 230 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario
