@@ -90,7 +90,10 @@ N8N_STOP = _n8n(
     "Stop leaves an n8n request without a final status (in progress forever), and "
     "a request stopped while waiting for the reply leaks its aiohttp session",
     r"last_status='Sending request to N8N\.\.\.' done=False",
-    # the leaked session, logged when it is garbage-collected (no function name)
+    # The leaked session is logged when it is garbage-collected, without a
+    # function name and often after the Stop scenario ended, so this signature
+    # is suite-wide (the documented exception to "function name plus error";
+    # gated off from n8n.py 2.3.1).
     log_patterns=("Unclosed client session",),
 )
 N8N_ERROR_CHUNK = _n8n(

@@ -60,7 +60,7 @@ function versions: google_gemini.py 1.16.1, azure_ai_foundry.py 2.7.0, n8n.py 2.
 ...
 --- gemini: 129s
 ...
-SUMMARY: 167 PASS, 0 FAIL, 124 KNOWN in 435s
+SUMMARY: 168 PASS, 0 FAIL, 124 KNOWN in 435s
 total runtime: 471s
 output: tests/e2e/out/20261009-004128-owui-e2e-004128-1234
 ```
@@ -163,11 +163,11 @@ Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-
 | Suite | Checks | `main` (0e47f2a): PASS / KNOWN | Known bugs seen on `main` | Fixed files of #182-#185: PASS / KNOWN |
 | --- | ---: | ---: | ---: | ---: |
 | `gemini` | 81 | 44 / 37 | 17 | 81 / 0 |
-| `azure` | 70 | 37 / 33 | 14 | 70 / 0 |
+| `azure` | 71 | 38 / 33 | 14 | 71 / 0 |
 | `n8n` | 51 | 37 / 14 | 10 | 51 / 0 |
 | `infomaniak` | 32 | 15 / 17 | 8 | 31 / 1 |
 | `filters` | 57 | 34 / 23 | 12 | 57 / 0 |
-| **all** | **291** | **167 / 124** | **61** | **290 / 1** |
+| **all** | **292** | **168 / 124** | **61** | **291 / 1** |
 
 There is no FAIL in either column. `harness/known_*.py` registers 63 known bugs; two
 Gemini bugs (`gemini-task-details`, `gemini-stream-data-prefix`) are hidden on `main`
@@ -235,7 +235,12 @@ purpose (`expect_errors` with the signature of the provoked error) and blocks th
 the narrow log signature of a known bug that reproduced in this suite (function name plus
 error, e.g. `Error in outlet filter time_token_tracker` + `'NoneType' object is not
 callable`). A different error in the same function, or the same error in another
-function, still fails it.
+function, still fails it. One exception: `n8n-stop` ignores `Unclosed client session`
+blocks for the rest of the suite, because aiohttp logs a leaked session without a
+function name when it is garbage-collected, often after the Stop scenario has ended.
+This only applies while the tested `n8n.py` is older than 2.3.1 (the marker is gated
+off from then on), and `n8n.browser.stop.*` itself still fails on a leak inside its
+window.
 
 The driver adds a few checks of its own; they only show up when something is wrong:
 

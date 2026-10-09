@@ -755,6 +755,33 @@ async def oyd_history(t: Suite, mock, model: str) -> None:
             known=known.AZURE_HISTORY_UNLINK,
         )
 
+    # Any API client can send this history: a long line of unclosed links must
+    # not make the unlinking quadratic (it runs in the event loop).
+    hostile = "[[doc1]](" * 9000 + "x"
+    history = [
+        {"role": "user", "content": "x100 charging?"},
+        {"role": "assistant", "content": hostile},
+        {"role": "user", "content": "and the warranty?"},
+    ]
+    await mock.reset()
+    started = time.monotonic()
+    r = await t.owui.chat(model, history, stream=False)
+    elapsed = time.monotonic() - started
+    req = await mock.last()
+    messages = (req.get("body") or {}).get("messages") or []
+    sent = next(
+        (m.get("content") for m in messages if m.get("role") == "assistant"), None
+    )
+    answered = r.status == 200 and r.content == LINKED
+    t.check(
+        "oyd.history-hostile",
+        "81 KB history line of unclosed [[docX]]( links: passed through unchanged "
+        "in under 3 s (unlinking stays linear)",
+        answered and sent == hostile and elapsed < 3.0,
+        f"elapsed={elapsed:.2f}s answered={answered} "
+        f"sent_unchanged={sent == hostile} {r.brief()}",
+    )
+
 
 async def oyd_big(t: Suite, mock, model: str) -> None:
     mark = t.mark()
