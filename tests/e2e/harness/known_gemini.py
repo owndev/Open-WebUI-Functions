@@ -98,7 +98,10 @@ GEMINI_181_MODELS = KnownIssue(
         r"^name='Google Gemini: Nano Banana 2\.1'$",
         r"\bmodel=(gemini-nano-banana-2\.1|gemini-4-flash-image) "
         r"upstream=\['streamGenerateContent'\]",
-        r"\bmodel=gemini-3\.1-flash-lite-image .*\bimageConfig=None\b",
+        # the request worked (HTTP 200, generateContent), only the ImageConfig
+        # is missing; with a failing upstream the action is None
+        r"^HTTP 200 .*\bmodel=gemini-3\.1-flash-lite-image imageConfig=None "
+        r"action=generateContent\b",
     ),
     # streamed with the browser's tools, which the image model rejects
     log_patterns=(
@@ -218,7 +221,12 @@ GEMINI_MODEL_CACHE = KnownIssue(
     "MODEL_ADDITIONAL, IMAGE_GENERATION_MODELS) until MODEL_CACHE_TTL expires",
     GEMINI_FIX,
     ref=FOUND_BY_REVIEW,
-    evidence=(r"\bstale_list=True\b",),
+    # the model list worked (several real models before, still several after the
+    # whitelist change); a failing upstream lists only 'gemini.error' both times
+    evidence=(
+        r"^before=([2-9]|\d{2,}) models after=\['gemini\.gemini-[^']+', "
+        r"'gemini\.[^']+'.*\] stale_list=True$",
+    ),
     file=GEMINI_FILE,
     fixed_in=GEMINI_FIXED_IN,
 )
