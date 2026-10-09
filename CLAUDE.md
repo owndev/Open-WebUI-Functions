@@ -13,9 +13,30 @@ A collection of **standalone Python functions for Open WebUI**. Each `.py` file 
 ```bash
 pixi run format   # ruff format
 pixi run lint     # ruff format + ruff check (line-length 88)
+# without pixi (e.g. Windows): uvx ruff@0.11.10 format <files>; uvx ruff@0.11.10 check <files>
 ```
 
-No test suite and no local runtime. The `pixi` env contains only Ruff — `open_webui.*`, `google.genai`, `aiohttp`, etc. are **not installed**, so imports will not resolve locally and nothing here is executable outside an Open WebUI instance.
+The `pixi` env contains only Ruff — `open_webui.*`, `google.genai`, `aiohttp`, etc. are **not installed** on the host, so the functions cannot be imported or run locally. They are tested inside a real Open WebUI container instead.
+
+## Testing
+
+Docker-based E2E tests live in `tests/e2e/` (human guide: `docs/testing.md`). Host needs only Docker + bash (Git Bash on Windows); mocks and driver run inside the Open WebUI container.
+
+```bash
+tests/e2e/run.sh <suite>                     # gemini | azure | n8n | infomaniak | filters | all
+tests/e2e/run.sh --image v0.11.3-slim gemini # A/B another Open WebUI release (default v0.11.4-slim)
+tests/e2e/run.sh --ref <branch> <suite>      # test files from a git ref; --src DIR / --file PATH=FILE
+tests/e2e/run.sh --keep --only 'azure.oyd' azure   # keep container; then --reuse --name <name>
+tests/e2e/run.sh --strict-known all          # as in CI: a tagged check that passes while its marker applies is FAIL
+tests/e2e/check_owui_api.sh [TAG|latest]     # static check of open_webui imports/APIs vs a release
+```
+
+- **What to run:** changed `pipelines/google/*` → `gemini`; `pipelines/azure/*` → `azure`; `pipelines/n8n/*` → `n8n`; `pipelines/infomaniak/*` → `infomaniak`; `filters/*` → `filters` (+ `gemini` for `google_search_tool`); `tests/e2e/**` → `all`. New Open WebUI release → `check_owui_api.sh latest`, then `run.sh --image <new tag> all`.
+- **Results:** `PASS` / `FAIL` / `KNOWN`. Exit 1 only on FAIL; exit 2 = setup error (Docker/container, leftover `NAME-data` volume without `--force`, an option without value, unknown suite, git ref or `--file` path, `--only` regex matching no group, driver error); 130/143 after Ctrl-C/SIGTERM. KNOWN = fails the way a bug registered in `tests/e2e/harness/known_<area>.py` does (its `evidence` matches the detail, or its log signature shows up with `since=`); a tagged check that fails differently is FAIL. KNOWN does not fail the run; its fixing branch may still be an unmerged/unpublished PR. Markers are **version-gated**: each `KnownIssue` names its `file` and the `fixed_in` version; once the tested file has that version, a failure is FAIL ("regression of known …") and a pass is listed as an obsolete marker ("drop marker"). So when you fix such a bug, bump the file's `version:` and set `fixed_in` to it; drop the markers once the fix is merged. `--only` is a Python regex: `'gemini.(api|image)'`, not `\|`. Output (git-ignored): `tests/e2e/out/<run>/` with `driver.txt`, `results.json`, `summary.md`, `server.log`, `mocks.txt`, staged `functions/` (LF); results are written for interrupted or timed-out runs too (partial).
+- **Baseline** (v0.11.4-slim, `--strict-known`, 2026-10-09): 292 checks (gemini 81, azure 71, n8n 51, infomaniak 32, filters 57). `--ref origin/main` → 168 PASS / 0 FAIL / 124 KNOWN; the seven fixed files of #182-#185 together → 291 / 0 / 1 (`infomaniak-name-prefix`, no fix yet) with 123 obsolete markers. Per-suite numbers and the scenario list: `docs/testing.md` → "What is tested". The `filters` suite needs network for the tiktoken encodings, edits the container's `/etc/hosts` and trust store, and its `offline` group needs a fresh container (no `--reuse`).
+- **Driver checks:** `<suite>.timeout` (`E2E_SUITE_TIMEOUT`, default 900 s; whole run `E2E_TIMEOUT`, default 1800 s), `<suite>.crash`, `<suite>.no-checks`, `<suite>.interrupted`, `run.server-log` (errors or secrets logged outside every suite's scan window; names the `function_<id>`), `run.mocks-log` (errors in `mocks.txt`). Ctrl-C cleans up within seconds; a killed `run.sh` leaves the container, the volume and an orphan driver in the container, which `--reuse` stops. Suites are discovered from `tests/e2e/suites/` (no registration).
+- **Add coverage** for every behaviour change: a `t.check(...)` in `tests/e2e/suites/<suite>.py` (API path `t.owui.chat`, browser path `t.browser().chat`, upstream request via `mock.last()`), mock behaviour in `tests/e2e/mocks/mock_<provider>.py`. Keep `tests/e2e` Ruff-clean. Evidence of a new known bug must not match unrelated failures: the CI meta-test (main's files with `E2E_MOCK_FAULT=500`) allows no KNOWN (`REQUEST_SIDE_KNOWN` in `.github/workflows/e2e.yml`, empty today, is only for bugs that can show nothing but the request sent upstream), so the evidence must include proof that the upstream answered (e.g. `HTTP 200` plus the mock's answer).
+- **Gotchas:** `valves/update` REPLACES all valves (use `update_valves`, which merges); refresh `/api/models?refresh=true` after model/filterIds changes; settings in the data volume override env vars; only the browser path (socket.io + saved chat) exercises event emitters, saved content, usage and sources; background tasks (`/api/v1/tasks/*`) call pipes with `__task__` set and `__event_emitter__=None`; the first Gemini install pip-installs `google-genai` (~30-60 s); in Git Bash prefix your own `docker exec`/`docker cp` with `MSYS_NO_PATHCONV=1` per command (do not export it; `run.sh` unsets it because `git -C /c/...` needs path conversion); never remove Docker images, only your containers/volumes.
 
 Manual test path: paste the single file into Open WebUI → Functions, set the env vars from its `Valves`, invoke it from a chat. `WEBUI_SECRET_KEY` must be set in the Open WebUI environment or API-key encryption silently degrades to plaintext.
 

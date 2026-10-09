@@ -27,6 +27,13 @@ This repo extends Open WebUI with pluggable Python pipelines and filters. If you
 - Use Pixi tasks for quality:
   - Format: `pixi run format`
   - Lint: `pixi run lint` (Ruff config in `ruff.toml`)
+- End-to-end tests against a real Open WebUI container (Docker + bash only, see `docs/testing.md`):
+  - `tests/e2e/run.sh <suite>` with suite `gemini`, `azure`, `n8n`, `infomaniak`, `filters` or `all`; run the suite of every file you change.
+  - `--image <tag>` tests another Open WebUI release, `--ref <branch>` / `--src <dir>` / `--file <path>=<file>` test other function files, `--keep` / `--reuse --name <name>` keep the container for debugging.
+  - Results are `PASS` / `FAIL` / `KNOWN`; KNOWN marks a registered known bug (`tests/e2e/harness/known.py`) and does not fail the run. Remove the marker when your change fixes it.
+  - Add a scenario (`tests/e2e/suites/<suite>.py`) and, if needed, mock behaviour (`tests/e2e/mocks/`) for behaviour changes.
+  - New Open WebUI release: `tests/e2e/check_owui_api.sh latest` checks the `open_webui` imports/APIs statically.
+  - Gotchas: `valves/update` replaces all valves; refresh `/api/models?refresh=true` after model changes; only the browser path (socket.io + saved chat) exercises event emitters and saved content; background tasks get `__event_emitter__=None`.
 - Fast manual test path: paste a single pipeline/filter into Open WebUI Admin → Functions, set required env (see each `Valves`), and call it from a chat. Encryption works once `WEBUI_SECRET_KEY` is set.
 - Useful references when implementing:
   - Azure pipeline: citations handling and SSE in `pipelines/azure/azure_ai_foundry.py`
