@@ -52,6 +52,18 @@ Click **Make a contribution** at the bottom of any docs page to make small chang
 
 3. Create a working branch and start with your changes!
 
+### Test your changes
+
+Code changes to `pipelines/` or `filters/` should be checked against a real Open WebUI before you open a PR. The repository ships a Docker-based end-to-end test environment that needs only **Docker** and **bash** (Git Bash on Windows) — no local Python:
+
+```bash
+tests/e2e/run.sh gemini        # suite of the file you changed: gemini, azure, n8n, infomaniak, filters
+tests/e2e/run.sh               # all suites
+pixi run lint                  # Ruff format + check (or: uvx ruff@0.11.10 check <files>)
+```
+
+The run must end without `FAIL` results (`KNOWN` marks registered known bugs and is fine). If your change alters behaviour, add or adjust a scenario in `tests/e2e/suites/`. See the [testing guide](../docs/testing.md) for options, debugging tips and how to add scenarios. The E2E workflow on pull requests runs the same suites; it is informational and does not block merging.
+
 ### Commit your update
 
 Commit the changes once you are happy with them.
