@@ -4,18 +4,19 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 2.6.2
+version: 2.7.0
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
-description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration.
+description: A filter for tracking the response time and token usage of a request with Azure Log Analytics integration (Logs Ingestion API or the deprecated HTTP Data Collector API).
 features:
   - Tracks the response time of a request.
   - Tracks Token Usage.
   - Calculates the average tokens per message.
   - Calculates the tokens per second.
-  - Sends metrics to Azure Log Analytics in the background (10 s timeout), so responses do not wait for it.
+  - Sends metrics to Azure Log Analytics in the background (10 s timeout), so responses do not wait for it: through the Azure Monitor Logs Ingestion API (data collection rule, Microsoft Entra ID token from a client secret, a managed identity on App Service / Functions / Container Apps / VMs, or AKS workload identity; tokens are cached and refreshed before they expire), or through the deprecated HTTP Data Collector API (shared key) as a fallback. LOG_ANALYTICS_INGESTION_API selects auto, logs_ingestion, data_collector or both.
   - Falls back to a len(text) // 4 token estimate while no tiktoken encoding is loaded (e.g. offline), without holding up requests. Estimates are marked (tokensEstimated in the record and the log line, "~" in the status).
 changelog:
+  - 2.7.0 - Azure Monitor Logs Ingestion API (#188). New valves LOG_ANALYTICS_INGESTION_API, LOG_ANALYTICS_DCR_ENDPOINT, LOG_ANALYTICS_DCR_IMMUTABLE_ID, LOG_ANALYTICS_DCR_STREAM_NAME, LOG_ANALYTICS_AUTH_MODE, LOG_ANALYTICS_TENANT_ID, LOG_ANALYTICS_CLIENT_ID, LOG_ANALYTICS_CLIENT_SECRET, LOG_ANALYTICS_AUTHORITY_HOST and LOG_ANALYTICS_INGESTION_SCOPE, all with environment variable defaults; LOG_ANALYTICS_LOG_TYPE can now also be set by environment variable (an installation that set that variable before, when it was ignored, and never saved the valve now sends to that log type). With the default "auto", records go to the Logs Ingestion API as soon as its settings are complete, otherwise through the HTTP Data Collector API exactly as in 2.6.2, which now logs a one-time deprecation warning. Tokens (client secret, managed identity, AKS workload identity) are requested without extra packages, cached per identity and refreshed before they expire; concurrent records share one token request, and a failed refresh keeps using the still-valid token. After a failed token request, or when fresh tokens keep being rejected (401), new token requests pause for 30 s. Endpoint and authority must use https. Any 2xx counts as success (the API answers 204). 400, 401, 403, 404, 413 and 429 are logged once each with a hint (scope, role assignment, DCR ID, stream name, 1 MB limit, Retry-After); records are not retried. "both" writes each record to both APIs for a side-by-side migration.
   - 2.6.2 - Open WebUI >= 0.10 compatibility. outlet() no longer raises a TypeError when Open WebUI runs outlet filters without an event emitter (API requests), so the Log Analytics send and later outlet filters are no longer skipped; the Log Analytics send no longer depends on the status event, a missing chat id falls back to a generated one, and messageId is the message id Open WebUI passes to the outlet (generated if absent). Open WebUI awaits outlet() before it returns an API response, so the Log Analytics send now runs in a background task with its own timeout (10 s, 5 s to connect) instead of AIOHTTP_CLIENT_TIMEOUT (no timeout by default); a slow or unreachable Log Analytics endpoint no longer delays or stalls responses. The record timestamp is UTC with a "Z" suffix, and the new boolean record field tokensEstimated tells estimated token counts from exact ones. SEND_TO_LOG_ANALYTICS="false" (or any value other than 1/true/yes/on) now disables the send instead of enabling it. A tiktoken encoding that cannot be loaded (offline, no cache) or a text it cannot encode no longer aborts the chat; token counts fall back to an estimate. The encoding is loaded in a worker thread, one load per encoding at a time; requests that arrive while it loads estimate instead of waiting, only the request that starts the first load waits (at most 5 s), and a failed load is retried in the background at most every 5 minutes. inlet() and outlet() are correlated through the request's __metadata__ (shared by both on Open WebUI 0.11), so the metrics stay correct when Open WebUI changes the last user message after the inlet (RAG context, legacy code interpreter prompt); the message fingerprint remains the fallback.
   - 2.6.1 - Replaced global variables with per-request fingerprinted storage to mitigate concurrency issues. Uses a hash of user ID, model, and the last user message to correlate inlet/outlet calls. Adds TTL-based cleanup for stale entries. Note: Open WebUI does not expose a guaranteed per-request ID in both inlet and outlet, so edge-case collisions remain theoretically possible when identical messages are sent simultaneously by anonymous users.
 """
@@ -28,10 +29,13 @@ import hmac
 import base64
 import hashlib
 import datetime
+import math
 import os
+import re
 import logging
 import aiohttp
 from typing import Optional, Any
+from urllib.parse import quote, quote_plus
 from open_webui.env import SRC_LOG_LEVELS
 from cryptography.fernet import Fernet, InvalidToken
 import tiktoken
@@ -79,6 +83,161 @@ _log_analytics_sends: set[asyncio.Task] = set()
 # Own timeout for the send. Open WebUI's AIOHTTP_CLIENT_TIMEOUT is unset by
 # default, which means no timeout at all.
 _LOG_ANALYTICS_TIMEOUT = aiohttp.ClientTimeout(total=10, sock_connect=5)
+
+# Azure Monitor Logs Ingestion API (data collection rules, Microsoft Entra ID).
+# A token is requested once per identity (cache key), not once per record:
+# concurrent records wait on one lock per key and share the result. A token is
+# refreshed _TOKEN_REFRESH_MARGIN seconds before it expires (at the latest at
+# half its lifetime). When a refresh fails, the still-valid cached token keeps
+# being used until _TOKEN_EXPIRY_SKEW seconds (at most a quarter of its
+# lifetime) before it expires, so a short Entra ID or proxy outage loses no
+# records. A failed token request, or a second 401 in a row, blocks new token
+# requests for that key for _TOKEN_RETRY_INTERVAL seconds; records without a
+# usable token are dropped meanwhile instead of sending one token request each.
+# These dicts hold only access tokens, timestamps and keys: never the client
+# secret, the IDENTITY_HEADER or the federated assertion, nor a hash of them.
+_LOGS_INGESTION_API_VERSION = "2023-01-01"
+_DEFAULT_AUTHORITY_HOST = "https://login.microsoftonline.com"
+_DEFAULT_INGESTION_SCOPE = "https://monitor.azure.com/.default"
+_IMDS_AUTHORITY = "http://169.254.169.254"
+_TOKEN_REFRESH_MARGIN = 300
+_TOKEN_EXPIRY_SKEW = 60
+_TOKEN_RETRY_INTERVAL = 30
+# key -> (token, refresh_at, usable_until), time.monotonic() based
+_ingestion_tokens: dict[tuple, tuple[str, float, float]] = {}
+_ingestion_token_locks: dict[tuple, asyncio.Lock] = {}
+_ingestion_token_failures: dict[tuple, float] = {}  # key -> monotonic failure time
+_ingestion_token_rejected: set[tuple] = set()  # last token got a 401, no 2xx since
+# One-time warnings (deprecation, incomplete settings): once per process.
+_log_analytics_warnings: set[str] = set()
+
+_INGESTION_API_MODES = ("auto", "logs_ingestion", "data_collector", "both")
+_AUTH_MODES = ("client_secret", "managed_identity")
+_DCR_IMMUTABLE_ID = re.compile(r"dcr-[0-9a-fA-F]{32}")
+_JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+_DATA_COLLECTOR_DEPRECATION = (
+    "Log Analytics: sending through the HTTP Data Collector API, which Microsoft "
+    "deprecated (support ended on 2026-09-14). Set up the Logs Ingestion API "
+    "(LOG_ANALYTICS_DCR_ENDPOINT, LOG_ANALYTICS_DCR_IMMUTABLE_ID and a Microsoft "
+    "Entra ID identity), see docs/setup-azure-log-analytics.md. This warning is "
+    "logged once."
+)
+# Token sources (managed identity is detected from the environment).
+_TOKEN_SOURCE_LABELS = {
+    "client_secret": "client secret",
+    "app_service": "managed identity (App Service)",
+    "imds": "managed identity (IMDS)",
+    "workload_identity": "workload identity",
+    "service_fabric": "managed identity (Service Fabric)",
+    "azure_arc": "managed identity (Azure Arc)",
+    "cloud_shell": "managed identity (Cloud Shell / Azure ML)",
+    "identity_binding": "workload identity (AKS identity binding)",
+}
+_UNSUPPORTED_TOKEN_SOURCES = {
+    "service_fabric": "managed identity on Service Fabric",
+    "azure_arc": "managed identity on Azure Arc",
+    "cloud_shell": "managed identity on Cloud Shell / Azure ML",
+    "identity_binding": "AKS identity bindings (AZURE_KUBERNETES_TOKEN_PROXY)",
+}
+# Hints for Microsoft Entra ID error codes (error_codes[0], never the text).
+_AADSTS_HINTS = {
+    7000215: "invalid client secret: use the secret's value, not its ID "
+    "(LOG_ANALYTICS_CLIENT_SECRET).",
+    7000222: "the client secret has expired: create a new one.",
+    700016: "application not found in the tenant: check LOG_ANALYTICS_CLIENT_ID, "
+    "LOG_ANALYTICS_TENANT_ID and LOG_ANALYTICS_AUTHORITY_HOST.",
+    90002: "tenant not found: check LOG_ANALYTICS_TENANT_ID and "
+    "LOG_ANALYTICS_AUTHORITY_HOST (cloud).",
+    70011: "check LOG_ANALYTICS_INGESTION_SCOPE (it must match the cloud).",
+    500011: "check LOG_ANALYTICS_INGESTION_SCOPE (it must match the cloud).",
+    700212: "the federated token has the wrong audience (direct federation needs "
+    "api://AzureADTokenExchange).",
+}
+_IMDS_UNREACHABLE = (
+    "no managed identity endpoint reachable (not running on Azure, or no identity "
+    "assigned)"
+)
+# Off Azure, 169.254.169.254 usually hangs until sock_connect instead of refusing.
+_CONNECT_ERRORS = (
+    aiohttp.ClientConnectorError,
+    getattr(aiohttp, "ConnectionTimeoutError", aiohttp.ServerTimeoutError),
+)
+
+
+class _TokenError(Exception):
+    """A token request failed; the message is safe to log (no secret, no token)."""
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _normalize_url(value: str) -> str:
+    """Strip, drop trailing slashes and add https:// when there is no scheme."""
+    value = value.strip().rstrip("/")
+    if value and "://" not in value:
+        value = "https://" + value
+    return value
+
+
+def _first_line(text: Any) -> str:
+    lines = str(text or "").strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _redact(text: str, secrets) -> str:
+    """Replace every non-empty secret (also URL-encoded) with ***."""
+    forms = set()
+    for secret in secrets:
+        if secret:
+            forms.update(
+                {secret, quote(secret), quote(secret, safe=""), quote_plus(secret)}
+            )
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "***")
+    return text
+
+
+def _token_source(cfg: dict) -> tuple[str, str, str]:
+    """(source, effective tenant, effective client id) for this request.
+
+    Managed identity is detected from the environment in the order
+    azure-identity uses, on every call (the platform may change it).
+    """
+    if cfg["auth_mode"] == "client_secret":
+        return "client_secret", cfg["tenant"], cfg["client_id"]
+    env = os.environ
+    if env.get("IDENTITY_ENDPOINT"):
+        if env.get("IDENTITY_HEADER"):
+            if env.get("IDENTITY_SERVER_THUMBPRINT"):
+                return "service_fabric", "", cfg["client_id"]
+            return "app_service", "", cfg["client_id"]
+        if env.get("IMDS_ENDPOINT"):
+            return "azure_arc", "", cfg["client_id"]
+    elif env.get("MSI_ENDPOINT"):
+        return "cloud_shell", "", cfg["client_id"]
+    elif env.get("AZURE_FEDERATED_TOKEN_FILE"):
+        tenant = cfg["tenant"] or env.get("AZURE_TENANT_ID", "").strip()
+        client_id = cfg["client_id"] or env.get("AZURE_CLIENT_ID", "").strip()
+        if env.get("AZURE_KUBERNETES_TOKEN_PROXY"):
+            return "identity_binding", tenant, client_id
+        return "workload_identity", tenant, client_id
+    return "imds", "", cfg["client_id"]
+
+
+def _token_lifetime(payload: dict) -> float:
+    """Seconds until the token expires (expires_in, else expires_on)."""
+    try:
+        if payload.get("expires_in") is not None:
+            lifetime = float(payload["expires_in"])
+        else:
+            lifetime = float(payload.get("expires_on")) - time.time()
+    except (TypeError, ValueError):
+        lifetime = math.nan
+    if not (math.isfinite(lifetime) and lifetime >= 1):
+        raise _TokenError("token response without a usable expiry")
+    return lifetime
 
 
 def _build_request_key(body: dict, user: Optional[dict] = None) -> str:
@@ -268,7 +427,67 @@ class Filter:
             json_schema_extra={"input": {"type": "password"}},
         )
         LOG_ANALYTICS_LOG_TYPE: str = Field(
-            default="OpenWebuiMetrics", description="Log Analytics log type name."
+            default=os.getenv("LOG_ANALYTICS_LOG_TYPE", "OpenWebuiMetrics"),
+            description="Log Analytics log type name (HTTP Data Collector API); "
+            "also the base of the default stream name Custom-<log type>_CL.",
+        )
+        LOG_ANALYTICS_INGESTION_API: str = Field(
+            default=os.getenv("LOG_ANALYTICS_INGESTION_API", "auto"),
+            description="auto (Logs Ingestion API once its settings are complete, "
+            "otherwise the deprecated HTTP Data Collector API), logs_ingestion, "
+            "data_collector or both (side-by-side migration).",
+        )
+        LOG_ANALYTICS_DCR_ENDPOINT: str = Field(
+            default=os.getenv("LOG_ANALYTICS_DCR_ENDPOINT", ""),
+            description="Logs ingestion endpoint of the data collection rule "
+            "(https://<dcr>-<xxxx>-<region>.logs.z1.ingest.monitor.azure.com) or "
+            "a data collection endpoint (required for private link).",
+        )
+        LOG_ANALYTICS_DCR_IMMUTABLE_ID: str = Field(
+            default=os.getenv("LOG_ANALYTICS_DCR_IMMUTABLE_ID", ""),
+            description="Immutable ID of the data collection rule (dcr-...).",
+        )
+        LOG_ANALYTICS_DCR_STREAM_NAME: str = Field(
+            default=os.getenv("LOG_ANALYTICS_DCR_STREAM_NAME", ""),
+            description="Stream name in the data collection rule. Empty: "
+            "Custom-<LOG_ANALYTICS_LOG_TYPE>_CL (e.g. Custom-OpenWebuiMetrics_CL).",
+        )
+        LOG_ANALYTICS_AUTH_MODE: str = Field(
+            default=os.getenv("LOG_ANALYTICS_AUTH_MODE", "client_secret"),
+            description="client_secret (app registration) or managed_identity "
+            "(App Service, Functions, Container Apps, VMs, AKS workload identity).",
+        )
+        LOG_ANALYTICS_TENANT_ID: str = Field(
+            default=os.getenv("LOG_ANALYTICS_TENANT_ID", ""),
+            description="Microsoft Entra ID tenant (GUID or domain). Workload "
+            "identity falls back to AZURE_TENANT_ID.",
+        )
+        LOG_ANALYTICS_CLIENT_ID: str = Field(
+            default=os.getenv("LOG_ANALYTICS_CLIENT_ID", ""),
+            description="Application (client) ID of the app registration; with "
+            "managed_identity the client ID of a user-assigned identity (empty: "
+            "system-assigned). Workload identity falls back to AZURE_CLIENT_ID.",
+        )
+        LOG_ANALYTICS_CLIENT_SECRET: EncryptedStr = Field(
+            default=os.getenv("LOG_ANALYTICS_CLIENT_SECRET", ""),
+            description="Client secret value (not the secret ID) of the app "
+            "registration.",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        LOG_ANALYTICS_AUTHORITY_HOST: str = Field(
+            default=os.getenv(
+                "LOG_ANALYTICS_AUTHORITY_HOST", "https://login.microsoftonline.com"
+            ),
+            description="Microsoft Entra ID authority: "
+            "https://login.microsoftonline.us (US Government), "
+            "https://login.partner.microsoftonline.cn (21Vianet).",
+        )
+        LOG_ANALYTICS_INGESTION_SCOPE: str = Field(
+            default=os.getenv(
+                "LOG_ANALYTICS_INGESTION_SCOPE", "https://monitor.azure.com/.default"
+            ),
+            description="Token scope: https://monitor.azure.us/.default (US "
+            "Government), https://monitor.azure.cn/.default (21Vianet).",
         )
 
     def __init__(self):
@@ -303,9 +522,184 @@ class Filter:
         )
         return authorization
 
+    def _warn_once(self, text: str, key: Optional[str] = None) -> None:
+        """Log a WARNING once per process (per ``key``, default the text)."""
+        key = key or text
+        if key not in _log_analytics_warnings:
+            _log_analytics_warnings.add(key)
+            self.log.warning(text)
+
+    def _ingestion_api_mode(self) -> str:
+        """LOG_ANALYTICS_INGESTION_API normalized; unknown values mean auto."""
+        raw = str(self.valves.LOG_ANALYTICS_INGESTION_API or "").strip()
+        mode = raw.lower().replace("-", "_") or "auto"
+        if mode not in _INGESTION_API_MODES:
+            self._warn_once(
+                f"Log Analytics: unknown LOG_ANALYTICS_INGESTION_API value "
+                f"{raw[:32]!r} (use auto, logs_ingestion, data_collector or both); "
+                f"using auto"
+            )
+            mode = "auto"
+        return mode
+
+    def _logs_ingestion_config(self) -> tuple[dict, list]:
+        """
+        Snapshot of the Logs Ingestion settings of this request, normalized,
+        and the names of the missing (or invalid) valves.
+
+        The background task must not read self.valves (Open WebUI swaps them
+        per request). client_secret stays the stored, still encrypted value;
+        it is decrypted only for the token request. Without WEBUI_SECRET_KEY,
+        or for an environment default, it is plaintext: never log cfg as a
+        whole, only its non-secret fields.
+        """
+        v = self.valves
+
+        def text(value) -> str:
+            return str(value or "").strip()
+
+        log_type = text(v.LOG_ANALYTICS_LOG_TYPE)
+        auth_raw = text(v.LOG_ANALYTICS_AUTH_MODE)
+        cfg = {
+            "endpoint": _normalize_url(text(v.LOG_ANALYTICS_DCR_ENDPOINT)),
+            "dcr_id": text(v.LOG_ANALYTICS_DCR_IMMUTABLE_ID),
+            "stream": text(v.LOG_ANALYTICS_DCR_STREAM_NAME)
+            or (f"Custom-{log_type}_CL" if log_type else ""),
+            "auth_mode": auth_raw.lower().replace("-", "_") or "client_secret",
+            "authority": _normalize_url(text(v.LOG_ANALYTICS_AUTHORITY_HOST))
+            or _DEFAULT_AUTHORITY_HOST,
+            "tenant": text(v.LOG_ANALYTICS_TENANT_ID),
+            "client_id": text(v.LOG_ANALYTICS_CLIENT_ID),
+            "client_secret": text(v.LOG_ANALYTICS_CLIENT_SECRET),
+            "scope": text(v.LOG_ANALYTICS_INGESTION_SCOPE) or _DEFAULT_INGESTION_SCOPE,
+        }
+        missing = []
+        if not cfg["endpoint"]:
+            missing.append("LOG_ANALYTICS_DCR_ENDPOINT")
+        elif not cfg["endpoint"].lower().startswith("https://"):
+            missing.append("LOG_ANALYTICS_DCR_ENDPOINT (must use https)")
+        if not cfg["dcr_id"]:
+            missing.append("LOG_ANALYTICS_DCR_IMMUTABLE_ID")
+        if not cfg["stream"]:
+            missing.append("LOG_ANALYTICS_DCR_STREAM_NAME")
+        if cfg["auth_mode"] not in _AUTH_MODES:
+            missing.append(f"LOG_ANALYTICS_AUTH_MODE (unknown value {auth_raw[:32]!r})")
+        if not cfg["authority"].lower().startswith("https://"):
+            missing.append("LOG_ANALYTICS_AUTHORITY_HOST (must use https)")
+        if cfg["auth_mode"] == "client_secret":
+            for name, field in (
+                ("LOG_ANALYTICS_TENANT_ID", "tenant"),
+                ("LOG_ANALYTICS_CLIENT_ID", "client_id"),
+                ("LOG_ANALYTICS_CLIENT_SECRET", "client_secret"),
+            ):
+                if not cfg[field]:
+                    missing.append(name)
+        return cfg, missing
+
+    def _logs_ingestion_partial(self) -> bool:
+        """True when any valve that only the Logs Ingestion API uses is set."""
+        v = self.valves
+        names = (
+            "LOG_ANALYTICS_DCR_ENDPOINT",
+            "LOG_ANALYTICS_DCR_IMMUTABLE_ID",
+            "LOG_ANALYTICS_DCR_STREAM_NAME",
+            "LOG_ANALYTICS_TENANT_ID",
+            "LOG_ANALYTICS_CLIENT_ID",
+            "LOG_ANALYTICS_CLIENT_SECRET",
+        )
+        auth = str(v.LOG_ANALYTICS_AUTH_MODE or "").strip().lower().replace("-", "_")
+        if auth not in ("", "client_secret"):
+            return True
+        return any(str(getattr(v, name) or "").strip() for name in names)
+
     def _send_to_log_analytics(self, data, chat_id: str, message_id: str) -> bool:
         """
-        Sign the request now and send it to Azure Log Analytics in a
+        Send the record through the API(s) LOG_ANALYTICS_INGESTION_API selects,
+        each in a background task. Returns True if at least one send started.
+
+        The settings are read here, before outlet() returns, so the background
+        tasks get the valve values of this request.
+        """
+        if not self.valves.SEND_TO_LOG_ANALYTICS:
+            self.log.debug("Log Analytics send skipped: not configured")
+            return False
+
+        mode = self._ingestion_api_mode()
+        dc_missing = [
+            name
+            for name in ("LOG_ANALYTICS_WORKSPACE_ID", "LOG_ANALYTICS_SHARED_KEY")
+            if not getattr(self.valves, name)
+        ]
+        li_cfg, li_missing, li_partial = None, [], False
+        if mode != "data_collector":
+            try:
+                li_cfg, li_missing = self._logs_ingestion_config()
+                li_partial = self._logs_ingestion_partial()
+            except Exception as e:
+                if mode != "auto":
+                    raise
+                # A bug in the new code must not stop a 2.6.2 configuration.
+                self._warn_once(
+                    f"Log Analytics: could not evaluate the Logs Ingestion API "
+                    f"settings ({type(e).__name__}); using the HTTP Data Collector API"
+                )
+                li_cfg, li_missing, li_partial = None, ["(error)"], False
+        li_ready = li_cfg is not None and not li_missing
+        dc_ready = not dc_missing
+
+        send_li = send_dc = False
+        if mode == "data_collector":
+            send_dc = True
+        elif mode == "logs_ingestion":
+            send_li = li_ready
+            if not li_ready:
+                self._warn_once(
+                    f"Log Analytics: LOG_ANALYTICS_INGESTION_API=logs_ingestion, but "
+                    f"the Logs Ingestion API is not fully configured (missing: "
+                    f"{', '.join(li_missing)}); records are not sent"
+                )
+        elif mode == "both":
+            send_li, send_dc = li_ready, dc_ready
+            if not li_ready and not dc_ready:
+                self._warn_once(
+                    f"Log Analytics: LOG_ANALYTICS_INGESTION_API=both, but neither API "
+                    f"is fully configured (missing: "
+                    f"{', '.join(li_missing + dc_missing)}); records are not sent"
+                )
+            elif not li_ready or not dc_ready:
+                api = (
+                    "Logs Ingestion API" if not li_ready else "HTTP Data Collector API"
+                )
+                self._warn_once(
+                    f"Log Analytics: LOG_ANALYTICS_INGESTION_API=both, but the {api} "
+                    f"is not fully configured (missing: "
+                    f"{', '.join(li_missing or dc_missing)}); sending only through "
+                    f"the other one"
+                )
+        else:  # auto
+            send_li = li_ready
+            send_dc = not li_ready
+            if not li_ready and li_partial:
+                fallback = (
+                    "using the HTTP Data Collector API"
+                    if dc_ready
+                    else "records are not sent"
+                )
+                self._warn_once(
+                    f"Log Analytics: the Logs Ingestion API is not fully configured "
+                    f"(missing: {', '.join(li_missing)}); {fallback}"
+                )
+
+        sent = False
+        if send_li:
+            sent = self._send_to_logs_ingestion(li_cfg, data, chat_id, message_id)
+        if send_dc:
+            sent = self._send_to_data_collector(data, chat_id, message_id) or sent
+        return sent
+
+    def _send_to_data_collector(self, data, chat_id: str, message_id: str) -> bool:
+        """
+        Sign the request now and send it to the HTTP Data Collector API in a
         background task. Returns False when sending is not configured.
 
         The request is built here, before outlet() returns, so the background
@@ -347,6 +741,7 @@ class Filter:
             "time-generated-field": "timestamp",
         }
 
+        self._warn_once(_DATA_COLLECTOR_DEPRECATION)
         task = asyncio.create_task(
             self._post_to_log_analytics(uri, headers, data, chat_id, message_id)
         )
@@ -399,6 +794,378 @@ class Filter:
             f"(chat={chat_id}, message={message_id})"
         )
         return False
+
+    def _send_to_logs_ingestion(
+        self, cfg: dict, data, chat_id: str, message_id: str
+    ) -> bool:
+        """Send a record to the Logs Ingestion API in a background task."""
+        if not _DCR_IMMUTABLE_ID.fullmatch(cfg["dcr_id"]):
+            # The value is not logged; once per distinct value.
+            self._warn_once(
+                "Log Analytics: LOG_ANALYTICS_DCR_IMMUTABLE_ID does not look like an "
+                "immutable ID (dcr- followed by 32 hex characters); copy immutableId "
+                "from the DCR's JSON view, not the DCR name or resource ID",
+                key=f"dcr-immutable-id:{cfg['dcr_id']}",
+            )
+        self.log.debug(
+            f"Sending to the Logs Ingestion API (endpoint={cfg['endpoint']}, "
+            f"dcr={cfg['dcr_id']}, stream={cfg['stream']}, auth={cfg['auth_mode']})"
+        )
+        task = asyncio.create_task(
+            self._post_to_logs_ingestion(cfg, data, chat_id, message_id)
+        )
+        _log_analytics_sends.add(task)
+        task.add_done_callback(_log_analytics_sends.discard)
+        return True
+
+    @staticmethod
+    def _ingestion_hint(status: int, cfg: dict, retry_after: Optional[str]) -> str:
+        """Actionable hint for an HTTP error of the Logs Ingestion API."""
+        if status == 400:
+            return (
+                "the record does not match the stream declaration of the DCR "
+                "(columns and types)."
+            )
+        if status == 401:
+            return (
+                "the token was rejected; check that LOG_ANALYTICS_INGESTION_SCOPE "
+                "matches the cloud of LOG_ANALYTICS_DCR_ENDPOINT."
+            )
+        if status == 403:
+            return (
+                "the identity needs the Monitoring Metrics Publisher role on the "
+                "data collection rule; a new role assignment can take up to 30 "
+                "minutes to take effect."
+            )
+        if status == 404:
+            return (
+                f"check LOG_ANALYTICS_DCR_ENDPOINT, LOG_ANALYTICS_DCR_IMMUTABLE_ID "
+                f"({cfg['dcr_id']}) and LOG_ANALYTICS_DCR_STREAM_NAME ({cfg['stream']})."
+            )
+        if status == 413:
+            return "the record exceeds the limit of 1 MB per call."
+        if status == 429:
+            # Retry-After is seconds or an HTTP date: shown as it came.
+            value = " ".join(str(retry_after or "").split())[:64] or "not given"
+            return (
+                f"throttled (per DCR: 12,000 requests or 2 GB per minute); "
+                f"Retry-After: {value}. The record is dropped, not retried."
+            )
+        return ""
+
+    async def _post_to_logs_ingestion(
+        self, cfg: dict, data, chat_id: str, message_id: str
+    ) -> bool:
+        """
+        POST a record to the Logs Ingestion API (runs as a background task).
+        Reads only cfg, never self.valves. Logs one line per failed record.
+        """
+        got = await self._get_ingestion_token(cfg, chat_id, message_id)
+        if got is None:
+            return False  # already logged
+        token, key = got
+        uri = (
+            f"{cfg['endpoint']}/dataCollectionRules/{quote(cfg['dcr_id'], safe='')}"
+            f"/streams/{quote(cfg['stream'], safe='')}"
+            f"?api-version={_LOGS_INGESTION_API_VERSION}"
+        )
+        request_id = str(uuid.uuid4())
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "x-ms-client-request-id": request_id,
+        }
+        session = None
+        response = None
+        try:
+            session = aiohttp.ClientSession(
+                trust_env=True, timeout=_LOG_ANALYTICS_TIMEOUT
+            )
+            response = await session.request(
+                method="POST", url=uri, json=data, headers=headers
+            )
+            status = response.status
+            if 200 <= status < 300:
+                _ingestion_token_rejected.discard(key)
+                self.log.info(
+                    f"Log Analytics data sent via the Logs Ingestion API "
+                    f"(chat={chat_id}, message={message_id})"
+                )
+                return True
+            body = await response.text()
+            code = response.headers.get("x-ms-error-code", "")
+            detail = ""
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                code = code or str(error.get("code") or "")
+                detail = str(error.get("message") or "")
+            detail = " ".join(_redact(detail or body, [token]).split())[:300]
+            code = " ".join(_redact(code, [token]).split())[:100]
+            hint = self._ingestion_hint(
+                status, cfg, response.headers.get("Retry-After")
+            )
+            if status == 401:
+                self._ingestion_token_unauthorized(key, token)
+            head = f"{status} {code}" if code else str(status)
+            self.log.error(
+                f"Error sending to Logs Ingestion API: {head}: "
+                f"{hint + ' ' if hint else ''}Response: {detail} "
+                f"(request={request_id}, chat={chat_id}, message={message_id})"
+            )
+        except Exception as e:
+            # str() of a timeout is empty: name the exception type.
+            reason = _redact(f"{type(e).__name__}: {e}", [token])
+            self.log.error(
+                f"Exception when sending to Logs Ingestion API: {reason} "
+                f"(chat={chat_id}, message={message_id})"
+            )
+        finally:
+            await cleanup_response(response, session)
+        return False
+
+    @staticmethod
+    def _ingestion_token_unauthorized(key: tuple, token: str) -> None:
+        """
+        A 401 from the ingestion endpoint: drop the cached token (only once
+        for concurrent 401s of the same token). A token fetched right after a
+        401 that is rejected too starts the token back-off, so a persistent
+        401 (wrong scope or cloud) cannot cause one token request per record.
+        """
+        cached = _ingestion_tokens.get(key)
+        if not cached or cached[0] != token:
+            return
+        _ingestion_tokens.pop(key, None)
+        if key in _ingestion_token_rejected:
+            _ingestion_token_failures[key] = time.monotonic()
+        else:
+            _ingestion_token_rejected.add(key)
+
+    async def _get_ingestion_token(
+        self, cfg: dict, chat_id: str, message_id: str
+    ) -> Optional[tuple[str, tuple]]:
+        """
+        (token, cache key) for the identity in cfg, or None (logged once).
+        One token request per key at a time; see the module comment.
+        """
+        source, tenant, client_id = _token_source(cfg)
+        key = (
+            cfg["auth_mode"],
+            source,
+            cfg["authority"],
+            tenant,
+            client_id,
+            cfg["scope"],
+        )
+        label = _TOKEN_SOURCE_LABELS.get(source, source)
+        cached = _ingestion_tokens.get(key)
+        if cached and time.monotonic() < cached[1]:
+            return cached[0], key
+        lock = _ingestion_token_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            cached = _ingestion_tokens.get(key)  # filled while we waited
+            if cached and now < cached[1]:
+                return cached[0], key
+            usable = cached[0] if cached and now < cached[2] else None
+            failed_at = _ingestion_token_failures.get(key)
+            if failed_at is not None and now - failed_at < _TOKEN_RETRY_INTERVAL:
+                if usable:
+                    return usable, key
+                self.log.warning(
+                    f"Log Analytics record dropped: no usable token for the Logs "
+                    f"Ingestion API ({label}); the last token request failed or its "
+                    f"token was rejected {now - failed_at:.0f}s ago, next token "
+                    f"request in {_TOKEN_RETRY_INTERVAL - (now - failed_at):.0f}s "
+                    f"(chat={chat_id}, message={message_id})"
+                )
+                return None
+            try:
+                token, lifetime = await self._request_token(
+                    cfg, source, tenant, client_id
+                )
+            except Exception as e:  # always a _TokenError, unless there is a bug
+                _ingestion_token_failures[key] = time.monotonic()
+                safe = str(e) if isinstance(e, _TokenError) else type(e).__name__
+                keep = (
+                    f", keeping the cached token for "
+                    f"{cached[2] - time.monotonic():.0f}s"
+                    if usable
+                    else ""
+                )
+                self.log.error(
+                    f"Could not get a Microsoft Entra ID token for the Logs Ingestion "
+                    f"API ({label}){keep}: {safe} (chat={chat_id}, message={message_id})"
+                )
+                return (usable, key) if usable else None
+            _ingestion_token_failures.pop(key, None)
+            now = time.monotonic()
+            _ingestion_tokens[key] = (
+                token,
+                now + max(lifetime - _TOKEN_REFRESH_MARGIN, lifetime / 2),
+                now + lifetime - min(_TOKEN_EXPIRY_SKEW, lifetime / 4),
+            )
+            return token, key
+
+    @staticmethod
+    def _token_error_text(
+        source: str, status: int, payload: Any, body: str, secrets: list
+    ) -> str:
+        """Loggable text of a failed token response (redacted, then truncated)."""
+        if not isinstance(payload, dict):
+            return f"{status} response: {_redact(_first_line(body), secrets)[:200]}"
+        error = " ".join(str(payload.get("error") or "error").split())[:100]
+        description = _redact(_first_line(payload.get("error_description")), secrets)
+        description = description[:200]
+        if source not in ("client_secret", "workload_identity"):
+            return f"{status} {error} - {description}"
+        codes = payload.get("error_codes")
+        try:
+            code = int(codes[0]) if isinstance(codes, list) and codes else None
+        except (TypeError, ValueError):
+            code = None
+        head = f"{status} {error}" + (f" AADSTS{code}" if code is not None else "")
+        hint = _AADSTS_HINTS.get(code) if code is not None else None
+        text = f"{head}: " + (f"{hint} " if hint else "") + f"Detail: {description}"
+        ids = [
+            f"{name}={str(payload[name])[:64]}"
+            for name in ("trace_id", "correlation_id")
+            if payload.get(name)
+        ]
+        if ids:
+            text += f" ({', '.join(ids)})"
+        return text
+
+    async def _request_token(
+        self, cfg: dict, source: str, tenant: str, client_id: str
+    ) -> tuple[str, float]:
+        """
+        Request an access token: (token, lifetime in seconds).
+
+        Reads only cfg and the environment, never self.valves. Every failure
+        leaves as a _TokenError with a redacted text: only this method knows
+        the plaintext client secret, IDENTITY_HEADER and federated assertion,
+        which are read here, used once and never stored or logged.
+        """
+        secrets: list = []
+        session = None
+        response = None
+        try:
+            if source in _UNSUPPORTED_TOKEN_SOURCES:
+                raise _TokenError(
+                    f"{_UNSUPPORTED_TOKEN_SOURCES[source]} is not supported; use "
+                    f"LOG_ANALYTICS_AUTH_MODE=client_secret"
+                )
+            scope = cfg["scope"]
+            resource = (
+                scope[: -len("/.default")] if scope.endswith("/.default") else scope
+            )
+            if source in ("client_secret", "workload_identity"):
+                form = {
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "scope": scope,
+                }
+                if source == "client_secret":
+                    stored = cfg["client_secret"]
+                    secret = EncryptedStr.decrypt(stored)
+                    if stored.startswith("encrypted:") and (
+                        EncryptedStr._get_encryption_key() is None
+                        or secret.startswith("encrypted:")
+                    ):
+                        raise _TokenError(
+                            "LOG_ANALYTICS_CLIENT_SECRET could not be decrypted (was "
+                            "WEBUI_SECRET_KEY changed or removed?); enter the client "
+                            "secret again"
+                        )
+                    secrets.append(secret)
+                    form["client_secret"] = secret
+                else:
+                    if not tenant or not client_id:
+                        raise _TokenError(
+                            "workload identity needs a tenant and client ID "
+                            "(LOG_ANALYTICS_TENANT_ID / AZURE_TENANT_ID, "
+                            "LOG_ANALYTICS_CLIENT_ID / AZURE_CLIENT_ID)"
+                        )
+                    token_file = os.environ.get("AZURE_FEDERATED_TOKEN_FILE", "")
+                    try:
+                        assertion = (
+                            await asyncio.to_thread(_read_text, token_file)
+                        ).strip()
+                    except OSError as e:  # the text names the path, not the content
+                        raise _TokenError(
+                            f"AZURE_FEDERATED_TOKEN_FILE could not be read "
+                            f"({type(e).__name__}: {e})"
+                        ) from None
+                    except Exception as e:
+                        raise _TokenError(
+                            f"AZURE_FEDERATED_TOKEN_FILE could not be read "
+                            f"({type(e).__name__})"
+                        ) from None
+                    if not assertion:
+                        raise _TokenError("AZURE_FEDERATED_TOKEN_FILE is empty")
+                    secrets.append(assertion)
+                    form["client_assertion_type"] = _JWT_BEARER
+                    form["client_assertion"] = assertion
+                url = f"{cfg['authority']}/{quote(tenant, safe='')}/oauth2/v2.0/token"
+                session = aiohttp.ClientSession(
+                    trust_env=True, timeout=_LOG_ANALYTICS_TIMEOUT
+                )
+                # data=dict: form-encoded (application/x-www-form-urlencoded)
+                response = await session.post(url, data=form)
+            else:
+                params = {"resource": resource}
+                if client_id:
+                    params["client_id"] = client_id
+                if source == "app_service":
+                    # Rotated by the platform: read it now, never cache it.
+                    identity_header = os.environ.get("IDENTITY_HEADER", "")
+                    secrets.append(identity_header)
+                    url = os.environ.get("IDENTITY_ENDPOINT", "")
+                    params["api-version"] = "2019-08-01"
+                    headers = {"X-IDENTITY-HEADER": identity_header}
+                else:  # imds
+                    host = os.environ.get("AZURE_POD_IDENTITY_AUTHORITY_HOST") or ""
+                    host = host.strip().rstrip("/") or _IMDS_AUTHORITY
+                    url = f"{host}/metadata/identity/oauth2/token"
+                    params["api-version"] = "2018-02-01"
+                    headers = {"Metadata": "true"}
+                # Local endpoints: never through a proxy.
+                session = aiohttp.ClientSession(
+                    trust_env=False, timeout=_LOG_ANALYTICS_TIMEOUT
+                )
+                response = await session.get(url, params=params, headers=headers)
+            status = response.status
+            body = await response.text()
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = None
+            if not 200 <= status < 300:
+                text = self._token_error_text(source, status, payload, body, secrets)
+                raise _TokenError(_redact(text, secrets))
+            if not isinstance(payload, dict):
+                raise _TokenError(f"{status} response is not JSON")
+            token = payload.get("access_token")
+            if not (
+                isinstance(token, str)
+                and token
+                and all(33 <= ord(c) <= 126 for c in token)
+            ):
+                raise _TokenError(f"{status} response without a usable access_token")
+            return token, _token_lifetime(payload)
+        except _TokenError:
+            raise
+        except Exception as e:
+            text = f"{type(e).__name__}: {e}"
+            if source == "imds" and isinstance(e, _CONNECT_ERRORS):
+                text = f"{_IMDS_UNREACHABLE}: {text}"
+            raise _TokenError(_redact(text, secrets)[:500]) from None
+        finally:
+            await cleanup_response(response, session)
 
     def _get_message_content(self, message):
         """Extract content from a message, handling different formats."""

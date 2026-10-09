@@ -2,10 +2,12 @@
 Filters suite: filters/{google_search_tool,vertex_ai_search_tool,time_token_tracker}.py
 in front of the probe pipe (tests/e2e/probe/probe_pipe.py), which reports what
 reached the pipe (messages, __metadata__ features/params, ...), so filter -> pipe
-coupling is checked without a provider. The tracker's Azure Log Analytics send
-goes to mocks/mock_la.py: this suite maps <workspace>.ods.opinsights.azure.com to
-127.0.0.1 in /etc/hosts, installs a throw-away test CA into the container's
-system store and starts the mock (HTTPS on 127.0.0.1:443, control on :9105).
+coupling is checked without a provider. The tracker's Azure Log Analytics sends
+go to mocks/mock_la.py: this suite maps <workspace>.ods.opinsights.azure.com
+(HTTP Data Collector API), the Microsoft Entra ID login hosts and the DCR
+ingestion hosts (Logs Ingestion API) to 127.0.0.1 in /etc/hosts, installs a
+throw-away test CA into the container's system store and starts the mock (HTTPS
+on 127.0.0.1:443, control on :9105, managed identity endpoints on :9106).
 Token counts are compared with tiktoken in the driver (same encodings, cached in
 TIKTOKEN_CACHE_DIR before the server needs them).
 
@@ -21,6 +23,14 @@ Groups (``--only filters.<group>``)
                counts on the API and browser path, special tokens, multi-turn
                averages, the "exactly two messages" rule, send switched off, HTTP
                errors, slow / hanging endpoint, estimate marker
+  ingest       Logs Ingestion API: request shape and 204, token cache /
+               concurrency / refresh, refresh failure with a still-valid token,
+               the 30 s token back-off and its end, token and HTTP errors with one
+               log line each, undecryptable secret, https-only and invalid
+               settings, slow / unreachable endpoints, mode selection and
+               fallback, both APIs, deprecation warning, sovereign cloud, App
+               Service / IMDS / workload identity (environment set through the
+               probe pipe's PROBE_ENV hook)
   valves       compact status (CALCULATE_ALL_MESSAGES / SHOW_* off)
   correlation  inlet/outlet correlation when Open WebUI rewrites the last user
                message after the inlet, concurrent identical requests
@@ -48,7 +58,7 @@ import time
 import uuid
 from email.utils import parsedate_to_datetime
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -60,6 +70,7 @@ GROUPS = (
     "global",
     "spec",
     "la",
+    "ingest",
     "valves",
     "correlation",
     "encoding",
@@ -69,7 +80,15 @@ GROUPS = (
     "vertex",
 )
 # Groups that need the Log Analytics mock (and a warm tracker).
-LA_GROUPS = ("la", "valves", "correlation", "encoding", "offline", "multimodel")
+LA_GROUPS = (
+    "la",
+    "ingest",
+    "valves",
+    "correlation",
+    "encoding",
+    "offline",
+    "multimodel",
+)
 TRACKER_GROUPS = ("model", "global", *LA_GROUPS)
 
 PROBE_FID = "e2e_probe"
@@ -89,6 +108,7 @@ SEARCH_MODEL = "e2e-probe-search"  # google_search_tool only
 VERTEX_MODEL = "e2e-probe-vertex"  # vertex_ai_search_tool only
 MULTI_SEARCH_MODEL = "e2e-probe-multi-search"  # google_search_tool + tracker
 MULTI_PLAIN_MODEL = "e2e-probe-multi-plain"  # tracker only
+ENV_MODEL = "e2e-probe-env"  # no filters: carries PROBE_ENV (ingest group)
 WORKSPACE_MODELS = (
     GPT4O_MODEL,
     DAVINCI_MODEL,
@@ -96,6 +116,7 @@ WORKSPACE_MODELS = (
     VERTEX_MODEL,
     MULTI_SEARCH_MODEL,
     MULTI_PLAIN_MODEL,
+    ENV_MODEL,
 )
 
 # time_token_tracker valves (public API: may grow, never shrink)
@@ -110,6 +131,16 @@ TRACKER_VALVES = (
     "LOG_ANALYTICS_WORKSPACE_ID",
     "LOG_ANALYTICS_SHARED_KEY",
     "LOG_ANALYTICS_LOG_TYPE",
+    "LOG_ANALYTICS_INGESTION_API",
+    "LOG_ANALYTICS_DCR_ENDPOINT",
+    "LOG_ANALYTICS_DCR_IMMUTABLE_ID",
+    "LOG_ANALYTICS_DCR_STREAM_NAME",
+    "LOG_ANALYTICS_AUTH_MODE",
+    "LOG_ANALYTICS_TENANT_ID",
+    "LOG_ANALYTICS_CLIENT_ID",
+    "LOG_ANALYTICS_CLIENT_SECRET",
+    "LOG_ANALYTICS_AUTHORITY_HOST",
+    "LOG_ANALYTICS_INGESTION_SCOPE",
 )
 
 # Log Analytics mock (mocks/mock_la.py)
@@ -120,18 +151,42 @@ LOG_TYPE = "E2E_Metrics"
 LA_CTL = "http://127.0.0.1:9105"
 LA_DIR = "/tmp/e2e-la"
 LA_OUT = "/e2e/out/mock_la.txt"
+# la-setup <dir> <san1,san2,...>: the CA is kept across --reuse runs (OpenSSL
+# caches CA certificates by subject hash in the long-running server process, so
+# a new CA with the same subject could fail verification); the server
+# certificate is reissued when it lacks a name or expires within an hour.
 LA_SETUP = r"""
 set -e
 mkdir -p "$1" && cd "$1"
-if [ ! -f srv.crt ]; then
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 \
+IFS=, read -ra sans <<< "$2"
+if [ ! -f ca.crt ] || [ ! -f ca.key ] \
+    || ! openssl x509 -in ca.crt -noout -checkend 3600 >/dev/null 2>&1; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 \
     -subj "/CN=E2E Log Analytics CA" 2>/dev/null
-  openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj "/CN=$2" \
-    2>/dev/null
-  printf "subjectAltName=DNS:%s\n" "$2" > ext.cnf
+  rm -f srv.crt
+fi
+issue=0
+if [ ! -f srv.crt ] \
+    || ! openssl x509 -in srv.crt -noout -checkend 3600 >/dev/null 2>&1; then
+  issue=1
+else
+  text=$(openssl x509 -in srv.crt -noout -text)
+  for san in "${sans[@]}"; do
+    case "$text" in *"DNS:$san"*) ;; *) issue=1 ;; esac
+  done
+fi
+if [ "$issue" = 1 ]; then
+  ext="DNS:${sans[0]}"
+  for san in "${sans[@]:1}"; do ext="$ext,DNS:$san"; done
+  openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr \
+    -subj "/CN=${sans[0]}" 2>/dev/null
+  printf "subjectAltName=%s\n" "$ext" > ext.cnf
   openssl x509 -req -in srv.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out srv.crt -days 2 -extfile ext.cnf 2>/dev/null
-  cp ca.crt /usr/local/share/ca-certificates/e2e-la-ca.crt
+    -out srv.crt -days 30 -extfile ext.cnf 2>/dev/null
+fi
+installed=/usr/local/share/ca-certificates/e2e-la-ca.crt
+if ! cmp -s ca.crt "$installed"; then
+  cp ca.crt "$installed"
   update-ca-certificates >/dev/null 2>&1
 fi
 """
@@ -151,6 +206,50 @@ AVG_KEYS = {"avgRequestTokens", "avgResponseTokens"}
 OPTIONAL_KEYS = {"tokensEstimated"}  # PR #184 (2.6.2), see la.estimate-marker
 SLOW_SECONDS = 6
 HANG_SECONDS = 20  # longer than the tracker's own 10 s timeout
+
+# Logs Ingestion API (mocks/mock_la.py, ingest group)
+TENANT = "11111111-2222-3333-4444-555555555555"
+CLIENT_SECRET = "e2e~Secret+/=&value.42"  # needs URL encoding; >= 6 chars
+DCR_ID = "dcr-0123456789abcdef0123456789abcdef"
+DCR_HOST = "e2e-dcr-ab12-westeurope.logs.z1.ingest.monitor.azure.com"
+GOV_DCR_HOST = "e2e-dce-cd34.usgovvirginia-1.ingest.monitor.azure.us"
+REFUSED_HOST = "e2e-dcr-down-westeurope.logs.z1.ingest.monitor.azure.com"
+LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoftonline.us")
+STREAM = f"Custom-{LOG_TYPE}_CL"  # default stream name derived from LOG_TYPE
+DEFAULT_SCOPE = "https://monitor.azure.com/.default"
+TOKEN_PATH = f"/{TENANT}/oauth2/v2.0/token"
+MI_PORT = 9106
+MI_URL = f"http://127.0.0.1:{MI_PORT}"
+MI_IMDS_URL = f"http://127.0.0.2:{MI_PORT}"  # not covered by NO_PROXY (mi.imds)
+PROBE_ENV_FILE = f"{LA_DIR}/probe-env.json"
+WI_TOKEN_FILE = f"{LA_DIR}/wi-token"
+DEPRECATION = "HTTP Data Collector API, which Microsoft deprecated"
+INGEST_HOSTS_LINES = [
+    f"127.0.0.1 {host}" for host in (*LOGIN_HOSTS, DCR_HOST, GOV_DCR_HOST)
+] + [f"127.0.0.9 {REFUSED_HOST}"]
+LA_SANS = (LA_HOST, *LOGIN_HOSTS, DCR_HOST, GOV_DCR_HOST)
+# Environment variables the probe pipe may set (tests/e2e/probe/probe_pipe.py).
+PROBE_ENV_NAMES = (
+    "IDENTITY_ENDPOINT",
+    "IDENTITY_HEADER",
+    "IDENTITY_SERVER_THUMBPRINT",
+    "IMDS_ENDPOINT",
+    "MSI_ENDPOINT",
+    "MSI_SECRET",
+    "AZURE_POD_IDENTITY_AUTHORITY_HOST",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_KUBERNETES_TOKEN_PROXY",
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "AZURE_AUTHORITY_HOST",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+# Issued tokens, identity headers, assertions etc. of the ingest group for the
+# final log.no-secrets check (collected in the group's finally).
+INGEST_SECRETS: list = []
 
 # tiktoken's encoding host; the offline group points it at the mock's tarpit
 TIKTOKEN_HOST = "openaipublic.blob.core.windows.net"
@@ -281,12 +380,16 @@ def close(a, b, rel: float = 1e-6) -> bool:
 
 
 def record_problems(entry: dict, exp: dict, model: str, user_id: str) -> list:
-    """Differences between one recorded Log Analytics POST and ``exp``.
+    """Differences between one recorded HTTP Data Collector POST and ``exp``:
+    the signed 2.6.2 request (``dc_transport_problems``) and the record
+    (``record_body_problems``)."""
+    return dc_transport_problems(entry) + record_body_problems(
+        entry, exp, model, user_id
+    )
 
-    ``exp``: req, resp, last, req_count, resp_count; optional ``tps`` (default
-    last / responseTime), ``avg`` (False: no average fields), ``chat_id`` (None:
-    any UUID), ``message_id`` (compared when given).
-    """
+
+def dc_transport_problems(entry: dict) -> list:
+    """Host, path, SharedKey signature and headers of a Data Collector POST."""
     problems = []
     headers = {k.lower(): v for k, v in (entry.get("headers") or {}).items()}
     if entry.get("host") != LA_HOST:
@@ -312,6 +415,57 @@ def record_problems(entry: dict, exp: dict, model: str, user_id: str) -> list:
             problems.append(f"x-ms-date={headers.get('x-ms-date')}")
     except (TypeError, ValueError):
         problems.append(f"x-ms-date={headers.get('x-ms-date')}")
+    return problems
+
+
+def li_transport_problems(
+    entry: dict,
+    host: str = DCR_HOST,
+    dcr: str = DCR_ID,
+    stream: str = STREAM,
+    status: Optional[int] = 204,
+) -> list:
+    """URI, Bearer token and headers of a Logs Ingestion API POST."""
+    problems = []
+    headers = {k.lower(): v for k, v in (entry.get("headers") or {}).items()}
+    if entry.get("host") != host:
+        problems.append(f"host={entry.get('host')}")
+    if entry.get("path") != f"/dataCollectionRules/{dcr}/streams/{stream}":
+        problems.append(f"path={entry.get('path')}")
+    if entry.get("query") != {"api-version": "2023-01-01"}:
+        problems.append(f"query={entry.get('query')}")
+    if not entry.get("token_ok") or entry.get("token_expired"):
+        problems.append(
+            f"token_ok={entry.get('token_ok')} expired={entry.get('token_expired')}"
+        )
+    if not str(headers.get("authorization", "")).startswith("Bearer <token#"):
+        problems.append(f"authorization={headers.get('authorization')}")
+    if headers.get("content-type") != "application/json":
+        problems.append(f"content-type={headers.get('content-type')}")
+    if "content-encoding" in headers:
+        problems.append(f"content-encoding={headers['content-encoding']}")
+    try:
+        uuid.UUID(str(headers.get("x-ms-client-request-id")))
+    except ValueError:
+        problems.append(
+            f"x-ms-client-request-id={headers.get('x-ms-client-request-id')}"
+        )
+    dc_headers = {"log-type", "x-ms-date", "time-generated-field"} & set(headers)
+    if dc_headers or "SharedKey" in str(headers.get("authorization", "")):
+        problems.append(f"Data Collector headers {sorted(dc_headers)}")
+    if status is not None and entry.get("status") != status:
+        problems.append(f"status={entry.get('status')}")
+    return problems
+
+
+def record_body_problems(entry: dict, exp: dict, model: str, user_id: str) -> list:
+    """Differences between the record of one recorded POST and ``exp``.
+
+    ``exp``: req, resp, last, req_count, resp_count; optional ``tps`` (default
+    last / responseTime), ``avg`` (False: no average fields), ``chat_id`` (None:
+    any UUID), ``message_id`` (compared when given).
+    """
+    problems = []
     body = entry.get("body")
     if not isinstance(body, list) or len(body) != 1 or not isinstance(body[0], dict):
         return problems + [f"body={short(body, 200)}"]
@@ -420,12 +574,15 @@ def send_timeout(t: Suite, mark: int, timeout: float = 8.0) -> float:
     return 0.5 if outlet_errors(t, mark) else timeout
 
 
-async def wait_log(t: Suite, mark: int, needle: str, timeout: float) -> list:
-    """Lines containing ``needle`` logged since ``mark`` (polls up to ``timeout``)."""
+async def wait_log(
+    t: Suite, mark: int, needle: str, timeout: float, n: int = 1
+) -> list:
+    """Lines containing ``needle`` logged since ``mark``, once there are ``n``
+    (polls up to ``timeout``)."""
     deadline = time.time() + timeout
     while True:
         lines = t.log.lines(mark, needle)
-        if lines or time.time() >= deadline:
+        if len(lines) >= n or time.time() >= deadline:
             return lines
         await asyncio.sleep(0.5)
 
@@ -470,26 +627,48 @@ class LogAnalytics:
         self.http = httpx.AsyncClient(base_url=LA_CTL, timeout=30)
 
     async def reset(self) -> None:
+        """Clear the records and reset every mode (config and tokens stay)."""
         await self.http.post("/__reset")
 
-    async def mode(self, status: int = 200, delay: float = 0.0) -> None:
-        await self.http.post("/__mode", json={"status": status, "delay": delay})
+    async def mode(
+        self, status: int = 200, delay: float = 0.0, target: str = "dc", **extra
+    ) -> None:
+        """Replace the whole mode of ``target`` (dc, token, ingest or msi);
+        ``extra``: expires_in, retry_after, error_code, echo_secret."""
+        await self.http.post(
+            "/__mode",
+            json={"target": target, "status": status, "delay": delay, **extra},
+        )
 
-    async def records(self) -> list:
-        return (await self.http.get("/__requests")).json()
+    async def records(self, kind: str = "dc") -> list:
+        """Recorded requests of ``kind`` (dc, token, ingest, msi or all)."""
+        return (await self.http.get("/__requests", params={"kind": kind})).json()
+
+    async def config(self, **values) -> None:
+        """tenant, client_secret, dcr_id, stream, identity_header, token_file."""
+        await self.http.post("/__config", json=values)
+
+    async def tokens(self) -> list:
+        """Every access token the mock issued."""
+        return (await self.http.get("/__tokens")).json()
+
+    async def revoke(self) -> None:
+        """Invalidate every issued token (the next ingestion POST gets 401)."""
+        await self.http.post("/__revoke")
 
     async def tarpit(self) -> list:
         return (await self.http.get("/__tarpit")).json()
 
-    async def wait(self, n: int = 1, timeout: float = 8.0) -> list:
-        """Recorded POSTs once there are ``n`` (or after ``timeout`` seconds)."""
+    async def wait(self, n: int = 1, timeout: float = 8.0, kind: str = "dc") -> list:
+        """Recorded requests of ``kind`` once there are ``n`` (or after
+        ``timeout`` seconds)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if len(await self.records()) >= n:
+            if len(await self.records(kind)) >= n:
                 await asyncio.sleep(0.3)  # one more would be a duplicate
                 break
             await asyncio.sleep(0.25)
-        return await self.records()
+        return await self.records(kind)
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -509,9 +688,12 @@ def kill_stale_mock() -> None:
 
 
 async def start_la_mock() -> tuple:
-    """Test CA + /etc/hosts entry + mock_la.py; returns (process, client)."""
-    subprocess.run(["bash", "-c", LA_SETUP, "la-setup", LA_DIR, LA_HOST], check=True)
-    edit_hosts(LA_HOSTS_LINE, add=True)
+    """Test CA + /etc/hosts entries + mock_la.py; returns (process, client)."""
+    subprocess.run(
+        ["bash", "-c", LA_SETUP, "la-setup", LA_DIR, ",".join(LA_SANS)], check=True
+    )
+    for line in (LA_HOSTS_LINE, *INGEST_HOSTS_LINES):
+        edit_hosts(line, add=True)
     kill_stale_mock()
     await asyncio.sleep(0.5)
     out = open(LA_OUT, "a", encoding="utf-8")
@@ -534,6 +716,14 @@ async def start_la_mock() -> tuple:
         await asyncio.sleep(0.5)
         try:
             await la.reset()
+            # Over loopback to the mock: the secret never reaches the server log.
+            await la.config(
+                tenant=TENANT,
+                client_secret=CLIENT_SECRET,
+                dcr_id=DCR_ID,
+                stream=STREAM,
+                token_file=WI_TOKEN_FILE,
+            )
             return proc, la
         except httpx.HTTPError:
             if proc.poll() is not None:
@@ -576,6 +766,8 @@ async def run(t: Suite) -> None:
             await vertex(t)
     finally:
         edit_hosts(TARPIT_LINE, add=False)
+        for line in INGEST_HOSTS_LINES:  # unlike LA_HOSTS_LINE, never left mapped
+            edit_hosts(line, add=False)
         for fid in FILTERS:
             await t.owui.set_global(fid, False)
         for model_id in WORKSPACE_MODELS:
@@ -591,7 +783,7 @@ async def run(t: Suite) -> None:
             not warnings,
             f"{len(warnings)} warnings: " + " || ".join(warnings[:3]),
         )
-    t.assert_no_secrets(LA_KEY)
+    t.assert_no_secrets(LA_KEY, *INGEST_SECRETS)
     t.scan_log()
 
 
@@ -826,6 +1018,41 @@ async def spec(t: Suite) -> None:
         and LA_KEY not in stored,
         f"stored={short(stored, 40)}",
     )
+    await t.owui.update_valves(TRACKER, LOG_ANALYTICS_CLIENT_SECRET=CLIENT_SECRET)
+    stored = (await t.owui.get_valves(TRACKER)).get("LOG_ANALYTICS_CLIENT_SECRET")
+    secret_spec = props.get("LOG_ANALYTICS_CLIENT_SECRET") or {}
+    input_type = (secret_spec.get("input") or {}).get("type")
+    t.check(
+        "spec.client-secret-encrypted",
+        "LOG_ANALYTICS_CLIENT_SECRET is a password valve and stored encrypted",
+        isinstance(stored, str)
+        and stored.startswith("encrypted:")
+        and CLIENT_SECRET not in stored
+        and input_type == "password",
+        f"stored={short(stored, 40)} input.type={input_type!r}",
+    )
+    want = {
+        "LOG_ANALYTICS_INGESTION_API": "auto",
+        "LOG_ANALYTICS_AUTH_MODE": "client_secret",
+        "LOG_ANALYTICS_AUTHORITY_HOST": "https://login.microsoftonline.com",
+        "LOG_ANALYTICS_INGESTION_SCOPE": DEFAULT_SCOPE,
+        "LOG_ANALYTICS_LOG_TYPE": "OpenWebuiMetrics",
+        "LOG_ANALYTICS_DCR_ENDPOINT": "",
+        "LOG_ANALYTICS_DCR_IMMUTABLE_ID": "",
+        "LOG_ANALYTICS_DCR_STREAM_NAME": "",
+        "LOG_ANALYTICS_TENANT_ID": "",
+        "LOG_ANALYTICS_CLIENT_ID": "",
+        "LOG_ANALYTICS_CLIENT_SECRET": "",
+    }
+    got = {name: (props.get(name) or {}).get("default", MISSING) for name in want}
+    diff = {name: got[name] for name in want if got[name] != want[name]}
+    t.check(
+        "spec.ingest-defaults",
+        "Logs Ingestion valve defaults (auto, client_secret, public cloud "
+        "authority and scope, OpenWebuiMetrics, the others empty)",
+        not diff,
+        f"differs: {diff}" if diff else f"defaults={got}",
+    )
     await t.owui.replace_valves(TRACKER, {})
     names = await t.valve_names(TRACKER)
     t.check(
@@ -859,6 +1086,8 @@ async def la_groups(t: Suite) -> None:
             await offline(t, la)
         if t.selected("multimodel"):
             await multimodel(t, la)
+        if t.selected("ingest"):
+            await ingest_group(t, la)
     finally:
         await la.close()
         proc.terminate()
@@ -1187,6 +1416,1189 @@ async def la_slow(t: Suite, la: LogAnalytics) -> None:
         ok,
         f"{detail} timeout_logged={timeout_lines[:1]} "
         f"outlet_errors={outlet_errors(t, mark0)[:1]}",
+    )
+
+
+# ---------------------------------------------------------- Logs Ingestion API
+TOKEN_ERROR = "Could not get a Microsoft Entra ID token"
+INGEST_ERROR = "Error sending to Logs Ingestion API"
+INGEST_EXCEPTION = "Exception when sending to Logs Ingestion API"
+INGEST_SENT = "sent via the Logs Ingestion API"
+DROPPED = "Log Analytics record dropped"
+# premise of ingest.mi.imds: a trust_env=True request through the same proxy
+# environment does not reach the IMDS mock
+PROXY_PREMISE = """
+import asyncio, sys, aiohttp
+async def main():
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as s:
+            async with s.get(sys.argv[1], headers={"Metadata": "true"}) as r:
+                print("STATUS", r.status)
+    except Exception as e:
+        print("ERROR", type(e).__name__)
+asyncio.run(main())
+"""
+PROXY_ENV = {
+    "HTTP_PROXY": "http://127.0.0.1:9",  # nothing listens
+    "http_proxy": "http://127.0.0.1:9",
+    "NO_PROXY": "localhost,127.0.0.1",  # the server's other local traffic
+    "no_proxy": "localhost,127.0.0.1",
+}
+
+
+def fresh_client_id(prefix: str = "e2e-app") -> str:
+    """A client id no earlier request used, i.e. a cold token cache (the cache
+    lives in the server process and survives --reuse)."""
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def li_valves(**over) -> dict:
+    """Every Logs Ingestion valve with an explicit value and a fresh client id,
+    then ``over``: update_valves merges into the stored valves, so a valve one
+    scenario overrides must not leak into the next one."""
+    return {
+        "SEND_TO_LOG_ANALYTICS": True,
+        "LOG_ANALYTICS_INGESTION_API": "auto",
+        "LOG_ANALYTICS_DCR_ENDPOINT": f"https://{DCR_HOST}",
+        "LOG_ANALYTICS_DCR_IMMUTABLE_ID": DCR_ID,
+        "LOG_ANALYTICS_DCR_STREAM_NAME": "",
+        "LOG_ANALYTICS_AUTH_MODE": "client_secret",
+        "LOG_ANALYTICS_TENANT_ID": TENANT,
+        "LOG_ANALYTICS_CLIENT_ID": fresh_client_id(),
+        "LOG_ANALYTICS_CLIENT_SECRET": CLIENT_SECRET,
+        "LOG_ANALYTICS_AUTHORITY_HOST": "https://login.microsoftonline.com",
+        "LOG_ANALYTICS_INGESTION_SCOPE": DEFAULT_SCOPE,
+        **over,
+    }
+
+
+async def set_li_valves(t: Suite, **over) -> dict:
+    valves = li_valves(**over)
+    await t.owui.update_valves(TRACKER, **valves)
+    return valves
+
+
+async def set_env(t: Suite, mapping: Optional[dict] = None) -> list:
+    """Set the managed identity / proxy environment of the server process
+    through the probe pipe (PROBE_ENV): every allow-listed name not in
+    ``mapping`` is removed, so a scenario never inherits one. The values go
+    through a file, never through the chat text. Returns problems."""
+    mapping = mapping or {}
+    unknown = sorted(set(mapping) - set(PROBE_ENV_NAMES))
+    with open(PROBE_ENV_FILE, "w", encoding="utf-8") as fh:
+        json.dump({name: mapping.get(name) for name in PROBE_ENV_NAMES}, fh)
+    r = await t.owui.chat(ENV_MODEL, f"PROBE_ENV={PROBE_ENV_FILE}")
+    rep = probe_report(r.content)
+    if (
+        r.status == 200
+        and rep.get("env_applied") == sorted(PROBE_ENV_NAMES)
+        and not rep.get("env_rejected")
+        and not rep.get("env_error")
+        and not unknown
+    ):
+        return []
+    return [
+        f"set_env: HTTP {r.status} applied={rep.get('env_applied')} "
+        f"rejected={rep.get('env_rejected')} error={rep.get('env_error')} "
+        f"unknown={unknown}"
+    ]
+
+
+async def li_chat(t: Suite, text: str, stream: bool = False) -> tuple:
+    """API request through the tracker: (result, seconds until the answer)."""
+    t0 = time.time()
+    r = await t.owui.chat(
+        PROBE_MODEL, text, stream=stream, features={"web_search": False}
+    )
+    return r, round(time.time() - t0, 2)
+
+
+def token_problems(
+    toks: list,
+    client_ids: list,
+    host: str = LOGIN_HOSTS[0],
+    scope: str = DEFAULT_SCOPE,
+    auth: str = "secret",
+) -> list:
+    """Recorded token requests vs. one expected client id per request."""
+    if len(toks) != len(client_ids):
+        return [f"token requests={len(toks)} want {len(client_ids)}"]
+    problems = []
+    for tok, client_id in zip(toks, client_ids):
+        content_type = str(tok.get("content_type") or "").split(";")[0].strip()
+        want = {
+            "host": host,
+            "path": TOKEN_PATH,
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "scope": scope,
+            "auth": auth,
+            "status": 200,
+        }
+        problems += [
+            f"{name}={tok.get(name)!r}"
+            for name, value in want.items()
+            if tok.get(name) != value
+        ]
+        if content_type != "application/x-www-form-urlencoded":
+            problems.append(f"content_type={tok.get('content_type')!r}")
+        if not tok.get(f"{auth}_ok"):
+            problems.append(f"{auth}_ok=False")
+    return problems
+
+
+def unclean(t: Suite, mark: int) -> list:
+    """Tracebacks and unclosed aiohttp sessions logged since ``mark``."""
+    tracebacks = [b for b in t.log.error_blocks(mark) if "Traceback" in b]
+    unclosed = t.log.lines(mark, "Unclosed client session", "Unclosed connector")
+    return ([f"{len(tracebacks)} tracebacks"] if tracebacks else []) + unclosed[:1]
+
+
+def header(entry: dict, name: str) -> Optional[str]:
+    for key, value in (entry.get("headers") or {}).items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+async def ingest_group(t: Suite, la: LogAnalytics) -> None:
+    state: dict = {"secrets": []}
+    try:
+        await upsert_derived_model(t, ENV_MODEL, "E2E Probe Env", [])
+        # A crashed --reuse run may have left a proxy or identity endpoint set.
+        state["env_problems"] = await set_env(t)
+        await ingest_api(t, la)
+        await ingest_token_cache(t, la)
+        retry = await ingest_token_errors(t, la, state)
+        await ingest_http_errors(t, la)
+        await ingest_refresh(t, la)
+        await ingest_slow(t, la)
+        await ingest_modes(t, la)
+        await ingest_clouds(t, la)
+        await ingest_managed_identity(t, la, state)
+        await ingest_retry_after_window(t, la, retry)
+    finally:
+        try:
+            INGEST_SECRETS.extend(await la.tokens())
+            await la.reset()
+            await la.config(stream=STREAM, identity_header="")
+        except httpx.HTTPError:
+            pass
+        INGEST_SECRETS.extend(state["secrets"])
+        await set_env(t)
+        await t.owui.replace_valves(
+            TRACKER,
+            {
+                "SEND_TO_LOG_ANALYTICS": True,
+                "LOG_ANALYTICS_WORKSPACE_ID": WORKSPACE,
+                "LOG_ANALYTICS_SHARED_KEY": LA_KEY,
+                "LOG_ANALYTICS_LOG_TYPE": LOG_TYPE,
+            },
+        )
+
+
+async def ingest_api(t: Suite, la: LogAnalytics) -> None:
+    """API and browser path: one exact record per response, 204, one token."""
+    valves = await set_li_valves(t)
+    user_id = t.owui.user.get("id")
+    for stream in (False, True):
+        await la.reset()
+        mark = t.mark()
+        r, _ = await li_chat(
+            t, f"Logs Ingestion API token count, stream={stream}.", stream
+        )
+        rep = probe_report(r.content)
+        posts = await la.wait(1, timeout=send_timeout(t, mark, 10), kind="ingest")
+        sent = await wait_log(t, mark, INGEST_SENT, 5)
+        await t.log.settle(0.3)
+        dc = await la.records()
+        toks = await la.records("token")
+        exp = expected(rep, r.content)
+        problems = (
+            li_transport_problems(posts[0])
+            + record_body_problems(posts[0], exp, PROBE_MODEL, user_id)
+            if len(posts) == 1
+            else [f"ingest posts={len(posts)}"]
+        )
+        rec = record_of(posts[0]) if posts else {}
+        ids = f"(chat={rec.get('chatId')}, message={rec.get('messageId')})"
+        if len(sent) != 1 or ids not in sent[0]:
+            problems.append(f"success lines={sent[:2]}")
+        if dc:
+            problems.append(f"dc posts={len(dc)}")
+        if stream:
+            if toks:
+                problems.append(f"token requests={len(toks)} (cached token expected)")
+        else:
+            problems += token_problems(toks, [valves["LOG_ANALYTICS_CLIENT_ID"]])
+        tag = "stream" if stream else "nonstream"
+        t.check(
+            f"ingest.api.{tag}",
+            f"API {tag}: one exact record to "
+            "{endpoint}/dataCollectionRules/{dcr}/streams/Custom-<log type>_CL with "
+            "a Bearer token, 204 logged as success; "
+            + (
+                "the cached token is reused"
+                if stream
+                else "one form-encoded client credentials token request"
+            ),
+            r.status == 200 and bool(rep) and not problems,
+            f"HTTP {r.status} problems={problems} exp={exp} "
+            f"outlet_errors={outlet_errors(t, mark)[:1]} rec={short(rec, 250)}",
+        )
+
+    await la.reset()
+    async with t.browser() as b:
+        c = await b.chat(PROBE_MODEL, "Browser via the Logs Ingestion API", stream=True)
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    rep = probe_report(c.content)
+    exp = {**expected(rep, c.content), "chat_id": c.chat_id, "message_id": c.message_id}
+    problems = (
+        li_transport_problems(posts[0])
+        + record_body_problems(posts[0], exp, PROBE_MODEL, user_id)
+        if len(posts) == 1
+        else [f"ingest posts={len(posts)}"]
+    )
+    rec = record_of(posts[0]) if posts else {}
+    try:
+        want = status_text(rec)
+    except (KeyError, TypeError, ValueError):
+        want = None
+    tracker = [s for s in c.status_history if "Req:" in (s.get("description") or "")]
+    t.check(
+        "ingest.browser",
+        "browser: the Logs Ingestion record has the chat id and the assistant "
+        "message id, the status text shows the record's values, done",
+        c.done
+        and not problems
+        and len(tracker) == 1
+        and tracker[0].get("description") == want
+        and tracker[0].get("done") is True,
+        f"problems={problems} status={tracker} want={want!r}",
+    )
+
+
+async def ingest_token_cache(t: Suite, la: LogAnalytics) -> None:
+    """One token for many records: sequential and concurrent."""
+    await la.reset()
+    await set_li_valves(t)
+    statuses = []
+    for i in range(3):
+        r, _ = await li_chat(t, f"cached token request {i}")
+        statuses.append(r.status)
+        await la.wait(i + 1, timeout=10, kind="ingest")
+    posts = await la.records("ingest")
+    toks = await la.records("token")
+    indexes = [p.get("token_index") for p in posts]
+    t.check(
+        "ingest.token-cached",
+        "3 sequential records: 3 posts with 204, 1 token request, the same token",
+        statuses == [200] * 3
+        and len(posts) == 3
+        and all(p.get("status") == 204 for p in posts)
+        and len(toks) == 1
+        and indexes == [toks[0].get("token_index")] * 3,
+        f"HTTP {statuses} posts={[p.get('status') for p in posts]} "
+        f"token_indexes={indexes} token_requests={len(toks)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t)
+    await la.mode(target="token", delay=4)
+    mark = t.mark()
+    t0 = time.time()
+    results = await asyncio.gather(
+        *(li_chat(t, f"concurrent token request {i}") for i in range(5))
+    )
+    posts = await la.wait(5, timeout=15, kind="ingest")
+    sent = await wait_log(t, mark, INGEST_SENT, max(0.5, t0 + 15 - time.time()), n=5)
+    toks = await la.records("token")
+    elapsed = sorted(e for _, e in results)
+    arrived = sorted(round(p["received"] - t0, 2) for p in posts)
+    t.check(
+        "ingest.token-concurrent",
+        "5 concurrent records while the token request takes 4 s: every API answer "
+        "< 3 s (outlet does not wait), exactly 1 token request, 5 posts with 204 "
+        "and 5 success lines within 15 s",
+        all(r.status == 200 for r, _ in results)
+        and elapsed[-1] < 3
+        and len(toks) == 1
+        and len(posts) == 5
+        and all(p.get("status") == 204 for p in posts)
+        and bool(arrived)
+        and arrived[-1] <= 15
+        and len(sent) == 5,
+        f"HTTP {[r.status for r, _ in results]} answers={elapsed}s "
+        f"token_requests={len(toks)} posts={[p.get('status') for p in posts]} "
+        f"arrived={arrived} success_lines={len(sent)}",
+    )
+
+
+async def ingest_token_errors(t: Suite, la: LogAnalytics, state: dict) -> dict:
+    """Wrong secret (one ERROR with the AADSTS hint, then the 30 s back-off),
+    redaction of an echoed secret, an undecryptable stored secret."""
+    await la.reset()
+    client_id = fresh_client_id()
+    await set_li_valves(
+        t,
+        LOG_ANALYTICS_CLIENT_ID=client_id,
+        LOG_ANALYTICS_CLIENT_SECRET="e2e-wrong-secret-1",
+    )
+    mark = t.mark()
+    r1, _ = await li_chat(t, "token error request 1")
+    errors = await wait_log(t, mark, TOKEN_ERROR, 12)
+    toks = await la.records("token")
+    failed_at = toks[0]["received"] if toks else time.time()
+    mark2 = t.mark()
+    r2, _ = await li_chat(t, "token error request 2")
+    dropped = await wait_log(t, mark2, DROPPED, 8)
+    await t.log.settle(1)
+    toks = await la.records("token")
+    posts = await la.records("ingest")
+    errors = t.log.lines(mark, TOKEN_ERROR)
+    dirty = unclean(t, mark)
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    needles = ("AADSTS7000215", "invalid_client", "not its ID")
+    t.check(
+        "ingest.token-error",
+        "wrong client secret: one ERROR with AADSTS7000215, invalid_client and the "
+        "'value, not its ID' hint, nothing posted; the next record within 30 s "
+        "sends no token request and logs one 'record dropped' WARNING",
+        r1.status == 200
+        and r2.status == 200
+        and len(errors) == 1
+        and all(n in errors[0] for n in needles)
+        and not posts
+        and len(toks) == 1
+        and len(dropped) == 1
+        and not dirty,
+        f"errors={errors[:2]} token_requests={len(toks)} posts={len(posts)} "
+        f"dropped={dropped[:1]} unclean={dirty}",
+    )
+    retry = {"client_id": client_id, "failed_at": failed_at}
+
+    wrong = "e2e-wrong+secret/2="  # changes when URL-encoded
+    state["secrets"].append(quote_plus(wrong))
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_SECRET=wrong)
+    await la.mode(target="token", echo_secret=True)
+    mark = t.mark()
+    await li_chat(t, "token error echo")
+    await wait_log(t, mark, TOKEN_ERROR, 12)
+    await t.log.settle(0.5)
+    blocks = [b for b in t.log.error_blocks(mark) if TOKEN_ERROR in b]
+    forms = (wrong, quote_plus(wrong), quote(wrong, safe=""))
+    leaked = [i for i, form in enumerate(forms) if any(form in b for b in blocks)]
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    t.check(
+        "ingest.token-error-echo",
+        "an error text that echoes the client secret (plain and form-encoded) is "
+        "logged redacted (***)",
+        len(blocks) == 1 and "echo ***" in blocks[0] and not leaked,
+        f"blocks={len(blocks)} leaked_forms={leaked} "
+        f"redacted={'***' in (blocks[0] if blocks else '')}",
+    )
+
+    value = "encrypted:e2e-not-a-fernet-token"
+    state["secrets"].append(value)
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_SECRET=value)
+    stored = (await t.owui.get_valves(TRACKER)).get("LOG_ANALYTICS_CLIENT_SECRET")
+    mark = t.mark()
+    r, _ = await li_chat(t, "undecryptable secret")
+    lines = await wait_log(t, mark, "could not be decrypted", 10)
+    await t.log.settle(1)
+    lines = t.log.lines(mark, "could not be decrypted")
+    toks = await la.records("token")
+    posts = await la.records("ingest")
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    t.check(
+        "ingest.secret-undecryptable",
+        "a stored client secret that cannot be decrypted (WEBUI_SECRET_KEY "
+        "changed): one ERROR 'could not be decrypted', nothing sent to Entra ID",
+        r.status == 200
+        and stored == value
+        and len(lines) == 1
+        and not toks
+        and not posts,
+        f"HTTP {r.status} stored_unchanged={stored == value} lines={lines[:1]} "
+        f"token_requests={len(toks)} posts={len(posts)}",
+    )
+    return retry
+
+
+async def ingest_http_errors(t: Suite, la: LogAnalytics) -> None:
+    """One actionable log line per failed record, no retry."""
+    await la.reset()
+    await set_li_valves(t)
+    r0, _ = await li_chat(t, "401 warm-up (caches token A)")
+    await la.wait(1, timeout=10, kind="ingest")
+    await la.revoke()
+    mark = t.mark()
+    r1, _ = await li_chat(t, "401 with the revoked token A")
+    lines = await wait_log(t, mark, f"{INGEST_ERROR}: 401", 10)
+    r2, _ = await li_chat(t, "401 then a new token")
+    posts = await la.wait(3, timeout=10, kind="ingest")
+    await t.log.settle(1)
+    lines = t.log.lines(mark, INGEST_ERROR)
+    toks = await la.records("token")
+    t.expect_errors(mark, ("time_token_tracker", f"{INGEST_ERROR}: 401"))
+    statuses = [p.get("status") for p in posts]
+    indexes = [p.get("token_index") for p in posts]
+    t.check(
+        "ingest.http-401",
+        "a revoked token (401): one line with the scope hint, the next record "
+        "requests exactly one new token and gets 204",
+        [r.status for r in (r0, r1, r2)] == [200] * 3
+        and len(lines) == 1
+        and "LOG_ANALYTICS_INGESTION_SCOPE" in lines[0]
+        and statuses == [204, 401, 204]
+        and len(toks) == 2
+        and indexes[:2] == [toks[0].get("token_index")] * 2
+        and indexes[2:] == [toks[1].get("token_index")],
+        f"lines={lines[:2]} statuses={statuses} token_indexes={indexes} "
+        f"token_requests={len(toks)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t)
+    await la.mode(target="ingest", status=401)
+    mark = t.mark()
+    for i in (1, 2):
+        await li_chat(t, f"persistent 401 request {i}")
+        await wait_log(t, mark, f"{INGEST_ERROR}: 401", 10, n=i)
+    mark3 = t.mark()
+    await li_chat(t, "persistent 401 request 3")
+    dropped = await wait_log(t, mark3, DROPPED, 8)
+    await t.log.settle(1)
+    lines = t.log.lines(mark, f"{INGEST_ERROR}: 401")
+    toks = await la.records("token")
+    posts = await la.records("ingest")
+    t.expect_errors(mark, ("time_token_tracker", f"{INGEST_ERROR}: 401"))
+    t.check(
+        "ingest.http-401-persistent",
+        "every token gets 401: two records with a new token each (one 401 line "
+        "each), then the token back-off: the third record sends nothing and logs "
+        "'record dropped'",
+        len(lines) == 2
+        and len(toks) == 2
+        and len(posts) == 2
+        and [p.get("token_index") for p in posts]
+        == [tok.get("token_index") for tok in toks]
+        and len(dropped) == 1,
+        f"lines={len(lines)} token_requests={len(toks)} posts={len(posts)} "
+        f"dropped={dropped[:1]}",
+    )
+
+    cases = (
+        (
+            "ingest.http-403",
+            "403: one ERROR line with the Monitoring Metrics Publisher role and the "
+            "30 minute propagation hint, no retry",
+            {"status": 403},
+            {},
+            (": 403", "Monitoring Metrics Publisher", "30 minutes"),
+        ),
+        (
+            "ingest.http-404",
+            "404 (unknown DCR immutable ID): one line naming the DCR ID and stream "
+            "name valves",
+            None,
+            {"LOG_ANALYTICS_DCR_IMMUTABLE_ID": "dcr-" + "f" * 32},
+            (
+                ": 404",
+                "LOG_ANALYTICS_DCR_IMMUTABLE_ID",
+                "LOG_ANALYTICS_DCR_STREAM_NAME",
+            ),
+        ),
+        (
+            "ingest.http-413",
+            "413: one line with the 1 MB limit, no retry",
+            {"status": 413},
+            {},
+            (": 413", "1 MB"),
+        ),
+        (
+            "ingest.http-429",
+            "429: one line with Retry-After as sent, no retry (one post 3 s later)",
+            {"status": 429, "retry_after": 17},
+            {},
+            (": 429", "Retry-After: 17"),
+        ),
+        (
+            "ingest.http-500",
+            "500: one line with the response body and the x-ms-client-request-id "
+            "of the request, no traceback, session closed",
+            {"status": 500},
+            {},
+            (f"{INGEST_ERROR}: 500", "e2e mock"),
+        ),
+    )
+    for sid, title, ingest_mode, over, needles in cases:
+        await la.reset()
+        await set_li_valves(t, **over)
+        if ingest_mode:
+            await la.mode(target="ingest", **ingest_mode)
+        mark = t.mark()
+        r, _ = await li_chat(t, f"{sid} please")
+        await wait_log(t, mark, INGEST_ERROR, 10)
+        await asyncio.sleep(3 if sid.endswith("429") else 1.5)  # a retry would show
+        await t.log.settle(0.5)
+        lines = t.log.lines(mark, INGEST_ERROR)
+        posts = await la.records("ingest")
+        dirty = unclean(t, mark)
+        t.expect_errors(mark, ("time_token_tracker", INGEST_ERROR))
+        problems = []
+        if len(lines) != 1 or not all(n in lines[0] for n in needles):
+            problems.append(f"lines={lines[:2]}")
+        if len(posts) != 1:
+            problems.append(f"posts={len(posts)}")
+        if sid.endswith("500"):
+            logged = re.search(r"request=([0-9a-f-]{36})", lines[0] if lines else "")
+            sent_id = header(posts[0], "x-ms-client-request-id") if posts else None
+            if not logged or logged.group(1) != sent_id:
+                problems.append(
+                    f"request id logged={logged.group(1) if logged else None} "
+                    f"sent={sent_id}"
+                )
+            problems += dirty
+        t.check(sid, title, r.status == 200 and not problems, f"problems={problems}")
+
+
+async def ingest_refresh(t: Suite, la: LogAnalytics) -> None:
+    """Token refresh before expiry, and a failed refresh with a valid token."""
+    await la.reset()
+    await set_li_valves(t)
+    await la.mode(target="token", expires_in=8)  # refresh after 4 s
+    await li_chat(t, "refresh request 1")
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    # The filter posts right after it received the token: its refresh time is
+    # at most 4 s after this post (the mock's token receipt is earlier).
+    anchor = posts[0]["received"] if posts else time.time()
+    await asyncio.sleep(max(0.0, anchor + 5 - time.time()))
+    await li_chat(t, "refresh request 2")
+    posts = await la.wait(2, timeout=10, kind="ingest")
+    toks = await la.records("token")
+    gap = round(toks[1]["received"] - toks[0]["received"], 2) if len(toks) > 1 else None
+    t.check(
+        "ingest.token-refresh",
+        "a token with 8 s lifetime is refreshed after half of it: 2 token "
+        "requests, the second before the first token expired, the second post "
+        "uses the new token, no expired token is sent",
+        len(toks) == 2
+        and gap is not None
+        and gap < 8
+        and len(posts) == 2
+        and posts[1].get("token_index") == toks[1].get("token_index")
+        and all(p.get("status") == 204 and not p.get("token_expired") for p in posts),
+        f"token_requests={len(toks)} gap={gap}s posts="
+        f"{[(p.get('status'), p.get('token_index')) for p in posts]}",
+    )
+
+    await la.reset()
+    await set_li_valves(t)
+    await la.mode(target="token", expires_in=12)  # refresh 6 s, usable until 9 s
+    await li_chat(t, "refresh fallback request 1")
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    toks = await la.records("token")
+    t0 = toks[0]["received"] if toks else time.time()
+    # refresh due <= anchor + 6, usable until >= t0 + 9 and <= anchor + 9
+    anchor = posts[0]["received"] if posts else time.time()
+    await la.mode(target="token", status=500)
+    await asyncio.sleep(max(0.0, anchor + 6.3 - time.time()))
+    mark2 = t.mark()
+    sent2 = round(time.time() - t0, 2)
+    await li_chat(t, "refresh fallback request 2")
+    posts = await la.wait(2, timeout=10, kind="ingest")
+    keep = await wait_log(t, mark2, "keeping the cached token", 5)
+    await asyncio.sleep(max(0.0, anchor + 9.8 - time.time()))
+    mark3 = t.mark()
+    sent3 = round(time.time() - t0, 2)
+    await li_chat(t, "refresh fallback request 3")
+    dropped = await wait_log(t, mark3, DROPPED, 6)
+    await t.log.settle(1)
+    toks = await la.records("token")
+    posts = await la.records("ingest")
+    keep = t.log.lines(mark2, "keeping the cached token")
+    t.expect_errors(mark2, ("time_token_tracker", "keeping the cached token"))
+    t.check(
+        "ingest.token-refresh-fallback",
+        "the refresh fails while the token is still valid: one ERROR 'keeping the "
+        "cached token', the record is sent with the old token (204); after the "
+        "token's usable time the next record is dropped without a token request",
+        len(keep) == 1
+        and len(posts) == 2
+        and posts[1].get("token_index") == toks[0].get("token_index")
+        and all(p.get("status") == 204 for p in posts)
+        and len(toks) == 2
+        and toks[1].get("status") == 500
+        and len(dropped) == 1,
+        f"request2_at={sent2}s request3_at={sent3}s keep={keep[:1]} posts="
+        f"{[(p.get('status'), p.get('token_index')) for p in posts]} token_requests="
+        f"{[(x.get('status'), x.get('token_index')) for x in toks]} dropped={dropped[:1]}",
+    )
+
+
+async def ingest_slow(t: Suite, la: LogAnalytics) -> None:
+    """Hanging token endpoint, slow and hanging ingestion, refused connection:
+    the API answer never waits."""
+    mark0 = t.mark()
+    results = {}
+    await la.reset()
+    await set_li_valves(t)
+    await la.mode(target="token", delay=HANG_SECONDS)
+    mark = t.mark()
+    r, elapsed = await li_chat(t, "token endpoint hangs")
+    lines = await wait_log(t, mark, TOKEN_ERROR, 15)
+    posts = await la.records("ingest")
+    results["token-hang"] = (r.status, elapsed, lines[:1], len(posts))
+    ok_a = (
+        r.status == 200
+        and elapsed < 2
+        and len(lines) == 1
+        and "TimeoutError" in lines[0]
+        and not posts
+    )
+
+    await la.reset()
+    await set_li_valves(t)  # another client id: (a)'s key is in its back-off
+    await la.mode(target="ingest", delay=SLOW_SECONDS)
+    mark = t.mark()
+    t0 = time.time()
+    r, elapsed = await li_chat(t, "slow ingestion")
+    posts = await la.wait(1, timeout=15, kind="ingest")
+    sent = await wait_log(t, mark, INGEST_SENT, max(0.5, t0 + 15 - time.time()))
+    sent_at = round(time.time() - t0, 2)
+    results["slow"] = (r.status, elapsed, len(posts), sent_at, bool(sent))
+    ok_b = r.status == 200 and elapsed < 2 and len(posts) == 1 and bool(sent)
+    ok_b = ok_b and sent_at <= 15
+
+    await la.reset()
+    await la.mode(target="ingest", delay=HANG_SECONDS)
+    mark = t.mark()
+    r, elapsed = await li_chat(t, "hanging ingestion")
+    lines = await wait_log(t, mark, INGEST_EXCEPTION, 16)
+    results["hang"] = (r.status, elapsed, lines[:1])
+    ok_c = (
+        r.status == 200 and elapsed < 2 and bool(lines) and "TimeoutError" in lines[0]
+    )
+    await la.mode(target="ingest")
+    t.expect_errors(
+        mark0,
+        ("time_token_tracker", TOKEN_ERROR),
+        ("time_token_tracker", INGEST_EXCEPTION),
+    )
+    print(f"          ingest.slow: {results}", flush=True)
+    t.check(
+        "ingest.slow-not-blocking",
+        f"hanging token endpoint, slow ({SLOW_SECONDS} s) and hanging "
+        f"({HANG_SECONDS} s) ingestion: API answer < 2 s each; the token request "
+        "times out (ERROR, nothing posted), the slow record arrives <= 15 s, the "
+        "hanging send times out",
+        ok_a and ok_b and ok_c,
+        f"{results}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_DCR_ENDPOINT=f"https://{REFUSED_HOST}")
+    mark = t.mark()
+    r, elapsed = await li_chat(t, "unreachable ingestion endpoint")
+    lines = await wait_log(t, mark, INGEST_EXCEPTION, 5)
+    await t.log.settle(0.5)
+    lines = t.log.lines(mark, INGEST_EXCEPTION)
+    t.expect_errors(mark, ("time_token_tracker", INGEST_EXCEPTION))
+    t.check(
+        "ingest.unreachable",
+        "ingestion endpoint refuses the connection: API answer < 2 s, one line "
+        "'Exception when sending to Logs Ingestion API: ClientConnectorError'",
+        r.status == 200
+        and elapsed < 2
+        and len(lines) == 1
+        and "ClientConnectorError" in lines[0],
+        f"HTTP {r.status} elapsed={elapsed}s lines={lines[:2]}",
+    )
+
+
+async def ingest_modes(t: Suite, la: LogAnalytics) -> None:
+    """LOG_ANALYTICS_INGESTION_API: auto, data_collector, logs_ingestion, both,
+    unknown values, invalid settings, deprecation warning."""
+    user_id = t.owui.user.get("id")
+    await la.reset()
+    await set_li_valves(t)
+    r, _ = await li_chat(t, "auto with both APIs configured")
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    await asyncio.sleep(1)
+    dc = await la.records()
+    t.check(
+        "ingest.mode.auto-li",
+        "auto with both APIs configured: Logs Ingestion API only",
+        r.status == 200
+        and len(posts) == 1
+        and posts[0].get("status") == 204
+        and not dc,
+        f"HTTP {r.status} ingest={[p.get('status') for p in posts]} dc={len(dc)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_SECRET="")
+    problems = []
+    for i in range(2):
+        r, _ = await li_chat(t, f"auto with incomplete Logs Ingestion settings {i}")
+        dc = await la.wait(i + 1, timeout=10)
+        rep = probe_report(r.content)
+        if len(dc) != i + 1:
+            problems.append(f"request {i}: dc posts={len(dc)}")
+        else:
+            problems += record_problems(
+                dc[i], expected(rep, r.content), PROBE_MODEL, user_id
+            )
+    await asyncio.sleep(1)
+    posts = await la.records("ingest")
+    needle = (
+        "not fully configured (missing: LOG_ANALYTICS_CLIENT_SECRET); using the "
+        "HTTP Data Collector API"
+    )
+    run_lines = t.log.lines(t.log_start, needle)
+    all_lines = t.log.lines(0, needle)
+    t.check(
+        "ingest.mode.auto-incomplete",
+        "auto with incomplete Logs Ingestion settings: the 2.6.2 Data Collector "
+        "request (signature, headers, record), one WARNING naming the missing "
+        "valve (once per process)",
+        not problems and not posts and len(run_lines) <= 1 and len(all_lines) >= 1,
+        f"problems={problems} ingest={len(posts)} warnings: this run "
+        f"{len(run_lines)}, since start {len(all_lines)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_INGESTION_API="data_collector")
+    r, _ = await li_chat(t, "data_collector forced")
+    dc = await la.wait(1, timeout=10)
+    await asyncio.sleep(1)
+    posts = await la.records("ingest")
+    toks = await la.records("token")
+    problems = (
+        record_problems(
+            dc[0], expected(probe_report(r.content), r.content), PROBE_MODEL, user_id
+        )
+        if len(dc) == 1
+        else [f"dc posts={len(dc)}"]
+    )
+    t.check(
+        "ingest.mode.data-collector",
+        "data_collector with complete Logs Ingestion settings: only the 2.6.2 "
+        "Data Collector request, no token request",
+        r.status == 200 and not problems and not posts and not toks,
+        f"HTTP {r.status} problems={problems} ingest={len(posts)} "
+        f"token_requests={len(toks)}",
+    )
+
+    await la.reset()
+    await set_li_valves(
+        t, LOG_ANALYTICS_INGESTION_API="logs_ingestion", LOG_ANALYTICS_DCR_ENDPOINT=""
+    )
+    statuses = []
+    for i in range(2):
+        r, _ = await li_chat(t, f"logs_ingestion incomplete {i}")
+        statuses.append(r.status)
+    await asyncio.sleep(2)
+    everything = await la.records("all")
+    needle = (
+        "LOG_ANALYTICS_INGESTION_API=logs_ingestion, but the Logs Ingestion API is "
+        "not fully configured (missing: LOG_ANALYTICS_DCR_ENDPOINT)"
+    )
+    run_lines = t.log.lines(t.log_start, needle)
+    all_lines = t.log.lines(0, needle)
+    t.check(
+        "ingest.mode.logs-ingestion-incomplete",
+        "logs_ingestion without LOG_ANALYTICS_DCR_ENDPOINT: nothing sent, one "
+        "WARNING naming the valve (once per process)",
+        statuses == [200, 200]
+        and not everything
+        and len(run_lines) <= 1
+        and len(all_lines) >= 1,
+        f"HTTP {statuses} requests={[e.get('kind') for e in everything]} warnings: "
+        f"this run {len(run_lines)}, since start {len(all_lines)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_INGESTION_API="both")
+    mark = t.mark()
+    r, _ = await li_chat(t, "both APIs please")
+    rep = probe_report(r.content)
+    dc = await la.wait(1, timeout=10)
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    sent_dc = await wait_log(t, mark, "Log Analytics data sent successfully", 5)
+    sent_li = await wait_log(t, mark, INGEST_SENT, 5)
+    problems = []
+    if len(dc) != 1:
+        problems.append(f"dc posts={len(dc)}")
+    else:
+        problems += record_problems(
+            dc[0], expected(rep, r.content), PROBE_MODEL, user_id
+        )
+    if len(posts) != 1:
+        problems.append(f"ingest posts={len(posts)}")
+    else:
+        problems += li_transport_problems(posts[0])
+    if dc and posts and dc[0].get("body") != posts[0].get("body"):
+        problems.append("dc body != ingest body")
+    if len(sent_dc) != 1 or len(sent_li) != 1:
+        problems.append(f"success lines dc={len(sent_dc)} li={len(sent_li)}")
+    t.check(
+        "ingest.mode.both",
+        "both: the same record to the Data Collector API (2.6.2 request) and the "
+        "Logs Ingestion API, one success line each",
+        r.status == 200 and not problems,
+        f"HTTP {r.status} problems={problems}",
+    )
+
+    hexa = uuid.uuid4().hex[:4]
+    endpoint_a = f"http://{DCR_HOST}"
+    dcr_c = f"my-dcr-{hexa}"
+    mark_a = t.mark()
+    seen = {}
+    for name, over in (
+        ("a", {"LOG_ANALYTICS_DCR_ENDPOINT": endpoint_a}),
+        ("b", {"LOG_ANALYTICS_AUTH_MODE": f"bogus-{hexa}"}),
+        ("c", {"LOG_ANALYTICS_DCR_IMMUTABLE_ID": dcr_c}),
+    ):
+        await la.reset()
+        await set_li_valves(t, LOG_ANALYTICS_INGESTION_API="logs_ingestion", **over)
+        mark = t.mark()
+        r, _ = await li_chat(t, f"invalid Logs Ingestion setting {name}")
+        if name == "c":
+            await wait_log(t, mark, f"{INGEST_ERROR}: 404", 10)
+        await asyncio.sleep(1.5)
+        seen[name] = (r.status, [e.get("kind") for e in await la.records("all")])
+    t.expect_errors(mark_a, ("time_token_tracker", f"{INGEST_ERROR}: 404"))
+    https = "LOG_ANALYTICS_DCR_ENDPOINT (must use https)"
+    run_https, all_https = t.log.lines(t.log_start, https), t.log.lines(0, https)
+    auth = t.log.lines(mark_a, "LOG_ANALYTICS_AUTH_MODE (unknown value")
+    dcr_hint = t.log.lines(mark_a, "does not look like an immutable ID")
+    # The DCR ID is no secret: the 404 hint names it on purpose.
+    shown = [
+        line
+        for line in t.log.lines(mark_a, endpoint_a, dcr_c)
+        if f"{INGEST_ERROR}: 404" not in line
+    ]
+    t.check(
+        "ingest.config-invalid",
+        "invalid settings: an http:// endpoint and an unknown auth mode count as "
+        "missing (WARNING, nothing sent); a DCR ID that is not dcr-<32 hex> logs "
+        "a hint and is still used; the warnings do not show the values",
+        seen.get("a") == (200, [])
+        and seen.get("b") == (200, [])
+        and seen.get("c") == (200, ["token", "ingest"])
+        and len(run_https) <= 1
+        and len(all_https) >= 1
+        and len(auth) == 1
+        and len(dcr_hint) == 1
+        and not shown,
+        f"requests={seen} https warnings: this run {len(run_https)}, since start "
+        f"{len(all_https)}; auth={auth[:1]} dcr_hint={len(dcr_hint)} "
+        f"values_shown={shown[:1]}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_INGESTION_API=f" BoGuS-{hexa} ")
+    mark = t.mark()
+    for i in range(2):
+        await li_chat(t, f"unknown mode {i}")
+    posts = await la.wait(2, timeout=10, kind="ingest")
+    await asyncio.sleep(1)
+    dc = await la.records()
+    lines = t.log.lines(mark, "unknown LOG_ANALYTICS_INGESTION_API value")
+    t.check(
+        "ingest.mode.unknown",
+        "an unknown LOG_ANALYTICS_INGESTION_API value: one WARNING, behaves as auto",
+        len(lines) == 1
+        and len(posts) == 2
+        and all(p.get("status") == 204 for p in posts)
+        and not dc,
+        f"warnings={lines[:2]} ingest={[p.get('status') for p in posts]} dc={len(dc)}",
+    )
+
+    run_lines = t.log.lines(t.log_start, DEPRECATION)
+    all_lines = t.log.lines(0, DEPRECATION)
+    t.check(
+        "ingest.deprecation-warning",
+        "sending through the HTTP Data Collector API logs one deprecation WARNING "
+        "per process",
+        len(run_lines) <= 1 and len(all_lines) >= 1,
+        f"this run {len(run_lines)}, since start {len(all_lines)}: {all_lines[:1]}",
+    )
+
+
+async def ingest_clouds(t: Suite, la: LogAnalytics) -> None:
+    """Sovereign cloud valves and endpoint normalization."""
+    await la.reset()
+    scope = "https://monitor.azure.us/.default"
+    valves = await set_li_valves(
+        t,
+        LOG_ANALYTICS_AUTHORITY_HOST="login.microsoftonline.us/",
+        LOG_ANALYTICS_INGESTION_SCOPE=scope,
+        LOG_ANALYTICS_DCR_ENDPOINT=f"https://{GOV_DCR_HOST}",
+    )
+    r, _ = await li_chat(t, "US Government cloud")
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    toks = await la.records("token")
+    problems = token_problems(
+        toks, [valves["LOG_ANALYTICS_CLIENT_ID"]], host=LOGIN_HOSTS[1], scope=scope
+    ) + (
+        li_transport_problems(posts[0], host=GOV_DCR_HOST)
+        if len(posts) == 1
+        else [f"ingest posts={len(posts)}"]
+    )
+    t.check(
+        "ingest.sovereign",
+        "US Government valves (authority without scheme and with a trailing "
+        "slash): token from login.microsoftonline.us with the .us scope, record "
+        "to the .azure.us endpoint, 204",
+        r.status == 200 and not problems,
+        f"HTTP {r.status} problems={problems}",
+    )
+
+    stream = "Custom-E2E_Explicit"
+    await la.reset()
+    await la.config(stream=stream)
+    try:
+        await set_li_valves(
+            t,
+            LOG_ANALYTICS_DCR_ENDPOINT=f"{DCR_HOST}/",
+            LOG_ANALYTICS_DCR_STREAM_NAME=stream,
+        )
+        r, _ = await li_chat(t, "endpoint without scheme, explicit stream")
+        posts = await la.wait(1, timeout=10, kind="ingest")
+    finally:
+        await la.config(stream=STREAM)
+    problems = (
+        li_transport_problems(posts[0], stream=stream)
+        if len(posts) == 1
+        else [f"ingest posts={len(posts)}"]
+    )
+    t.check(
+        "ingest.endpoint-normalized",
+        "endpoint without https:// and with a trailing slash, explicit "
+        "LOG_ANALYTICS_DCR_STREAM_NAME: exact URI, 204",
+        r.status == 200 and not problems,
+        f"HTTP {r.status} problems={problems}",
+    )
+
+
+async def ingest_managed_identity(t: Suite, la: LogAnalytics, state: dict) -> None:
+    """App Service, IMDS (without proxy), AKS workload identity, unsupported."""
+    env_problems = list(state.get("env_problems") or [])
+    mi_valves = {
+        "LOG_ANALYTICS_AUTH_MODE": "managed_identity",
+        "LOG_ANALYTICS_CLIENT_SECRET": "",
+    }
+
+    header_a = f"e2e-idh-{uuid.uuid4().hex}"
+    header_b = f"e2e-idh-{uuid.uuid4().hex}"
+    state["secrets"] += [header_a, header_b]
+    client_id = fresh_client_id("e2e-uami")
+    env = {"IDENTITY_ENDPOINT": f"{MI_URL}/msi/token", "IDENTITY_HEADER": header_a}
+    await la.reset()
+    await la.config(identity_header=header_a)
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_ID=client_id, **mi_valves)
+    await la.mode(target="msi", expires_in=8)
+    problems = env_problems + await set_env(t, env)
+    try:
+        await li_chat(t, "App Service managed identity 1")
+        posts = await la.wait(1, timeout=10, kind="ingest")
+        anchor = posts[0]["received"] if posts else time.time()
+        problems += await set_env(t, {**env, "IDENTITY_HEADER": header_b})
+        await la.config(identity_header=header_b)
+        await asyncio.sleep(max(0.0, anchor + 5 - time.time()))
+        await li_chat(t, "App Service managed identity 2")
+        posts = await la.wait(2, timeout=10, kind="ingest")
+    finally:
+        problems += await set_env(t)
+        await la.config(identity_header="")
+    msi = await la.records("msi")
+    toks = await la.records("token")
+    for rec in msi:
+        query = rec.get("query") or {}
+        want = {
+            "api-version": "2019-08-01",
+            "resource": "https://monitor.azure.com",
+            "client_id": client_id,
+        }
+        problems += [
+            f"{k}={query.get(k)!r}" for k, v in want.items() if query.get(k) != v
+        ]
+        if rec.get("flavour") != "app_service" or not rec.get("header_ok"):
+            problems.append(
+                f"flavour={rec.get('flavour')} header_ok={rec.get('header_ok')}"
+            )
+    if len(msi) != 2:
+        problems.append(f"msi requests={len(msi)}")
+    problems += [p for e in posts for p in li_transport_problems(e)]
+    t.check(
+        "ingest.mi.app-service",
+        "managed identity on App Service: IDENTITY_ENDPOINT with X-IDENTITY-HEADER "
+        "(read per request: the rotated header is used), api-version 2019-08-01, "
+        "resource without /.default, user-assigned client_id; 2 records with 204",
+        len(posts) == 2 and not toks and not problems,
+        f"problems={problems} posts={len(posts)} token_route={len(toks)}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_ID="", **mi_valves)
+    await la.mode(target="msi", expires_in=8)  # no stale cache in a --reuse rerun
+    problems = list(env_problems)
+    problems += await set_env(
+        t, {"AZURE_POD_IDENTITY_AUTHORITY_HOST": MI_IMDS_URL, **PROXY_ENV}
+    )
+    try:
+        r, _ = await li_chat(t, "IMDS managed identity")
+        posts = await la.wait(1, timeout=10, kind="ingest")
+    finally:
+        problems += await set_env(t)
+    premise = await asyncio.to_thread(
+        subprocess.run,
+        [
+            "python3",
+            "-c",
+            PROXY_PREMISE,
+            f"{MI_IMDS_URL}/metadata/identity/oauth2/token?api-version=2018-02-01"
+            "&resource=https://monitor.azure.com",
+        ],
+        env={**os.environ, **PROXY_ENV},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    premise_out = (premise.stdout or premise.stderr).strip()
+    msi = await la.records("msi")
+    for rec in msi:
+        query = rec.get("query") or {}
+        if (
+            rec.get("flavour") != "imds"
+            or rec.get("local_ip") != "127.0.0.2"
+            or not rec.get("header_ok")
+            or query.get("api-version") != "2018-02-01"
+            or query.get("resource") != "https://monitor.azure.com"
+            or "client_id" in query
+        ):
+            problems.append(f"msi={short(rec, 200)}")
+    if len(msi) != 1:
+        problems.append(f"msi requests={len(msi)}")
+    problems += (
+        li_transport_problems(posts[0]) if len(posts) == 1 else [f"posts={len(posts)}"]
+    )
+    t.check(
+        "ingest.mi.imds",
+        "managed identity on a VM (IMDS): Metadata: true, api-version 2018-02-01, "
+        "system-assigned (no client_id), reached directly although HTTP_PROXY is "
+        "set (a trust_env request through the same environment fails at the "
+        "proxy); record with 204",
+        r.status == 200 and not problems and premise_out.startswith("ERROR Client"),
+        f"problems={problems} premise={premise_out[:120]!r}",
+    )
+
+    hex_a, hex_b = uuid.uuid4().hex, uuid.uuid4().hex
+    assertion_a, assertion_b = f"e2e-fed-{hex_a}", f"e2e-fed-{hex_b}"
+    state["secrets"] += [assertion_a, assertion_b]
+    client_1, client_2 = fresh_client_id("e2e-wi"), fresh_client_id("e2e-wi")
+    env = {
+        "AZURE_FEDERATED_TOKEN_FILE": WI_TOKEN_FILE,
+        "AZURE_TENANT_ID": TENANT,
+        "AZURE_CLIENT_ID": client_1,
+    }
+    with open(WI_TOKEN_FILE, "w", encoding="utf-8") as fh:
+        fh.write(assertion_a + "\n")
+    await la.reset()
+    await set_li_valves(
+        t, LOG_ANALYTICS_TENANT_ID="", LOG_ANALYTICS_CLIENT_ID="", **mi_valves
+    )
+    await la.mode(target="token", expires_in=8)
+    problems = env_problems + await set_env(t, env)
+    try:
+        await li_chat(t, "workload identity 1")
+        posts = await la.wait(1, timeout=10, kind="ingest")
+        anchor = posts[0]["received"] if posts else time.time()
+        with open(WI_TOKEN_FILE, "w", encoding="utf-8") as fh:
+            fh.write(assertion_b + "\n")
+        await asyncio.sleep(max(0.0, anchor + 5 - time.time()))
+        await li_chat(t, "workload identity 2")
+        await la.wait(2, timeout=10, kind="ingest")
+        problems += await set_env(t, {**env, "AZURE_CLIENT_ID": client_2})
+        await li_chat(t, "workload identity 3")
+        posts = await la.wait(3, timeout=10, kind="ingest")
+    finally:
+        problems += await set_env(t)
+    toks = await la.records("token")
+    problems += token_problems(toks, [client_1, client_1, client_2], auth="assertion")
+    problems += [
+        f"form={tok.get('form')}"
+        for tok in toks
+        if "client_secret" in (tok.get("form") or {})
+        or (tok.get("form") or {}).get("client_assertion_type")
+        != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    ]
+    problems += (
+        [p for e in posts for p in li_transport_problems(e)]
+        if len(posts) == 3
+        else [f"posts={len(posts)}"]
+    )
+    t.check(
+        "ingest.mi.workload-identity",
+        "AKS workload identity: client assertion from AZURE_FEDERATED_TOKEN_FILE "
+        "(read per token request: the rotated file is used), tenant and client id "
+        "from AZURE_TENANT_ID / AZURE_CLIENT_ID (a changed AZURE_CLIENT_ID gets its "
+        "own token), no client secret; 3 records with 204",
+        not problems,
+        f"problems={problems}",
+    )
+
+    await la.reset()
+    await set_li_valves(t, **mi_valves)
+    problems = env_problems + await set_env(
+        t, {"IDENTITY_ENDPOINT": f"{MI_URL}/arc", "IMDS_ENDPOINT": MI_URL}
+    )
+    mark = t.mark()
+    try:
+        await li_chat(t, "Azure Arc managed identity")
+        lines = await wait_log(t, mark, "Azure Arc is not supported", 8)
+        await t.log.settle(1)
+    finally:
+        problems += await set_env(t)
+    lines = t.log.lines(mark, "Azure Arc is not supported")
+    msi = await la.records("msi")
+    posts = await la.records("ingest")
+    t.expect_errors(mark, ("time_token_tracker", TOKEN_ERROR))
+    t.check(
+        "ingest.mi.unsupported",
+        "managed identity on Azure Arc: one ERROR 'not supported', no request",
+        len(lines) == 1 and not msi and not posts and not problems,
+        f"lines={lines[:1]} msi={len(msi)} posts={len(posts)} problems={problems}",
+    )
+
+
+async def ingest_retry_after_window(t: Suite, la: LogAnalytics, retry: dict) -> None:
+    """The 30 s token back-off of ingest.token-error ends; the fixed secret
+    works without a restart (the secret is not part of the cache key)."""
+    await la.reset()
+    await set_li_valves(t, LOG_ANALYTICS_CLIENT_ID=retry["client_id"])
+    waited = max(0.0, retry["failed_at"] + 31 - time.time())
+    await asyncio.sleep(waited)
+    r, _ = await li_chat(t, "after the token back-off")
+    posts = await la.wait(1, timeout=10, kind="ingest")
+    toks = await la.records("token")
+    problems = token_problems(toks, [retry["client_id"]]) + (
+        [p.get("status") for p in posts if p.get("status") != 204]
+        if len(posts) == 1
+        else [f"posts={len(posts)}"]
+    )
+    t.check(
+        "ingest.token-retry-after-window",
+        "31 s after the failed token request, the same identity with the fixed "
+        "secret gets exactly one new token and its record is sent (204)",
+        r.status == 200 and not problems,
+        f"waited={waited:.1f}s problems={problems}",
     )
 
 
