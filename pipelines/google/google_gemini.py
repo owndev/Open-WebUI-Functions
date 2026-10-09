@@ -4,23 +4,30 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.16.1
+version: 1.17.0
 required_open_webui_version: 0.9.0
 requirements: google-genai>=1.66.0, google-genai<3
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
   - Optimized asynchronous API calls for maximum performance
-  - Intelligent model caching with configurable TTL
+  - Intelligent model caching with configurable TTL, refreshed at once when model valves change
   - Streamlined dynamic model specification with automatic prefix handling
   - Smart streaming response handling with safety checks
+  - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
+  - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
+  - Extra image generation model IDs configurable without a code change
+  - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
+  - Native tools and URL context left out for image models, which do not support them
+  - Search grounding left out for image models without Search support (gemini-2.5-flash-image, gemini-3.1-flash-lite-image)
   - Intelligent image optimization with size-aware compression algorithms
   - Automated image upload to Open WebUI with robust fallback support
+  - Generated images and videos linked in the answer for API clients
   - Optimized text-to-image and image-to-image workflows
   - Non-streaming mode for image generation to prevent chunk overflow
-  - Progressive status updates for optimal user experience
+  - Progressive status updates, each closed when a request ends, fails or is stopped
   - Consolidated error handling and comprehensive logging
   - Seamless Google Generative AI and Vertex AI integration
   - Advanced generation parameters (temperature, max tokens, etc.)
@@ -46,6 +53,8 @@ features:
   - Automatic video upload to Open WebUI with chat file attachments
   - Image-to-video generation support for Veo models
   - Negative prompt and person generation controls for video
+  - Token usage reporting for streaming and non-streaming responses
+  - Usable as task model for title, tag and follow-up generation
 """
 
 import os
@@ -62,7 +71,17 @@ import io
 import uuid
 import aiofiles
 from PIL import Image
-from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
+from typing import (
+    List,
+    Union,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+)
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from cryptography.fernet import Fernet, InvalidToken
@@ -334,7 +353,8 @@ class Pipe:
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
             description="Thinking level for Gemini 3 models. Most Gemini 3 models support 'low'/'high', "
-            "while gemini-3.1-flash-image-preview supports 'minimal'/'high'. "
+            "while gemini-3.1-flash-image and gemini-3.1-flash-lite-image support 'minimal'/'high' "
+            "and gemini-nano-banana-2.1 supports 'minimal'/'medium'/'high'. "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -407,6 +427,17 @@ class Pipe:
             default=os.getenv("GOOGLE_IMAGE_GENERATION_RESOLUTION", "default"),
             description="Default resolution for image generation.",
             json_schema_extra={"enum": RESOLUTION_OPTIONS},
+        )
+        IMAGE_GENERATION_MODELS: str = Field(
+            default=os.getenv("GOOGLE_IMAGE_GENERATION_MODELS", ""),
+            description="A comma-separated list of extra model IDs to treat as Gemini 3 "
+            "image models: called without streaming, images uploaded to the chat, and "
+            "given the aspect ratio/resolution (ImageConfig) and thinking level settings. "
+            "List image models released after this pipeline version whose IDs use "
+            "neither Gemini 3 nor Nano Banana naming (e.g. a future gemini-4-flash-image); "
+            "without an entry they get no ImageConfig and no thinking_level. Known "
+            "Gemini 3 and Nano Banana image models need not be listed. Imagen IDs "
+            "(imagen-*) are ignored.",
         )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
@@ -593,14 +624,14 @@ class Pipe:
         ordered_stats: List[Dict[str, Any]],
         reused_flags: List[bool],
         total_limit: int,
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
     ) -> None:
         """Emit per-image optimization stats aligned with final combined order.
 
         ordered_stats: stats list in the exact order images will be sent (same length as combined image list)
         reused_flags: parallel list indicating whether image originated from history
         """
-        if not ordered_stats:
+        if not ordered_stats or not __event_emitter__:
             return
         for idx, stat in enumerate(ordered_stats, start=1):
             reused = reused_flags[idx - 1] if idx - 1 < len(reused_flags) else False
@@ -615,7 +646,8 @@ class Pipe:
             reasons = stat.get("reasons") if stat else None
             if reasons:
                 desc += " | " + ", ".join(reasons[:3])
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -625,9 +657,10 @@ class Pipe:
                         "done": False,
                         "details": stat_copy,
                     },
-                }
+                },
             )
-        await __event_emitter__(
+        await self._safe_emit(
+            __event_emitter__,
             {
                 "type": "status",
                 "data": {
@@ -635,13 +668,13 @@ class Pipe:
                     "description": f"{len(ordered_stats)} image(s) processed (limit {total_limit}).",
                     "done": True,
                 },
-            }
+            },
         )
 
     async def _build_image_generation_contents(
         self,
         messages: List[Dict[str, Any]],
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
@@ -721,7 +754,8 @@ class Pipe:
                 }
                 for i in range(len(combined))
             ]
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -730,7 +764,7 @@ class Pipe:
                         "images": mapping,
                         "done": True,
                     },
-                }
+                },
             )
 
         # Build parts
@@ -781,10 +815,17 @@ class Pipe:
         # Model cache
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
+        self._model_cache_key: Optional[Tuple[Any, ...]] = None
 
-    def _get_client(self) -> genai.Client:
+    def _get_client(self, user: Optional[UserModel] = None) -> genai.Client:
         """
         Validates API credentials and returns a genai.Client instance.
+
+        Args:
+            user: The requesting user, whose X-OpenWebUI-User-* headers are sent
+                when ENABLE_FORWARD_USER_INFO_HEADERS is on. Passed per call
+                (never kept on the shared Pipe instance), so concurrent
+                requests of different users cannot forward each other's headers.
         """
         self._validate_api_key()
 
@@ -800,11 +841,7 @@ class Pipe:
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
             headers = {}
-            if (
-                self.valves.ENABLE_FORWARD_USER_INFO_HEADERS
-                and hasattr(self, "user")
-                and self.user
-            ):
+            if self.valves.ENABLE_FORWARD_USER_INFO_HEADERS and user:
 
                 def sanitize_header_value(value: Any, max_length: int = 255) -> str:
                     if value is None:
@@ -820,16 +857,16 @@ class Pipe:
 
                 user_attrs = {
                     "X-OpenWebUI-User-Name": sanitize_header_value(
-                        getattr(self.user, "name", None)
+                        getattr(user, "name", None)
                     ),
                     "X-OpenWebUI-User-Id": sanitize_header_value(
-                        getattr(self.user, "id", None)
+                        getattr(user, "id", None)
                     ),
                     "X-OpenWebUI-User-Email": sanitize_header_value(
-                        getattr(self.user, "email", None)
+                        getattr(user, "email", None)
                     ),
                     "X-OpenWebUI-User-Role": sanitize_header_value(
-                        getattr(self.user, "role", None)
+                        getattr(user, "role", None)
                     ),
                 }
                 headers = {k: v for k, v in user_attrs.items() if v not in (None, "")}
@@ -880,10 +917,26 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
+    def _get_model_cache_key(self) -> Tuple[Any, ...]:
+        """The valves that decide which models are listed and how they are named."""
+        return (
+            self.valves.BASE_URL,
+            self.valves.API_VERSION,
+            self.valves.USE_VERTEX_AI,
+            self.valves.VERTEX_PROJECT,
+            self.valves.VERTEX_LOCATION,
+            self.valves.MODEL_WHITELIST,
+            self.valves.MODEL_ADDITIONAL,
+            self.valves.IMAGE_GENERATION_MODELS,
+        )
+
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
         """
         Retrieve available Google models suitable for content generation.
-        Uses caching to reduce API calls.
+        Uses caching to reduce API calls. The cache is only used while the
+        valves that shape the list (endpoint, whitelist, additional and image
+        generation models) are unchanged, so a valve change shows on the next
+        model list refresh instead of after MODEL_CACHE_TTL.
 
         Args:
             force_refresh: Whether to force refreshing the model cache
@@ -893,9 +946,11 @@ class Pipe:
         """
         # Check cache first
         current_time = time.time()
+        cache_key = self._get_model_cache_key()
         if (
             not force_refresh
             and self._model_cache is not None
+            and self._model_cache_key == cache_key
             and (current_time - self._model_cache_time) < self.valves.MODEL_CACHE_TTL
         ):
             self.log.debug("Using cached model list")
@@ -976,6 +1031,7 @@ class Pipe:
             # Update cache
             self._model_cache = list(filtered_models.values())
             self._model_cache_time = current_time
+            self._model_cache_key = cache_key
             self.log.debug(f"Found {len(self._model_cache)} Gemini models")
             return self._model_cache
 
@@ -983,6 +1039,44 @@ class Pipe:
             self.log.exception(f"Could not fetch models from Google: {str(e)}")
             # Return a specific error entry for the UI
             return [{"id": "error", "name": f"Could not fetch models: {str(e)}"}]
+
+    # A Gemini model ID with "image" as its own dash-separated segment.
+    _GEMINI_IMAGE_MODEL_RE = re.compile(r"(?:^|/)gemini-[^/]*-image(?:-|$)")
+
+    # gemini-nano-banana-2.1 and its variants ("-preview", "@001"), but not
+    # e.g. gemini-nano-banana-2.10.
+    _NANO_BANANA_2_1_RE = re.compile(r"gemini-nano-banana-2\.1(?:[-@]|$)")
+
+    # Image models whose model pages list Search grounding as "Not supported"
+    # (https://ai.google.dev/gemini-api/docs/models), incl. their preview IDs.
+    _NO_SEARCH_GROUNDING_MODELS = (
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-lite-image",
+    )
+
+    def _supports_search_grounding(self, model_id: str) -> bool:
+        """Return False for models that do not support Google Search grounding."""
+        model_lower = model_id.rsplit("/", 1)[-1].lower()
+        return not model_lower.startswith(self._NO_SEARCH_GROUNDING_MODELS)
+
+    def _is_configured_image_model(self, model_id: str) -> bool:
+        """Return True if the IMAGE_GENERATION_MODELS valve lists the model."""
+        configured = {
+            listed.rsplit("/", 1)[-1].lower()
+            for listed in re.findall(
+                r"[^,\s]+", self.valves.IMAGE_GENERATION_MODELS or ""
+            )
+        }
+        return model_id.rsplit("/", 1)[-1].lower() in configured
+
+    @staticmethod
+    def _is_nano_banana_model(model_id: str) -> bool:
+        """Return True for Nano Banana IDs such as "gemini-nano-banana-2.1".
+
+        Unlike the older image models, these IDs carry neither "image" nor a
+        Gemini version in their name.
+        """
+        return "nano-banana" in model_id.lower()
 
     def _check_image_generation_support(self, model_id: str) -> bool:
         """
@@ -994,25 +1088,49 @@ class Pipe:
         Returns:
             True if the model supports image generation, False otherwise
         """
+        model_lower = model_id.lower()
+
+        # Imagen models ("imagen-...") use the predict API, not generateContent,
+        # so they are never Gemini image models, even if IMAGE_GENERATION_MODELS
+        # lists them.
+        if model_lower.startswith("imagen-") or "/imagen-" in model_lower:
+            return False
+
+        # Models the admin declared as image models (IMAGE_GENERATION_MODELS)
+        if self._is_configured_image_model(model_id):
+            return True
+
         # Known image generation models (both Gemini 2.5 and Gemini 3)
         image_generation_models = [
             "gemini-2.5-flash-image",
             "gemini-2.5-flash-image-preview",
             "gemini-3-flash-image",
             "gemini-3-flash-image-preview",
+            "gemini-3.1-flash-image",
             "gemini-3.1-flash-image-preview",
+            "gemini-3.1-flash-lite-image",
             "gemini-3-pro-image",
             "gemini-3-pro-image-preview",
         ]
 
         # Check for exact matches or pattern matches
         for pattern in image_generation_models:
-            if model_id == pattern or pattern in model_id:
+            if model_lower == pattern or pattern in model_lower:
                 return True
 
+        # Nano Banana models, e.g. "gemini-nano-banana-2.1"
+        if self._is_nano_banana_model(model_id):
+            return True
+
+        # Gemini image models carry "image" as a separate name segment, both as
+        # preview and as released (GA) ID, e.g. "gemini-3.1-flash-image",
+        # "gemini-2.0-flash-preview-image-generation".
+        if self._GEMINI_IMAGE_MODEL_RE.search(model_lower):
+            return True
+
         # Additional pattern checking for future models
-        if "image" in model_id.lower() and (
-            "generation" in model_id.lower() or "preview" in model_id.lower()
+        if "image" in model_lower and (
+            "generation" in model_lower or "preview" in model_lower
         ):
             return True
 
@@ -1026,16 +1144,26 @@ class Pipe:
         )
 
     def _is_gemini_3_image_model(self, model_id: str) -> bool:
-        """Return True for Gemini 3.x image generation models."""
-        return self._is_gemini_3_family_model(
-            model_id
-        ) and self._check_image_generation_support(model_id)
+        """Return True for image models with the features of Gemini 3 image models.
+
+        These take ImageConfig (aspect ratio, resolution) and thinking_level:
+        Gemini 3.x image IDs, Nano Banana IDs (gemini-nano-banana-*), whose names
+        carry no Gemini version, and the IDs listed in IMAGE_GENERATION_MODELS.
+        """
+        if not self._check_image_generation_support(model_id):
+            return False
+        return (
+            self._is_gemini_3_family_model(model_id)
+            or self._is_nano_banana_model(model_id)
+            or self._is_configured_image_model(model_id)
+        )
 
     def _check_image_config_support(self, model_id: str) -> bool:
         """
         Check if a model supports ImageConfig (aspect_ratio and image_size parameters).
 
-        ImageConfig is only supported by Gemini 3 image generation models.
+        ImageConfig is only supported by Gemini 3 image generation models,
+        including the Nano Banana IDs and the IDs in IMAGE_GENERATION_MODELS.
         Gemini 2.5 image models support image generation but not ImageConfig.
 
         Args:
@@ -1084,8 +1212,9 @@ class Pipe:
         """
         Check if a model supports the thinking_level parameter.
 
-        Gemini 3 models support thinking_level and should NOT use thinking_budget.
-        Other models (like Gemini 2.5) use thinking_budget instead.
+        Gemini 3 models (and image models with Gemini 3 image features, such as
+        the Nano Banana IDs) support thinking_level and should NOT use
+        thinking_budget. Other models (like Gemini 2.5) use thinking_budget instead.
 
         Args:
             model_id: The model ID to check
@@ -1093,19 +1222,39 @@ class Pipe:
         Returns:
             True if the model supports thinking_level, False otherwise
         """
-        return self._is_gemini_3_family_model(model_id)
+        return self._is_gemini_3_family_model(
+            model_id
+        ) or self._is_gemini_3_image_model(model_id)
 
     def _get_supported_thinking_levels(self, model_id: str) -> List[str]:
-        """Return the supported thinking levels for a specific Gemini 3 model."""
+        """Return the supported thinking levels for a specific Gemini 3 model.
+
+        An empty list means the levels are not known; the configured level is
+        then sent unchanged (e.g. other Nano Banana IDs, IMAGE_GENERATION_MODELS).
+        """
         model_lower = model_id.lower()
 
-        if model_lower.startswith("gemini-3.1-flash-image"):
+        # https://ai.google.dev/gemini-api/docs/generate-content/image-generation
+        if self._NANO_BANANA_2_1_RE.match(model_lower):
+            return ["minimal", "medium", "high"]
+
+        if model_lower.startswith(
+            ("gemini-3.1-flash-image", "gemini-3.1-flash-lite-image")
+        ):
             return ["minimal", "high"]
 
         if self._is_gemini_3_family_model(model_id):
             return ["low", "high"]
 
         return []
+
+    @staticmethod
+    def _get_supported_image_sizes(model_id: str) -> Optional[List[str]]:
+        """Return the image_size values a model accepts, or None if not restricted."""
+        if model_id.lower().startswith("gemini-3.1-flash-lite-image"):
+            # Nano Banana 2 Lite only generates 1K images.
+            return ["1K"]
+        return None
 
     def _coerce_thinking_level(
         self, requested_level: str, supported_levels: List[str]
@@ -1269,16 +1418,120 @@ class Pipe:
         )
 
     @staticmethod
-    def _is_open_webui_image_tool(tool_name: str) -> bool:
-        """Return True for Open WebUI's built-in image generation tools."""
-        return tool_name in {"generate_image", "edit_image"}
-
-    @staticmethod
     def _image_data_hash(image_data: Any) -> str:
         """Build a stable hash for generated image data across bytes/str inputs."""
         if isinstance(image_data, bytes):
             return hashlib.sha256(image_data).hexdigest()
         return hashlib.sha256(str(image_data).encode("utf-8")).hexdigest()
+
+    async def _safe_emit(
+        self, __event_emitter__: Optional[Callable], event: Dict[str, Any]
+    ) -> None:
+        """Send an event if an emitter is available; never raise.
+
+        Open WebUI passes no event emitter (None) to background tasks such as
+        title, tag and follow-up generation, so every emit must be optional.
+        """
+        if not __event_emitter__:
+            return
+        try:
+            await __event_emitter__(event)
+        except Exception as emit_error:
+            self.log.warning(
+                f"Failed to emit {event.get('type', 'unknown')} event: {emit_error}"
+            )
+
+    async def _close_client(self, client: Optional[genai.Client]) -> None:
+        """Close both transports (async and sync) of a per-request genai client."""
+        if client is None:
+            return
+        try:
+            await client.aio.aclose()
+        except Exception as close_error:
+            self.log.debug(f"Failed to close Gemini client: {close_error}")
+        try:
+            client.close()
+        except Exception as close_error:
+            self.log.debug(f"Failed to close Gemini sync client: {close_error}")
+
+    @staticmethod
+    def _track_statuses(
+        __event_emitter__: Optional[Callable], running: Dict[str, Dict[str, Any]]
+    ) -> Optional[Callable]:
+        """Wrap an event emitter to record the status actions still running.
+
+        `running` maps every status action whose last event had done=False
+        (thinking, image_processing, video_generation, ...) to that event's
+        data; an event of the same action with done=True removes it.
+        """
+        if not __event_emitter__:
+            return __event_emitter__
+
+        async def emit(event: Dict[str, Any]) -> Any:
+            data = event.get("data") if event.get("type") == "status" else None
+            if isinstance(data, dict) and data.get("action"):
+                if data.get("done") is False:
+                    running[data["action"]] = data
+                elif data.get("done"):
+                    running.pop(data["action"], None)
+            return await __event_emitter__(event)
+
+        return emit
+
+    async def _finish_running_statuses(
+        self,
+        __event_emitter__: Optional[Callable],
+        running: Dict[str, Dict[str, Any]],
+        cancelled: bool,
+    ) -> None:
+        """Send a final done=True status for every action still running.
+
+        Called from `finally`, so a stopped (cancelled) or failed request leaves
+        no "Thinking…", "Processing image request..." or "Generating video..."
+        status behind.
+        """
+        for action in list(running):
+            data: Dict[str, Any] = {"action": action, "done": True}
+            if action == "thinking":
+                data["hidden"] = True
+            else:
+                label = action.replace("_", " ").capitalize()
+                data["description"] = f"{label} {'stopped' if cancelled else 'failed'}"
+            await self._safe_emit(__event_emitter__, {"type": "status", "data": data})
+        running.clear()
+
+    @staticmethod
+    def _is_chat_message(__metadata__: Optional[Dict[str, Any]]) -> bool:
+        """Whether the request belongs to a chat message (browser path).
+
+        API requests (POST /api/chat/completions without chat_id) get an event
+        emitter in Open WebUI 0.9+ too, but with an empty chat_id/message_id:
+        events such as "files" are neither saved nor shown to the client then.
+        """
+        metadata = __metadata__ or {}
+        return bool(metadata.get("chat_id")) and bool(metadata.get("message_id"))
+
+    @staticmethod
+    def _content_chunk(content: str, model: str) -> Dict[str, Any]:
+        """An OpenAI chat.completion.chunk carrying `content` as delta.
+
+        Yielded instead of a plain str: Open WebUI forwards a str chunk that
+        starts with "data:" as a raw SSE line, which loses such an answer.
+        """
+        return {
+            "id": f"{model}-{uuid.uuid4()}",
+            "created": int(time.time()),
+            "model": model,
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": None,
+                    "delta": {"role": "assistant", "content": content},
+                }
+            ],
+        }
 
     async def _emit_generated_image_files(
         self,
@@ -1336,6 +1589,103 @@ class Pipe:
             "name": name,
             "meta": {"content_type": mime_type},
         }
+
+    async def _collect_generated_image(
+        self,
+        inline_data: Any,
+        seen_hashes: set[str],
+        generated_images: List[str],
+        generated_image_files: List[Dict[str, Any]],
+        __request__: Optional[Request],
+        __user__: Optional[dict],
+        __event_emitter__: Optional[Callable],
+    ) -> None:
+        """Upload one generated image (or inline it) and record how to show it.
+
+        Uploaded images go to generated_image_files (attached via a "files"
+        event); data URLs go to generated_images as markdown.
+        """
+        mime_type = inline_data.mime_type or "image/png"
+        image_data = inline_data.data
+
+        image_hash = self._image_data_hash(image_data)
+        if image_hash in seen_hashes:
+            self.log.debug(
+                "Skipping duplicate generated image part from Gemini response"
+            )
+            return
+        seen_hashes.add(image_hash)
+
+        if __request__ and __user__:
+            # Handle generated images with unified upload method
+            self.log.debug(
+                f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
+            )
+            image_url = await self._upload_image_with_status(
+                image_data,
+                mime_type,
+                __request__,
+                __user__,
+                __event_emitter__,
+            )
+            if image_url.startswith("data:"):
+                generated_images.append(f"![Generated Image]({image_url})")
+            else:
+                generated_image_files.append(
+                    self._build_generated_image_file(
+                        content_url=image_url,
+                        mime_type=mime_type,
+                    )
+                )
+            return
+
+        # Fallback: return as base64 data URL if no request/user context
+        if isinstance(image_data, bytes):
+            image_data_b64 = base64.b64encode(image_data).decode("utf-8")
+        else:
+            image_data_b64 = str(image_data)
+        data_url = f"data:{mime_type};base64,{image_data_b64}"
+        generated_images.append(f"![Generated Image]({data_url})")
+
+    async def _append_generated_images(
+        self,
+        content: str,
+        answer_text: str,
+        generated_images: List[str],
+        generated_image_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+        __metadata__: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Attach collected images to the message and return the final content.
+
+        Uploaded images are attached to the chat message with a "files" event.
+        Without a chat message (API clients) that event reaches nobody, so the
+        answer links the uploaded images as markdown instead.
+        """
+        files_emitted = False
+        if self._is_chat_message(__metadata__):
+            files_emitted = await self._emit_generated_image_files(
+                generated_image_files, __event_emitter__
+            )
+
+        if generated_image_files and not files_emitted:
+            generated_images.extend(
+                f"![Generated Image]({image_file['url']})"
+                for image_file in generated_image_files
+            )
+
+        if generated_image_files and files_emitted and not answer_text.strip():
+            if content:
+                content += "\n\n"
+            content += "Generated image."
+
+        # Add generated images
+        if generated_images:
+            if content:
+                content += "\n\n"
+            content += "\n\n".join(generated_images)
+
+        return content
 
     @staticmethod
     def _build_generated_video_file(
@@ -2141,7 +2491,7 @@ class Pipe:
         mime_type: str,
         __request__: Request,
         __user__: dict,
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
     ) -> str:
         """
         Unified image upload method with status updates and fallback handling.
@@ -2150,7 +2500,8 @@ class Pipe:
             URL to uploaded image or data URL fallback
         """
         try:
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2158,10 +2509,10 @@ class Pipe:
                         "description": "Uploading generated image to your library...",
                         "done": False,
                     },
-                }
+                },
             )
 
-            self.user = user = await Users.get_user_by_id(__user__["id"])
+            user = await Users.get_user_by_id(__user__["id"])
 
             # Convert image data to base64 string if needed
             if isinstance(image_data, bytes):
@@ -2176,7 +2527,8 @@ class Pipe:
                 mime_type=mime_type,
             )
 
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2184,7 +2536,7 @@ class Pipe:
                         "description": "Image uploaded successfully!",
                         "done": True,
                     },
-                }
+                },
             )
 
             return image_url
@@ -2197,7 +2549,8 @@ class Pipe:
             else:
                 image_data_b64 = str(image_data)
 
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2205,7 +2558,7 @@ class Pipe:
                         "description": "Using inline image (upload failed)",
                         "done": True,
                     },
-                }
+                },
             )
 
             return f"data:{mime_type};base64,{image_data_b64}"
@@ -2370,7 +2723,7 @@ class Pipe:
         mime_type: str,
         __request__: Request,
         __user__: dict,
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
         __metadata__: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Upload video with status updates and data-URL fallback.
@@ -2379,7 +2732,8 @@ class Pipe:
             Tuple of (file_entry_or_None, content_url_or_data_url_or_None)
         """
         try:
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2387,10 +2741,10 @@ class Pipe:
                         "description": "Uploading generated video to your library...",
                         "done": False,
                     },
-                }
+                },
             )
 
-            self.user = user = await Users.get_user_by_id(__user__["id"])
+            user = await Users.get_user_by_id(__user__["id"])
             chat_id = __metadata__.get("chat_id") if __metadata__ else None
             message_id = __metadata__.get("message_id") if __metadata__ else None
             video_url, file_entry = await self._upload_video(
@@ -2402,7 +2756,8 @@ class Pipe:
                 message_id=message_id,
             )
 
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2410,14 +2765,15 @@ class Pipe:
                         "description": "Video uploaded successfully!",
                         "done": True,
                     },
-                }
+                },
             )
             return file_entry, video_url
 
         except Exception as e:
             self.log.warning(f"Video upload failed, falling back to data URL: {e}")
             video_data_b64 = base64.b64encode(video_data).decode("utf-8")
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2425,7 +2781,7 @@ class Pipe:
                         "description": "Using inline video (upload failed)",
                         "done": True,
                     },
-                }
+                },
             )
             return None, f"data:{mime_type};base64,{video_data_b64}"
 
@@ -2499,6 +2855,17 @@ class Pipe:
                 # Validate and normalize the values
                 validated_aspect_ratio = self._validate_aspect_ratio(aspect_ratio)
                 validated_resolution = self._validate_resolution(resolution)
+                supported_sizes = self._get_supported_image_sizes(model_id)
+                if (
+                    validated_resolution
+                    and supported_sizes is not None
+                    and validated_resolution not in supported_sizes
+                ):
+                    self.log.warning(
+                        f"Resolution '{validated_resolution}' is not supported by {model_id} "
+                        f"(supported: {', '.join(supported_sizes)}). Using the model default."
+                    )
+                    validated_resolution = None
 
                 # Create image config if we have at least one valid value
                 if validated_aspect_ratio or validated_resolution:
@@ -2659,8 +3026,25 @@ class Pipe:
         params = __metadata__.get("params", {})
         tools = []
 
-        if features.get("google_search_tool", False):
-            if self.valves.USE_ENTERPRISE_WEB_SEARCH:
+        # Background tasks (title, tags, follow-ups, queries) inherit the chat's
+        # request metadata, including the grounding flags that the search filters
+        # set there. A task only works on the chat it is given, so it gets no
+        # grounding tools and does not run Google or Vertex AI searches.
+        is_task = bool(__metadata__.get("task"))
+        if is_task and (
+            features.get("google_search_tool") or features.get("vertex_ai_search")
+        ):
+            self.log.debug(
+                f"Grounding disabled for background task '{__metadata__.get('task')}'"
+            )
+
+        if features.get("google_search_tool", False) and not is_task:
+            if not self._supports_search_grounding(model_id):
+                self.log.debug(
+                    f"Search grounding is not supported by {model_id}; "
+                    "not sending the search tool"
+                )
+            elif self.valves.USE_ENTERPRISE_WEB_SEARCH:
                 self.log.debug("Enabling Enterprise Web Search grounding")
                 tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
@@ -2668,12 +3052,22 @@ class Pipe:
             else:
                 self.log.debug("Enabling Google search grounding")
                 tools.append(types.Tool(google_search=types.GoogleSearch()))
-            self.log.debug("Enabling URL context grounding")
-            tools.append(types.Tool(url_context=types.UrlContext()))
+            # Gemini image models do not support URL context (most of them
+            # support Search grounding, see _supports_search_grounding).
+            if enable_image_generation:
+                self.log.debug("URL context is not supported by image models")
+            else:
+                self.log.debug("Enabling URL context grounding")
+                tools.append(types.Tool(url_context=types.UrlContext()))
 
-        if features.get("vertex_ai_search", False) or (
-            self.valves.USE_VERTEX_AI
-            and (self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE"))
+        if not is_task and (
+            features.get("vertex_ai_search", False)
+            or (
+                self.valves.USE_VERTEX_AI
+                and (
+                    self.valves.VERTEX_AI_RAG_STORE or os.getenv("VERTEX_AI_RAG_STORE")
+                )
+            )
         ):
             vertex_rag_store = (
                 params.get("vertex_rag_store")
@@ -2699,18 +3093,22 @@ class Pipe:
                 )
 
         if __tools__ is not None and params.get("function_calling") == "native":
-            for name, tool_def in __tools__.items():
-                if enable_image_generation and self._is_open_webui_image_tool(name):
-                    self.log.debug(
-                        f"Skipping Open WebUI built-in image tool '{name}' for native Gemini image generation"
-                    )
-                    continue
-                if not name.startswith("_"):
-                    tool = tool_def["callable"]
-                    self.log.debug(
-                        f"Adding tool '{name}' with signature {tool.__signature__}"
-                    )
-                    tools.append(tool)
+            if enable_image_generation:
+                # Gemini image models do not support function calling. In Native
+                # mode Open WebUI 0.10+ attaches its built-in tools to every chat,
+                # so none are sent; this also keeps Open WebUI's own generate_image
+                # and edit_image tools away from native Gemini image generation.
+                self.log.debug(
+                    f"Not sending {len(__tools__)} native tool(s) to image model {model_id}"
+                )
+            else:
+                for name, tool_def in __tools__.items():
+                    if not name.startswith("_"):
+                        tool = tool_def["callable"]
+                        self.log.debug(
+                            f"Adding tool '{name}' with signature {tool.__signature__}"
+                        )
+                        tools.append(tool)
 
         if tools:
             gen_config_params["tools"] = tools
@@ -2727,6 +3125,12 @@ class Pipe:
         for chunk in grounding_chunks:
             if hasattr(chunk, "retrieved_context") and chunk.retrieved_context:
                 context = chunk.retrieved_context
+                # The SDK field is "text"; "chunk_text" is kept as a fallback.
+                chunk_text = (
+                    getattr(context, "text", None)
+                    or getattr(context, "chunk_text", None)
+                    or ""
+                )
                 formatted_sources.append(
                     {
                         "source": {
@@ -2734,7 +3138,7 @@ class Pipe:
                             "type": "vertex_ai_search",
                             "uri": getattr(context, "uri", None),
                         },
-                        "document": [getattr(context, "chunk_text", None) or ""],
+                        "document": [chunk_text],
                         "metadata": [
                             {"source": getattr(context, "title", None) or "Document"}
                         ],
@@ -2762,7 +3166,7 @@ class Pipe:
         self,
         grounding_metadata_list: List[types.GroundingMetadata],
         text: str,
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
     ):
         """Process and emit grounding metadata events."""
         grounding_chunks = []
@@ -2785,11 +3189,14 @@ class Pipe:
         if grounding_chunks:
             sources = self._format_grounding_chunks_as_sources(grounding_chunks)
             for source in sources:
-                await __event_emitter__({"type": "source", "data": source})
+                await self._safe_emit(
+                    __event_emitter__, {"type": "source", "data": source}
+                )
 
         # Add status specifying google queries used for grounding
         if web_search_queries:
-            await __event_emitter__(
+            await self._safe_emit(
+                __event_emitter__,
                 {
                     "type": "status",
                     "data": {
@@ -2800,7 +3207,7 @@ class Pipe:
                             for query in web_search_queries
                         ],
                     },
-                }
+                },
             )
 
         # Add citations in the text body
@@ -2836,23 +3243,72 @@ class Pipe:
 
         return replaced_text if replaced_text is not None else text
 
+    async def _start_stream(
+        self, open_stream: Callable[[], Awaitable[AsyncIterator[Any]]]
+    ) -> AsyncIterator[Any]:
+        """Open a Gemini stream, retrying temporary errors up to its first chunk.
+
+        generate_content_stream returns a lazy iterator: the HTTP request, and a
+        ServerError (5xx) with it, only happens when the first chunk is read.
+        Opening the stream and reading that chunk are therefore retried together
+        (RETRY_COUNT), before anything has been sent to Open WebUI. Errors after
+        the first chunk are not retried, because the answer has already started.
+        """
+
+        async def open_and_read_first() -> Tuple[AsyncIterator[Any], List[Any]]:
+            stream = (await open_stream()).__aiter__()
+            try:
+                return stream, [await stream.__anext__()]
+            except StopAsyncIteration:
+                return stream, []
+
+        stream, first = await self._retry_with_backoff(open_and_read_first)
+
+        async def chunks() -> AsyncIterator[Any]:
+            for chunk in first:
+                yield chunk
+            async for chunk in stream:
+                yield chunk
+
+        return chunks()
+
     async def _handle_streaming_response(
         self,
-        response_iterator: Any,
-        __event_emitter__: Callable,
+        open_stream: Callable[[], Awaitable[AsyncIterator[Any]]],
+        __event_emitter__: Optional[Callable],
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
+        client: Optional[genai.Client] = None,
+        model: str = "",
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
 
         Args:
-            response_iterator: Iterator from generate_content
+            open_stream: Coroutine function that calls generate_content_stream.
+                It is called (and retried on temporary errors, see _start_stream)
+                when Open WebUI starts reading this generator.
             __event_emitter__: Event emitter for status updates
+            client: The per-request genai client used by open_stream. The stream
+                sends its HTTP request lazily through this client's transport, so
+                the client must stay referenced until the stream ends. If it were
+                garbage collected, google-genai would close the transport and the
+                stream would fail. It is closed at the end.
+            model: Model ID of the request (Open WebUI's, with function prefix)
+                for the chat.completion.chunk dicts.
+            __metadata__: Request metadata (decides how generated images are
+                attached).
 
         Returns:
-            Generator yielding text chunks
+            Generator yielding chat.completion.chunk dicts (answer and error
+            messages) and a usage chunk
         """
+        # Remember statuses that are still running, to close them if the request
+        # is stopped or fails (see finally).
+        running_statuses: Dict[str, Dict[str, Any]] = {}
+        __event_emitter__ = self._track_statuses(__event_emitter__, running_statuses)
+        cancelled = False
 
         async def emit_chat_event(event_type: str, data: Dict[str, Any]) -> None:
             if not __event_emitter__:
@@ -2870,12 +3326,22 @@ class Pipe:
         thought_chunks: list[str] = []
         thinking_started_at: Optional[float] = None
         stream_usage_metadata = None
+        generated_images: list[str] = []
+        generated_image_files: List[Dict[str, Any]] = []
+        seen_generated_image_hashes: set[str] = set()
+        last_thought_image: Any = None
+        last_finish_reason: Any = None
 
         try:
+            response_iterator = await self._start_stream(open_stream)
             async for chunk in response_iterator:
                 # Capture usage metadata (final chunk has complete data)
                 if getattr(chunk, "usage_metadata", None):
                     stream_usage_metadata = chunk.usage_metadata
+                if chunk.candidates and getattr(
+                    chunk.candidates[0], "finish_reason", None
+                ):
+                    last_finish_reason = chunk.candidates[0].finish_reason
 
                 # Check for safety feedback or empty chunks
                 if not chunk.candidates:
@@ -2892,7 +3358,7 @@ class Pipe:
                                 "error": True,
                             },
                         )
-                        yield message
+                        yield self._content_chunk(message, model)
                     else:
                         message = "[Blocked by safety settings]"
                         await emit_chat_event(
@@ -2904,7 +3370,7 @@ class Pipe:
                                 "error": True,
                             },
                         )
-                        yield message
+                        yield self._content_chunk(message, model)
                     return  # Stop generation
 
                 if chunk.candidates[0].grounding_metadata:
@@ -2920,23 +3386,23 @@ class Pipe:
                     self.log.warning(f"Failed to access content parts: {parts_error}")
                     if hasattr(chunk, "text") and chunk.text:
                         answer_chunks.append(chunk.text)
-                        await __event_emitter__(
+                        await self._safe_emit(
+                            __event_emitter__,
                             {
                                 "type": "chat:message:delta",
                                 "data": {
                                     "role": "assistant",
                                     "content": chunk.text,
                                 },
-                            }
+                            },
                         )
                     continue
 
                 for part in parts:
                     try:
+                        is_thought = bool(getattr(part, "thought", False))
                         # Thought parts (internal reasoning)
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
+                        if is_thought and getattr(part, "text", None):
                             if thinking_started_at is None:
                                 thinking_started_at = time.time()
                             thought_chunks.append(part.text)
@@ -2945,7 +3411,8 @@ class Pipe:
                             MAX_PREVIEW = 120
                             if len(preview) > MAX_PREVIEW:
                                 preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                            await __event_emitter__(
+                            await self._safe_emit(
+                                __event_emitter__,
                                 {
                                     "type": "status",
                                     "data": {
@@ -2954,25 +3421,72 @@ class Pipe:
                                         "done": False,
                                         "hidden": False,
                                     },
-                                }
+                                },
                             )
+
+                        # Interim image from the thinking process: the final image
+                        # follows as a regular part, so this one is not uploaded
+                        # (only kept as fallback if no final image arrives).
+                        elif is_thought and getattr(part, "inline_data", None):
+                            self.log.debug("Skipping interim thought image")
+                            last_thought_image = part.inline_data
 
                         # Regular answer text
                         elif getattr(part, "text", None):
                             answer_chunks.append(part.text)
-                            await __event_emitter__(
+                            await self._safe_emit(
+                                __event_emitter__,
                                 {
                                     "type": "chat:message:delta",
                                     "data": {
                                         "role": "assistant",
                                         "content": part.text,
                                     },
-                                }
+                                },
+                            )
+
+                        # Generated images: normally image models use the
+                        # non-streaming path, but a model that is not detected
+                        # as an image model can still return inline images.
+                        elif getattr(part, "inline_data", None):
+                            self.log.info(
+                                "Gemini returned an image while streaming; "
+                                "attaching it to the final message"
+                            )
+                            await self._collect_generated_image(
+                                part.inline_data,
+                                seen_generated_image_hashes,
+                                generated_images,
+                                generated_image_files,
+                                __request__,
+                                __user__,
+                                __event_emitter__,
                             )
                     except Exception as part_error:
                         # Log part processing errors but continue with the stream
                         self.log.warning(f"Error processing content part: {part_error}")
                         continue
+
+            # seen_generated_image_hashes records every final (non-thought) image
+            # part. If the response had thought images only, attach the last one.
+            if (
+                last_thought_image is not None
+                and not seen_generated_image_hashes
+                and self._allows_thought_image_fallback(last_finish_reason)
+            ):
+                self.log.warning(
+                    "Gemini returned thought images but no final image; "
+                    "attaching the last thought image instead"
+                )
+                await self._collect_generated_image(
+                    last_thought_image,
+                    seen_generated_image_hashes,
+                    generated_images,
+                    generated_image_files,
+                    __request__,
+                    __user__,
+                    __event_emitter__,
+                )
 
             # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
@@ -3009,6 +3523,16 @@ class Pipe:
             if not final_content:
                 final_content = ""
 
+            if generated_images or generated_image_files:
+                final_content = await self._append_generated_images(
+                    final_content,
+                    final_answer_text,
+                    generated_images,
+                    generated_image_files,
+                    __event_emitter__,
+                    __metadata__,
+                )
+
             # Ensure downstream consumers (UI, TTS) receive the complete response once streaming ends.
             await emit_chat_event(
                 "replace", {"role": "assistant", "content": final_content}
@@ -3020,17 +3544,18 @@ class Pipe:
 
             if thought_chunks:
                 # Clear the thinking status without a summary in the status emitter
-                await __event_emitter__(
+                await self._safe_emit(
+                    __event_emitter__,
                     {
                         "type": "status",
                         "data": {"action": "thinking", "done": True, "hidden": True},
-                    }
+                    },
                 )
 
             # Yield usage data as dict so the middleware can extract and save it to DB
             usage = self._build_usage_dict(stream_usage_metadata)
             if usage:
-                yield {"usage": usage}
+                yield self._usage_chunk(usage)
 
             await emit_chat_event(
                 "chat:finish",
@@ -3039,7 +3564,13 @@ class Pipe:
 
             # Yield final content to ensure the async iterator completes properly.
             # This ensures the response is persisted even if the user navigates away.
-            yield final_content
+            # As a chunk dict, so an answer starting with "data:" stays content.
+            yield self._content_chunk(final_content, model)
+
+        except (asyncio.CancelledError, GeneratorExit):
+            # Stopped by the user or the client went away
+            cancelled = True
+            raise
 
         except Exception as e:
             self.log.exception(f"Error during streaming: {e}")
@@ -3060,7 +3591,82 @@ class Pipe:
                     "error": True,
                 },
             )
-            yield message
+            yield self._content_chunk(message, model)
+
+        finally:
+            await self._finish_running_statuses(
+                __event_emitter__, running_statuses, cancelled
+            )
+            await self._close_client(client)
+
+    @staticmethod
+    def _usage_chunk(usage: Dict[str, int]) -> Dict[str, Any]:
+        """OpenAI-style final stream chunk that carries only token usage."""
+        return {"choices": [], "usage": usage}
+
+    def _build_non_stream_result(
+        self,
+        content: str,
+        usage: Optional[Dict[str, int]],
+        model: str,
+        stream_requested: bool,
+    ) -> Union[Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
+        """
+        Return a completed (non-streamed) answer in the shape Open WebUI expects.
+
+        - Request with stream=false (API clients, background tasks such as title,
+          tag and follow-up generation): an OpenAI chat.completion dict, so the
+          token usage is returned to the caller and saved by Open WebUI.
+        - Request with stream=true answered without streaming (image models, or
+          GOOGLE_STREAMING_ENABLED=false): an async generator that yields one
+          content chunk and then a usage chunk. A chat.completion dict would be
+          forwarded as a single chunk without a delta and the message would
+          stay empty.
+        """
+        response_id = f"{model}-{uuid.uuid4()}"
+        created = int(time.time())
+
+        if stream_requested:
+
+            async def single_chunk_stream():
+                # A dict chunk (not a str) so content starting with "data:" is not
+                # mistaken for a raw SSE line by Open WebUI.
+                yield {
+                    "id": response_id,
+                    "created": created,
+                    "model": model,
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "logprobs": None,
+                            "finish_reason": None,
+                            "delta": {"role": "assistant", "content": content},
+                        }
+                    ],
+                }
+                if usage:
+                    yield self._usage_chunk(usage)
+
+            return single_chunk_stream()
+
+        result: Dict[str, Any] = {
+            "id": response_id,
+            "created": created,
+            "model": model,
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": content},
+                }
+            ],
+        }
+        if usage:
+            result["usage"] = usage
+        return result
 
     @staticmethod
     def _build_usage_dict(usage_metadata: Any) -> Optional[Dict[str, int]]:
@@ -3102,16 +3708,33 @@ class Pipe:
 
         return None
 
+    def _allows_thought_image_fallback(self, finish_reason: Any) -> bool:
+        """
+        Whether the last thought image may stand in for a missing final image.
+
+        Only for a normal finish: any other reason (IMAGE_SAFETY,
+        IMAGE_PROHIBITED_CONTENT, NO_IMAGE, ...) means Gemini withheld the final
+        image, so no interim image is shown in its place.
+        """
+        if finish_reason is None:
+            return True
+        name = getattr(finish_reason, "name", None) or str(finish_reason)
+        return name in ("STOP", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED")
+
     async def _generate_video(
         self,
         body: Dict[str, Any],
         model_id: str,
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
         __metadata__: Optional[Dict[str, Any]] = None,
-    ) -> Union[str, Dict[str, Any]]:
-        """Generate video using Google Veo models (long-running operation with polling)."""
+        user: Optional[UserModel] = None,
+    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
+        """Generate video using Google Veo models (long-running operation with polling).
+
+        `user` is the requesting user for the forwarded user info headers.
+        """
 
         async def emit_status(description: str, done: bool) -> None:
             if not __event_emitter__:
@@ -3161,16 +3784,50 @@ class Pipe:
 
         await emit_status(f"Starting video generation with {model_id}...", False)
 
-        client = self._get_client()
+        client = self._get_client(user)
         try:
-            generate_kwargs: Dict[str, Any] = {
-                "model": model_id,
-                "prompt": prompt,
-                "config": config,
-            }
-            if reference_image:
-                generate_kwargs["image"] = reference_image
-            operation = await client.aio.models.generate_videos(**generate_kwargs)
+            return await self._run_video_generation(
+                client=client,
+                model_id=model_id,
+                prompt=prompt,
+                reference_image=reference_image,
+                config=config,
+                emit_status=emit_status,
+                body=body,
+                __event_emitter__=__event_emitter__,
+                __request__=__request__,
+                __user__=__user__,
+                __metadata__=__metadata__,
+            )
+        finally:
+            # The client is per request: close it after polling and the
+            # downloads (which use its sync transport), also on error or stop.
+            await self._close_client(client)
+
+    async def _run_video_generation(
+        self,
+        client: genai.Client,
+        model_id: str,
+        prompt: str,
+        reference_image: Optional[types.Image],
+        config: types.GenerateVideosConfig,
+        emit_status: Callable[[str, bool], Awaitable[None]],
+        body: Dict[str, Any],
+        __event_emitter__: Optional[Callable],
+        __request__: Optional[Request],
+        __user__: Optional[dict],
+        __metadata__: Optional[Dict[str, Any]],
+    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
+        """Start a Veo operation, poll it, then upload and attach the videos."""
+        try:
+            # The prompt/image arguments are deprecated in google-genai; the
+            # inputs go into a GenerateVideosSource instead.
+            source = types.GenerateVideosSource(prompt=prompt, image=reference_image)
+            operation = await client.aio.models.generate_videos(
+                model=model_id,
+                source=source,
+                config=config,
+            )
         except Exception as e:
             self.log.exception(f"Video generation request failed: {e}")
             await emit_status(f"Video generation failed: {e}", True)
@@ -3313,9 +3970,13 @@ class Pipe:
 
         await emit_status(f"Video generation complete ({elapsed}s)", True)
 
-        files_emitted = await self._emit_generated_video_files(
-            generated_video_files, __event_emitter__
-        )
+        # Without a chat message (API clients) a "files" event reaches nobody,
+        # so the answer links the uploaded videos instead.
+        files_emitted = False
+        if self._is_chat_message(__metadata__):
+            files_emitted = await self._emit_generated_video_files(
+                generated_video_files, __event_emitter__
+            )
 
         content_parts: List[str] = []
         if generated_video_files and files_emitted:
@@ -3326,9 +3987,6 @@ class Pipe:
                 else f"Generated {video_count} videos attached."
             )
         else:
-            content_parts.extend(generated_video_links)
-
-        if generated_video_files and not files_emitted:
             content_parts.extend(generated_video_links)
 
         if upload_failure_count:
@@ -3345,9 +4003,11 @@ class Pipe:
             else "[No video content generated]"
         )
 
-        return {
-            "choices": [{"message": {"role": "assistant", "content": content}}],
-        }
+        # A bare {"choices": [{"message": ...}]} dict loses the text when Open WebUI
+        # requested a stream (the browser default), so match the request shape.
+        return self._build_non_stream_result(
+            content, None, body.get("model", model_id), bool(body.get("stream", False))
+        )
 
     async def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
         """
@@ -3396,7 +4056,7 @@ class Pipe:
         self,
         body: Dict[str, Any],
         __metadata__: dict[str, Any],
-        __event_emitter__: Callable,
+        __event_emitter__: Optional[Callable],
         __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
@@ -3419,10 +4079,17 @@ class Pipe:
         request_id = id(body)
         self.log.debug(f"Processing request {request_id}")
         self.log.debug(f"User request body: {__user__}")
-        if __user__:
-            self.user = await Users.get_user_by_id(__user__["id"])
-        else:
-            self.user = None
+        # The requesting user for the forwarded user info headers. A local, not
+        # an attribute: the Pipe instance is shared by concurrent requests.
+        user: Optional[UserModel] = None
+        if __user__ and self.valves.ENABLE_FORWARD_USER_INFO_HEADERS:
+            user = await Users.get_user_by_id(__user__["id"])
+
+        # Remember statuses that are still running, to close them if the request
+        # is stopped or fails (see finally).
+        running_statuses: Dict[str, Dict[str, Any]] = {}
+        __event_emitter__ = self._track_statuses(__event_emitter__, running_statuses)
+        cancelled = False
 
         try:
             # Parse and validate model ID
@@ -3443,13 +4110,16 @@ class Pipe:
                     __request__,
                     __user__,
                     __metadata__,
+                    user=user,
                 )
 
             # Check if this model supports image generation
             supports_image_generation = self._check_image_generation_support(model_id)
 
-            # Get stream flag
+            # Get stream flag. stream_requested is what Open WebUI asked for and
+            # decides the return shape; stream is whether we stream from Gemini.
             stream = body.get("stream", False)
+            stream_requested = bool(stream)
             if not self.valves.STREAMING_ENABLED:
                 if stream:
                     self.log.debug("Streaming disabled via GOOGLE_STREAMING_ENABLED")
@@ -3495,7 +4165,7 @@ class Pipe:
             )
 
             # Make the API call
-            client = self._get_client()
+            client = self._get_client(user)
             if stream:
                 # For image generation models, disable streaming to avoid chunk size issues
                 if supports_image_generation:
@@ -3504,28 +4174,27 @@ class Pipe:
                     )
                     stream = False
                 else:
-                    try:
 
-                        async def get_streaming_response():
-                            return await client.aio.models.generate_content_stream(
-                                model=model_id,
-                                contents=contents,
-                                config=generation_config,
-                            )
-
-                        response_iterator = await self._retry_with_backoff(
-                            get_streaming_response
-                        )
-                        self.log.debug(f"Request {request_id}: Got streaming response")
-                        return self._handle_streaming_response(
-                            response_iterator, __event_emitter__, __request__, __user__
+                    async def get_streaming_response():
+                        return await client.aio.models.generate_content_stream(
+                            model=model_id,
+                            contents=contents,
+                            config=generation_config,
                         )
 
-                    except Exception as e:
-                        self.log.exception(
-                            f"Error in streaming request {request_id}: {e}"
-                        )
-                        return f"Error during streaming: {e}"
+                    self.log.debug(f"Request {request_id}: Streaming response")
+                    # The request (with its retries) only starts when Open WebUI
+                    # reads the stream. Hand the client over so it lives (and is
+                    # closed) with the stream.
+                    return self._handle_streaming_response(
+                        get_streaming_response,
+                        __event_emitter__,
+                        __request__,
+                        __user__,
+                        client=client,
+                        model=body.get("model", model_id),
+                        __metadata__=__metadata__,
+                    )
 
             # Non-streaming path (now also used for image generation)
             if not stream or supports_image_generation:
@@ -3543,7 +4212,8 @@ class Pipe:
 
                     # Send processing status for image generation
                     if supports_image_generation:
-                        await __event_emitter__(
+                        await self._safe_emit(
+                            __event_emitter__,
                             {
                                 "type": "status",
                                 "data": {
@@ -3551,7 +4221,7 @@ class Pipe:
                                     "description": "Processing image request...",
                                     "done": False,
                                 },
-                            }
+                            },
                         )
 
                     response = await self._retry_with_backoff(get_response)
@@ -3559,7 +4229,8 @@ class Pipe:
 
                     # Clear processing status for image generation
                     if supports_image_generation:
-                        await __event_emitter__(
+                        await self._safe_emit(
+                            __event_emitter__,
                             {
                                 "type": "status",
                                 "data": {
@@ -3567,7 +4238,7 @@ class Pipe:
                                     "description": "Processing complete",
                                     "done": True,
                                 },
-                            }
+                            },
                         )
 
                     # Handle "Thinking" and produce final formatted content
@@ -3589,76 +4260,56 @@ class Pipe:
                     generated_images: list[str] = []
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
+                    last_thought_image: Any = None
 
                     for part in parts:
-                        if getattr(part, "thought", False) and getattr(
-                            part, "text", None
-                        ):
+                        is_thought = bool(getattr(part, "thought", False))
+                        if is_thought and getattr(part, "text", None):
                             thought_segments.append(part.text)
+                        elif is_thought and getattr(part, "inline_data", None):
+                            # Gemini 3 image models return up to two interim images
+                            # from their thinking process as thought parts when
+                            # thoughts are included. The final image follows as a
+                            # regular part, so interim images are not uploaded
+                            # (only kept as fallback if no final image arrives).
+                            self.log.debug("Skipping interim thought image")
+                            last_thought_image = part.inline_data
                         elif getattr(part, "text", None):
                             answer_segments.append(part.text)
-                        elif (
-                            getattr(part, "inline_data", None)
-                            and __request__
-                            and __user__
-                        ):
-                            # Handle generated images with unified upload method
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
-
-                            self.log.debug(
-                                f"Processing generated image: mime_type={mime_type}, data_type={type(image_data)}, data_length={len(image_data)}"
-                            )
-
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
-                                self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
-                                )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
-
-                            image_url = await self._upload_image_with_status(
-                                image_data,
-                                mime_type,
+                        elif getattr(part, "inline_data", None):
+                            await self._collect_generated_image(
+                                part.inline_data,
+                                seen_generated_image_hashes,
+                                generated_images,
+                                generated_image_files,
                                 __request__,
                                 __user__,
                                 __event_emitter__,
                             )
-                            if image_url.startswith("data:"):
-                                generated_images.append(
-                                    f"![Generated Image]({image_url})"
-                                )
-                            else:
-                                generated_image_files.append(
-                                    self._build_generated_image_file(
-                                        content_url=image_url,
-                                        mime_type=mime_type,
-                                    )
-                                )
 
-                        elif getattr(part, "inline_data", None):
-                            # Fallback: return as base64 data URL if no request/user context
-                            mime_type = part.inline_data.mime_type
-                            image_data = part.inline_data.data
-
-                            image_hash = self._image_data_hash(image_data)
-                            if image_hash in seen_generated_image_hashes:
-                                self.log.debug(
-                                    "Skipping duplicate generated image part from Gemini response"
-                                )
-                                continue
-                            seen_generated_image_hashes.add(image_hash)
-
-                            if isinstance(image_data, bytes):
-                                image_data_b64 = base64.b64encode(image_data).decode(
-                                    "utf-8"
-                                )
-                            else:
-                                image_data_b64 = str(image_data)
-
-                            data_url = f"data:{mime_type};base64,{image_data_b64}"
-                            generated_images.append(f"![Generated Image]({data_url})")
+                    # seen_generated_image_hashes records every final (non-thought)
+                    # image part. If the response had thought images only, attach
+                    # the last one.
+                    if (
+                        last_thought_image is not None
+                        and not seen_generated_image_hashes
+                        and self._allows_thought_image_fallback(
+                            getattr(candidate, "finish_reason", None)
+                        )
+                    ):
+                        self.log.warning(
+                            "Gemini returned thought images but no final image; "
+                            "attaching the last thought image instead"
+                        )
+                        await self._collect_generated_image(
+                            last_thought_image,
+                            seen_generated_image_hashes,
+                            generated_images,
+                            generated_image_files,
+                            __request__,
+                            __user__,
+                            __event_emitter__,
+                        )
 
                     final_answer = "".join(answer_segments)
 
@@ -3666,7 +4317,9 @@ class Pipe:
                     grounding_metadata_list = []
                     if getattr(candidate, "grounding_metadata", None):
                         grounding_metadata_list.append(candidate.grounding_metadata)
-                    if grounding_metadata_list:
+                    # Like the streaming path: without an emitter (background tasks)
+                    # sources cannot be shown, so do not add citation markers either.
+                    if grounding_metadata_list and __event_emitter__:
                         cited = await self._process_grounding_metadata(
                             grounding_metadata_list,
                             final_answer,
@@ -3677,8 +4330,11 @@ class Pipe:
                     # Combine all content
                     full_response = ""
 
-                    # If we have thoughts, wrap them using <details>
-                    if thought_segments:
+                    # If we have thoughts, wrap them using <details>. Background tasks
+                    # (title, tags, follow-ups, ...) parse JSON out of the answer, so
+                    # they get the answer only.
+                    is_task = bool((__metadata__ or {}).get("task"))
+                    if thought_segments and not is_task:
                         duration_s = int(max(0, time.time() - start_ts))
                         # Format each line with > for blockquote while preserving formatting
                         thought_content = "".join(thought_segments).strip()
@@ -3698,30 +4354,14 @@ class Pipe:
                     # Add the main answer
                     full_response += final_answer
 
-                    files_emitted = await self._emit_generated_image_files(
-                        generated_image_files, __event_emitter__
+                    full_response = await self._append_generated_images(
+                        full_response,
+                        final_answer,
+                        generated_images,
+                        generated_image_files,
+                        __event_emitter__,
+                        __metadata__,
                     )
-
-                    if generated_image_files and not files_emitted:
-                        generated_images.extend(
-                            f"![Generated Image]({image_file['url']})"
-                            for image_file in generated_image_files
-                        )
-
-                    if (
-                        generated_image_files
-                        and files_emitted
-                        and not final_answer.strip()
-                    ):
-                        if full_response:
-                            full_response += "\n\n"
-                        full_response += "Generated image."
-
-                    # Add generated images
-                    if generated_images:
-                        if full_response:
-                            full_response += "\n\n"
-                        full_response += "\n\n".join(generated_images)
 
                     # Build response with usage for middleware to extract and save to DB
                     usage = self._build_usage_dict(
@@ -3732,20 +4372,38 @@ class Pipe:
                         full_response if full_response else "[No content generated]"
                     )
 
-                    # Emit usage data so Open WebUI can capture it before we return the string
-                    if usage:
-                        await __event_emitter__({"type": "usage", "data": usage})
-
-                    # Return the content as a string for non-streaming calls.
-                    # This ensures Open WebUI captures the final content correctly
-                    # and propagates it to subsequent events (like outlet filters).
-                    return content
+                    # Return content and usage in the shape that matches the request
+                    # (dict for stream=false, content + usage chunks for stream=true)
+                    # so Open WebUI saves both and passes the content to outlet filters.
+                    return self._build_non_stream_result(
+                        content, usage, body.get("model", model_id), stream_requested
+                    )
 
                 except Exception as e:
                     self.log.exception(
                         f"Error in non-streaming request {request_id}: {e}"
                     )
+                    if supports_image_generation:
+                        await self._safe_emit(
+                            __event_emitter__,
+                            {
+                                "type": "status",
+                                "data": {
+                                    "action": "image_processing",
+                                    "description": "Image request failed",
+                                    "done": True,
+                                },
+                            },
+                        )
                     return f"Error generating content: {e}"
+                finally:
+                    # The client is per request; nothing uses it after this point.
+                    await self._close_client(client)
+
+        except asyncio.CancelledError:
+            # Stopped by the user
+            cancelled = True
+            raise
 
         except (ClientError, ServerError, APIError) as api_error:
             error_type = type(api_error).__name__
@@ -3767,3 +4425,11 @@ class Pipe:
 
             # Return a user-friendly error message
             return f"An error occurred while processing your request: {e}"
+
+        finally:
+            # A started action (image_processing, video_generation, ...) gets a
+            # final status even if the request was stopped or failed. A returned
+            # stream closes its own statuses.
+            await self._finish_running_statuses(
+                __event_emitter__, running_statuses, cancelled
+            )

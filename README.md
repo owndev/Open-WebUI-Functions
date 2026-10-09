@@ -158,17 +158,18 @@ The functions include a built-in encryption mechanism for sensitive information:
 > This pipeline provides seamless integration with Azure OpenAI and other Azure AI models, with advanced features such as Azure Search integration and multiple model support.
 
 - Enables interaction with **Azure OpenAI** and other **Azure AI** models.
-- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only).
-- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion (Azure OpenAI only).
+- Supports Azure Search / RAG integration for enhanced document retrieval (Azure OpenAI only). It uses Azure OpenAI On Your Data, which Microsoft retires on October 14, 2026; see [Connect a Foundry IQ knowledge base](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/foundry-iq-connect) for the recommended migration.
+- **Native OpenWebUI citations support** 🎯: Rich citation cards, source previews, relevance scores, and automatic `[docX]` → clickable markdown link conversion, also for streamed answers (Azure OpenAI only). Answers with `[docX]` references show only the referenced documents; answers without any show all retrieved documents (default) or none with `AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES=false`.
+- **Search only where it helps**: Background tasks (titles, tags, follow-ups) skip Azure AI Search and add no sources; `tools`/`tool_choice` (including Open WebUI's built-in tools) and `stream_options` are not sent together with `data_sources`, which Azure would otherwise ignore or reject, so function calling is not available in chats that use Azure AI Search.
 - **Relevance scores**: BM25 keyword and semantic rerank scores from Azure AI Search are displayed as a relevance percentage on citation cards, with independently configurable normalization via `BM25_SCORE_MAX` and `RERANK_SCORE_MAX`.
 - Supports multiple models via `AZURE_AI_MODEL` (semicolon- or comma-separated, for example `gpt-4o;gpt-4o-mini`) or automatic model extraction from the Azure OpenAI URL.
 - **Large predefined model catalogue** (GPT-4o, GPT-5, o3, o4-mini, Phi-4, DeepSeek-R1/V3, Mistral, Llama 3.x, Cohere, Grok, and more) via `USE_PREDEFINED_AZURE_AI_MODELS`.
 - Customizable pipeline display prefix via `AZURE_AI_PIPELINE_PREFIX`.
 - **Flexible authentication**: `api-key` header (default) or `Authorization: Bearer` token via `AZURE_AI_USE_AUTHORIZATION_HEADER`.
-- **Token usage tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database.
+- **Token usage tracking**: Requests `stream_options.include_usage` in streaming mode so token counts are saved to the Open WebUI database (not available for streaming with Azure AI Search, which does not support it).
 - Filters valid parameters to ensure clean requests.
 - Handles both streaming and non-streaming responses.
-- Provides configurable error handling and timeouts.
+- Provides configurable error handling and timeouts; a stream that fails ends with an `Error: …` message instead of an empty or cut-off answer, and streamed events of up to 4 MiB (large Azure AI Search contexts) are read.
 - Supports encryption of sensitive information such as API keys.
 
 🔗 [Azure AI Pipeline in Open WebUI](https://openwebui.com/f/owndev/azure_ai)
@@ -223,20 +224,22 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Supports integration with the Google Generative AI API or Vertex AI API for content generation.
 - Sends messages from Open WebUI to **Google Gemini**.
 - Supports encryption of sensitive information such as API keys.
-- Supports both streaming and non-streaming responses (streaming is automatically disabled for image generation models).
-- **Thinking & reasoning**: Configurable thinking levels (`low` / `high`) for Gemini 3 models and thinking budgets (0–32 768 tokens) for Gemini 2.5 models, with per-chat override support.
+- Supports both streaming and non-streaming responses (streaming is automatically disabled for image generation models, including released IDs such as `gemini-3.1-flash-image`).
+- **Thinking & reasoning**: Configurable thinking levels (`low` / `high`; `minimal` / `high` for `gemini-3.1-flash-image` and `gemini-3.1-flash-lite-image`, `minimal` / `medium` / `high` for `gemini-nano-banana-2.1`) for Gemini 3 models and thinking budgets (0–32 768 tokens) for Gemini 2.5 models, with per-chat override support.
 - **Lean history**: Previously rendered thinking summaries are stripped from assistant messages before the conversation is replayed to the API (configurable).
-- Provides configurable error handling and timeouts.
+- Provides configurable error handling and timeouts: temporary API errors are retried (`GOOGLE_RETRY_COUNT`) for streaming and non-streaming requests, and every started status (thinking, image, video) is closed when a request fails or is stopped.
 - **Advanced image processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
 - **Multi-image history**: Configurable history image limit, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
 - **Image generation (Gemini 3)**: Configurable aspect ratio (for example `16:9` or `1:1`) and resolution (`1K`, `2K`, or `4K`) for Gemini 3 image models, with per-user valve overrides.
+- **Nano Banana image models**: `gemini-nano-banana-2.1`, `gemini-3.1-flash-image` and `gemini-3.1-flash-lite-image` are detected as image models; each generated image is uploaded once (interim thought images are skipped unless no final image arrives). API clients get generated images and videos as links in the answer. Google Search grounding is left out for the image models without Search support (`gemini-2.5-flash-image`, `gemini-3.1-flash-lite-image`). Newer image models outside Gemini 3 / Nano Banana naming can be added via `GOOGLE_IMAGE_GENERATION_MODELS` without a code change.
 - **Video generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video for all supported Veo models. Videos are automatically uploaded and embedded with playback controls.
-- **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database.
-- **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`.
+- **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database, for streaming and non-streaming responses.
+- **Background tasks**: Works as the Open WebUI task model for title, tag and follow-up generation (without Google Search grounding, even when the chat uses it).
+- **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`; changes show on the next model list refresh, without waiting for the model cache TTL.
 - Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
-- Native tool calling support
+- Native tool calling support (on Open WebUI 0.10+ set Function Calling to **Legacy** for now, see [known limitations](./docs/google-gemini-integration.md#known-limitations-on-open-webui--010))
 - Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)
