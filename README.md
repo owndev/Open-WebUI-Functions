@@ -239,7 +239,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`; changes show on the next model list refresh, without waiting for the model cache TTL.
 - Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
-- Native tool calling support (on Open WebUI 0.10+ set Function Calling to **Legacy** for now, see [known limitations](./docs/google-gemini-integration.md#known-limitations-on-open-webui--010))
+- [Native tool calling through Open WebUI's tool loop](./docs/google-gemini-integration.md#native-tool-calling) (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval); tool calls are returned to API clients
 - Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)

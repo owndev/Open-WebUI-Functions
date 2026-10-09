@@ -4,9 +4,9 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.17.0
+version: 1.18.0
 required_open_webui_version: 0.9.0
-requirements: google-genai>=1.66.0, google-genai<3
+requirements: google-genai>=1.68.0, google-genai<3
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -35,7 +35,10 @@ features:
   - Military-grade encrypted storage of sensitive API keys
   - Intelligent grounding with Google search integration
   - Vertex AI Search grounding for RAG
-  - Native tool calling support with automatic signature management
+  - Native tool calling through Open WebUI's tool loop (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval)
+  - Thought signatures carried across tool rounds and turns
+  - Tool calls returned to API clients as OpenAI tool_calls (streaming and non-streaming)
+  - Google Search grounding together with function calling on Gemini 3
   - URL context grounding for specified web pages
   - Unified image processing with consolidated helper methods
   - Optimized payload creation for image generation models
@@ -63,9 +66,11 @@ import sys
 import time
 import asyncio
 import base64
+import copy
 import hashlib
 import importlib
 import importlib.metadata
+import json
 import logging
 import io
 import uuid
@@ -88,6 +93,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.internal.db import get_async_db_context
 from fastapi import Request, UploadFile, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from open_webui.routers.files import upload_file
 from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel, Users
@@ -145,12 +151,52 @@ except importlib.metadata.PackageNotFoundError:
     raise ImportError(
         "google-genai is not installed. Open WebUI 0.11.4+ no longer bundles it: "
         "keep ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS enabled or install "
-        "'google-genai>=1.66.0,<3' into the Open WebUI environment."
+        "'google-genai>=1.68.0,<3' into the Open WebUI environment."
     ) from None
 
 from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 from google.genai.errors import ClientError, ServerError, APIError  # noqa: E402
+
+# Function names Gemini accepts: the intersection of the Gemini API rules
+# (FunctionCall.name: letters, digits, "_", "-") and the Vertex AI rules (start
+# with a letter or "_", at most 64 characters).
+_GEMINI_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+
+# Thought signature Gemini accepts in place of a missing one (e.g. for a tool
+# call an API client sent back without its reasoning_details).
+SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+
+# Prefix of tool call ids the pipeline makes up when Gemini sends none. They are
+# never sent back to Gemini.
+SYNTHETIC_TOOL_CALL_ID_PREFIX = "owui_"
+
+# reasoning_details formats: the thought signature of one function call, and the
+# complete model content of a round with server-side tool parts.
+REASONING_FORMAT_SIGNATURE = "google-gemini-v1"
+REASONING_FORMAT_CONTENT = "google-gemini-v1-content"
+
+# Text of the user message Open WebUI adds after tool results that held images.
+TOOL_IMAGES_TEXT = (
+    "Here are the images from the tool results above. Please analyze them."
+)
+
+
+def _gemini_function_name(name: str) -> str:
+    """Map an Open WebUI tool name to a function name Gemini accepts.
+
+    Valid names stay as they are; any other name gets its invalid characters
+    replaced and a hash suffix, so the mapping is deterministic (no state is
+    needed across rounds and turns) and distinct names stay distinct.
+    """
+    if _GEMINI_FUNCTION_NAME_RE.match(name):
+        return name
+    base = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    if not re.match(r"[A-Za-z_]", base[:1] or "0"):
+        base = "_" + base
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{base[:55]}_{digest}"  # <= 64 chars
+
 
 ASPECT_RATIO_OPTIONS: List[str] = [
     "default",
@@ -1512,26 +1558,64 @@ class Pipe:
         return bool(metadata.get("chat_id")) and bool(metadata.get("message_id"))
 
     @staticmethod
-    def _content_chunk(content: str, model: str) -> Dict[str, Any]:
-        """An OpenAI chat.completion.chunk carrying `content` as delta.
+    def _chunk(
+        delta: Dict[str, Any],
+        model: str,
+        finish_reason: Optional[str] = None,
+        response_id: Optional[str] = None,
+        created: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """An OpenAI chat.completion.chunk carrying `delta`.
 
         Yielded instead of a plain str: Open WebUI forwards a str chunk that
-        starts with "data:" as a raw SSE line, which loses such an answer.
+        starts with "data:" as a raw SSE line, which loses such an answer. The
+        chunks of one pipe call share `response_id` and `created`.
         """
         return {
-            "id": f"{model}-{uuid.uuid4()}",
-            "created": int(time.time()),
+            "id": response_id or f"{model}-{uuid.uuid4()}",
+            "created": int(time.time()) if created is None else created,
             "model": model,
             "object": "chat.completion.chunk",
             "choices": [
                 {
                     "index": 0,
                     "logprobs": None,
-                    "finish_reason": None,
-                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": finish_reason,
+                    "delta": delta,
                 }
             ],
         }
+
+    @staticmethod
+    def _sse(
+        chunks: Union[List[Dict[str, Any]], AsyncIterator[Dict[str, Any]]],
+    ) -> StreamingResponse:
+        """Return chunk dicts as an SSE StreamingResponse that ends with [DONE].
+
+        Open WebUI passes a StreamingResponse on unchanged. For a generator it
+        appends a finish_reason "stop" chunk of its own, which would make API
+        clients report "stop" for a round that ended with tool calls; and on
+        the browser path with stream=false only a StreamingResponse starts
+        Open WebUI's tool loop.
+        """
+
+        async def body() -> AsyncIterator[str]:
+            try:
+                if isinstance(chunks, list):
+                    for chunk in chunks:
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                else:
+                    async for chunk in chunks:
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                # Stops the inner generator (and closes its client) also when
+                # the client goes away in the middle of the stream.
+                aclose = getattr(chunks, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+        return StreamingResponse(body(), media_type="text/event-stream")
 
     async def _emit_generated_image_files(
         self,
@@ -2016,13 +2100,18 @@ class Pipe:
         return content
 
     def _prepare_content(
-        self, messages: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        self, messages: List[Dict[str, Any]], model_id: str = ""
+    ) -> Tuple[List[Union[Dict[str, Any], types.Content]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
 
+        An assistant message with tool_calls and the tool messages after it
+        become a model content with function_call parts followed by one user
+        content with function_response parts (see _convert_tool_round).
+
         Args:
             messages: List of message objects from the request
+            model_id: The model ID (decides whether thought signatures are required)
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -2036,10 +2125,46 @@ class Pipe:
         # Combine with default system prompt if configured
         system_message = self._combine_system_prompts(user_system_message)
 
+        # Gemini checks the thought signatures of the function calls in the
+        # current turn, which starts at the most recent user message (Open
+        # WebUI's message with the images of tool results counts as one).
+        turn_start = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+            default=-1,
+        )
+        strict = self._requires_thought_signatures(model_id)
+
         # Prepare contents for the API
-        contents = []
-        for message in messages:
+        contents: List[Union[Dict[str, Any], types.Content]] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
             role = message.get("role")
+
+            tool_calls = message.get("tool_calls") if role == "assistant" else None
+            tool_calls = [
+                tool_call
+                for tool_call in (tool_calls if isinstance(tool_calls, list) else [])
+                if isinstance(tool_call, dict)
+            ]
+            if tool_calls or role == "tool":
+                # The run of tool messages that answers this message
+                start = index + 1 if tool_calls else index
+                end = start
+                while end < len(messages) and messages[end].get("role") == "tool":
+                    end += 1
+                contents.extend(
+                    self._convert_tool_round(
+                        message if tool_calls else None,
+                        tool_calls,
+                        messages[start:end],
+                        placeholder=strict and index > turn_start,
+                    )
+                )
+                index = end
+                continue
+
+            index += 1
             if role == "system":
                 continue  # Skip system messages, handled separately
 
@@ -2077,6 +2202,336 @@ class Pipe:
                 contents.append({"role": api_role, "parts": parts})
 
         return contents, system_message
+
+    @staticmethod
+    def _requires_thought_signatures(model_id: str) -> bool:
+        """Whether Gemini checks the thought signatures of the model's function
+        calls (Gemini 3 and later; not Gemini 1.x and 2.x)."""
+        return not re.match(r"^gemini-(1|2)[.-]", model_id.lower())
+
+    @staticmethod
+    def _is_synthetic_tool_call_id(call_id: Any) -> bool:
+        """Whether a tool call id is missing or was made up by the pipeline."""
+        return not call_id or str(call_id).startswith(SYNTHETIC_TOOL_CALL_ID_PREFIX)
+
+    @staticmethod
+    def _is_tool_images_message(message: Dict[str, Any]) -> bool:
+        """Whether a message is the user message in which Open WebUI passes on
+        the images of tool results."""
+        content = message.get("content")
+        return (
+            message.get("role") == "user"
+            and isinstance(content, list)
+            and bool(content)
+            and isinstance(content[0], dict)
+            and content[0].get("type") == "text"
+            and content[0].get("text") == TOOL_IMAGES_TEXT
+        )
+
+    @classmethod
+    def _is_tool_continuation(cls, messages: List[Dict[str, Any]]) -> bool:
+        """Whether the request continues a turn after tool results, i.e. it is a
+        later round of Open WebUI's tool loop (or an API client's)."""
+        if not messages:
+            return False
+        if messages[-1].get("role") == "tool":
+            return True
+        return (
+            len(messages) > 1
+            and cls._is_tool_images_message(messages[-1])
+            and messages[-2].get("role") == "tool"
+        )
+
+    @staticmethod
+    def _message_reasoning_details(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The pipeline's reasoning_details items of an assistant message."""
+        details = message.get("reasoning_details")
+        if not details:
+            fields = message.get("provider_specific_fields")
+            details = (
+                fields.get("reasoning_details") if isinstance(fields, dict) else None
+            )
+        if not isinstance(details, list):
+            return []
+        return [
+            item
+            for item in details
+            if isinstance(item, dict)
+            and item.get("format")
+            in (REASONING_FORMAT_SIGNATURE, REASONING_FORMAT_CONTENT)
+        ]
+
+    def _convert_tool_round(
+        self,
+        message: Optional[Dict[str, Any]],
+        tool_calls: List[Dict[str, Any]],
+        tool_messages: List[Dict[str, Any]],
+        placeholder: bool,
+    ) -> List[Union[Dict[str, Any], types.Content]]:
+        """Convert an assistant message with tool_calls and its tool messages.
+
+        Gemini expects all function calls of a step in one model content and
+        all their results in the user content directly after it (FC1, FC2,
+        FR1, FR2); interleaving them is rejected.
+
+        Args:
+            message: The assistant message, or None for tool messages that do
+                not follow one
+            tool_calls: The message's tool calls
+            tool_messages: The tool messages directly after the message
+            placeholder: Put SKIP_THOUGHT_SIGNATURE on the first function call
+                if it has no signature (current turn of a model that checks them)
+        """
+        contents: List[Union[Dict[str, Any], types.Content]] = []
+        call_names: Dict[str, str] = {}
+        if message is not None:
+            answered = {
+                tool_message.get("tool_call_id")
+                for tool_message in tool_messages
+                if tool_message.get("tool_call_id")
+            }
+            model_content, call_names = self._build_tool_call_content(
+                message, tool_calls, answered, placeholder
+            )
+            if model_content is not None:
+                contents.append(model_content)
+
+        responses = [
+            part
+            for part in (
+                self._build_function_response_part(tool_message, call_names)
+                for tool_message in tool_messages
+            )
+            if part is not None
+        ]
+        if responses:
+            contents.append(types.Content(role="user", parts=responses))
+        return contents
+
+    def _build_tool_call_content(
+        self,
+        message: Dict[str, Any],
+        tool_calls: List[Dict[str, Any]],
+        answered: set,
+        placeholder: bool,
+    ) -> Tuple[Optional[types.Content], Dict[str, str]]:
+        """Build the model content of an assistant message with tool_calls.
+
+        Returns the content (None if nothing is left) and a map of the tool call
+        ids that have a result to their Gemini function names.
+        """
+        details = self._message_reasoning_details(message)
+        parts: Optional[List[types.Part]] = None
+
+        # A round with server-side tool parts (Search grounding together with
+        # functions on Gemini 3) is replayed exactly as Gemini sent it.
+        stored = self._restore_stored_content(details, tool_calls)
+        if stored is not None:
+            parts = list(stored.parts or [])
+        else:
+            parts = []
+            text = self._tool_call_message_text(message.get("content"))
+            if text:
+                parts.append(types.Part(text=text))
+            signatures = {
+                item.get("id"): item.get("data")
+                for item in details
+                if item.get("type") == "reasoning.encrypted"
+                and item.get("format") == REASONING_FORMAT_SIGNATURE
+                and item.get("id")
+            }
+            for tool_call in tool_calls:
+                parts.append(
+                    self._build_function_call_part(
+                        tool_call, signatures.get(tool_call.get("id"))
+                    )
+                )
+
+        # The function_call parts correspond 1:1 (in order) to the tool calls.
+        # Only calls with a result are kept: Gemini rejects a function call
+        # without a function response (e.g. a call Open WebUI did not run).
+        call_names: Dict[str, str] = {}
+        kept: List[types.Part] = []
+        position = 0
+        for part in parts:
+            if not part.function_call:
+                kept.append(part)
+                continue
+            tool_call = tool_calls[position] if position < len(tool_calls) else {}
+            position += 1
+            call_id = tool_call.get("id")
+            if call_id and call_id in answered:
+                call_names[call_id] = part.function_call.name or ""
+                kept.append(part)
+            else:
+                self.log.warning(
+                    f"Dropping unmatched function call '{part.function_call.name}'"
+                )
+
+        calls = [part for part in kept if part.function_call]
+        if not calls:
+            text = "".join(part.text for part in kept if part.text and not part.thought)
+            if not text:
+                return None, call_names
+            return types.Content(role="model", parts=[types.Part(text=text)]), {}
+
+        if placeholder and not calls[0].thought_signature:
+            # Applied after the pairing, so a dropped first call cannot leave the
+            # step without a signature. As str: google-genai decodes it like a
+            # real (base64) signature and sends the literal value.
+            index = next(i for i, part in enumerate(kept) if part is calls[0])
+            kept[index] = types.Part.model_validate(
+                {
+                    **calls[0].model_dump(exclude_none=True),
+                    "thought_signature": SKIP_THOUGHT_SIGNATURE,
+                }
+            )
+        return types.Content(role="model", parts=kept), call_names
+
+    def _restore_stored_content(
+        self, details: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]]
+    ) -> Optional[types.Content]:
+        """Restore the model content stored for a round with server-side parts."""
+        first_id = tool_calls[0].get("id") if tool_calls else None
+        if not first_id:
+            return None
+        item = next(
+            (
+                item
+                for item in details
+                if item.get("format") == REASONING_FORMAT_CONTENT
+                and item.get("id") == first_id
+            ),
+            None,
+        )
+        if item is None:
+            return None
+        try:
+            content = types.Content.model_validate_json(
+                base64.b64decode(item.get("data") or "")
+            )
+            calls = [
+                part.function_call for part in content.parts or [] if part.function_call
+            ]
+            matches = len(calls) == len(tool_calls) and all(
+                call.id == tool_call.get("id")
+                if call.id
+                else call.name
+                == _gemini_function_name(
+                    str((tool_call.get("function") or {}).get("name") or "")
+                )
+                for call, tool_call in zip(calls, tool_calls)
+            )
+        except Exception as restore_error:
+            self.log.debug(f"Stored model content not readable: {restore_error}")
+            matches = False
+        if not matches:
+            self.log.warning(
+                f"Could not restore stored model content for tool call '{first_id}'"
+            )
+            return None
+        return content.model_copy(update={"role": "model"})
+
+    def _tool_call_message_text(self, content: Any) -> str:
+        """Text of an assistant message with tool_calls ("" if blank)."""
+        if isinstance(content, list):
+            content = "".join(
+                item["text"]
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            )
+        if not isinstance(content, str):
+            return ""
+        # API clients send the rendered thinking summary back as well
+        if self.valves.STRIP_THINKING_FROM_HISTORY:
+            content = self._THINKING_DETAILS_RE.sub("", content)
+        return content if content.strip() else ""
+
+    def _build_function_call_part(
+        self, tool_call: Dict[str, Any], signature: Optional[str]
+    ) -> types.Part:
+        """Build a function_call part from an OpenAI tool call."""
+        function = tool_call.get("function") or {}
+        name = _gemini_function_name(str(function.get("name") or ""))
+        arguments = function.get("arguments")
+        args: Any = arguments
+        if isinstance(arguments, str):
+            try:
+                args = json.loads(arguments)
+            except ValueError:
+                args = None
+        if not isinstance(args, dict):
+            self.log.warning(f"Invalid tool call arguments for '{name}'")
+            args = {}
+        call_id = tool_call.get("id")
+        function_call = types.FunctionCall(
+            id=None if self._is_synthetic_tool_call_id(call_id) else call_id,
+            name=name,
+            args=args,
+        )
+        if signature:
+            try:
+                # The base64 str is passed unchanged; google-genai decodes it
+                # (standard and url-safe alphabet) and re-encodes it on the wire.
+                return types.Part(
+                    function_call=function_call, thought_signature=signature
+                )
+            except Exception:
+                self.log.warning(f"Ignoring invalid thought signature of '{name}'")
+        return types.Part(function_call=function_call)
+
+    def _build_function_response_part(
+        self, tool_message: Dict[str, Any], call_names: Dict[str, str]
+    ) -> Optional[types.Part]:
+        """Build a function_response part from a tool message."""
+        call_id = tool_message.get("tool_call_id") or ""
+        name = call_names.get(call_id) if call_id else None
+        if name is None and tool_message.get("name"):
+            # API clients may send the function name with the result
+            name = _gemini_function_name(str(tool_message["name"]))
+        if name is None:
+            self.log.warning(f"Dropping unmatched tool result '{call_id}'")
+            return None
+        text = self._tool_result_text(tool_message.get("content"))
+        response = {"error": text} if text.startswith("Error:") else {"output": text}
+        return types.Part(
+            function_response=types.FunctionResponse(
+                id=None if self._is_synthetic_tool_call_id(call_id) else call_id,
+                name=name,
+                response=response,
+            )
+        )
+
+    def _tool_result_text(self, content: Any) -> str:
+        """Text of a tool message's content.
+
+        Images are not forwarded here: Open WebUI moves the images of tool
+        results into a user message after the tool messages.
+        """
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if isinstance(content, list):
+            texts: List[str] = []
+            skipped = 0
+            for item in content:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif (
+                    isinstance(item, dict)
+                    and item.get("type") in ("text", "input_text")
+                    and isinstance(item.get("text"), str)
+                ):
+                    texts.append(item["text"])
+                else:
+                    skipped += 1
+            if skipped:
+                self.log.debug(f"Not forwarding {skipped} non-text tool result part(s)")
+            return "".join(texts)
+        return json.dumps(content, ensure_ascii=False, default=str)
 
     def _process_multimodal_content(
         self, content_list: List[Dict[str, Any]]
@@ -2795,15 +3250,376 @@ class Pipe:
                 return value
         return None
 
+    # JSON Schema keys that google-genai sends verbatim (parameters_json_schema)
+    # but that Gemini does not need or may reject.
+    _SCHEMA_DROP_KEYS = frozenset(
+        {
+            "$schema",
+            "$id",
+            "$comment",
+            "examples",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+        }
+    )
+    # Keywords whose value maps names to schemas: the names are not keywords.
+    _SCHEMA_NAME_MAP_KEYS = frozenset(
+        {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    )
+
+    @classmethod
+    def _sanitize_parameters_schema(cls, schema: Any) -> Optional[Dict[str, Any]]:
+        """Clean up a tool's JSON Schema for parameters_json_schema.
+
+        parameters_json_schema accepts $ref/$defs, anyOf/oneOf/allOf, type
+        arrays with "null", enum, format and default, which FunctionDeclaration
+        .parameters (Gemini's Schema) rejects, so the schema is kept as it is
+        apart from keys that are not needed or reported to fail.
+
+        Returns None for an object schema without properties (a tool without
+        parameters), which is then declared without parameters.
+        """
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, list):
+                return [walk(item) for item in node]
+            if not isinstance(node, dict):
+                return node
+            out: Dict[str, Any] = {}
+            for key, value in node.items():
+                if key in cls._SCHEMA_DROP_KEYS or str(key).startswith("x-"):
+                    continue
+                if key in ("exclusiveMinimum", "exclusiveMaximum") and isinstance(
+                    value, bool
+                ):
+                    continue
+                if key == "items" and isinstance(value, list):
+                    out["prefixItems"] = walk(value)  # tuple form
+                elif key in cls._SCHEMA_NAME_MAP_KEYS and isinstance(value, dict):
+                    out[key] = {name: walk(sub) for name, sub in value.items()}
+                else:
+                    out[key] = walk(value)
+            required, properties = out.get("required"), out.get("properties")
+            if isinstance(required, list) and isinstance(properties, dict):
+                out["required"] = [
+                    name
+                    for name in required
+                    if isinstance(name, str) and name in properties
+                ]
+            return out
+
+        root = walk(copy.deepcopy(schema) if isinstance(schema, dict) else {})
+        root.setdefault("type", "object")
+        if (
+            root.get("type") == "object"
+            and not root.get("properties")
+            and not any(key in root for key in ("$ref", "anyOf", "oneOf", "allOf"))
+        ):
+            return None
+        return root
+
+    def _build_function_declarations(
+        self,
+        body: Dict[str, Any],
+        __metadata__: Optional[Dict[str, Any]],
+        image_model: bool,
+        model_id: str,
+    ) -> Tuple[List[types.FunctionDeclaration], Dict[str, str]]:
+        """Declare the tools of the request (body["tools"]) to Gemini.
+
+        Open WebUI puts an OpenAI tool spec into body["tools"] for every tool it
+        offers in Native mode (built-in, workspace, MCP, OpenAPI, terminal and
+        direct tools) and runs Gemini's function calls itself; API clients send
+        their own tools and run the calls themselves.
+
+        Returns:
+            (declarations, {gemini_name: open_webui_name}), rebuilt per request
+        """
+        tools = body.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return [], {}
+        metadata = __metadata__ or {}
+        if (metadata.get("params") or {}).get("function_calling") == "legacy":
+            return [], {}  # Open WebUI chooses the tools itself
+        if metadata.get("task"):
+            self.log.debug(
+                f"No function declarations for background task '{metadata.get('task')}'"
+            )
+            return [], {}
+        if image_model:
+            # Gemini image models do not support function calling. In Native
+            # mode Open WebUI 0.10+ attaches its built-in tools to every chat,
+            # so none are sent; this also keeps Open WebUI's own generate_image
+            # and edit_image tools away from native Gemini image generation.
+            self.log.debug(
+                f"Not sending {len(tools)} tool(s) to image model {model_id}"
+            )
+            return [], {}
+
+        declarations: List[types.FunctionDeclaration] = []
+        name_map: Dict[str, str] = {}
+        for entry in tools:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("type", "function") != "function"
+            ):
+                continue
+            spec = entry.get("function")
+            name = spec.get("name") if isinstance(spec, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            gemini_name = _gemini_function_name(name)
+            if gemini_name in name_map:
+                # Gemini rejects a request with duplicate declarations
+                self.log.warning(f"Skipping duplicate tool declaration '{name}'")
+                continue
+            name_map[gemini_name] = name
+            declaration: Dict[str, Any] = {"name": gemini_name}
+            description = spec.get("description")
+            if isinstance(description, str) and description.strip():
+                declaration["description"] = description.strip()
+            schema = self._sanitize_parameters_schema(spec.get("parameters"))
+            if schema is not None:
+                declaration["parameters_json_schema"] = schema
+            declarations.append(types.FunctionDeclaration(**declaration))
+        return declarations, name_map
+
+    def _map_tool_choice(
+        self, tool_choice: Any, name_map: Dict[str, str]
+    ) -> Optional[types.FunctionCallingConfig]:
+        """Map an OpenAI tool_choice (sent by API clients) to Gemini's config.
+
+        "auto", None and unknown shapes leave Gemini's default in place.
+        parallel_tool_calls has no Gemini equivalent and is ignored.
+        """
+        if tool_choice == "none":
+            # The declarations stay, so function calls in the history remain valid
+            return types.FunctionCallingConfig(mode="NONE")
+        if tool_choice == "required":
+            return types.FunctionCallingConfig(mode="ANY")
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function = tool_choice.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(name, str) and name:
+                gemini_name = _gemini_function_name(name)
+                if name_map.get(gemini_name) == name:
+                    return types.FunctionCallingConfig(
+                        mode="ANY", allowed_function_names=[gemini_name]
+                    )
+            self.log.debug(f"Ignoring tool_choice for undeclared function '{name}'")
+        return None
+
+    @staticmethod
+    def _owui_function_name(name: str, name_map: Dict[str, str]) -> str:
+        """Map the name of a Gemini function call back to the Open WebUI tool.
+
+        Unknown names are passed on unchanged; Open WebUI then answers with a
+        "Tool not found" result.
+        """
+        for prefix in ("default_api.", "default_api:"):
+            if name.startswith(prefix) and name[len(prefix) :] in name_map:
+                name = name[len(prefix) :]
+                break
+        return name_map.get(name, name)
+
+    @staticmethod
+    def _is_server_side_part(part: Any) -> bool:
+        """Whether a part holds a tool call Gemini ran itself (e.g. Search)."""
+        return any(
+            getattr(part, field, None) is not None
+            for field in (
+                "tool_call",
+                "tool_response",
+                "executable_code",
+                "code_execution_result",
+            )
+        )
+
+    def _function_calls_to_openai(
+        self, parts: List[types.Part], name_map: Dict[str, str]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Convert Gemini function_call parts to OpenAI tool_calls.
+
+        Returns (tool_calls, reasoning_details). Each thought signature becomes
+        a reasoning_details item with the id of its tool call; Open WebUI (and
+        API clients) send it back with the tool call in the next request.
+        """
+        tool_calls: List[Dict[str, Any]] = []
+        details: List[Dict[str, Any]] = []
+        for index, part in enumerate(parts):
+            call = part.function_call
+            # Vertex AI and Gemini 2.5 may send no id
+            call_id = (
+                call.id or f"{SYNTHETIC_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:24]}"
+            )
+            tool_calls.append(
+                {
+                    "index": index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": self._owui_function_name(call.name or "", name_map),
+                        "arguments": json.dumps(
+                            call.args or {}, ensure_ascii=False, default=str
+                        ),
+                    },
+                }
+            )
+            if part.thought_signature:
+                details.append(
+                    {
+                        "type": "reasoning.encrypted",
+                        "format": REASONING_FORMAT_SIGNATURE,
+                        "id": call_id,
+                        "index": index,
+                        "data": base64.b64encode(part.thought_signature).decode(
+                            "ascii"
+                        ),
+                    }
+                )
+        return tool_calls, details
+
+    @staticmethod
+    def _stored_content_item(
+        parts: List[types.Part], tool_calls: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """A reasoning_details item that stores the complete model content.
+
+        Used for rounds with server-side tool parts: Gemini expects them back
+        with all their fields. Consecutive unsigned text parts with the same
+        thought flag (stream pieces) are merged.
+        """
+        merged: List[Tuple[types.Part, bool]] = []
+        for part in parts:
+            plain_text = isinstance(part.text, str) and set(
+                part.model_dump(exclude_none=True)
+            ) <= {"text", "thought"}
+            if (
+                plain_text
+                and merged
+                and merged[-1][1]
+                and bool(merged[-1][0].thought) == bool(part.thought)
+            ):
+                previous = merged[-1][0]
+                merged[-1] = (
+                    previous.model_copy(update={"text": previous.text + part.text}),
+                    True,
+                )
+            else:
+                merged.append((part, plain_text))
+        content = types.Content(role="model", parts=[part for part, _ in merged])
+        return {
+            "type": "reasoning.encrypted",
+            "format": REASONING_FORMAT_CONTENT,
+            "id": tool_calls[0]["id"],
+            "index": len(tool_calls),
+            "data": base64.b64encode(
+                content.model_dump_json(exclude_none=True).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    def _tool_round_result(
+        self,
+        function_call_parts: List[types.Part],
+        all_parts: List[types.Part],
+        server_side: bool,
+        name_map: Dict[str, str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """tool_calls and reasoning_details of a round that ended with calls."""
+        tool_calls, details = self._function_calls_to_openai(
+            function_call_parts, name_map
+        )
+        if server_side:
+            details.append(self._stored_content_item(all_parts, tool_calls))
+        return tool_calls, details
+
+    def _round_chunks(
+        self,
+        chunk: Callable[..., Dict[str, Any]],
+        *,
+        reasoning: Optional[str] = None,
+        content: Optional[str] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        details: Optional[List[Dict[str, Any]]] = None,
+        usage: Optional[Dict[str, int]] = None,
+        content_first: bool = False,
+        stop: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """The chunks that end a round.
+
+        With tool calls: reasoning_content (R), reasoning_details (D), content
+        (C, before D with content_first), tool_calls (T), finish_reason
+        "tool_calls" (F) and usage (U). Without tool calls the same minus D/T,
+        with a finish_reason "stop" chunk only if `stop` (own SSE framing).
+        """
+        chunks: List[Dict[str, Any]] = []
+        if reasoning:
+            chunks.append(chunk({"reasoning_content": reasoning}))
+        if content and content_first:
+            chunks.append(chunk({"content": content}))
+        if details:
+            chunks.append(chunk({"reasoning_details": details}))
+        if content and not content_first:
+            chunks.append(chunk({"content": content}))
+        if tool_calls:
+            chunks.append(
+                chunk({"role": "assistant", "content": None, "tool_calls": tool_calls})
+            )
+            chunks.append(chunk({}, "tool_calls"))
+        elif stop:
+            chunks.append(chunk({}, "stop"))
+        if usage:
+            chunks.append(self._usage_chunk(usage))
+        return chunks
+
+    @staticmethod
+    def _finish_reason_name(finish_reason: Any) -> str:
+        """Name of a finish reason; compared as str because newer SDKs add
+        enum members."""
+        if finish_reason is None:
+            return ""
+        return str(getattr(finish_reason, "name", None) or finish_reason)
+
+    @classmethod
+    def _tool_call_error_text(cls, finish_reason: Any) -> Optional[str]:
+        """Answer text for a round in which Gemini's tool call failed."""
+        name = cls._finish_reason_name(finish_reason)
+        if name == "MALFORMED_FUNCTION_CALL":
+            return (
+                "Error: Gemini returned a malformed tool call "
+                "(MALFORMED_FUNCTION_CALL). Please try again."
+            )
+        if name == "UNEXPECTED_TOOL_CALL":
+            return (
+                "Error: Gemini called a tool that is not available "
+                "(UNEXPECTED_TOOL_CALL)."
+            )
+        return None
+
+    @staticmethod
+    def _thinking_details_block(thought_text: str, duration_s: int) -> str:
+        """The <details> thinking summary of an answer without tool calls."""
+        quoted_content = "\n".join(
+            f"> {line}" for line in thought_text.strip().split("\n")
+        )
+        return f"""<details>
+<summary>Thought ({duration_s}s)</summary>
+
+{quoted_content}
+
+</details>""".strip()
+
     def _configure_generation(
         self,
         body: Dict[str, Any],
         system_instruction: Optional[str],
         __metadata__: Dict[str, Any],
-        __tools__: dict[str, Any] | None = None,
         __user__: Optional[dict] = None,
         enable_image_generation: bool = False,
         model_id: str = "",
+        function_declarations: Optional[List[types.FunctionDeclaration]] = None,
+        name_map: Optional[Dict[str, str]] = None,
     ) -> types.GenerateContentConfig:
         """
         Configure generation parameters and safety settings.
@@ -2813,6 +3629,8 @@ class Pipe:
             system_instruction: Optional system instruction string
             enable_image_generation: Whether to enable image generation
             model_id: The model ID being used (for feature support checks)
+            function_declarations: The request's tools (_build_function_declarations)
+            name_map: Gemini function name -> Open WebUI tool name
 
         Returns:
             types.GenerateContentConfig
@@ -3092,26 +3910,69 @@ class Pipe:
                     "Vertex AI Search requested but vertex_rag_store not provided in params, valves, or env"
                 )
 
-        if __tools__ is not None and params.get("function_calling") == "native":
-            if enable_image_generation:
-                # Gemini image models do not support function calling. In Native
-                # mode Open WebUI 0.10+ attaches its built-in tools to every chat,
-                # so none are sent; this also keeps Open WebUI's own generate_image
-                # and edit_image tools away from native Gemini image generation.
-                self.log.debug(
-                    f"Not sending {len(__tools__)} native tool(s) to image model {model_id}"
+        # Function declarations go after the grounding tools. Gemini only returns
+        # the calls; Open WebUI (or the API client) runs the tools.
+        tool_config: Optional[types.ToolConfig] = None
+        if function_declarations:
+            grounding_kinds = {
+                kind
+                for tool in tools
+                for kind in (
+                    "google_search",
+                    "enterprise_web_search",
+                    "url_context",
+                    "retrieval",
                 )
+                if getattr(tool, kind, None) is not None
+            }
+            if not grounding_kinds:
+                tools.append(types.Tool(function_declarations=function_declarations))
+                function_calling_config = self._map_tool_choice(
+                    body.get("tool_choice"), name_map or {}
+                )
+                if function_calling_config:
+                    tool_config = types.ToolConfig(
+                        function_calling_config=function_calling_config
+                    )
+            elif (
+                # Built-in tools together with functions ("tool combination")
+                # work on Gemini 3 only and need server-side tool invocations
+                # (google-genai >= 1.68.0); Vertex AI does not allow Search with
+                # function calling, and the SDK rejects the flag there.
+                not self.valves.USE_VERTEX_AI
+                and self._is_gemini_3_family_model(model_id)
+                and grounding_kinds <= {"google_search", "url_context"}
+                and "include_server_side_tool_invocations"
+                in types.ToolConfig.model_fields
+            ):
+                tools.append(types.Tool(function_declarations=function_declarations))
+                tool_config_params: Dict[str, Any] = {
+                    "include_server_side_tool_invocations": True
+                }
+                function_calling_config = self._map_tool_choice(
+                    body.get("tool_choice"), name_map or {}
+                )
+                if function_calling_config:
+                    tool_config_params["function_calling_config"] = (
+                        function_calling_config
+                    )
+                tool_config = types.ToolConfig(**tool_config_params)
             else:
-                for name, tool_def in __tools__.items():
-                    if not name.startswith("_"):
-                        tool = tool_def["callable"]
-                        self.log.debug(
-                            f"Adding tool '{name}' with signature {tool.__signature__}"
-                        )
-                        tools.append(tool)
+                self.log.debug(
+                    "Grounding tools take precedence: not declaring "
+                    f"{len(function_declarations)} function(s) for {model_id}"
+                )
 
         if tools:
             gen_config_params["tools"] = tools
+        if tool_config:
+            gen_config_params["tool_config"] = tool_config
+
+        # Never let google-genai run tools itself (automatic function calling);
+        # no Python callable is passed to it anyway.
+        gen_config_params["automatic_function_calling"] = (
+            types.AutomaticFunctionCallingConfig(disable=True)
+        )
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -3281,6 +4142,9 @@ class Pipe:
         client: Optional[genai.Client] = None,
         model: str = "",
         __metadata__: Optional[Dict[str, Any]] = None,
+        tool_mode: bool = False,
+        name_map: Optional[Dict[str, str]] = None,
+        continuation: bool = False,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """
         Handle streaming response from Gemini API.
@@ -3298,11 +4162,16 @@ class Pipe:
             model: Model ID of the request (Open WebUI's, with function prefix)
                 for the chat.completion.chunk dicts.
             __metadata__: Request metadata (decides how generated images are
-                attached).
+                attached and whether the request belongs to a chat message).
+            tool_mode: Functions were declared. A round that ends with function
+                calls returns them as tool_calls; on the API path the generator
+                also yields its own finish chunks (pipe() wraps it in _sse).
+            name_map: Gemini function name -> Open WebUI tool name.
+            continuation: The request continues a turn after tool results.
 
         Returns:
-            Generator yielding chat.completion.chunk dicts (answer and error
-            messages) and a usage chunk
+            Generator yielding chat.completion.chunk dicts (answer, error
+            messages and tool calls) and a usage chunk
         """
         # Remember statuses that are still running, to close them if the request
         # is stopped or fails (see finally).
@@ -3310,8 +4179,28 @@ class Pipe:
         __event_emitter__ = self._track_statuses(__event_emitter__, running_statuses)
         cancelled = False
 
+        is_chat = self._is_chat_message(__metadata__)
+        # A later round of Open WebUI's tool loop ("live" mode): from the first
+        # tool round on, the chat shows the message's output items, which only
+        # chunks yielded by the pipe reach (chat:* events and the text preview
+        # change nothing visible). Thoughts and text are yielded as they arrive.
+        live = is_chat and continuation
+        # API path in tool mode: own finish chunks, so the last finish_reason a
+        # client sees is "tool_calls" when the round ended with tool calls.
+        own_finish = tool_mode and not is_chat
+        response_id = f"{model}-{uuid.uuid4()}"
+        created = int(time.time())
+
+        def chunk(
+            delta: Dict[str, Any], finish_reason: Optional[str] = None
+        ) -> Dict[str, Any]:
+            return self._chunk(delta, model, finish_reason, response_id, created)
+
+        def text_chunk(content: str) -> Dict[str, Any]:
+            return chunk({"role": "assistant", "content": content})
+
         async def emit_chat_event(event_type: str, data: Dict[str, Any]) -> None:
-            if not __event_emitter__:
+            if not __event_emitter__ or live:
                 return
             try:
                 await __event_emitter__({"type": event_type, "data": data})
@@ -3331,81 +4220,96 @@ class Pipe:
         seen_generated_image_hashes: set[str] = set()
         last_thought_image: Any = None
         last_finish_reason: Any = None
+        # Tool mode: function calls of this round (sent when the stream has
+        # ended), all its parts and whether Gemini ran server-side tools
+        function_call_parts: List[types.Part] = []
+        all_parts: List[types.Part] = []
+        server_side = False
 
         try:
             response_iterator = await self._start_stream(open_stream)
-            async for chunk in response_iterator:
+            async for response_chunk in response_iterator:
                 # Capture usage metadata (final chunk has complete data)
-                if getattr(chunk, "usage_metadata", None):
-                    stream_usage_metadata = chunk.usage_metadata
-                if chunk.candidates and getattr(
-                    chunk.candidates[0], "finish_reason", None
+                if getattr(response_chunk, "usage_metadata", None):
+                    stream_usage_metadata = response_chunk.usage_metadata
+                if response_chunk.candidates and getattr(
+                    response_chunk.candidates[0], "finish_reason", None
                 ):
-                    last_finish_reason = chunk.candidates[0].finish_reason
+                    last_finish_reason = response_chunk.candidates[0].finish_reason
 
                 # Check for safety feedback or empty chunks
-                if not chunk.candidates:
+                if not response_chunk.candidates:
                     # Check prompt feedback
-                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
-                        block_reason = chunk.prompt_feedback.block_reason.name
+                    feedback = response_chunk.prompt_feedback
+                    if feedback and feedback.block_reason:
+                        block_reason = feedback.block_reason.name
                         message = f"[Blocked due to Prompt Safety: {block_reason}]"
-                        await emit_chat_event(
-                            "chat:finish",
-                            {
-                                "role": "assistant",
-                                "content": message,
-                                "done": True,
-                                "error": True,
-                            },
-                        )
-                        yield self._content_chunk(message, model)
                     else:
                         message = "[Blocked by safety settings]"
-                        await emit_chat_event(
-                            "chat:finish",
-                            {
-                                "role": "assistant",
-                                "content": message,
-                                "done": True,
-                                "error": True,
-                            },
-                        )
-                        yield self._content_chunk(message, model)
+                    await emit_chat_event(
+                        "chat:finish",
+                        {
+                            "role": "assistant",
+                            "content": message,
+                            "done": True,
+                            "error": True,
+                        },
+                    )
+                    yield text_chunk(message)
+                    if own_finish:
+                        yield chunk({}, "stop")
                     return  # Stop generation
 
-                if chunk.candidates[0].grounding_metadata:
-                    grounding_metadata_list.append(
-                        chunk.candidates[0].grounding_metadata
-                    )
-                # Prefer fine-grained parts to split thoughts vs. normal text
+                candidate = response_chunk.candidates[0]
+                if candidate.grounding_metadata:
+                    grounding_metadata_list.append(candidate.grounding_metadata)
+                # Prefer fine-grained parts to split thoughts vs. normal text.
+                # A candidate without content (e.g. a finish reason only) has
+                # no parts.
                 parts = []
                 try:
-                    parts = chunk.candidates[0].content.parts or []
+                    content = getattr(candidate, "content", None)
+                    parts = (content.parts or []) if content is not None else []
                 except Exception as parts_error:
                     # Fallback: use aggregated text if parts aren't accessible
                     self.log.warning(f"Failed to access content parts: {parts_error}")
-                    if hasattr(chunk, "text") and chunk.text:
-                        answer_chunks.append(chunk.text)
-                        await self._safe_emit(
-                            __event_emitter__,
-                            {
-                                "type": "chat:message:delta",
-                                "data": {
-                                    "role": "assistant",
-                                    "content": chunk.text,
+                    if hasattr(response_chunk, "text") and response_chunk.text:
+                        answer_chunks.append(response_chunk.text)
+                        if live:
+                            yield chunk({"content": response_chunk.text})
+                        else:
+                            await self._safe_emit(
+                                __event_emitter__,
+                                {
+                                    "type": "chat:message:delta",
+                                    "data": {
+                                        "role": "assistant",
+                                        "content": response_chunk.text,
+                                    },
                                 },
-                            },
-                        )
+                            )
                     continue
 
                 for part in parts:
                     try:
+                        if tool_mode:
+                            all_parts.append(part)
+                            if getattr(part, "function_call", None):
+                                function_call_parts.append(part)
+                                continue
+                            if self._is_server_side_part(part):
+                                server_side = True
+                                continue
+
                         is_thought = bool(getattr(part, "thought", False))
                         # Thought parts (internal reasoning)
                         if is_thought and getattr(part, "text", None):
                             if thinking_started_at is None:
                                 thinking_started_at = time.time()
                             thought_chunks.append(part.text)
+                            if live:
+                                yield chunk({"reasoning_content": part.text})
+                                continue
                             # Emit a live preview of what is currently being thought
                             preview = part.text.replace("\n", " ").strip()
                             MAX_PREVIEW = 120
@@ -3434,16 +4338,19 @@ class Pipe:
                         # Regular answer text
                         elif getattr(part, "text", None):
                             answer_chunks.append(part.text)
-                            await self._safe_emit(
-                                __event_emitter__,
-                                {
-                                    "type": "chat:message:delta",
-                                    "data": {
-                                        "role": "assistant",
-                                        "content": part.text,
+                            if live:
+                                yield chunk({"content": part.text})
+                            else:
+                                await self._safe_emit(
+                                    __event_emitter__,
+                                    {
+                                        "type": "chat:message:delta",
+                                        "data": {
+                                            "role": "assistant",
+                                            "content": part.text,
+                                        },
                                     },
-                                },
-                            )
+                                )
 
                         # Generated images: normally image models use the
                         # non-streaming path, but a model that is not detected
@@ -3488,8 +4395,58 @@ class Pipe:
                     __event_emitter__,
                 )
 
-            # After processing all chunks, handle grounding data
             final_answer_text = "".join(answer_chunks)
+
+            # A failed tool call without any answer: tell the user instead of
+            # leaving the message empty.
+            error_text = (
+                None
+                if function_call_parts or final_answer_text
+                else self._tool_call_error_text(last_finish_reason)
+            )
+            if error_text:
+                final_answer_text = error_text
+                if live:
+                    yield chunk({"content": error_text})
+
+            usage = self._build_usage_dict(stream_usage_metadata)
+
+            if live:
+                # Sources and the search status only: the text has already been
+                # sent, so no [n] citation markers can be added to it.
+                if grounding_metadata_list and __event_emitter__:
+                    await self._process_grounding_metadata(
+                        grounding_metadata_list,
+                        final_answer_text,
+                        __event_emitter__,
+                    )
+                if generated_images or generated_image_files:
+                    links = await self._append_generated_images(
+                        "",
+                        final_answer_text,
+                        generated_images,
+                        generated_image_files,
+                        __event_emitter__,
+                        __metadata__,
+                    )
+                    if links:
+                        yield chunk(
+                            {"content": f"\n\n{links}" if final_answer_text else links}
+                        )
+                tool_calls, details = (
+                    self._tool_round_result(
+                        function_call_parts, all_parts, server_side, name_map or {}
+                    )
+                    if function_call_parts
+                    else ([], [])
+                )
+                for round_chunk in self._round_chunks(
+                    chunk, tool_calls=tool_calls, details=details, usage=usage
+                ):
+                    yield round_chunk
+                return
+
+            # After processing all chunks, handle grounding data
             if grounding_metadata_list and __event_emitter__:
                 cited = await self._process_grounding_metadata(
                     grounding_metadata_list,
@@ -3498,26 +4455,67 @@ class Pipe:
                 )
                 final_answer_text = cited or final_answer_text
 
-            final_content = final_answer_text
             details_block: Optional[str] = None
-
             if thought_chunks:
                 duration_s = int(
                     max(0, time.time() - (thinking_started_at or time.time()))
                 )
-                # Format each line with > for blockquote while preserving formatting
-                thought_content = "".join(thought_chunks).strip()
-                quoted_lines = []
-                for line in thought_content.split("\n"):
-                    quoted_lines.append(f"> {line}")
-                quoted_content = "\n".join(quoted_lines)
+                details_block = self._thinking_details_block(
+                    "".join(thought_chunks), duration_s
+                )
 
-                details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+            if function_call_parts:
+                # The round ends with tool calls: the turn is not over, so no
+                # replace / chat:message / chat:finish. In the chat the thoughts
+                # go to Open WebUI's reasoning item (reasoning_content), which
+                # it shows anyway once a thought signature arrives; API clients
+                # get the <details> summary as before.
+                if thought_chunks:
+                    await self._safe_emit(
+                        __event_emitter__,
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "thinking",
+                                "done": True,
+                                "hidden": True,
+                            },
+                        },
+                    )
+                content = final_answer_text
+                if own_finish and details_block:
+                    content = f"{details_block}{content}"
+                if generated_images or generated_image_files:
+                    content = await self._append_generated_images(
+                        content,
+                        final_answer_text,
+                        generated_images,
+                        generated_image_files,
+                        __event_emitter__,
+                        __metadata__,
+                    )
+                tool_calls, details = self._tool_round_result(
+                    function_call_parts, all_parts, server_side, name_map or {}
+                )
+                reasoning = (
+                    "".join(thought_chunks).strip()
+                    if is_chat and thought_chunks
+                    else None
+                )
+                for round_chunk in self._round_chunks(
+                    chunk,
+                    reasoning=reasoning,
+                    content=content,
+                    tool_calls=tool_calls,
+                    details=details,
+                    usage=usage,
+                    content_first=own_finish,
+                ):
+                    yield round_chunk
+                return
 
-{quoted_content}
-
-</details>""".strip()
+            final_content = final_answer_text
+            if details_block:
                 final_content = f"{details_block}{final_answer_text}"
 
             if not final_content:
@@ -3552,8 +4550,19 @@ class Pipe:
                     },
                 )
 
+            if own_finish:
+                # API path in tool mode: answer, own finish chunk, then usage
+                await emit_chat_event(
+                    "chat:finish",
+                    {"role": "assistant", "content": final_content, "done": True},
+                )
+                yield text_chunk(final_content)
+                yield chunk({}, "stop")
+                if usage:
+                    yield self._usage_chunk(usage)
+                return
+
             # Yield usage data as dict so the middleware can extract and save it to DB
-            usage = self._build_usage_dict(stream_usage_metadata)
             if usage:
                 yield self._usage_chunk(usage)
 
@@ -3565,7 +4574,7 @@ class Pipe:
             # Yield final content to ensure the async iterator completes properly.
             # This ensures the response is persisted even if the user navigates away.
             # As a chunk dict, so an answer starting with "data:" stays content.
-            yield self._content_chunk(final_content, model)
+            yield text_chunk(final_content)
 
         except (asyncio.CancelledError, GeneratorExit):
             # Stopped by the user or the client went away
@@ -3591,7 +4600,9 @@ class Pipe:
                     "error": True,
                 },
             )
-            yield self._content_chunk(message, model)
+            yield text_chunk(message)
+            if own_finish:
+                yield chunk({}, "stop")
 
         finally:
             await self._finish_running_statuses(
@@ -3661,6 +4672,156 @@ class Pipe:
                     "logprobs": None,
                     "finish_reason": "stop",
                     "message": {"role": "assistant", "content": content},
+                }
+            ],
+        }
+        if usage:
+            result["usage"] = usage
+        return result
+
+    @staticmethod
+    async def _iterate_chunks(
+        chunks: List[Dict[str, Any]],
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield prepared chunks (a stream answer built without streaming)."""
+        for chunk in chunks:
+            yield chunk
+
+    async def _build_tool_round_response(
+        self,
+        *,
+        final_answer: str,
+        details_block: str,
+        reasoning: str,
+        function_call_parts: List[types.Part],
+        all_parts: List[types.Part],
+        server_side: bool,
+        name_map: Dict[str, str],
+        usage: Optional[Dict[str, int]],
+        model: str,
+        is_chat: bool,
+        continuation: bool,
+        stream_requested: bool,
+        generated_images: List[str],
+        generated_image_files: List[Dict[str, Any]],
+        __event_emitter__: Optional[Callable],
+        __metadata__: Optional[Dict[str, Any]],
+    ) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]], StreamingResponse]:
+        """
+        Return a round answered without streaming in the shape its path needs.
+
+        - Browser path: reasoning_content, reasoning_details, the answer, the
+          tool calls and their finish chunk, then usage (in a later round of the
+          tool loop the answer comes right after the thoughts). With stream=true
+          as a generator; with stream=false as a StreamingResponse, the only
+          shape for which Open WebUI runs its tool loop.
+        - API path: the answer as before (<details> summary + text). With
+          stream=true as SSE with own finish chunks; with stream=false as a
+          chat.completion with message.tool_calls.
+        """
+        response_id = f"{model}-{uuid.uuid4()}"
+        created = int(time.time())
+
+        def chunk(
+            delta: Dict[str, Any], finish_reason: Optional[str] = None
+        ) -> Dict[str, Any]:
+            return self._chunk(delta, model, finish_reason, response_id, created)
+
+        tool_calls, details = (
+            self._tool_round_result(
+                function_call_parts, all_parts, server_side, name_map
+            )
+            if function_call_parts
+            else ([], [])
+        )
+
+        if is_chat:
+            content = await self._append_generated_images(
+                final_answer,
+                final_answer,
+                generated_images,
+                generated_image_files,
+                __event_emitter__,
+                __metadata__,
+            )
+            chunks = self._round_chunks(
+                chunk,
+                reasoning=reasoning or None,
+                content=content,
+                tool_calls=tool_calls,
+                details=details,
+                usage=usage,
+                content_first=continuation,
+            )
+            if stream_requested:
+                return self._iterate_chunks(chunks)
+            return self._sse(chunks)
+
+        content = await self._append_generated_images(
+            details_block + final_answer,
+            final_answer,
+            generated_images,
+            generated_image_files,
+            __event_emitter__,
+            __metadata__,
+        )
+        if not stream_requested:
+            return self._tool_calls_completion(
+                content, tool_calls, details, usage, model
+            )
+        if tool_calls:
+            return self._sse(
+                self._round_chunks(
+                    chunk,
+                    content=content,
+                    tool_calls=tool_calls,
+                    details=details,
+                    usage=usage,
+                    content_first=True,
+                )
+            )
+        chunks = [
+            chunk(
+                {"role": "assistant", "content": content or "[No content generated]"}
+            ),
+            chunk({}, "stop"),
+        ]
+        if usage:
+            chunks.append(self._usage_chunk(usage))
+        return self._sse(chunks)
+
+    @staticmethod
+    def _tool_calls_completion(
+        content: str,
+        tool_calls: List[Dict[str, Any]],
+        details: List[Dict[str, Any]],
+        usage: Optional[Dict[str, int]],
+        model: str,
+    ) -> Dict[str, Any]:
+        """A chat.completion whose message carries tool_calls (API clients)."""
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": content or None,
+            # Open WebUI returns this dict unchanged; message tool_calls have
+            # no index (only stream deltas do)
+            "tool_calls": [
+                {key: value for key, value in tool_call.items() if key != "index"}
+                for tool_call in tool_calls
+            ],
+        }
+        if details:
+            message["reasoning_details"] = details
+        result: Dict[str, Any] = {
+            "id": f"{model}-{uuid.uuid4()}",
+            "created": int(time.time()),
+            "model": model,
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "tool_calls",
+                    "message": message,
                 }
             ],
         }
@@ -4057,23 +5218,33 @@ class Pipe:
         body: Dict[str, Any],
         __metadata__: dict[str, Any],
         __event_emitter__: Optional[Callable],
-        __tools__: dict[str, Any] | None,
         __request__: Optional[Request] = None,
         __user__: Optional[dict] = None,
-    ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
+    ) -> Union[
+        str,
+        Dict[str, Any],
+        AsyncIterator[Union[str, Dict[str, Any]]],
+        StreamingResponse,
+    ]:
         """
         Main method for sending requests to the Google Gemini endpoint.
+
+        Tools are declared from body["tools"] (the OpenAI tool specs Open WebUI
+        builds for every tool type, or an API client's tools). When Gemini
+        answers with function calls, the round ends and they are returned as
+        OpenAI tool_calls: on the browser path Open WebUI runs the tools and
+        calls the pipe again with the results, API clients run them themselves.
 
         Args:
             body: The request body containing messages and other parameters.
             __metadata__: Request metadata
             __event_emitter__: Event emitter for status updates
-            __tools__: Available tools
             __request__: FastAPI request object (for image upload)
             __user__: User information (for image upload)
 
         Returns:
-            Response from Google Gemini API, which could be a string or an iterator for streaming.
+            Response from Google Gemini API: a string, a dict, an iterator for
+            streaming, or an SSE StreamingResponse (see _sse).
         """
         # Setup logging for this request
         request_id = id(body)
@@ -4125,6 +5296,12 @@ class Pipe:
                     self.log.debug("Streaming disabled via GOOGLE_STREAMING_ENABLED")
                 stream = False
             messages = body.get("messages", [])
+            model_name = body.get("model", model_id)
+
+            # The browser path (a chat message), where Open WebUI runs the tool
+            # loop, and whether this request is a later round of a tool turn
+            is_chat = self._is_chat_message(__metadata__)
+            continuation = self._is_tool_continuation(messages)
 
             # For image generation models, gather ALL images from the last user turn
             if supports_image_generation:
@@ -4145,7 +5322,7 @@ class Pipe:
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
-                contents, system_instruction = self._prepare_content(messages)
+                contents, system_instruction = self._prepare_content(messages, model_id)
                 if not contents:
                     return "Error: No valid message content found"
                 self.log.debug(
@@ -4154,14 +5331,23 @@ class Pipe:
 
             # Configure generation parameters and safety settings
             self.log.debug(f"Supports image generation: {supports_image_generation}")
+            function_declarations, name_map = self._build_function_declarations(
+                body, __metadata__, supports_image_generation, model_id
+            )
             generation_config = self._configure_generation(
                 body,
                 system_instruction,
                 __metadata__,
-                __tools__,
                 __user__,
                 supports_image_generation,
                 model_id,
+                function_declarations=function_declarations,
+                name_map=name_map,
+            )
+            # Tool mode: functions are actually declared in this request
+            tool_mode = any(
+                getattr(tool, "function_declarations", None)
+                for tool in generation_config.tools or []
             )
 
             # Make the API call
@@ -4186,15 +5372,22 @@ class Pipe:
                     # The request (with its retries) only starts when Open WebUI
                     # reads the stream. Hand the client over so it lives (and is
                     # closed) with the stream.
-                    return self._handle_streaming_response(
+                    stream_response = self._handle_streaming_response(
                         get_streaming_response,
                         __event_emitter__,
                         __request__,
                         __user__,
                         client=client,
-                        model=body.get("model", model_id),
+                        model=model_name,
                         __metadata__=__metadata__,
+                        tool_mode=tool_mode,
+                        name_map=name_map,
+                        continuation=continuation,
                     )
+                    if tool_mode and not is_chat:
+                        # API clients in tool mode: own SSE framing (see _sse)
+                        return self._sse(stream_response)
+                    return stream_response
 
             # Non-streaming path (now also used for image generation)
             if not stream or supports_image_generation:
@@ -4242,17 +5435,30 @@ class Pipe:
                         )
 
                     # Handle "Thinking" and produce final formatted content
+                    candidate = response.candidates[0] if response.candidates else None
+                    parts = (
+                        getattr(getattr(candidate, "content", None), "parts", None)
+                        or []
+                    )
+                    # Tool mode: the round's function calls (they win over a
+                    # SAFETY or MAX_TOKENS finish)
+                    function_call_parts = [
+                        part
+                        for part in parts
+                        if tool_mode and getattr(part, "function_call", None)
+                    ]
+
                     # Check for safety blocks first
-                    safety_message = self._get_safety_block_message(response)
-                    if safety_message:
-                        return safety_message
+                    if not function_call_parts:
+                        safety_message = self._get_safety_block_message(response)
+                        if safety_message:
+                            return safety_message
 
-                    # Get the first candidate (safety checks passed)
-                    candidate = response.candidates[0]
-
-                    # Process content parts - use new streamlined approach
-                    parts = getattr(getattr(candidate, "content", None), "parts", [])
-                    if not parts:
+                    # A failed tool call without any answer gets an error text
+                    tool_call_error = self._tool_call_error_text(
+                        getattr(candidate, "finish_reason", None)
+                    )
+                    if not parts and not tool_call_error:
                         return "[No content generated or unexpected response structure]"
 
                     answer_segments: list[str] = []
@@ -4261,8 +5467,14 @@ class Pipe:
                     generated_image_files: List[Dict[str, Any]] = []
                     seen_generated_image_hashes: set[str] = set()
                     last_thought_image: Any = None
+                    server_side = False
 
                     for part in parts:
+                        if tool_mode and getattr(part, "function_call", None):
+                            continue  # collected above
+                        if tool_mode and self._is_server_side_part(part):
+                            server_side = True
+                            continue
                         is_thought = bool(getattr(part, "thought", False))
                         if is_thought and getattr(part, "text", None):
                             thought_segments.append(part.text)
@@ -4312,6 +5524,8 @@ class Pipe:
                         )
 
                     final_answer = "".join(answer_segments)
+                    if tool_call_error and not function_call_parts and not final_answer:
+                        final_answer = tool_call_error
 
                     # Apply grounding (if available) and send sources/status as needed
                     grounding_metadata_list = []
@@ -4327,32 +5541,55 @@ class Pipe:
                         )
                         final_answer = cited or final_answer
 
-                    # Combine all content
-                    full_response = ""
-
                     # If we have thoughts, wrap them using <details>. Background tasks
                     # (title, tags, follow-ups, ...) parse JSON out of the answer, so
                     # they get the answer only.
                     is_task = bool((__metadata__ or {}).get("task"))
+                    details_block = ""
                     if thought_segments and not is_task:
-                        duration_s = int(max(0, time.time() - start_ts))
-                        # Format each line with > for blockquote while preserving formatting
-                        thought_content = "".join(thought_segments).strip()
-                        quoted_lines = []
-                        for line in thought_content.split("\n"):
-                            quoted_lines.append(f"> {line}")
-                        quoted_content = "\n".join(quoted_lines)
+                        details_block = self._thinking_details_block(
+                            "".join(thought_segments),
+                            int(max(0, time.time() - start_ts)),
+                        )
 
-                        details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+                    # Build response with usage for middleware to extract and save to DB
+                    usage = self._build_usage_dict(
+                        getattr(response, "usage_metadata", None)
+                    )
 
-{quoted_content}
+                    # Tool rounds (and API requests in tool mode) get their own
+                    # shapes, see _build_tool_round_response
+                    if (
+                        function_call_parts
+                        or (tool_mode and not is_chat and stream_requested)
+                        or (
+                            is_chat
+                            and continuation
+                            and stream_requested
+                            and not supports_image_generation
+                        )
+                    ):
+                        return await self._build_tool_round_response(
+                            final_answer=final_answer,
+                            details_block=details_block,
+                            reasoning="".join(thought_segments).strip(),
+                            function_call_parts=function_call_parts,
+                            all_parts=list(parts),
+                            server_side=server_side,
+                            name_map=name_map,
+                            usage=usage,
+                            model=model_name,
+                            is_chat=is_chat,
+                            continuation=continuation,
+                            stream_requested=stream_requested,
+                            generated_images=generated_images,
+                            generated_image_files=generated_image_files,
+                            __event_emitter__=__event_emitter__,
+                            __metadata__=__metadata__,
+                        )
 
-</details>""".strip()
-                        full_response += details_block
-
-                    # Add the main answer
-                    full_response += final_answer
+                    # Combine all content
+                    full_response = details_block + final_answer
 
                     full_response = await self._append_generated_images(
                         full_response,
@@ -4363,11 +5600,6 @@ class Pipe:
                         __metadata__,
                     )
 
-                    # Build response with usage for middleware to extract and save to DB
-                    usage = self._build_usage_dict(
-                        getattr(response, "usage_metadata", None)
-                    )
-
                     content = (
                         full_response if full_response else "[No content generated]"
                     )
@@ -4376,7 +5608,7 @@ class Pipe:
                     # (dict for stream=false, content + usage chunks for stream=true)
                     # so Open WebUI saves both and passes the content to outlet filters.
                     return self._build_non_stream_result(
-                        content, usage, body.get("model", model_id), stream_requested
+                        content, usage, model_name, stream_requested
                     )
 
                 except Exception as e:
