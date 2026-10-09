@@ -270,6 +270,7 @@ def _oyd_valves(mock, base_valves: dict) -> dict:
         "AZURE_AI_DATA_SOURCES": json.dumps(DATA_SOURCES),
         "AZURE_AI_INCLUDE_SEARCH_SCORES": True,
         SHOW_ALL: True,
+        "AZURE_AI_SEARCH_MODE": "on_your_data",
     }
 
 
