@@ -15,7 +15,8 @@ not fail the run, but only when the failure looks like that bug:
 - ``log_patterns``: server-log signatures of the bug. A signature is a string or
   a tuple of strings that must ALL occur in one ERROR / Traceback block; name the
   function (``function_<id>:``, ``outlet filter <id>``) together with the error
-  so that nothing else matches. When the check passes ``since=mark``, a matching
+  so that nothing else matches (``harness.logs`` turns Open WebUI 0.12's module
+  name ``function_<id>_<hex>`` back into ``function_<id>``). When the check passes ``since=mark``, a matching
   block logged since ``mark`` also counts as evidence. Once the bug has
   reproduced, the suite's ``server-log`` check ignores ERROR and failing
   WARNING blocks that match these signatures (background tasks and later
