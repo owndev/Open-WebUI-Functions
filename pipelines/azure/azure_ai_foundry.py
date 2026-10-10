@@ -4,7 +4,7 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 3.0.0
+version: 3.0.1
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A pipeline for interacting with Azure AI services, enabling seamless communication with various AI models via configurable headers and robust error handling. This includes support for Azure OpenAI models as well as other Azure AI models by dynamically managing headers and request configurations. Azure AI Search (RAG) works with every chat endpoint and model: the pipeline queries the search index itself and adds the documents to the prompt. Since 3.0.0 it no longer uses Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026 (see https://github.com/owndev/Open-WebUI-Functions/issues/187).
@@ -28,6 +28,7 @@ features:
   - A request with data_sources (Azure OpenAI On Your Data) ends with an error that names its removal instead of being forwarded
   - Streamed events of up to 4 MiB are read; a stream that fails ends with an "Error: ..." message instead of an empty or cut off answer
 changelog:
+  - 3.0.1 - Open WebUI 0.12: Azure AI Search searches with the text the user typed again when Open WebUI adds its own RAG template to the message (attached files, chats, knowledge, web search). Open WebUI 0.12 renamed the metadata key the pipeline read (user_prompt -> base_user_prompt), so the search text was the template around the message instead; Open WebUI 0.11 and older behave as before.
   - 3.0.0 - BREAKING: Azure OpenAI On Your Data (data_sources), which Microsoft retires on October 14, 2026, is no longer used. The pipeline queries Azure AI Search itself (Search REST API, default api-version 2026-04-01) with the azure_search configuration in AZURE_AI_DATA_SOURCES and adds the documents to the prompt as [doc1]..[docN], for every chat endpoint and model (Azure OpenAI deployments, Foundry /models, serverless, non-OpenAI models). Citations, [docX] links, relevance scores and the history unlinking work as before; API clients get the citations as context (first SSE event or message.context). Breaking: data_sources sent by a client or an inlet filter end the request with "Error: Azure AI Search: data_sources in the request is not supported ..." and are never forwarded; data source types other than azure_search, and an AZURE_AI_DATA_SOURCES that is not valid JSON, are configuration errors (fail closed, no answer without the documents); with a managed identity the Open WebUI host's identity calls Azure AI Search and needs the Search Index Data Reader role; the Open WebUI host must reach the search service over the network; vector query types need embedding_dependency or an index vectorizer; strictness, in_scope and role_information are applied by the pipeline (approximations of On Your Data); tools, tool_choice and stream_options are forwarded in chats with Azure AI Search; the On Your Data retirement warning of 2.8.1 is gone. New valves AZURE_AI_SEARCH_KEY (encrypted), AZURE_AI_SEARCH_API_VERSION, AZURE_AI_SEARCH_QUERY_GENERATION and AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS; every existing valve keeps its name. To keep On Your Data until Microsoft turns it off, stay on 2.8.1 (https://github.com/owndev/Open-WebUI-Functions/blob/3ff6cf9/pipelines/azure/azure_ai_foundry.py).
 """
 
@@ -2404,14 +2405,19 @@ class Pipe:
         metadata: Optional[dict],
     ) -> str:
         """
-        The user's text for the search: Open WebUI's user_prompt (stored
-        before its own RAG template is added; without a leading
+        The user's text for the search: the prompt Open WebUI stores in the
+        metadata before its own RAG template is added (base_user_prompt since
+        Open WebUI 0.12, user_prompt before; without a leading
         <attached_files> block), else the text of the current turn's user
         message. Whitespace collapsed, at most 1,000 characters. Empty for an
-        image-only turn. A user_prompt that is Open WebUI's tool-images
+        image-only turn. A stored prompt that is Open WebUI's tool-images
         message (a conversation replayed by an API client) is not used.
         """
-        prompt = metadata.get("user_prompt") if isinstance(metadata, dict) else None
+        prompt = None
+        if isinstance(metadata, dict):
+            prompt = metadata.get("base_user_prompt")
+            if not isinstance(prompt, str):
+                prompt = metadata.get("user_prompt")
         if isinstance(prompt, str) and not prompt.lstrip().startswith(
             self.TOOL_IMAGES_TEXT
         ):
@@ -3795,8 +3801,9 @@ class Pipe:
             __event_emitter__: Optional event emitter function for status updates
             __task__: Open WebUI background task (e.g. "title_generation"),
                 None for regular chat requests
-            __metadata__: Open WebUI request metadata (user_prompt, chat and
-                message id), used by Azure AI Search
+            __metadata__: Open WebUI request metadata (base_user_prompt or,
+                before Open WebUI 0.12, user_prompt; chat and message id),
+                used by Azure AI Search
 
         Returns:
             Response from Azure AI API, which could be a string, dictionary or streaming response
