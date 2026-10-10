@@ -21,8 +21,9 @@ LOG = re.compile(r"PROBE_LOG=(/\S+|off)")
 # Loggers whose DEBUG output PROBE_LOG may capture (never the server's own).
 LOG_ALLOWED = ("time_token_tracker",)
 # Environment variables the filters suite may change in the server process
-# (managed identity / workload identity detection, proxy). The container sets
-# none of them at docker run, so removing one never drops a real setting.
+# (managed identity / workload identity detection, proxy). run.sh sets only
+# IDENTITY_ENDPOINT / IDENTITY_HEADER at docker run (the azure suite's managed
+# identity mock); the filters suite puts the container's values back at the end.
 ENV_ALLOWED = (
     "IDENTITY_ENDPOINT",
     "IDENTITY_HEADER",

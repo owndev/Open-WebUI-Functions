@@ -256,6 +256,14 @@ PROBE_ENV_NAMES = (
     "NO_PROXY",
     "no_proxy",
 )
+# The container's own values of those variables: run.sh sets IDENTITY_ENDPOINT
+# and IDENTITY_HEADER at docker run (App Service managed identity for the azure
+# suite, mocks/mock_search.py). The driver runs in the same container and sees
+# them too; the ingest group removes them while it runs and puts them back at
+# the end, for the suites after it and for --reuse runs.
+CONTAINER_ENV = {
+    name: os.environ[name] for name in PROBE_ENV_NAMES if name in os.environ
+}
 # Issued tokens, identity headers, assertions etc. of the ingest group for the
 # final log.no-secrets check (collected in the group's finally).
 INGEST_SECRETS: list = []
@@ -1662,7 +1670,7 @@ async def ingest_group(t: Suite, la: LogAnalytics) -> None:
         except httpx.HTTPError:
             pass
         INGEST_SECRETS.extend(state["secrets"])
-        await set_env(t)
+        await set_env(t, CONTAINER_ENV)
         await t.owui.replace_valves(
             TRACKER,
             {

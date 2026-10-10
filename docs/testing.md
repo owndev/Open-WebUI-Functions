@@ -159,8 +159,10 @@ answer (overlapping requests), `PROBE_SLEEP[<model>]=<s>` only that model's answ
 (multi-model chats). `PROBE_ENV=<file>` sets (or, for `null`, removes) the environment
 variables of a JSON object in that file in the server process, for an allow-list of
 managed identity, workload identity and proxy variables only; the `ingest` group uses
-it to switch between App Service, IMDS and workload identity without a restart. The
-values go through the file, never through the chat text. `PROBE_LOG=<file>` writes
+it to switch between App Service, IMDS and workload identity without a restart and
+puts the container's own `IDENTITY_ENDPOINT` / `IDENTITY_HEADER` (set by `run.sh` for
+the azure suite) back at its end. The values go through the file, never through the
+chat text. `PROBE_LOG=<file>` writes
 everything the `time_token_tracker` logger logs, DEBUG included, to that file
 (`PROBE_LOG=off` stops it): the server log runs at INFO, so the `filters` suite captures
 the tracker's DEBUG output while its Log Analytics groups run (`tracker_debug.log` in
