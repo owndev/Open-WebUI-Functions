@@ -7,6 +7,8 @@ Routes
   GET  /{version}/models                                model list
   POST /{version}/models/{model}:generateContent        JSON answer
   POST /{version}/models/{model}:streamGenerateContent  SSE answer (?alt=sse)
+  POST /{version}/models/{model}:predict                Imagen (Open WebUI's image engine
+                                                        "gemini", endpoint method predict)
   POST /{version}/models/{model}:predictLongRunning     Veo: start an operation
   GET  /{version}/models/{model}/operations/{op}        Veo: poll the operation
   GET  /{version}/files/{id}:download                   Veo: download the video
@@ -33,6 +35,12 @@ Answers
     (plus a thought part when thoughts are requested)
   - Veo: the operation starts pending; the first poll reports ``done: true`` with
     one video whose Files API ``uri`` google-genai downloads from this mock
+  - Open WebUI's own image engine "gemini" (built-in tools generate_image /
+    edit_image): its generateContent requests to an image model get the image
+    answer above (no thoughts: it asks for none); ``:predict`` (Imagen) answers
+    ``predictions`` with ``parameters.sampleCount`` (default 1) PNGs, FINAL_PNG
+    or the ``final-image-<n>`` PNG of the prompt (``instances`` as an object, as
+    Open WebUI sends it, or as a list)
 
 Tools an image model does not support are rejected like the real API does
 (HTTP 400 INVALID_ARGUMENT; an approximation of the real messages):
@@ -99,7 +107,7 @@ Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
   "skip_thought_signature_validator").
 
 Each recorded request carries ``model``, ``action`` (generateContent,
-streamGenerateContent, predictLongRunning, download), ``tool_kinds`` (keys of
+streamGenerateContent, predict, predictLongRunning, download), ``tool_kinds`` (keys of
 the request's ``tools`` entries, e.g. ``googleSearch``) and, for generate
 requests, ``status`` (the HTTP status the mock answered with) plus what the
 tool scenarios assert on (``_tool_view``): ``declared``, ``decl`` (raw schema per
@@ -946,6 +954,8 @@ async def model_action(request: web.Request) -> web.StreamResponse:
             await asyncio.sleep(0.05)
         await resp.write_eof()
         return resp
+    if action == "predict":
+        return web.json_response(_predict(body))
     if action == "predictLongRunning":
         op = f"op-{next(_op_ids)}"
         prompt = str(((body.get("instances") or [{}])[0] or {}).get("prompt") or "")
@@ -953,6 +963,17 @@ async def model_action(request: web.Request) -> web.StreamResponse:
             _slow_ops[op] = SLOW_VIDEO_POLLS
         return web.json_response({"name": f"models/{model}/operations/{op}"})
     return _not_found(request)
+
+
+def _predict(body: dict) -> dict:
+    """Imagen ``:predict`` answer: ``sampleCount`` PNGs for the prompt."""
+    instances = body.get("instances")
+    if isinstance(instances, list):
+        instances = instances[0] if instances else {}
+    prompt = str((instances if isinstance(instances, dict) else {}).get("prompt") or "")
+    count = (body.get("parameters") or {}).get("sampleCount") or 1
+    image = {"bytesBase64Encoded": _final_png(prompt), "mimeType": "image/png"}
+    return {"predictions": [dict(image) for _ in range(max(1, min(int(count), 4)))]}
 
 
 async def get_operation(request: web.Request) -> web.Response:

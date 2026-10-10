@@ -47,6 +47,9 @@ Groups (``--only gemini.<group>``)
                OpenAPI, MCP and direct tools, approval, follow-up turns, unknown
                tool, malformed call, grounding with tools (and the next turn),
                task / legacy / no built-in tools, streaming valve off
+  owuitools    Open WebUI's built-in image generation / editing (image engine
+               "gemini" on the mock) and code interpreter tools called by a
+               Gemini text model
 
 The browser path sends the web UI's default params, i.e. native function
 calling with Open WebUI's built-in tools (functionDeclarations). The "images"
@@ -93,6 +96,7 @@ GROUPS = (
     "imgedit",
     "toolsapi",
     "tools",
+    "owuitools",
 )
 FID = "gemini"
 PATH = "pipelines/google/google_gemini.py"
@@ -464,6 +468,7 @@ async def run(t: Suite) -> None:
         ("imgedit", imgedit),
         ("toolsapi", toolsapi_group),
         ("tools", tools_group),
+        ("owuitools", owuitools_group),
     ):
         if t.selected(group):
             try:
@@ -2615,3 +2620,10 @@ async def tools_group(t: Suite, mock) -> None:
     from . import _gemini_tools
 
     await _gemini_tools.tools(t, mock)
+
+
+# Open WebUI's built-in image and code interpreter tools: suites/_gemini_owuitools.py
+async def owuitools_group(t: Suite, mock) -> None:
+    from . import _gemini_owuitools
+
+    await _gemini_owuitools.owuitools(t, mock)
