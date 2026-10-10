@@ -35,7 +35,8 @@ Groups (``--only gemini.<group>``)
   streamimg    inline image from a model the pipe does not detect (stream path)
   imgedit      image editing across turns (#194): generated images and uploads of
                a saved chat sent with the edit request (in order, each once),
-               follow-up tasks without them, guided regeneration,
+               follow-up tasks without them, guided regeneration (and no
+               guided regeneration after an empty answer),
                IMAGE_HISTORY_MAX_REFERENCES keeps the current and the newest
                images, older saved forms (data: URL files, markdown links),
                temporary chats and database errors use the request, files of
@@ -2217,6 +2218,7 @@ async def imgedit(t: Suite, mock) -> None:
     await imgedit_guided(t, mock)
     await imgedit_dedup(t, mock)
     await imgedit_saved(t, mock)
+    await imgedit_empty_answer(t, mock)
     await imgedit_temporary(t, mock)
     await imgedit_db_error(t, mock)
     await imgedit_foreign(t, mock)
@@ -2615,6 +2617,82 @@ async def imgedit_saved(t: Suite, mock) -> None:
         ],
         f"chat: HTTP {status} notes: HTTP {notes_status} "
         f"done={getattr(c2, 'done', None)} {_edit_report(req)}",
+    )
+
+
+async def imgedit_empty_answer(t: Suite, mock) -> None:
+    """A saved chat whose answer is empty without an error (stopped before its
+    first token). Open WebUI 0.12 leaves every answer without content and
+    output out of the request (load_messages_from_db), up to 0.11 only a failed
+    one: the edit turn after it must not count as a guided regeneration (which
+    would send the saved edit message's upload as history too)."""
+    upload = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    photo = await _upload_png(t.owui, UPLOAD_PNG_2, "photo.png")
+    user_id, answer_id, now = str(uuid.uuid4()), str(uuid.uuid4()), int(time.time())
+    user1 = {
+        "id": user_id,
+        "parentId": None,
+        "childrenIds": [answer_id],
+        "role": "user",
+        "content": "Draw a certificate with this logo",
+        "timestamp": now,
+        "models": [IMAGE_GA],
+        "files": [upload],
+    }
+    answer1 = {
+        "id": answer_id,
+        "parentId": user_id,
+        "childrenIds": [],
+        "role": "assistant",
+        "content": "",
+        "model": IMAGE_GA,
+        "done": True,
+        "timestamp": now,
+    }
+    status, chat = await t.owui.api(
+        "POST",
+        "/api/v1/chats/new",
+        {
+            "chat": {
+                "title": "E2E empty answer chat",
+                "models": [IMAGE_GA],
+                "history": {
+                    "currentId": answer_id,
+                    "messages": {user_id: user1, answer_id: answer1},
+                },
+                "messages": [user1, answer1],
+            }
+        },
+    )
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    c2, req = None, {"contents": 0, "sent": [], "images": []}
+    if status == 200 and chat_id:
+        await _set(t, IMAGE_DEDUP_HISTORY=False)  # a second copy would be sent
+        try:
+            async with t.browser() as b:
+                await mock.reset()
+                c2 = await b.chat(
+                    IMAGE_GA,
+                    "Add this photo",
+                    params=LEGACY,
+                    chat_id=chat_id,
+                    parent_id=answer_id,
+                    user_files=[photo],
+                )
+                req = await _edit_request(mock)
+        finally:
+            await _set(t, IMAGE_DEDUP_HISTORY=DEFAULTS["IMAGE_DEDUP_HISTORY"])
+    t.check(
+        "imgedit.empty-answer",
+        "saved chat with an empty answer (no error) before the edit turn, "
+        "IMAGE_DEDUP_HISTORY=false: the upload of turn 1 is history, the upload "
+        "of the edit turn is sent once (not a guided regeneration)",
+        bool(upload["id"])
+        and bool(photo["id"])
+        and getattr(c2, "done", False)
+        and "Add this photo" in (req["sent"] or [""])[0]
+        and req["sent"][1:] == ["[Image 1]", "upload1", "[Image 2]", "upload2"],
+        f"chat: HTTP {status} done={getattr(c2, 'done', None)} {_edit_report(req)}",
     )
 
 
