@@ -60,6 +60,11 @@ class ChatResult:
     finish_reasons: list = field(default_factory=list)
     done_last: bool = False  # "data: [DONE]" is the last data line
     openai_finish_reason: Optional[str] = None  # openai SDK's stream accumulator
+    # stream only: SSE events after the first "data: [DONE]" (OpenAI-style
+    # clients stop reading there) and the delta content among them (also part
+    # of ``content``)
+    after_done: int = 0
+    after_done_content: str = ""
 
     def brief(self) -> str:
         return (
@@ -74,6 +79,9 @@ def parse_sse(text: str) -> dict:
     Only ``choices[].delta.content`` counts as content. A chunk with a full
     ``choices[].message`` (a chat.completion dict answered to a stream request)
     goes to ``message_content`` and adds ``STREAM_MESSAGE_ERROR`` to ``errors``.
+    Events after the first ``[DONE]`` are still parsed, and also counted in
+    ``after_done`` (their delta content in ``after_done_content``): an
+    OpenAI-style client stops reading at ``[DONE]`` and never sees them.
 
     Tool calling: ``tool_calls`` merged by index (id, name, arguments
     concatenated; ``index`` None when a delta had none), every
@@ -96,6 +104,8 @@ def parse_sse(text: str) -> dict:
         "done_seen": False,
         "done_last": False,
         "openai_finish_reason": None,
+        "after_done": 0,
+        "after_done_content": "",
     }
     calls: dict = {}
     chunks: list = []  # what an OpenAI client reads (up to [DONE])
@@ -104,6 +114,8 @@ def parse_sse(text: str) -> dict:
             continue
         payload = line[5:].strip()
         out["done_last"] = payload == "[DONE]"
+        if out["done"]:
+            out["after_done"] += 1
         if payload == "[DONE]":
             out["done"] = out["done_seen"] = True
             continue
@@ -119,7 +131,10 @@ def parse_sse(text: str) -> dict:
             out["errors"].append(data["error"])
         for choice in (data.get("choices") if isinstance(data, dict) else None) or []:
             delta = choice.get("delta") or {}
-            out["content"] += delta.get("content") or ""
+            delta_text = delta.get("content") or ""
+            out["content"] += delta_text
+            if out["done"]:
+                out["after_done_content"] += delta_text
             out["reasoning_content"] += delta.get("reasoning_content") or ""
             out["reasoning_details"] += [
                 d for d in delta.get("reasoning_details") or [] if isinstance(d, dict)
@@ -466,6 +481,8 @@ class OWUI:
                 "openai_finish_reason",
             ):
                 setattr(result, key, parsed[key])
+            result.after_done = parsed["after_done"]
+            result.after_done_content = parsed["after_done_content"]
             return result
         try:
             result.json = r.json()

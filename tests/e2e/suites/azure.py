@@ -8,40 +8,49 @@ Groups (``--only azure.<group>``)
            predefined models, fallback model
   api      API path non-stream / stream, api-key / Bearer header, path and
            api-version, allow-listed body (extra client keys dropped), tools
-           forwarded, stream_options only for streams, errors (JSON 400,
-           text/plain 500)
+           forwarded, stream_options only for streams, errors (JSON 400 with
+           exactly Azure's message, text/plain 500)
   dotted   model names containing dots reach upstream intact
   browser  browser path: saved answer, usage, full status sequence, error status
-  tasks    background title task, also with Azure AI Search valves (#123)
-  oyd      Azure AI Search "On Your Data": [docX] links (also split across
-           stream deltas, already linked, URL with parentheses), links in the
-           history sent back as [docX], only referenced sources saved (show-all
-           valve), relevance scores, no data_sources for background tasks (#123,
-           also without a websocket session), no tools / stream_options with
-           data_sources, large context events, content null; the On Your Data
-           retirement warning: none for requests without (or with empty)
-           data_sources, one for the first valve request and one for the first
-           client request after the function was saved again, none for later
-           requests, never with the search key
-  logs     no API key and no citation text in the server log
-
-Browser chats of the oyd group that test the stream / citation handling send
-``params.function_calling = "legacy"``, so Open WebUI does not add its built-in
-tools (with tools Azure ignores data_sources, see the mock). The chats without
-that parameter are the realistic web UI case and check that the pipe drops the
-built-in tools.
+  tasks    background title task (with Azure AI Search valves: rag.tasks.*)
+  rag      Azure AI Search retrieval of the pipe (3.0.0, #187; On Your Data
+           and its data_sources are gone) against mocks/mock_search.py:
+           request bodies per query_type, embeddings, auth (key, key valve,
+           token, managed identity), query generation (fallback, pause),
+           strictness, merge, top-n, budget, sanitizing, prompt placement,
+           citations, scores, [docX] links (also split across stream deltas,
+           already linked, URL with parentheses; API and browser; nothing
+           after [DONE]), history unlinking (also links saved before 2.8.0, a
+           hostile history line), only referenced sources (show-all valve,
+           references to documents that do not exist), large and too large
+           stream events, content null, tool rounds, tasks (also without a
+           websocket session), client data_sources (API stream and
+           non-stream, browser: an error naming the removal, ERROR line and
+           terminal status), the removed AZURE_AI_SEARCH_MODE valve, no On
+           Your Data retirement notice, fail-closed errors, Stop; see
+           suites/_azure_rag.py
+  logs     no API key, no search key or token and no citation or search text
+           in the server log
 """
 
 import asyncio
 import json
 import time
-import uuid
 
 from harness import Suite, short
 from harness.known import staged_version, version_tuple
-from harness.owui import completion_text
 
-GROUPS = ("valves", "models", "api", "dotted", "browser", "tasks", "oyd", "logs")
+# "rag" runs before "logs" (which scans what rag logged).
+GROUPS = (
+    "valves",
+    "models",
+    "api",
+    "dotted",
+    "browser",
+    "tasks",
+    "rag",
+    "logs",
+)
 FID = "azure"
 PATH = "pipelines/azure/azure_ai_foundry.py"
 KEY = "mock-key-123"
@@ -63,6 +72,30 @@ MAIN_VALVES = (
 )
 SHOW_ALL = "AZURE_AI_SHOW_ALL_CITATIONS_WITHOUT_REFERENCES"
 SHOW_ALL_SINCE = "2.8.0"  # first version with the SHOW_ALL valve
+# Azure AI Search retrieval of the pipe (#187): first version and its valves
+# with their defaults (None: no default checked).
+SEARCH_SINCE = "3.0.0"
+SEARCH_VALVES = {
+    "AZURE_AI_SEARCH_KEY": None,  # encrypted, password input
+    "AZURE_AI_SEARCH_API_VERSION": "2026-04-01",
+    "AZURE_AI_SEARCH_QUERY_GENERATION": "auto",
+    "AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS": -1,
+}
+SEARCH_ENUMS = {
+    "AZURE_AI_SEARCH_QUERY_GENERATION": {"auto", "always", "off"},
+}
+# The mode valve of the unreleased 2.9.0 (pipeline / on_your_data): never
+# released, removed with On Your Data in 3.0.0.
+SEARCH_MODE = "AZURE_AI_SEARCH_MODE"
+# Secrets of the rag group (mock values); never in the server log.
+RAG_SEARCH_KEY = "mock-search-key-456"
+RAG_SEARCH_TOKEN = "mock-search-token-789"
+RAG_EMBED_KEY = "mock-embed-key-321"
+RAG_EMBED_TOKEN = "mock-embed-token-e2e"
+RAG_JSON_KEY = "json-plaintext-key-000"
+# Texts the rag group sends to the Search mock or gets back (generated
+# queries, document titles and URLs): not at INFO in the server log.
+SEARCH_TEXTS = ("x100 warranty", "Release Notes", "docs.example.com/x100")
 # Client keys Open WebUI passes through to the pipe but the allow-list must drop.
 NOT_ALLOWED = {"user": "u-e2e", "logit_bias": {"50256": -100}, "foo_not_allowed": "x"}
 ALLOWED = {
@@ -82,7 +115,6 @@ ALLOWED = {
     "tool_choice",
     "tools",
     "top_p",
-    "data_sources",
     "stream_options",
 }
 USAGE_OPTIONS = {"include_usage": True}
@@ -96,32 +128,13 @@ TOOLS = [
         },
     }
 ]
-SEARCH_ENDPOINT = "https://mock-search.search.windows.net"
-SEARCH_INDEX = "x100-docs"
-SEARCH_KEY = "e2e-search-key-4711"  # in DATA_SOURCES; must never be logged
-DATA_SOURCES = [
-    {
-        "type": "azure_search",
-        "parameters": {
-            "endpoint": SEARCH_ENDPOINT,
-            "index_name": SEARCH_INDEX,
-            "authentication": {"type": "api_key", "key": SEARCH_KEY},
-        },
-    }
-]
-# The On Your Data retirement warning (since 2.8.1): logged once per loaded
-# copy of the module (saving the function loads it again) for the first
-# request that sends a non-empty data_sources. Lines with all of OYD_NOTICE
-# count as the notice, whatever their level.
-OYD_NOTICE = ("On Your Data", "October 14, 2026")
-OYD_NOTICE_SINCE = "2.8.1"
 MANUAL_URL = "https://docs.example.com/x100/manual.pdf"
 LINKED = (
     f"The X100 charges via USB-C [[doc1]]({MANUAL_URL}). "
     "It has a two-year warranty [[doc2]](faq/warranty.html)."
 )
 UNLINKED = "The X100 charges via USB-C [doc1]. It has a two-year warranty [doc2]."
-# mock trigger "paren-url": doc1's URL is .../manual_(v2).pdf
+# mock_search trigger "paren-url": doc1's URL is .../manual_(v2).pdf
 PAREN_LINKED = LINKED.replace(
     MANUAL_URL, "https://docs.example.com/x100/manual_%28v2%29.pdf"
 )
@@ -131,15 +144,12 @@ REFERENCED_SOURCES = ["[doc1] - X100 Product Manual", "[doc2] - Warranty FAQ"]
 ALL_SOURCES = REFERENCED_SOURCES + ["[doc3] - Release Notes"]
 # text of doc1 (mock); must not appear in the server log at INFO
 CITATION_TEXT = "The X100 charges via USB-C at up to 65 W."
-FILLER = "bigdoc bigdoc bigdoc"  # document text of the big/huge contexts
-INCLUDE_CONTEXTS = ["citations", "all_retrieved_documents"]
+FILLER = "bigdoc bigdoc bigdoc"  # filler text of the big documents and events
 TASKS = {
     "title_generation": True,
     "tags_generation": True,
     "follow_up_generation": True,
 }
-# Browser chats without Open WebUI's built-in tools (see the module docstring).
-NO_BUILTIN_TOOLS = {"function_calling": "legacy"}
 STATUS_STREAM = [
     "Sending request to Azure AI...",
     "Streaming response from Azure AI...",
@@ -148,14 +158,26 @@ STATUS_STREAM = [
 STATUS_NONSTREAM = ["Sending request to Azure AI...", "Request completed"]
 LINE_TOO_LONG = "Got more than 131072 bytes"
 STREAM_ERROR = ("function_azure:stream_processor_with_citations", "Error processing")
+# The whole answer to the mock's force-400 (content filter): Azure's message
+# and nothing appended (e.g. no On Your Data hint as in the 2.9.0 pre-releases)
+FILTERED_ERROR = (
+    "Error: The response was filtered due to the prompt triggering Azure OpenAI's "
+    "content management policy."
+)
+
+
+# First line of the task in Open WebUI's RAG template (a file attached to a
+# chat message): it starts with "### Task:" too, but is no background task.
+RAG_TEMPLATE_TASK = "Respond to the user query using the provided context"
 
 
 def _is_task(entry: dict) -> bool:
-    return "### Task:" in json.dumps((entry.get("body") or {}).get("messages"))
-
-
-def _is_answer(entry: dict) -> bool:
-    return not _is_task(entry)
+    """A background-task request: a "### Task:" that is not the RAG template."""
+    text = json.dumps((entry.get("body") or {}).get("messages"))
+    return any(
+        not part.removeprefix("\\n").lstrip().startswith(RAG_TEMPLATE_TASK)
+        for part in text.split("### Task:")[1:]
+    )
 
 
 def _statuses(history: list) -> list:
@@ -181,67 +203,6 @@ def _answered(content: str) -> bool:
     return bool(content) and not content.startswith("Error")
 
 
-def _upstream(entry: dict) -> str:
-    """Upstream body keys and whether the mock ignored data_sources."""
-    body = entry.get("body") or {}
-    return (
-        f"upstream keys={sorted(body)} "
-        f"data_sources_ignored={bool(entry.get('data_sources_ignored'))}"
-    )
-
-
-def _oyd_notices(t: Suite, mark: int) -> list:
-    """Full server-log lines of the On Your Data retirement notice since
-    ``mark``."""
-    return [
-        line
-        for line in t.log.since(mark).splitlines()
-        if all(part in line for part in OYD_NOTICE)
-    ]
-
-
-def _oyd_notice_expected() -> int:
-    """Notices per loaded copy of the module: 1 for the staged pipeline from
-    OYD_NOTICE_SINCE on, 0 before."""
-    version = staged_version(PATH)
-    return int(version_tuple(version) >= version_tuple(OYD_NOTICE_SINCE))
-
-
-async def _check_oyd_notice(
-    t: Suite, sid: str, title: str, mark: int, expected: int, ok=True, detail=""
-) -> bool:
-    """Check: exactly ``expected`` retirement notices since ``mark`` (and
-    ``ok``), each a WARNING of the pipe with the link to #187 and without any
-    part of the data_sources."""
-    await t.log.settle(0.5)
-    notices = _oyd_notices(t, mark)
-    leaked = [
-        name
-        for name, value in (
-            ("search key", SEARCH_KEY),
-            ("endpoint", SEARCH_ENDPOINT),
-            ("index", SEARCH_INDEX),
-        )
-        if any(value in notice for notice in notices)
-    ]
-    shape = all(
-        "| WARNING" in notice
-        and "function_azure:pipe" in notice
-        and "issues/187" in notice
-        and "once per process" in notice
-        for notice in notices
-    )
-    first = notices[0].replace(SEARCH_KEY, "***") if notices else ""
-    return t.check(
-        sid,
-        title,
-        bool(ok) and len(notices) == expected and shape and not leaked,
-        f"{detail} version={staged_version(PATH)} notices={len(notices)} "
-        f"expected={expected} WARNING of the pipe with #187={shape} "
-        f"data_sources parts in the notice={leaked} line={short(first, 400)}",
-    )
-
-
 def _allow_listed(body: dict) -> bool:
     """Only allow-listed keys went upstream, the extra client keys were dropped
     and an allow-listed optional parameter (temperature) was kept."""
@@ -258,18 +219,6 @@ async def _models(t: Suite) -> dict:
         m["id"]: m.get("name")
         for m in await t.owui.models()
         if m["id"].startswith(FID + ".")
-    }
-
-
-def _oyd_valves(mock, base_valves: dict) -> dict:
-    return {
-        **base_valves,
-        "AZURE_AI_ENDPOINT": f"{mock.url}/openai/deployments/gpt-4.1/chat/completions"
-        "?api-version=2025-01-01-preview",
-        "AZURE_AI_MODEL": "gpt-4.1",
-        "AZURE_AI_DATA_SOURCES": json.dumps(DATA_SOURCES),
-        "AZURE_AI_INCLUDE_SEARCH_SCORES": True,
-        SHOW_ALL: True,
     }
 
 
@@ -312,12 +261,16 @@ async def run(t: Suite) -> None:
     if t.selected("browser"):
         await browser(t, mock)
     if t.selected("tasks"):
-        await tasks(t, mock, base_valves)
-    if t.selected("oyd"):
-        await oyd(t, mock, base_valves)
+        await tasks(t, mock)
+    rag_mark = None
+    if t.selected("rag"):
+        from suites._azure_rag import rag  # needs this module's names
+
+        rag_mark = t.mark()
+        await rag(t, mock, base_valves)
     await t.owui.update_valves(FID, **base_valves)
     if t.selected("logs"):
-        logs(t)
+        logs(t, rag_mark)
     t.scan_log()
 
 
@@ -326,14 +279,39 @@ def valves_compat(t: Suite, spec: dict) -> None:
     required = list(MAIN_VALVES)
     if version_tuple(version) >= version_tuple(SHOW_ALL_SINCE):
         required.append(SHOW_ALL)
+    search = version_tuple(version) >= version_tuple(SEARCH_SINCE)
+    if search:
+        required.extend(SEARCH_VALVES)
     missing = [name for name in required if name not in spec]
     show_all_default = (spec.get(SHOW_ALL) or {}).get("default")
+    wrong = []
+    if search:
+        if SEARCH_MODE in spec:
+            wrong.append(f"{SEARCH_MODE} still a valve")
+        for name, default in SEARCH_VALVES.items():
+            got = (spec.get(name) or {}).get("default")
+            if default is not None and got != default:
+                wrong.append(f"{name}.default={got!r}")
+        for name, values in SEARCH_ENUMS.items():
+            enum = (spec.get(name) or {}).get("enum")
+            if set(enum or ()) != values:
+                wrong.append(f"{name}.enum={enum}")
+        key_input = ((spec.get("AZURE_AI_SEARCH_KEY") or {}).get("input") or {}).get(
+            "type"
+        )
+        if key_input != "password":
+            wrong.append(f"AZURE_AI_SEARCH_KEY.input={key_input!r}")
     t.check(
         "valves.compat",
         f"valve names of 2.7.0 kept; {SHOW_ALL} defaults to true "
-        f"(since {SHOW_ALL_SINCE})",
-        not missing and (SHOW_ALL not in required or show_all_default is True),
-        f"version={version} missing={missing} {SHOW_ALL}.default={show_all_default}",
+        f"(since {SHOW_ALL_SINCE}); the Azure AI Search valves with their "
+        f"defaults, enums and a password input for the key, no {SEARCH_MODE} "
+        f"(since {SEARCH_SINCE})",
+        not missing
+        and (SHOW_ALL not in required or show_all_default is True)
+        and not wrong,
+        f"version={version} missing={missing} {SHOW_ALL}.default={show_all_default} "
+        f"wrong={wrong}",
     )
 
 
@@ -512,8 +490,9 @@ async def api(t: Suite, mock, base_valves: dict) -> None:
         t.expect_errors(mark, ("function_azure:pipe", "Error in Azure AI request: 400"))
         t.check(
             f"api.error-400.{'stream' if stream else 'nonstream'}",
-            f"upstream HTTP 400 -> readable error (stream={stream})",
-            r.status == 200 and "content management policy" in r.content,
+            f"upstream HTTP 400 -> readable error (stream={stream}): exactly "
+            "'Error: <Azure's message>', no hint appended",
+            r.status == 200 and r.content == FILTERED_ERROR,
             r.brief(),
         )
 
@@ -588,16 +567,17 @@ async def browser(t: Suite, mock) -> None:
     last = _last_status(c.status_history)
     t.check(
         "browser.error-status",
-        "browser path upstream HTTP 400: error saved, final 'Error: ...' status done",
+        "browser path upstream HTTP 400: error saved and final status done, both "
+        "exactly 'Error: <Azure's message>' (no hint appended)",
         c.done
-        and "content management policy" in c.content
-        and str(last.get("description", "")).startswith("Error:")
+        and c.content == FILTERED_ERROR
+        and last.get("description") == FILTERED_ERROR
         and last.get("done") is True,
         f"{c.brief()} statuses={_statuses(c.status_history)}",
     )
 
 
-async def tasks(t: Suite, mock, base_valves: dict) -> None:
+async def tasks(t: Suite, mock) -> None:
     await mock.reset()
     status, answer, raw = await t.owui.title_task(
         f"{FID}.gpt-4o", [{"role": "user", "content": "Hi"}]
@@ -607,482 +587,6 @@ async def tasks(t: Suite, mock, base_valves: dict) -> None:
         "title task via /api/v1/tasks/title/completions",
         status == 200 and answer and "Mock Title" in answer,
         f"HTTP {status} answer={short(answer)} raw={short(raw, 200)}",
-    )
-
-    await t.owui.update_valves(FID, **_oyd_valves(mock, base_valves))
-    await mock.reset()
-    status, answer, raw = await t.owui.title_task(
-        f"{FID}.gpt-4.1", [{"role": "user", "content": "x100 charging?"}]
-    )
-    requests = await mock.requests(_is_task)
-    with_sources = [e for e in requests if (e.get("body") or {}).get("data_sources")]
-    answered = status == 200 and bool(answer) and "Mock Title" in answer
-    t.check(
-        "tasks.title.oyd",
-        "title task with Azure AI Search valves: answered, sent without "
-        "data_sources (#123)",
-        answered and requests and not with_sources,
-        f"answered={answered} task requests={len(requests)} "
-        f"with data_sources={len(with_sources)} HTTP {status} "
-        f"answer={short(answer)}",
-    )
-    await t.owui.update_valves(FID, **base_valves)
-
-
-async def oyd(t: Suite, mock, base_valves: dict) -> None:
-    oyd_valves = _oyd_valves(mock, base_valves)
-    await oyd_notice_none(t, mock, base_valves, oyd_valves)
-    await t.owui.update_valves(FID, **oyd_valves)
-    model = f"{FID}.gpt-4.1"
-    await oyd_api(t, mock, model, oyd_valves)
-    await oyd_history(t, mock, model)
-    await oyd_big(t, mock, model)
-    await oyd_browser(t, mock, model, oyd_valves)
-    await oyd_browser_tools(t, mock, model)
-    await oyd_no_session(t, mock, model)
-    await oyd_usage_capability(t, mock, model)
-    await oyd_notice_once(t)
-
-
-async def oyd_notice_none(t: Suite, mock, base_valves: dict, oyd_valves: dict) -> None:
-    """Requests without data_sources log no retirement notice: a chat without
-    AZURE_AI_DATA_SOURCES, the same with an empty data_sources list from the
-    client and a title task with the valve (tasks drop data_sources). Runs
-    before the first data_sources request of the suite, because the notice
-    is logged only once per loaded copy of the module."""
-    await t.owui.update_valves(FID, **base_valves)
-    await mock.reset()
-    r = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=True)
-    empty = await t.owui.chat(f"{FID}.gpt-4o", "Hi", stream=False, data_sources=[])
-    await t.owui.update_valves(FID, **oyd_valves)
-    status, answer, _ = await t.owui.title_task(
-        model=f"{FID}.gpt-4.1",
-        messages=[{"role": "user", "content": "x100 charging?"}],
-    )
-    requests = await mock.requests()
-    tasks = [e for e in requests if _is_task(e)]
-    with_sources = [e for e in requests if (e.get("body") or {}).get("data_sources")]
-    empty_sent = [
-        e for e in requests if (e.get("body") or {}).get("data_sources") == []
-    ]
-    await _check_oyd_notice(
-        t,
-        "oyd.notice.none",
-        "requests without data_sources (no AZURE_AI_DATA_SOURCES, also with "
-        "data_sources [] from the client; title task with the valve) log no On "
-        "Your Data retirement notice",
-        t.log_start,
-        0,
-        ok=r.status == 200
-        and _answered(r.content)
-        and empty.status == 200
-        and _answered(empty.content)
-        and status == 200
-        and bool(answer)
-        and len(requests) > len(tasks) > 0
-        and not with_sources,
-        detail=f"{r.brief()} empty data_sources: {empty.brief()} "
-        f"(forwarded as [] {len(empty_sent)}x) task HTTP {status} "
-        f"answer={short(answer)} upstream requests={len(requests)} "
-        f"(tasks {len(tasks)}) with data_sources={len(with_sources)}",
-    )
-
-
-async def oyd_notice_once(t: Suite) -> None:
-    """After all data_sources requests of the group (valve and client, API and
-    browser path, stream and non-stream, history, tools, big contexts): one
-    retirement notice per loaded copy of the module (oyd.notice.valve and,
-    after the reload, oyd.notice.client), none for the later requests; the
-    search key appears nowhere in the server log."""
-    key_logged = t.log.since(t.log_start).count(SEARCH_KEY)
-    expected = 2 * _oyd_notice_expected()
-    await _check_oyd_notice(
-        t,
-        "oyd.notice.once",
-        "On Your Data retirement notice once per loaded copy of the module: "
-        f"{expected} in the suite (valve and client window), none for the later "
-        "data_sources requests; search key never logged "
-        f"(since {OYD_NOTICE_SINCE})",
-        t.log_start,
-        expected,
-        ok=not key_logged,
-        detail=f"search key logged {key_logged}x",
-    )
-
-
-async def oyd_api(t: Suite, mock, model: str, oyd_valves: dict) -> None:
-    question = "x100 charging and warranty?"
-    expected_notices = _oyd_notice_expected()
-    await mock.reset()
-    mark = t.mark()  # first data_sources request of the suite (valve)
-    r = await t.owui.chat(model, question, stream=False)
-    req = await mock.last()
-    parameters = (
-        (((req.get("body") or {}).get("data_sources") or [{}])[0]).get("parameters")
-        or {}
-    )
-    t.check(
-        "oyd.api.nonstream",
-        "On Your Data non-stream: [docX] rewritten to markdown links",
-        r.status == 200 and r.content == LINKED,
-        f"{r.brief()} include_contexts={parameters.get('include_contexts')}",
-    )
-    await _check_oyd_notice(
-        t,
-        "oyd.notice.valve",
-        "the first request with data_sources from AZURE_AI_DATA_SOURCES (API, "
-        "non-stream) logs the On Your Data retirement notice once: a WARNING "
-        "of the pipe with the link to #187, without any part of the "
-        f"data_sources (since {OYD_NOTICE_SINCE})",
-        mark,
-        expected_notices,
-        ok=r.status == 200 and bool(parameters),
-        detail=f"HTTP {r.status} data_sources upstream={bool(parameters)}",
-    )
-    t.check(
-        "oyd.api-version",
-        "upstream URL keeps path and api-version of AZURE_AI_ENDPOINT (Azure "
-        "OpenAI deployment endpoint)",
-        req.get("path") == "/openai/deployments/gpt-4.1/chat/completions"
-        and (req.get("query") or {}).get("api-version") == "2025-01-01-preview",
-        f"path={req.get('path')} query={req.get('query')}",
-    )
-
-    await mock.reset()
-    r = await t.owui.chat(model, question, stream=True)
-    req = await mock.last()
-    t.check(
-        "oyd.api.stream",
-        "On Your Data stream: [docX] links and [DONE], no stream_options upstream",
-        r.status == 200
-        and r.content == LINKED
-        and r.done
-        and "stream_options" not in (req.get("body") or {}),
-        f"{r.brief()} done={r.done} upstream keys={sorted(req.get('body') or {})}",
-    )
-    body_model = (req.get("body") or {}).get("model")
-    t.check(
-        "oyd.dotted.stream",
-        "On Your Data stream: dotted model name reaches upstream intact",
-        body_model == "gpt-4.1",
-        f"body.model={body_model!r} {r.brief()}",
-    )
-
-    await mock.reset()
-    r = await t.owui.chat(model, question, stream=True, stream_options=USAGE_OPTIONS)
-    req = await mock.last()
-    await t.log.settle(0.5)
-    sent_options = (req.get("body") or {}).get("stream_options")
-    t.check(
-        "oyd.stream-options",
-        "client stream_options is not forwarded together with data_sources",
-        r.status == 200
-        and r.content == LINKED
-        and "stream_options" not in (req.get("body") or {}),
-        f"{r.brief()} upstream stream_options={sent_options}",
-    )
-
-    for stream in (True, False):
-        await mock.reset()
-        r = await t.owui.chat(
-            model, question, stream=stream, tools=TOOLS, tool_choice="auto"
-        )
-        req = await mock.last()
-        body = req.get("body") or {}
-        t.check(
-            f"oyd.tools.api.{'stream' if stream else 'nonstream'}",
-            "tools / tool_choice are not sent with data_sources, the answer is "
-            f"grounded (stream={stream})",
-            r.status == 200
-            and r.content == LINKED
-            and "tools" not in body
-            and "tool_choice" not in body
-            and bool(body.get("data_sources")),
-            f"{r.brief()} {_upstream(req)}",
-        )
-
-    for sid, text, expected in (
-        ("oyd.split-tokens.api", "x100 split-tokens", LINKED),
-        ("oyd.split-link.api", "x100 split-link", SPLIT_LINK),
-        ("oyd.no-finish.api", "x100 split-tokens no-finish", LINKED[:-1]),
-    ):
-        await mock.reset()
-        r = await t.owui.chat(model, text, stream=True)
-        t.check(
-            sid,
-            f"API stream '{text}': references split across deltas are linked "
-            "once, [DONE] forwarded",
-            r.status == 200 and r.content == expected and r.done,
-            f"{r.brief()} done={r.done}",
-        )
-
-    await mock.reset()
-    r = await t.owui.chat(model, "x100 paren-url", stream=False)
-    t.check(
-        "oyd.paren-url",
-        "parentheses in citation URLs are percent-encoded in the link",
-        r.status == 200 and r.content == PAREN_LINKED,
-        r.brief(),
-    )
-
-    # data_sources sent by the client (no AZURE_AI_DATA_SOURCES valve). Saving
-    # the function again loads a fresh copy of the module, so this is the
-    # first data_sources request of that copy and must log the notice itself.
-    reload_status, reload_data = await t.owui.install_function(
-        FID, "Azure AI Foundry", t.source(PATH)
-    )
-    # also tells the harness the password valves again (install forgets them)
-    await t.owui.update_valves(FID, **{**oyd_valves, "AZURE_AI_DATA_SOURCES": ""})
-    await mock.reset()
-    mark = t.mark()
-    r = await t.owui.chat(model, question, stream=True, data_sources=DATA_SOURCES)
-    req = await mock.last()
-    await t.log.settle(0.5)
-    body = req.get("body") or {}
-    t.check(
-        "oyd.client-data-sources",
-        "data_sources from the client: [docX] links and [DONE], no stream_options "
-        "upstream",
-        r.status == 200
-        and r.content == LINKED
-        and r.done
-        and bool(body.get("data_sources"))
-        and "stream_options" not in body,
-        f"{r.brief()} done={r.done} upstream "
-        f"stream_options={body.get('stream_options')} {_upstream(req)}",
-    )
-    reloaded = reload_status == 200 and isinstance(reload_data, dict)
-    await _check_oyd_notice(
-        t,
-        "oyd.notice.client",
-        "after the function was saved again (fresh module), the first request "
-        "with data_sources from the client (API, stream, no "
-        "AZURE_AI_DATA_SOURCES) logs the On Your Data retirement notice once "
-        f"(since {OYD_NOTICE_SINCE})",
-        mark,
-        expected_notices,
-        ok=reloaded and r.status == 200 and bool(body.get("data_sources")),
-        detail=f"function saved again: HTTP {reload_status} "
-        f"{'' if reloaded else short(reload_data, 200)} {r.brief()}",
-    )
-    await t.owui.update_valves(FID, **oyd_valves)
-
-
-async def oyd_history(t: Suite, mock, model: str) -> None:
-    cases = (
-        (
-            "oyd.history-unlink",
-            "links of earlier answers go back to Azure as plain [docX]",
-            PAREN_LINKED,
-            UNLINKED,
-        ),
-        (
-            "oyd.legacy-history-paren",
-            "links saved before 2.8.0 with ')' in the URL go back as plain [docX]",
-            "y [[doc1]](https://docs.example.com/a_(b).pdf) z",
-            "y [doc1] z",
-        ),
-    )
-    for sid, title, earlier, expected in cases:
-        history = [
-            {"role": "user", "content": "x100 charging?"},
-            {"role": "assistant", "content": earlier},
-            {"role": "user", "content": "and the warranty?"},
-        ]
-        await mock.reset()
-        r = await t.owui.chat(model, history, stream=False)
-        req = await mock.last()
-        messages = (req.get("body") or {}).get("messages") or []
-        sent = next(
-            (m.get("content") for m in messages if m.get("role") == "assistant"), None
-        )
-        answered = r.status == 200 and r.content == LINKED
-        t.check(
-            sid,
-            title,
-            answered and sent == expected,
-            f"answered={answered} sent={sent!r} {r.brief()}",
-        )
-
-    # Any API client can send this history: a long line of unclosed links must
-    # not make the unlinking quadratic (it runs in the event loop).
-    hostile = "[[doc1]](" * 9000 + "x"
-    history = [
-        {"role": "user", "content": "x100 charging?"},
-        {"role": "assistant", "content": hostile},
-        {"role": "user", "content": "and the warranty?"},
-    ]
-    await mock.reset()
-    started = time.monotonic()
-    r = await t.owui.chat(model, history, stream=False)
-    elapsed = time.monotonic() - started
-    req = await mock.last()
-    messages = (req.get("body") or {}).get("messages") or []
-    sent = next(
-        (m.get("content") for m in messages if m.get("role") == "assistant"), None
-    )
-    answered = r.status == 200 and r.content == LINKED
-    t.check(
-        "oyd.history-hostile",
-        "81 KB history line of unclosed [[docX]]( links: passed through unchanged "
-        "in under 3 s (unlinking stays linear)",
-        answered and sent == hostile and elapsed < 3.0,
-        f"elapsed={elapsed:.2f}s answered={answered} "
-        f"sent_unchanged={sent == hostile} {r.brief()}",
-    )
-
-
-async def oyd_big(t: Suite, mock, model: str) -> None:
-    mark = t.mark()
-    await mock.reset()
-    r = await t.owui.chat(model, "x100 big-context", stream=True)
-    await t.log.settle(0.5)
-    too_long = len(t.log.lines(mark, LINE_TOO_LONG))
-    t.check(
-        "oyd.big-context",
-        "a ~300 KB context event (one SSE line) is read: linked answer and [DONE]",
-        r.status == 200 and r.content == LINKED and r.done and not too_long,
-        f"{r.brief()} done={r.done} line_too_long_log={too_long}",
-    )
-
-    mark = t.mark()
-    await mock.reset()
-    r = await t.owui.chat(model, "x100 huge-context", stream=True)
-    await t.log.settle(0.5)
-    too_long = len(t.log.lines(mark, LINE_TOO_LONG))
-    leaked = FILLER in t.log.since(mark)
-    # the stream fails on purpose (event larger than the pipe reads)
-    t.expect_errors(mark, STREAM_ERROR)
-    t.check(
-        "oyd.huge-context.api",
-        "a context event over 4 MiB ends the stream with an 'Error: ...' delta and "
-        "[DONE], without document text in the answer or the log",
-        r.status == 200
-        and r.content.startswith("Error:")
-        and FILLER not in r.content
-        and r.done
-        and not leaked,
-        f"{r.brief()} done={r.done} line_too_long_log={too_long} "
-        f"document text in log={leaked}",
-    )
-
-
-async def oyd_browser(t: Suite, mock, model: str, oyd_valves: dict) -> None:
-    """Browser chats without Open WebUI's built-in tools."""
-    params = NO_BUILTIN_TOOLS
-    async with t.browser() as b:
-        for sid, text, expected in (
-            ("oyd.split-tokens.browser", "x100 split-tokens", LINKED),
-            ("oyd.split-link.browser", "x100 split-link", SPLIT_LINK),
-            ("oyd.no-finish.browser", "x100 split-tokens no-finish", LINKED[:-1]),
-        ):
-            await mock.reset()
-            c = await b.chat(model, text, stream=True, params=params)
-            t.check(
-                sid,
-                f"browser stream '{text}': linked answer saved, referenced sources",
-                c.done
-                and c.content == expected
-                and c.source_names == REFERENCED_SOURCES,
-                c.brief(),
-            )
-
-        await mock.reset()
-        c = await b.chat(model, "x100 no-refs", stream=True, params=params)
-        t.check(
-            "oyd.no-refs.default",
-            "answer without [docX], show-all valve default -> all 3 sources",
-            c.done and c.content == NO_REFS and c.source_names == ALL_SOURCES,
-            c.brief(),
-        )
-        await t.owui.update_valves(FID, **{**oyd_valves, SHOW_ALL: False})
-        await mock.reset()
-        c = await b.chat(model, "x100 no-refs", stream=True, params=params)
-        t.check(
-            "oyd.no-refs.valve-false",
-            "answer without [docX], show-all valve false -> no sources",
-            c.done and c.content == NO_REFS and c.source_names == [],
-            c.brief(),
-        )
-
-        for include in (True, False):
-            await t.owui.update_valves(
-                FID, **{**oyd_valves, "AZURE_AI_INCLUDE_SEARCH_SCORES": include}
-            )
-            await mock.reset()
-            c = await b.chat(model, "x100 charging?", stream=True, params=params)
-            req = await mock.last(_is_answer)
-            parameters = (
-                (((req.get("body") or {}).get("data_sources") or [{}])[0]).get(
-                    "parameters"
-                )
-                or {}
-            )
-            distances = [s.get("distances") for s in c.sources]
-            if include:
-                ok = parameters.get("include_contexts") == INCLUDE_CONTEXTS and (
-                    distances == [[0.8], [0.12]]
-                )
-                title = (
-                    "AZURE_AI_INCLUDE_SEARCH_SCORES=true: include_contexts sent, "
-                    "relevance scores saved (rerank 3.2/4.0, BM25 12/100)"
-                )
-            else:
-                ok = "include_contexts" not in parameters and (
-                    distances == [[0.0], [0.0]]
-                )
-                title = (
-                    "AZURE_AI_INCLUDE_SEARCH_SCORES=false: no include_contexts, "
-                    "scores 0"
-                )
-            t.check(
-                f"oyd.scores.{'on' if include else 'off'}",
-                title,
-                c.done and c.content == LINKED and ok,
-                f"include_contexts={parameters.get('include_contexts')} "
-                f"distances={distances} {c.brief()}",
-            )
-        await t.owui.update_valves(FID, **oyd_valves)
-
-        mark = t.mark()
-        await mock.reset()
-        # Open WebUI 0.11 never marks a non-stream answer without content as
-        # done (non_streaming_chat_response_handler), so do not wait for it.
-        c = await b.chat(
-            model, "x100 content-null", stream=False, params=params, wait=10
-        )
-        last = _last_status(c.status_history)
-        t.check(
-            "oyd.content-null",
-            "non-stream answer with content null (content filter): the Azure "
-            "response, no pipe error, final status 'Request completed'",
-            not c.content.startswith("Error")
-            and not c.error
-            and last.get("description") == "Request completed"
-            and last.get("done") is True,
-            f"{c.brief()} statuses={_statuses(c.status_history)}",
-        )
-
-        mark = t.mark()
-        await mock.reset()
-        c = await b.chat(model, "x100 huge-context", stream=True, params=params)
-        await t.log.settle(0.5)
-        too_long = len(t.log.lines(mark, LINE_TOO_LONG))
-        t.expect_errors(mark, STREAM_ERROR)
-    last = _last_status(c.status_history)
-    description = str(last.get("description", ""))
-    t.check(
-        "oyd.huge-context.browser",
-        "browser: a context event over 4 MiB -> 'Error: ...' saved and final "
-        "'Error: ...' status done, without document text",
-        c.done
-        and c.content.startswith("Error:")
-        and FILLER not in c.content
-        and description.startswith("Error:")
-        and FILLER not in description
-        and last.get("done") is True,
-        f"{c.brief()} last status={short(description, 120)} done={last.get('done')} "
-        f"line_too_long_log={too_long}",
     )
 
 
@@ -1102,178 +606,35 @@ async def _wait_tasks(t: Suite, mock, chat_id, timeout: float = 60) -> str:
     return f"tasks={count} tags={tags}"
 
 
-async def oyd_browser_tools(t: Suite, mock, model: str) -> None:
-    """Browser chats as the web UI sends them: Open WebUI adds its built-in
-    tools, which must not reach Azure together with data_sources."""
-    question = "x100 charging and warranty?"
-    async with t.browser() as b:
-        await mock.reset()
-        c = await b.chat(
-            model, question, stream=True, background_tasks=TASKS, wait_title=True
-        )
-        waited = await _wait_tasks(t, mock, c.chat_id)
-        c = await b.reload(c)
-        answer_req = await mock.last(_is_answer)
-        upstream = _upstream(answer_req)
-        t.check(
-            "oyd.browser.content",
-            "browser path (built-in tools): linked answer saved, no tools upstream",
-            c.done
-            and c.content == LINKED
-            and "tools" not in (answer_req.get("body") or {}),
-            f"{c.brief()} {upstream}",
-        )
-        task_requests = await mock.requests(_is_task)
-        with_sources = [
-            e for e in task_requests if (e.get("body") or {}).get("data_sources")
-        ]
-        t.check(
-            "oyd.tasks.no-data-sources",
-            "background tasks are sent without data_sources",
-            task_requests and not with_sources,
-            f"answered={_answered(c.content)} task requests={len(task_requests)} "
-            f"with data_sources={len(with_sources)} {waited}",
-        )
-        t.check(
-            "oyd.browser.sources",
-            "saved sources = only the referenced documents, also after background "
-            "tasks",
-            c.source_names == REFERENCED_SOURCES,
-            f"{c.brief()} title={c.title!r} {waited} {upstream}",
-        )
-
-        await mock.reset()
-        c = await b.chat(model, question, stream=True)
-        req = await mock.last(_is_answer)
-        body = req.get("body") or {}
-        t.check(
-            "oyd.browser.stream-status",
-            "browser stream (built-in tools): linked answer, upstream body only "
-            "data_sources/messages/model/stream, statusHistory complete and done",
-            c.done
-            and c.content == LINKED
-            and sorted(body) == ["data_sources", "messages", "model", "stream"]
-            and _status_sequence(c.status_history, STATUS_STREAM),
-            f"{c.brief()} statuses={_statuses(c.status_history)} {_upstream(req)}",
-        )
-
-        await mock.reset()
-        c = await b.chat(model, question, stream=False)
-        req = await mock.last(_is_answer)
-        t.check(
-            "oyd.browser.nonstream",
-            "browser non-stream (built-in tools): linked answer, referenced "
-            "sources, usage, statusHistory complete and done",
-            c.done
-            and c.content == LINKED
-            and c.source_names == REFERENCED_SOURCES
-            and (c.usage or {}).get("total_tokens") == 18
-            and _status_sequence(c.status_history, STATUS_NONSTREAM),
-            f"{c.brief()} statuses={_statuses(c.status_history)} {_upstream(req)}",
-        )
-
-
-async def oyd_no_session(t: Suite, mock, model: str) -> None:
-    """Saved chat without a websocket session (no built-in tools): background
-    tasks run with the message's metadata, so their events must not reach it
-    (#123: 9 sources and 7 statuses on 2.7.0)."""
-    text = "x100 charging and warranty?"
-    aid, uid = str(uuid.uuid4()), str(uuid.uuid4())
-    body = {
-        "model": model,
-        "stream": False,
-        "messages": [{"role": "user", "content": text}],
-        "id": aid,
-        "parent_id": None,
-        "user_message": {
-            "id": uid,
-            "parentId": None,
-            "childrenIds": [aid],
-            "role": "user",
-            "content": text,
-            "timestamp": int(time.time()),
-            "models": [model],
-        },
-        "background_tasks": TASKS,
-    }
-    await mock.reset()
-    status, data = await t.owui.api("POST", "/api/chat/completions", body)
-    answer = completion_text(data) or ""
-    chat_id = data.get("chat_id") if isinstance(data, dict) else None
-    if not chat_id:
-        _, chats = await t.owui.api("GET", "/api/v1/chats/?page=1")
-        for chat in (chats if isinstance(chats, list) else [])[:10]:
-            saved = await t.owui.get_chat(chat["id"])
-            messages = ((saved.get("chat") or {}).get("history") or {}).get(
-                "messages"
-            ) or {}
-            if aid in messages:
-                chat_id = chat["id"]
-                break
-    waited = await _wait_tasks(t, mock, chat_id)
-    saved = await t.owui.get_chat(chat_id) if chat_id else {}
-    messages = ((saved.get("chat") or {}).get("history") or {}).get("messages") or {}
-    message = messages.get(aid) or {}
-    names = [(s.get("source") or {}).get("name") for s in message.get("sources") or []]
-    history = message.get("statusHistory") or []
-    task_requests = await mock.requests(_is_task)
-    with_sources = [
-        e for e in task_requests if (e.get("body") or {}).get("data_sources")
-    ]
-    answered = status == 200 and answer == LINKED
-    t.check(
-        "oyd.no-session.sources",
-        "saved chat without websocket session + background tasks: linked answer, "
-        "only the referenced sources and the answer's statuses (#123)",
-        answered
-        and message.get("content") == LINKED
-        and names == REFERENCED_SOURCES
-        and _status_sequence(history, STATUS_NONSTREAM)
-        and not with_sources,
-        f"answered={answered} task requests={len(task_requests)} "
-        f"with data_sources={len(with_sources)} sources={names} "
-        f"statuses={_statuses(history)} content={short(message.get('content'))} "
-        f"chat={chat_id} {waited}",
-    )
-
-
-async def oyd_usage_capability(t: Suite, mock, model: str) -> None:
-    """Open WebUI 0.11.1+ adds stream_options to streamed requests of models
-    with the 'usage' capability; Azure On Your Data rejects it."""
-    status = await t.owui.upsert_model(
-        model, "Azure gpt-4.1 (usage)", capabilities={"usage": True}
-    )
-    try:
-        async with t.browser() as b:
-            await mock.reset()
-            c = await b.chat(model, "x100 charging?", stream=True)
-            req = await mock.last(_is_answer)
-            await t.log.settle(0.5)
-        body = req.get("body") or {}
-        t.check(
-            "oyd.usage-capability",
-            "model with the usage capability (Open WebUI adds stream_options): "
-            "stream_options not sent with data_sources, linked answer",
-            c.done and c.content == LINKED and "stream_options" not in body,
-            f"model upsert HTTP {status} {c.brief()} upstream "
-            f"stream_options={body.get('stream_options')} {_upstream(req)}",
-        )
-    finally:
-        await t.owui.delete_model(model)
-
-
-def logs(t: Suite) -> None:
+def logs(t: Suite, rag_mark=None) -> None:
     t.assert_no_secrets(
         KEY,
+        RAG_SEARCH_KEY,
+        RAG_SEARCH_TOKEN,
+        RAG_EMBED_KEY,
+        RAG_EMBED_TOKEN,
+        RAG_JSON_KEY,
         sid="logs.no-secrets",
-        title="the API key never appears in the server log (any level)",
+        title="the API key, the search keys and tokens never appear in the "
+        "server log (INFO and above; the pipe at DEBUG: rag.log.debug)",
     )
-    if not t.selected("oyd"):
+    if not t.selected("rag"):
         return  # no citations were fetched
     logged = t.log.since(t.log_start).count(CITATION_TEXT)
     t.check(
         "logs.no-citation-content",
-        "citation content (document text) is not logged at INFO",
+        "citation content (document text) is not logged at INFO or above",
         not logged,
         f"citation text logged {logged}x",
+    )
+    if rag_mark is None:
+        return
+    text = t.log.since(rag_mark)
+    found = {needle: text.count(needle) for needle in SEARCH_TEXTS if needle in text}
+    t.check(
+        "logs.no-search-text",
+        "generated search queries, document titles and URLs are not logged at "
+        "INFO or above",
+        not found,
+        f"logged: {found}",
     )

@@ -281,6 +281,8 @@ class BrowserSession:
         extra_body: Optional[dict] = None,
         until=None,
         user_files: Optional[list] = None,
+        files: Optional[list] = None,
+        extra: Optional[dict] = None,
     ) -> BrowserChat:
         """Send one user message and wait until the saved answer is ``done``.
 
@@ -309,6 +311,15 @@ class BrowserSession:
         an upload from ``owui.upload_file``). Like the web UI, image files are
         not sent as the request's ``files``: Open WebUI turns the image files
         of the saved user messages into image_url parts.
+
+        ``files``: items attached to the user message, as the web UI sends
+        them (saved on the user message after ``user_files`` and sent as the
+        request's ``files``), e.g. ``{"type": "chat", "id": <chat id>,
+        "context": "full"}``.
+
+        ``extra``: more keys of the request body, e.g. ``data_sources`` as an
+        inlet filter would add them (Open WebUI hands unknown keys to the pipe);
+        merged before ``extra_body``.
         """
         if models:
             ids = list(models) if models[0] == model else [model, *models]
@@ -338,6 +349,9 @@ class BrowserSession:
             "params": params or {},
             "background_tasks": background_tasks or {},
         }
+        if files:
+            user_message["files"] = [*(user_files or []), *files]
+            body["files"] = list(files)
         if models:
             body["message_ids"] = [
                 {"model_id": m, "message_id": a, "modelIdx": i}
@@ -351,6 +365,8 @@ class BrowserSession:
             body["tool_ids"] = list(tool_ids)
         if tool_servers is not None:
             body["tool_servers"] = list(tool_servers)
+        if extra:
+            body.update(extra)
         body.update(extra_body or {})
         status, data = await self.owui.api("POST", "/api/chat/completions", body)
         answers = [

@@ -26,7 +26,7 @@ Docker-based E2E tests live in `tests/e2e/` (human guide: `docs/testing.md`). Ho
 tests/e2e/run.sh <suite>                     # gemini | azure | n8n | infomaniak | filters | all
 tests/e2e/run.sh --image v0.11.3-slim gemini # A/B another Open WebUI release (default v0.11.4-slim)
 tests/e2e/run.sh --ref <branch> <suite>      # test files from a git ref; --src DIR / --file PATH=FILE
-tests/e2e/run.sh --keep --only 'azure.oyd' azure   # keep container; then --reuse --name <name>
+tests/e2e/run.sh --keep --only 'azure.rag' azure   # keep container; then --reuse --name <name>
 tests/e2e/run.sh --strict-known all          # as in CI: a tagged check that passes while its marker applies is FAIL
 tests/e2e/check_owui_api.sh [TAG|latest]     # static check of open_webui imports/APIs vs a release
 ```
@@ -91,7 +91,7 @@ Expose a `Filter` class with `inlet(body)` and/or `outlet(body)`, mutating the r
 
 ## Provider quirks worth knowing before editing
 
-- **Azure** (`azure_ai_foundry.py`): model goes in the `x-ms-model-mesh-model-name` header, or in the body when `AZURE_AI_MODEL_IN_BODY=true`. `AZURE_AI_MODEL` accepts semicolon/comma/space-separated lists. Azure AI Search citations are extracted, normalized into Open WebUI `source` events, and `[docX]` references are rewritten into markdown links — the streaming path has its own citation-aware processor (`stream_processor_with_citations`).
+- **Azure** (`azure_ai_foundry.py`): model goes in the `x-ms-model-mesh-model-name` header, or in the body when `AZURE_AI_MODEL_IN_BODY=true`. `AZURE_AI_MODEL` accepts semicolon/comma/space-separated lists. Azure AI Search citations are extracted, normalized into Open WebUI `source` events, and `[docX]` references are rewritten into markdown links — the streaming path has its own citation-aware processor (`stream_processor_with_citations`). Since 3.0.0 the pipe queries Azure AI Search itself (`_retrieve`), injects a `<documents>` block into the current user message, and feeds an On-Your-Data-shaped `context` (synthetic first SSE event / `message.context`) into that same citation code. Azure OpenAI On Your Data is gone: nothing sends `data_sources` upstream, and a request body carrying `data_sources` ends with an `AzureSearchError`.
 - **Gemini** (`google_gemini.py`, ~3.6k lines): streaming is force-disabled for image-generation models; thinking output is wrapped in `<details>` and emitted incrementally; generated images/videos are uploaded through Open WebUI's file API and referenced by `url_path_for("get_file_content_by_id", ...)`.
 - **N8N** (`n8n.py`): streamed responses may mix SSE, NDJSON / back-to-back JSON and plain text — `N8NStreamParser` handles all of them incrementally (line-based, string-aware brace matching whose state persists across `feed()` calls, so keep it linear). n8n `{"type": "error"}` chunks end up in `parser.errors` and the final status. Tool-usage display only works non-streaming.
 

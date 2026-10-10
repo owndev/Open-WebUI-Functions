@@ -314,6 +314,8 @@ start_container() {
   CREATED=1
   # The server output is mirrored to /tmp/e2e/server.log so the driver can
   # inspect it per scenario; `docker logs` keeps working as usual.
+  # IDENTITY_ENDPOINT / IDENTITY_HEADER emulate App Service managed identity:
+  # azure-identity then mints its tokens from mocks/mock_search.py.
   dk run -d --name "$NAME" \
     -p "127.0.0.1:${PORT}:8080" \
     -v "$VOLUME:/app/backend/data" \
@@ -322,6 +324,8 @@ start_container() {
     -e VERTEX_AI_RAG_STORE="$VERTEX_RAG_STORE" \
     -e PYTHONUNBUFFERED=1 -e SEND_TO_LOG_ANALYTICS=false \
     -e RAG_EMBEDDING_ENGINE=openai -e PYTHONWARNINGS=always::ResourceWarning \
+    -e IDENTITY_ENDPOINT=http://127.0.0.1:9106/msi/token \
+    -e IDENTITY_HEADER=e2e-identity-header \
     "$IMAGE" bash -c 'mkdir -p /tmp/e2e; bash start.sh 2>&1 | tee -a /tmp/e2e/server.log' \
     >/dev/null || die "docker run failed (port ${PORT:-auto} busy? image $IMAGE missing?)"
 }

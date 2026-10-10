@@ -5,8 +5,11 @@ Run every provider mock in one process (used by tests/e2e/run.sh).
   azure       127.0.0.1:9102   mock_azure.py
   n8n         127.0.0.1:9103   mock_n8n.py
   infomaniak  127.0.0.1:9104   mock_infomaniak.py
+  search      127.0.0.1:9106   mock_search.py (Azure AI Search + managed identity tokens)
   tools       127.0.0.1:9111   mock_tools.py (OpenAPI tool server; no E2E_MOCK_FAULT)
   mcp         127.0.0.1:9112   mock_tools.py (MCP tool server, optional)
+
+(9105 is the control port of mock_la.py, which the filters suite starts.)
 
 usage:
   python serve_all.py              # serve until stopped
@@ -23,6 +26,7 @@ import mock_azure
 import mock_gemini
 import mock_infomaniak
 import mock_n8n
+import mock_search
 import mock_tools
 from common import fault_status
 
@@ -32,6 +36,7 @@ MOCKS = {
     "azure": (9102, mock_azure.make_app),
     "n8n": (9103, mock_n8n.make_app),
     "infomaniak": (9104, mock_infomaniak.make_app),
+    "search": (9106, mock_search.make_app),
     "tools": (mock_tools.PORT, mock_tools.make_app),
 }
 
