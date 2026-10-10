@@ -757,7 +757,7 @@ Gemini 3 requires the thought signatures of its function calls back in the follo
 ### Display in the chat
 
 - In a turn with tool calls, Gemini's thinking appears as Open WebUI's own "Thought for N seconds" block. The duration can read 0 seconds, because the thoughts of a round arrive together with its tool calls. With `GOOGLE_INCLUDE_THOUGHTS=false` Gemini 3 still sends thought signatures, so the block appears without content for every tool round.
-- Answers without tool calls keep the `<details>` thinking summary.
+- Answers without tool calls show the thinking as a `<details type="reasoning">` block in the answer, which Open WebUI renders as the same localized block (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 - The answer after a tool call is streamed as it arrives. It has no inline `[1]` citation markers; its Google Search sources are still attached.
 - For a chat request with `stream=false`, the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
 
@@ -1033,8 +1033,9 @@ answer:
   translations.
 - While a streamed answer is still thinking, the chat shows the block live with
   `done="false"`: Open WebUI's "Thinking..." with a spinner, and the thoughts so far
-  when expanded (updated about every 0.4 seconds). The block switches to `done="true"`
-  when the first part of the answer arrives.
+  when expanded. The view is updated when new thoughts arrive, at most every 0.4
+  seconds, so the newest thoughts can show up a moment later. The block switches to
+  `done="true"` when the first part of the answer arrives.
 - `duration` is the time from the first thought to the first part of the answer in a
   streamed answer, and the duration of the request without streaming (also for image
   models).

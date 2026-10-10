@@ -4319,7 +4319,8 @@ class Pipe:
         # Search statuses in the shape of Open WebUI's own web search, which it
         # renders in the user's language: the queries ("Searching" + chips), then
         # the sites found ("Searched {{count}} sites" + list). "items" only, no
-        # "urls": Open WebUI counts (urls || items).
+        # "urls": Open WebUI counts (urls || items). Each query once: Open WebUI
+        # keys the query chips by their text, and a duplicate key throws.
         if web_search_queries:
             await self._safe_emit(
                 __event_emitter__,
@@ -4327,7 +4328,7 @@ class Pipe:
                     "type": "status",
                     "data": {
                         "action": "web_search_queries_generated",
-                        "queries": web_search_queries,
+                        "queries": list(dict.fromkeys(web_search_queries)),
                         "done": True,
                     },
                 },

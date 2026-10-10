@@ -825,7 +825,9 @@ def _grounding(body):
         ],
     }
     if "googleSearch" in kinds:
-        metadata["webSearchQueries"] = ["mock search query"]
+        # The same query twice: the pipe must send each query once (Open WebUI
+        # renders the query chips in a keyed each block, duplicates throw).
+        metadata["webSearchQueries"] = ["mock search query", "mock search query"]
     return metadata
 
 
