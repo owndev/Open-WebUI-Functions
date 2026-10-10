@@ -94,22 +94,23 @@ jobs:
     name: Open WebUI ${{ matrix.target.label }}
     needs: images
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         target: ${{ fromJSON(needs.images.outputs.targets) }}
     env:
       E2E_STRICT_KNOWN: "1"
-      # Time budget of the driver (25 min); with the start-up and the 60 s grace of
-      # run.sh it stays well below the step timeout.
-      E2E_TIMEOUT: "1500"
+      # Time budget of the driver (30 min, as the run.sh default; a full run takes
+      # about 17-19 min); with the start-up and the 60 s grace of run.sh it stays
+      # well below the step timeout.
+      E2E_TIMEOUT: "1800"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Run E2E suites
-        timeout-minutes: 35
+        timeout-minutes: 40
         env:
           IMAGE: ${{ matrix.target.image }}
           SUITES: ${{ inputs.suites || 'all' }}
