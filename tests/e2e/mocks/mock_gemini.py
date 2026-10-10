@@ -69,6 +69,11 @@ part that is not Open WebUI's tool-image message, see ``_turn_text``)
                        colour (255, 255, n) instead of FINAL_PNG (n = 1-255), so
                        the images of the turns of a chat differ
   slow-video           Veo: the operation stays pending for SLOW_VIDEO_POLLS polls
+  paced-thinking       streaming text models: ten thought parts "Paced thought <i>."
+                       0.15 s apart, then the answer "Paced answer done." in three
+                       parts 1.2 s apart (the first 0.15 s after the last thought)
+  slow-thinking        streaming text models: twelve thought parts "Slow thought <i>."
+                       0.5 s apart, then the answer "Slow answer."
 
 Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
   {"rounds": [[{"name": "get_current_timestamp", "args": {}}], [...]],
@@ -177,6 +182,23 @@ VERTEX_CHUNK = {
 }
 _op_ids = itertools.count(1)
 _slow_ops: dict = {}  # operation id -> polls left before it is done
+# Paced streams: trigger -> (thought texts, seconds between thoughts, answer
+# parts, seconds between answer parts); the thinking ends where the answer starts
+PACED = {
+    "paced-thinking": (
+        [f"Paced thought {i}." for i in range(1, 11)],
+        0.15,
+        ["Paced ", "answer ", "done."],
+        1.2,
+    ),
+    "slow-thinking": (
+        [f"Slow thought {i}." for i in range(1, 13)],
+        0.5,
+        ["Slow answer."],
+        0.05,
+    ),
+}
+STREAM_PAUSE = 0.05  # seconds after every streamed chunk
 
 
 def png_b64(r: int, g: int, b: int) -> str:
@@ -803,7 +825,9 @@ def _grounding(body):
         ],
     }
     if "googleSearch" in kinds:
-        metadata["webSearchQueries"] = ["mock search query"]
+        # The same query twice: the pipe must send each query once (Open WebUI
+        # renders the query chips in a keyed each block, duplicates throw).
+        metadata["webSearchQueries"] = ["mock search query", "mock search query"]
     return metadata
 
 
@@ -893,6 +917,9 @@ def _stream_chunks(model: str, body) -> list:
         )
         return chunks
     task = task_answer(text)
+    paced = next((key for key in PACED if key in text), None)
+    if paced and not task:
+        return _paced_chunks(body, thoughts, *PACED[paced])
     pieces = [task] if task else ["Hello ", "from mock ", "(stream)."]
     if "data-prefix" in text:
         pieces = ["data: starts ", "like SSE."]
@@ -902,6 +929,22 @@ def _stream_chunks(model: str, body) -> list:
     chunks += [_chunk([{"text": piece}], body) for piece in pieces[:-1]]
     chunks.append(_chunk([{"text": pieces[-1]}], body, True, USAGE_STREAM))
     return chunks
+
+
+def _paced_chunks(body, thoughts, texts, thought_gap, pieces, piece_gap) -> list:
+    """Chunks of a paced stream; a float is an extra pause (seconds) after the
+    previous chunk, on top of STREAM_PAUSE."""
+    items = []
+    if thoughts:
+        for text in texts:
+            items += [
+                _chunk([{"text": text, "thought": True}], body),
+                thought_gap - STREAM_PAUSE,
+            ]
+    for piece in pieces[:-1]:
+        items += [_chunk([{"text": piece}], body), piece_gap - STREAM_PAUSE]
+    items.append(_chunk([{"text": pieces[-1]}], body, True, USAGE_STREAM))
+    return items
 
 
 async def list_models(request: web.Request) -> web.Response:
@@ -950,8 +993,11 @@ async def model_action(request: web.Request) -> web.StreamResponse:
             else _stream_chunks(model, body)
         )
         for chunk in chunks:
+            if isinstance(chunk, float):  # pause of a paced stream
+                await asyncio.sleep(max(0.0, chunk))
+                continue
             await resp.write(f"data: {json.dumps(chunk)}\r\n\r\n".encode())
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(STREAM_PAUSE)
         await resp.write_eof()
         return resp
     if action == "predict":

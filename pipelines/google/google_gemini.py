@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.18.0
+version: 1.19.0
 required_open_webui_version: 0.9.0
 requirements: google-genai>=1.68.0, google-genai<3
 license: Apache License 2.0
@@ -34,7 +34,7 @@ features:
   - Advanced generation parameters (temperature, max tokens, etc.)
   - Configurable safety settings with environment variable support
   - Military-grade encrypted storage of sensitive API keys
-  - Intelligent grounding with Google search integration
+  - Intelligent grounding with Google search integration, shown with Open WebUI's own localized search statuses (queries, searched sites)
   - Vertex AI Search grounding for RAG
   - Native tool calling through Open WebUI's tool loop (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval)
   - Thought signatures carried across tool rounds and turns
@@ -46,6 +46,7 @@ features:
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
   - Configurable thinking levels for Gemini 3 models with model-specific validation
+  - Thinking shown as Open WebUI's native reasoning block, live while Gemini thinks, with a title in the user's language
   - Thinking summaries stripped from replayed history to save tokens (configurable)
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
   - Configurable image generation aspect ratio (1:1, 16:9, etc.) and resolution (1K, 2K, 4K)
@@ -191,6 +192,10 @@ TOOL_IMAGES_TEXT = (
 # Chat ids Open WebUI does not save: temporary chats (also the legacy "local:"
 # prefix) and channel messages. Their history exists only in the request.
 UNSAVED_CHAT_ID_PREFIXES = ("temporary:", "local:", "channel:")
+
+# Seconds between two updates of the live thinking block in the chat (Open WebUI
+# saves the message content on every update).
+LIVE_THINKING_INTERVAL = 0.4
 
 
 def _gemini_function_name(name: str) -> str:
@@ -1683,8 +1688,8 @@ class Pipe:
         """Wrap an event emitter to record the status actions still running.
 
         `running` maps every status action whose last event had done=False
-        (thinking, image_processing, video_generation, ...) to that event's
-        data; an event of the same action with done=True removes it.
+        (image_processing, video_generation, ...) to that event's data; an
+        event of the same action with done=True removes it.
         """
         if not __event_emitter__:
             return __event_emitter__
@@ -1709,16 +1714,15 @@ class Pipe:
         """Send a final done=True status for every action still running.
 
         Called from `finally`, so a stopped (cancelled) or failed request leaves
-        no "Thinking…", "Processing image request..." or "Generating video..."
-        status behind.
+        no "Processing image request..." or "Generating video..." status behind.
         """
         for action in list(running):
-            data: Dict[str, Any] = {"action": action, "done": True}
-            if action == "thinking":
-                data["hidden"] = True
-            else:
-                label = action.replace("_", " ").capitalize()
-                data["description"] = f"{label} {'stopped' if cancelled else 'failed'}"
+            label = action.replace("_", " ").capitalize()
+            data: Dict[str, Any] = {
+                "action": action,
+                "done": True,
+                "description": f"{label} {'stopped' if cancelled else 'failed'}",
+            }
             await self._safe_emit(__event_emitter__, {"type": "status", "data": data})
         running.clear()
 
@@ -2235,8 +2239,11 @@ class Pipe:
         return model_id
 
     # Matches the thinking summary this pipeline prepends to its own answers, i.e. a
-    # <details> block whose <summary> is exactly "Thought (12s)". The summary shape is
-    # kept strict so an answer that merely talks about <details> blocks survives.
+    # <details> block whose <summary> is exactly "Thought (12s)": the plain
+    # <details> of chats saved before 1.19.0 and the <details type="reasoning" ...>
+    # block (done="false" when the answer was stopped while Gemini was thinking).
+    # The summary shape is kept strict so an answer that merely talks about
+    # <details> blocks survives.
     # Non-greedy on purpose: a "</details>" inside the quoted thoughts ends the match
     # early and leaves a harmless remainder rather than eating the real answer.
     _THINKING_DETAILS_RE = re.compile(
@@ -2248,7 +2255,7 @@ class Pipe:
     def _strip_thinking_from_content(self, content: Any) -> Any:
         """Remove rendered thinking summaries from an assistant message.
 
-        Open WebUI stores what the user sees, so the "<details><summary>Thought
+        Open WebUI stores what the user sees, so the "<details ...><summary>Thought
         (Ns)</summary>" block emitted for the UI comes back verbatim in the message
         history and would otherwise be replayed to the API (issue #176). Gemini has
         no use for it: reasoning context is carried by the API itself, not by the
@@ -3839,12 +3846,26 @@ class Pipe:
         return None
 
     @staticmethod
-    def _thinking_details_block(thought_text: str, duration_s: int) -> str:
-        """The <details> thinking summary of an answer without tool calls."""
+    def _thinking_details_block(
+        thought_text: str, duration_s: int, done: bool = True
+    ) -> str:
+        """The <details> thinking summary of an answer without tool calls.
+
+        type="reasoning" makes Open WebUI render it as its own reasoning item,
+        titled in the user's language ("Thought for 5 seconds", or "Thinking..."
+        with a spinner while done="false"); it ignores the <summary> then. The
+        summary stays "Thought (Ns)" for API clients and other renderers, and
+        _THINKING_DETAILS_RE finds the block by it.
+        """
         quoted_content = "\n".join(
             f"> {line}" for line in thought_text.strip().split("\n")
         )
-        return f"""<details>
+        attributes = (
+            f'type="reasoning" done="true" duration="{duration_s}"'
+            if done
+            else 'type="reasoning" done="false"'
+        )
+        return f"""<details {attributes}>
 <summary>Thought ({duration_s}s)</summary>
 
 {quoted_content}
@@ -4295,22 +4316,42 @@ class Pipe:
                     __event_emitter__, {"type": "source", "data": source}
                 )
 
-        # Add status specifying google queries used for grounding
+        # Search statuses in the shape of Open WebUI's own web search, which it
+        # renders in the user's language: the queries ("Searching" + chips), then
+        # the sites found ("Searched {{count}} sites" + list). "items" only, no
+        # "urls": Open WebUI counts (urls || items). Each query once: Open WebUI
+        # keys the query chips by their text, and a duplicate key throws.
         if web_search_queries:
             await self._safe_emit(
                 __event_emitter__,
                 {
                     "type": "status",
                     "data": {
-                        "action": "web_search",
-                        "description": "This response was grounded with Google Search",
-                        "urls": [
-                            f"https://www.google.com/search?q={query}"
-                            for query in web_search_queries
-                        ],
+                        "action": "web_search_queries_generated",
+                        "queries": list(dict.fromkeys(web_search_queries)),
+                        "done": True,
                     },
                 },
             )
+            items: List[Dict[str, str]] = []
+            for chunk in grounding_chunks:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None) if web else None
+                if uri and all(item["link"] != uri for item in items):
+                    items.append({"title": web.title or uri, "link": uri})
+            if items:
+                await self._safe_emit(
+                    __event_emitter__,
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "web_search",
+                            "description": "Searched {{count}} sites",
+                            "items": items,
+                            "done": True,
+                        },
+                    },
+                )
 
         # Add citations in the text body
         replaced_text: Optional[str] = None
@@ -4454,7 +4495,15 @@ class Pipe:
         # Accumulate content separately for answer and thoughts
         answer_chunks: list[str] = []
         thought_chunks: list[str] = []
+        # The thinking lasts from the first thought to the first answer part
+        # after it (or to the end of the stream if no answer follows)
         thinking_started_at: Optional[float] = None
+        thinking_ended_at: Optional[float] = None
+        # In a chat (not live), the thoughts so far are shown as a live
+        # <details type="reasoning" done="false"> block through replace events,
+        # which Open WebUI renders as its own "Thinking..." item
+        show_live_thinking = is_chat and not live and bool(__event_emitter__)
+        last_live_thinking = 0.0
         stream_usage_metadata = None
         generated_images: list[str] = []
         generated_image_files: List[Dict[str, Any]] = []
@@ -4466,6 +4515,24 @@ class Pipe:
         function_call_parts: List[types.Part] = []
         all_parts: List[types.Part] = []
         server_side = False
+
+        def thinking_block(done: bool) -> str:
+            started = thinking_started_at or time.time()
+            ended = thinking_ended_at or time.time()
+            return self._thinking_details_block(
+                "".join(thought_chunks), int(max(0, ended - started)), done=done
+            )
+
+        async def emit_live_thinking() -> None:
+            """Replace the message with the thinking block (done once the answer
+            has started) and the answer so far."""
+            nonlocal last_live_thinking
+            last_live_thinking = time.monotonic()
+            block = thinking_block(done=thinking_ended_at is not None)
+            await emit_chat_event(
+                "replace",
+                {"role": "assistant", "content": block + "".join(answer_chunks)},
+            )
 
         try:
             response_iterator = await self._start_stream(open_stream)
@@ -4551,23 +4618,14 @@ class Pipe:
                             if live:
                                 yield chunk({"reasoning_content": part.text})
                                 continue
-                            # Emit a live preview of what is currently being thought
-                            preview = part.text.replace("\n", " ").strip()
-                            MAX_PREVIEW = 120
-                            if len(preview) > MAX_PREVIEW:
-                                preview = preview[:MAX_PREVIEW].rstrip() + "…"
-                            await self._safe_emit(
-                                __event_emitter__,
-                                {
-                                    "type": "status",
-                                    "data": {
-                                        "action": "thinking",
-                                        "description": f"Thinking… {preview}",
-                                        "done": False,
-                                        "hidden": False,
-                                    },
-                                },
-                            )
+                            # Show the thoughts so far (throttled; the first
+                            # answer part always sends the finished block)
+                            if (
+                                show_live_thinking
+                                and time.monotonic() - last_live_thinking
+                                >= LIVE_THINKING_INTERVAL
+                            ):
+                                await emit_live_thinking()
 
                         # Interim image from the thinking process: the final image
                         # follows as a regular part, so this one is not uploaded
@@ -4579,8 +4637,16 @@ class Pipe:
                         # Regular answer text
                         elif getattr(part, "text", None):
                             answer_chunks.append(part.text)
+                            thinking_done = bool(thought_chunks) and (
+                                thinking_ended_at is None
+                            )
+                            if thinking_done:
+                                thinking_ended_at = time.time()
                             if live:
                                 yield chunk({"content": part.text})
+                            elif thinking_done and show_live_thinking:
+                                # The finished block plus this first answer part
+                                await emit_live_thinking()
                             else:
                                 await self._safe_emit(
                                     __event_emitter__,
@@ -4698,30 +4764,19 @@ class Pipe:
 
             details_block: Optional[str] = None
             if thought_chunks:
-                duration_s = int(
-                    max(0, time.time() - (thinking_started_at or time.time()))
-                )
-                details_block = self._thinking_details_block(
-                    "".join(thought_chunks), duration_s
-                )
+                details_block = thinking_block(done=True)
 
             if function_call_parts:
                 # The round ends with tool calls: the turn is not over, so no
-                # replace / chat:message / chat:finish. In the chat the thoughts
-                # go to Open WebUI's reasoning item (reasoning_content), which
-                # it shows anyway once a thought signature arrives; API clients
+                # chat:message / chat:finish. In the chat the thoughts go to
+                # Open WebUI's reasoning item (reasoning_content), which it
+                # shows anyway once a thought signature arrives; API clients
                 # get the <details> summary as before.
-                if thought_chunks:
-                    await self._safe_emit(
-                        __event_emitter__,
-                        {
-                            "type": "status",
-                            "data": {
-                                "action": "thinking",
-                                "done": True,
-                                "hidden": True,
-                            },
-                        },
+                if show_live_thinking and thought_chunks:
+                    # The output items take over: do not leave the live block
+                    # in the saved content
+                    await emit_chat_event(
+                        "replace", {"role": "assistant", "content": ""}
                     )
                 content = final_answer_text
                 if own_finish and details_block:
@@ -4780,16 +4835,6 @@ class Pipe:
                 "chat:message",
                 {"role": "assistant", "content": final_content, "done": True},
             )
-
-            if thought_chunks:
-                # Clear the thinking status without a summary in the status emitter
-                await self._safe_emit(
-                    __event_emitter__,
-                    {
-                        "type": "status",
-                        "data": {"action": "thinking", "done": True, "hidden": True},
-                    },
-                )
 
             if own_finish:
                 # API path in tool mode: answer, own finish chunk, then usage

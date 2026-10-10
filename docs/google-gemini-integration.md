@@ -59,7 +59,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
 > Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models.
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 
   > [!Note]
   > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
@@ -74,7 +74,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
 
 - **Flexible Error Handling**  
-  Retries temporary errors (server errors such as HTTP 500/503, `GOOGLE_RETRY_COUNT` times with exponential backoff) and logs errors for transparency. Streaming requests are retried until their first chunk arrives; an error after that ends the answer with an error message. Every status the pipeline started (thinking, image processing, video generation, uploads) gets a final status when a request fails or is stopped, so no spinner is left behind.
+  Retries temporary errors (server errors such as HTTP 500/503, `GOOGLE_RETRY_COUNT` times with exponential backoff) and logs errors for transparency. Streaming requests are retried until their first chunk arrives; an error after that ends the answer with an error message. Every status the pipeline started (image processing, video generation, uploads) gets a final status when a request fails or is stopped, so no spinner is left behind.
 
 - **Integration with Google Generative AI or Vertex AI API**  
   Connect using either the Google Generative AI API or Google Cloud Vertex AI for content generation.
@@ -657,7 +657,7 @@ GOOGLE_MODEL_WHITELIST="gemini-exp-1206,gemini-2.0-flash-exp,gemini-1.5-pro"
 
 For instance, the following [Filter (google_search_tool.py)](../filters/google_search_tool.py) will replace Open Web UI default web search function with Google search grounding + the URL context tool.
 
-When enabled, sources and google queries from the search used by Gemini will be displayed with the response.
+When enabled, the sources and the Google queries of the search used by Gemini are displayed with the response. The queries and the searched sites use Open WebUI's own web search statuses ("Searching" with the queries, then "Searched N sites" with the list), which Open WebUI shows in the user's language.
 
 Open WebUI's background tasks for the chat (title, tag and follow-up generation) inherit the `google_search_tool` flag from the chat request. The pipeline sends no grounding tools with these tasks, so they do not run extra Google searches. Image generation models get Google Search grounding but not the URL context tool, which they do not support. The exceptions are `gemini-2.5-flash-image` and `gemini-3.1-flash-lite-image` (and their preview IDs): they support neither, so they get no search tool (Google Search or Enterprise Web Search) and no URL context.
 
@@ -757,7 +757,7 @@ Gemini 3 requires the thought signatures of its function calls back in the follo
 ### Display in the chat
 
 - In a turn with tool calls, Gemini's thinking appears as Open WebUI's own "Thought for N seconds" block. The duration can read 0 seconds, because the thoughts of a round arrive together with its tool calls. With `GOOGLE_INCLUDE_THOUGHTS=false` Gemini 3 still sends thought signatures, so the block appears without content for every tool round.
-- Answers without tool calls keep the `<details>` thinking summary.
+- Answers without tool calls show the thinking as a `<details type="reasoning">` block in the answer, which Open WebUI renders as the same localized block (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 - The answer after a tool call is streamed as it arrives. It has no inline `[1]` citation markers; its Google Search sources are still attached.
 - For a chat request with `stream=false`, the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
 
@@ -1014,8 +1014,39 @@ Open WebUI passes no event emitter to background tasks (title, tags, follow-ups,
 
 ### Thinking Summaries in Conversation History
 
-When thoughts are enabled, the pipeline renders them as a collapsible
-`<details><summary>Thought (12s)</summary>...</details>` block in front of the answer.
+When thoughts are enabled, the pipeline puts them in a collapsible block in front of the
+answer:
+
+```html
+<details type="reasoning" done="true" duration="12">
+<summary>Thought (12s)</summary>
+
+> The thoughts, quoted
+
+</details>
+```
+
+- `type="reasoning"` makes Open WebUI render the block as its own reasoning item, like
+  the thinking of other reasoning models and of Gemini's tool rounds. Open WebUI writes
+  the title itself, in each user's language ("Thought for 12 seconds", in German
+  "Nachgedacht für 12 Sekunden"), and ignores the `<summary>`. The pipeline ships no
+  translations.
+- While a streamed answer is still thinking, the chat shows the block live with
+  `done="false"`: Open WebUI's "Thinking..." with a spinner, and the thoughts so far
+  when expanded. The view is updated when new thoughts arrive, at most every 0.4
+  seconds, so the newest thoughts can show up a moment later. The block switches to
+  `done="true"` when the first part of the answer arrives.
+- `duration` is the time from the first thought to the first part of the answer in a
+  streamed answer, and the duration of the request without streaming (also for image
+  models).
+- The `<summary>Thought (12s)</summary>` stays in every block, so API clients, which
+  get the block in the answer's content, and other Markdown renderers still see a title.
+- An answer stopped while Gemini was thinking keeps the `done="false"` block, which
+  Open WebUI then shows as "Thought" without a spinner.
+- Background tasks (title, tag and follow-up generation) get no block.
+- Chats saved before 1.19.0 hold a plain `<details>` block, which Open WebUI shows with
+  its English summary "Thought (12s)" as the title.
+
 Open WebUI stores what the user sees, so that block comes back verbatim in the message
 history of every follow-up turn.
 
@@ -1033,8 +1064,10 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=false
 ```
 
 > [!NOTE]
-> Only the pipeline's own `Thought (…)` summaries are removed. Other `<details>` blocks
-> in a message, and anything written by the user, are left untouched.
+> Only the pipeline's own `Thought (…)` summaries are removed: the `type="reasoning"`
+> blocks (also a `done="false"` block of a stopped answer) and the plain `<details>`
+> blocks of chats saved before 1.19.0. Other `<details>` blocks in a message, and
+> anything written by the user, are left untouched.
 
 ### Thinking Compatibility
 
