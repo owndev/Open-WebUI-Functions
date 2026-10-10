@@ -1053,8 +1053,8 @@ async def rag_query_text(r: Rag) -> None:
 
     # A file attached in the browser: Open WebUI puts an <attached_files>
     # block (native function calling) and its RAG template with the file
-    # around the last user message; __metadata__.user_prompt keeps the typed
-    # prompt (after the block).
+    # around the last user message; __metadata__ keeps the typed prompt (after
+    # the block) as base_user_prompt (Open WebUI 0.12) or user_prompt (0.11).
     async with t.browser() as b:
         earlier = await b.chat(MODEL, "x100 earlier chat e2e?", stream=True)
         await r.reset()
@@ -1078,9 +1078,63 @@ async def rag_query_text(r: Rag) -> None:
         and "<attached_files>" in question
         and [s.get("search") for s in searches] == [QUESTION]
         and _grounded(chat),
-        f"{c.brief()} attached_block={'<attached_files>' in question} "
-        f"question={short(question, 120)} {_search_brief(searches)} "
-        f"{_chat_brief(chat)}",
+        f"{_search_brief(searches)} attached_block={'<attached_files>' in question} "
+        f"question={short(question, 120)} {c.brief()} {_chat_brief(chat)}",
+    )
+
+    # The same rule for both metadata keys on every Open WebUI version: the
+    # staged file runs in this process (as rag.log.debug) with a user message
+    # wrapped like the one above. Open WebUI stores the prompt before adding
+    # its RAG template as base_user_prompt since 0.12
+    # (utils/middleware.py, process_chat_payload) and as user_prompt up to 0.11.
+    block = '<attached_files>\n<file type="chat" id="c1" name="e2e"/>\n</attached_files>\n\n'
+    wrapped = (
+        f"{block}### Task:\nRespond to the user query using the provided "
+        f"context.\n<context>\nearlier chat\n</context>\n\n<user_query>\n"
+        f"{QUESTION}\n</user_query>"
+    )
+    variants = (
+        ("base_user_prompt", {"base_user_prompt": block + QUESTION}),
+        ("user_prompt", {"user_prompt": block + QUESTION}),
+        ("both", {"base_user_prompt": QUESTION, "user_prompt": "stale prompt"}),
+        ("base None", {"base_user_prompt": None, "user_prompt": block + QUESTION}),
+    )
+    seen, failure = [], ""
+    try:
+        module = _load_staged_pipe()
+        for n, (label, prompts) in enumerate(variants, start=900):
+            await r.reset()
+            text = await asyncio.wait_for(
+                _pipe_in_process(
+                    module.Pipe(),
+                    r.valves(),
+                    MODEL,
+                    [{"role": "user", "content": wrapped}],
+                    n,
+                    prompts=prompts,
+                ),
+                120,
+            )
+            searched = [s.get("search") for s in await r.searches()]
+            seen.append((label, text == LINKED, searched))
+    except Exception as exc:  # the check reports it
+        failure = f"{type(exc).__name__}: {short(str(exc), 200)} "
+    finally:
+        logging.getLogger("azure_ai.pipe").setLevel(logging.NOTSET)
+    r.check(
+        "query-text.metadata",
+        "staged file in the driver process, user message wrapped in Open "
+        "WebUI's <attached_files> block and RAG template: the search text is "
+        "the typed prompt from __metadata__ base_user_prompt (Open WebUI 0.12) "
+        "or user_prompt (0.11); base_user_prompt wins when both are set",
+        not failure
+        and len(seen) == len(variants)
+        and all(answered and searched == [QUESTION] for _, answered, searched in seen),
+        f"{failure}"
+        + " ".join(
+            f"{label}: answered={answered} search={searched!r}"
+            for label, answered, searched in seen
+        ),
     )
 
 
@@ -3585,16 +3639,25 @@ def _load_staged_pipe():
 
 
 async def _pipe_in_process(
-    pipe, valves: dict, model: str, messages, n: int, extra: Optional[dict] = None
+    pipe,
+    valves: dict,
+    model: str,
+    messages,
+    n: int,
+    extra: Optional[dict] = None,
+    prompts: Optional[dict] = None,
 ) -> str:
     """One pipe() call in this process: the answer text or the SSE stream
-    (``extra``: more keys of the request body)."""
+    (``extra``: more keys of the request body; ``prompts``: the prompt keys of
+    ``__metadata__``, by default ``user_prompt`` with the last message's text)."""
     pipe.valves = pipe.Valves(**valves)
     stream = isinstance(messages, tuple)  # a tuple: stream=True
 
     async def emit(event):
         pass
 
+    if prompts is None:
+        prompts = {"user_prompt": _text(messages[-1]["content"])}
     result = await pipe.pipe(
         {"model": model, "stream": stream, "messages": list(messages), **(extra or {})},
         __event_emitter__=emit,
@@ -3602,7 +3665,7 @@ async def _pipe_in_process(
             "user_id": "debug-user",
             "chat_id": "debug-chat",
             "message_id": f"debug-{n}",
-            "user_prompt": _text(messages[-1]["content"]),
+            **prompts,
         },
     )
     if hasattr(result, "body_iterator"):

@@ -11,6 +11,15 @@ finds WARNING blocks and ``secrets(mark, ...)`` plaintext secrets at any level.
 run.sh starts the container with ``PYTHONWARNINGS=always::ResourceWarning``, so
 unclosed sockets / files show up as ``ResourceWarning:`` lines (counted as
 errors) instead of being dropped silently.
+
+Module names: up to 0.11 Open WebUI loads a function as the module
+``function_<id>`` (a tool as ``tool_<id>``), so its log lines read
+``function_azure:pipe:4120 - ...``. Open WebUI 0.12 loads each copy as
+``function_<id>_<32 hex digits>`` (``utils/plugin.py``, ``uuid.uuid4().hex``).
+Everything this module reads from the log (``since``, ``lines`` and the blocks
+of ``errors`` / ``warnings`` / ``error_blocks``) has that suffix removed, so a
+signature such as ``("function_azure:pipe", "request: 400")`` means the same on
+every version. The ``server.log`` in the output directory stays as logged.
 """
 
 import asyncio
@@ -29,6 +38,18 @@ _ERROR_START = re.compile(
 # Loguru WARNING lines, "WARNING: ..." lines and Python warnings
 # ("file.py:12: UserWarning: ...").
 _WARNING_START = re.compile(r"\| WARNING\s*\||^WARNING:|\b\w*Warning: ")
+
+# Open WebUI 0.12 module names: function_<id>_<uuid4 hex> (tool_<id>_<hex>).
+# Ids may contain underscores (time_token_tracker); the name is followed by
+# ":<function>:<line>" (loguru) or ends the line ("Loaded module: <name>").
+_MODULE_SUFFIX = re.compile(r"\b((?:function|tool)_\w+?)_[0-9a-f]{32}(?=[:\s]|$)")
+
+
+def normalize_module_names(text: str) -> str:
+    """``function_<id>_<32 hex>`` (Open WebUI 0.12) -> ``function_<id>`` (as
+    logged up to 0.11); the same for ``tool_<id>_<32 hex>``."""
+    return _MODULE_SUFFIX.sub(r"\1", text)
+
 
 # Error blocks Open WebUI itself produces, not caused by the functions under test.
 # Each entry is a tuple of substrings that must ALL occur in the block.
@@ -71,7 +92,7 @@ class ServerLog:
         try:
             with open(self.path, "rb") as fh:
                 fh.seek(mark)
-                return fh.read().decode("utf-8", "replace")
+                return normalize_module_names(fh.read().decode("utf-8", "replace"))
         except OSError:
             return ""
 
@@ -96,7 +117,8 @@ class ServerLog:
 
         A block starts at a loguru line matching ``start`` (or a non-loguru line
         matching it outside any block, e.g. a traceback) and runs until the next
-        loguru line.
+        loguru line. The lines have their module names normalized
+        (``normalize_module_names``); the offsets are those of the raw log.
         """
         try:
             with open(self.path, "rb") as fh:
@@ -106,7 +128,7 @@ class ServerLog:
             return []
         blocks, current, offset = [], None, mark
         for raw in data.split(b"\n"):
-            line = raw.decode("utf-8", "replace").rstrip("\r")
+            line = normalize_module_names(raw.decode("utf-8", "replace").rstrip("\r"))
             is_loguru = bool(_LOGURU.match(line))
             if start.search(line) and (is_loguru or current is None):
                 current = (offset, [line])

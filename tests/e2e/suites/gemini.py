@@ -35,7 +35,8 @@ Groups (``--only gemini.<group>``)
   streamimg    inline image from a model the pipe does not detect (stream path)
   imgedit      image editing across turns (#194): generated images and uploads of
                a saved chat sent with the edit request (in order, each once),
-               follow-up tasks without them, guided regeneration,
+               follow-up tasks without them, guided regeneration (and no
+               guided regeneration after an empty answer),
                IMAGE_HISTORY_MAX_REFERENCES keeps the current and the newest
                images, older saved forms (data: URL files, markdown links),
                temporary chats and database errors use the request, files of
@@ -74,6 +75,7 @@ import zlib
 
 from harness import BrowserSession, Suite, short
 from harness.browser import FRONTEND_FEATURES
+from harness.known import version_tuple
 
 GROUPS = (
     "models",
@@ -2216,6 +2218,7 @@ async def imgedit(t: Suite, mock) -> None:
     await imgedit_guided(t, mock)
     await imgedit_dedup(t, mock)
     await imgedit_saved(t, mock)
+    await imgedit_empty_answer(t, mock)
     await imgedit_temporary(t, mock)
     await imgedit_db_error(t, mock)
     await imgedit_foreign(t, mock)
@@ -2617,6 +2620,82 @@ async def imgedit_saved(t: Suite, mock) -> None:
     )
 
 
+async def imgedit_empty_answer(t: Suite, mock) -> None:
+    """A saved chat whose answer is empty without an error (stopped before its
+    first token). Open WebUI 0.12 leaves every answer without content and
+    output out of the request (load_messages_from_db), up to 0.11 only a failed
+    one: the edit turn after it must not count as a guided regeneration (which
+    would send the saved edit message's upload as history too)."""
+    upload = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    photo = await _upload_png(t.owui, UPLOAD_PNG_2, "photo.png")
+    user_id, answer_id, now = str(uuid.uuid4()), str(uuid.uuid4()), int(time.time())
+    user1 = {
+        "id": user_id,
+        "parentId": None,
+        "childrenIds": [answer_id],
+        "role": "user",
+        "content": "Draw a certificate with this logo",
+        "timestamp": now,
+        "models": [IMAGE_GA],
+        "files": [upload],
+    }
+    answer1 = {
+        "id": answer_id,
+        "parentId": user_id,
+        "childrenIds": [],
+        "role": "assistant",
+        "content": "",
+        "model": IMAGE_GA,
+        "done": True,
+        "timestamp": now,
+    }
+    status, chat = await t.owui.api(
+        "POST",
+        "/api/v1/chats/new",
+        {
+            "chat": {
+                "title": "E2E empty answer chat",
+                "models": [IMAGE_GA],
+                "history": {
+                    "currentId": answer_id,
+                    "messages": {user_id: user1, answer_id: answer1},
+                },
+                "messages": [user1, answer1],
+            }
+        },
+    )
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    c2, req = None, {"contents": 0, "sent": [], "images": []}
+    if status == 200 and chat_id:
+        await _set(t, IMAGE_DEDUP_HISTORY=False)  # a second copy would be sent
+        try:
+            async with t.browser() as b:
+                await mock.reset()
+                c2 = await b.chat(
+                    IMAGE_GA,
+                    "Add this photo",
+                    params=LEGACY,
+                    chat_id=chat_id,
+                    parent_id=answer_id,
+                    user_files=[photo],
+                )
+                req = await _edit_request(mock)
+        finally:
+            await _set(t, IMAGE_DEDUP_HISTORY=DEFAULTS["IMAGE_DEDUP_HISTORY"])
+    t.check(
+        "imgedit.empty-answer",
+        "saved chat with an empty answer (no error) before the edit turn, "
+        "IMAGE_DEDUP_HISTORY=false: the upload of turn 1 is history, the upload "
+        "of the edit turn is sent once (not a guided regeneration)",
+        bool(upload["id"])
+        and bool(photo["id"])
+        and getattr(c2, "done", False)
+        and "Add this photo" in (req["sent"] or [""])[0]
+        and req["sent"][1:] == ["[Image 1]", "upload1", "[Image 2]", "upload2"],
+        f"chat: HTTP {status} done={getattr(c2, 'done', None)} {_edit_report(req)}",
+    )
+
+
 async def imgedit_temporary(t: Suite, mock) -> None:
     """A temporary chat is not saved: the image history comes from the request,
     which the web UI builds without the files of assistant messages."""
@@ -2707,14 +2786,17 @@ async def imgedit_db_error(t: Suite, mock) -> None:
 
 async def imgedit_foreign(t: Suite, mock) -> None:
     """Files of another user are never read: a message can name any file id.
-    An admin may read them (also when continuing the user's chat)."""
+    An admin may read them (also when continuing the user's chat, which Open
+    WebUI allows up to 0.11)."""
     setup_error, grants, denied, video_denied, id_logged = "", [], 0, 0, []
     c1 = c2 = c3 = ru = ra = vo = vf = None
     empty = {"contents": 0, "sent": [], "images": []}
     r1 = r2 = r3 = user_req = admin_req = empty
     own_image = foreign_image = ""
     other = None
+    owui_version: tuple = ()
     try:
+        owui_version = version_tuple(await t.owui.version())
         other = await t.owui.create_user("E2E Image Edit User", IMGEDIT_USER)
         grants = [
             await _grant_read(t, IMAGE_GA, "Gemini 3.1 Flash Image"),
@@ -2822,16 +2904,34 @@ async def imgedit_foreign(t: Suite, mock) -> None:
         f"turn1: {_edit_report(r1)} turn2_done={getattr(c2, 'done', None)} "
         f"turn2: {_edit_report(r2)}",
     )
+    # Open WebUI 0.12 gives an admin read access only to another user's chat:
+    # chat_completion (main.py) asks Chats.get_accessible_chat_by_id(chat_id,
+    # user, permission="write"), which needs the owner, a chat shared with
+    # share_mode "continue" or a shared folder (models/chats.py), and answers
+    # 404, so the pipe is never called. Up to 0.11 it allowed the owner or any
+    # admin (Chats.is_chat_owner(...) or user.role == "admin").
+    admin_refused = owui_version >= (0, 12)
     t.check(
         "imgedit.admin",
-        "browser, an admin continues the user's chat: the chat is read, the "
-        "admin's file of turn 1 and the user's generated image are sent",
+        (
+            "browser, an admin continues the user's chat: Open WebUI 0.12 "
+            "refuses it (HTTP 404, an admin may only read another user's chat), "
+            "the pipe is not called"
+            if admin_refused
+            else "browser, an admin continues the user's chat: the chat is read, "
+            "the admin's file of turn 1 and the user's generated image are sent"
+        ),
         not setup_error
-        and getattr(c3, "done", False)
-        and r3["sent"]
-        == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"],
-        f"{setup_error}turn3_done={getattr(c3, 'done', None)} "
-        f"turn3: {_edit_report(r3)}",
+        and (
+            getattr(c3, "http_status", None) == 404 and r3["contents"] == 0
+            if admin_refused
+            else getattr(c3, "done", False)
+            and r3["sent"]
+            == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"]
+        ),
+        f"{setup_error}owui={'.'.join(map(str, owui_version)) or '?'} "
+        f"turn3: HTTP {getattr(c3, 'http_status', None)} "
+        f"done={getattr(c3, 'done', None)} {_edit_report(r3)}",
     )
     t.check(
         "imgedit.api-foreign",

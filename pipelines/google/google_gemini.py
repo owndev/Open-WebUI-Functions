@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.19.0
+version: 1.19.1
 required_open_webui_version: 0.9.0
 requirements: google-genai>=1.68.0, google-genai<3
 license: Apache License 2.0
@@ -630,8 +630,11 @@ class Pipe:
         """How many user messages end ``messages`` (after the last answer).
 
         In the request, Open WebUI's message with the images of tool results is
-        not counted. In a saved chain, a failed answer without content is
-        skipped: Open WebUI leaves it out of the request.
+        not counted. An answer without content, output and tool calls is
+        skipped in the request and in a saved chain alike: Open WebUI leaves
+        such an answer out of the request (up to 0.11 only a failed one, since
+        0.12 every one, e.g. an answer stopped before its first token), so both
+        sides count the same on every Open WebUI version.
         """
         count = 0
         for msg in reversed(messages):
@@ -641,11 +644,10 @@ class Pipe:
                     continue
                 count += 1
             elif not (
-                saved
-                and role == "assistant"
-                and msg.get("error")
+                role == "assistant"
                 and not msg.get("content")
                 and not msg.get("output")
+                and not msg.get("tool_calls")
             ):
                 break
         return count

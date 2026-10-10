@@ -71,7 +71,8 @@ from harness.mocks import Mock
 
 TRUE = ("1", "true", "yes", "on")
 
-# Function modules are named function_<id> in Open WebUI's log lines.
+# Function modules are named function_<id> in Open WebUI's log lines (0.12:
+# function_<id>_<hex>, which ServerLog normalizes to function_<id>).
 _FUNCTION = re.compile(r"\bfunction_\w+")
 
 # mocks.txt: lines that start an error block. The first traceback after a

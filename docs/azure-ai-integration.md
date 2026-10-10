@@ -285,7 +285,7 @@ The pipeline reads the first entry with `"type": "azure_search"` (with several e
 | `allow_partial_result` (default `false`) | with several generated queries: `false` fails the answer when one search fails, `true` continues with the others | supported |
 | `include_contexts` | ignored; scores come from the search hits (`AZURE_AI_INCLUDE_SEARCH_SCORES`) | ignored |
 
-The search text is your message as plain text for the simple parser (never Lucene syntax); a `-` at the start of a word, which the parser would read as "NOT", is replaced by a space.
+The search text is your message as plain text for the simple parser (never Lucene syntax); a `-` at the start of a word, which the parser would read as "NOT", is replaced by a space. When Open WebUI wraps your message in its own RAG template (attached files or chats, knowledge, web search), the search still uses the text you typed: the pipeline reads it from the request metadata (`base_user_prompt` since Open WebUI 0.12, `user_prompt` before). Up to v3.0.0 it read only `user_prompt`, so on Open WebUI 0.12 the search text was the template around your message.
 
 #### Strictness, `top_n_documents` and the Token Budget
 
