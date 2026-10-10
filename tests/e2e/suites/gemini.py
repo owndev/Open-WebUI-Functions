@@ -74,6 +74,7 @@ import zlib
 
 from harness import BrowserSession, Suite, short
 from harness.browser import FRONTEND_FEATURES
+from harness.known import version_tuple
 
 GROUPS = (
     "models",
@@ -2707,14 +2708,17 @@ async def imgedit_db_error(t: Suite, mock) -> None:
 
 async def imgedit_foreign(t: Suite, mock) -> None:
     """Files of another user are never read: a message can name any file id.
-    An admin may read them (also when continuing the user's chat)."""
+    An admin may read them (also when continuing the user's chat, which Open
+    WebUI allows up to 0.11)."""
     setup_error, grants, denied, video_denied, id_logged = "", [], 0, 0, []
     c1 = c2 = c3 = ru = ra = vo = vf = None
     empty = {"contents": 0, "sent": [], "images": []}
     r1 = r2 = r3 = user_req = admin_req = empty
     own_image = foreign_image = ""
     other = None
+    owui_version: tuple = ()
     try:
+        owui_version = version_tuple(await t.owui.version())
         other = await t.owui.create_user("E2E Image Edit User", IMGEDIT_USER)
         grants = [
             await _grant_read(t, IMAGE_GA, "Gemini 3.1 Flash Image"),
@@ -2822,16 +2826,34 @@ async def imgedit_foreign(t: Suite, mock) -> None:
         f"turn1: {_edit_report(r1)} turn2_done={getattr(c2, 'done', None)} "
         f"turn2: {_edit_report(r2)}",
     )
+    # Open WebUI 0.12 gives an admin read access only to another user's chat:
+    # chat_completion (main.py) asks Chats.get_accessible_chat_by_id(chat_id,
+    # user, permission="write"), which needs the owner, a chat shared with
+    # share_mode "continue" or a shared folder (models/chats.py), and answers
+    # 404, so the pipe is never called. Up to 0.11 it allowed the owner or any
+    # admin (Chats.is_chat_owner(...) or user.role == "admin").
+    admin_refused = owui_version >= (0, 12)
     t.check(
         "imgedit.admin",
-        "browser, an admin continues the user's chat: the chat is read, the "
-        "admin's file of turn 1 and the user's generated image are sent",
+        (
+            "browser, an admin continues the user's chat: Open WebUI 0.12 "
+            "refuses it (HTTP 404, an admin may only read another user's chat), "
+            "the pipe is not called"
+            if admin_refused
+            else "browser, an admin continues the user's chat: the chat is read, "
+            "the admin's file of turn 1 and the user's generated image are sent"
+        ),
         not setup_error
-        and getattr(c3, "done", False)
-        and r3["sent"]
-        == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"],
-        f"{setup_error}turn3_done={getattr(c3, 'done', None)} "
-        f"turn3: {_edit_report(r3)}",
+        and (
+            getattr(c3, "http_status", None) == 404 and r3["contents"] == 0
+            if admin_refused
+            else getattr(c3, "done", False)
+            and r3["sent"]
+            == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"]
+        ),
+        f"{setup_error}owui={'.'.join(map(str, owui_version)) or '?'} "
+        f"turn3: HTTP {getattr(c3, 'http_status', None)} "
+        f"done={getattr(c3, 'done', None)} {_edit_report(r3)}",
     )
     t.check(
         "imgedit.api-foreign",
