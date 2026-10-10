@@ -1027,19 +1027,20 @@ async def image(t: Suite, mock) -> None:
             t.check(
                 sid,
                 f"{model.split('.', 1)[1]} (browser, built-in tools): forced "
-                "non-stream, one image file with the final image, text, usage, "
-                "statuses closed without failure",
+                "non-stream, one image file with the final image, text after the "
+                'thinking block (type="reasoning", done="true"), usage, statuses '
+                "closed without failure",
                 c.done
                 and _actions(reqs) == ["generateContent"]
                 and names == ["final"]
                 and urls_ok
-                and "Here is your image." in c.content
+                and _block_ok(c.content, "Mock image thinking.", "Here is your image.")
                 and "![" not in c.content
                 and _usage(c.usage) == USAGE_IMAGE
                 and _status_ok(c),
                 c.brief()
                 + f" model={model.split('.', 1)[1]} upstream={_actions(reqs)} {report}"
-                f" {_status_report(c)}",
+                f" {_status_report(c)} {_block_report(c.content)}",
             )
 
 
