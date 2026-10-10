@@ -53,6 +53,11 @@ class ChatResult:
     # stream only: choices[].message.content of chat.completion chunks (not part
     # of ``content``, see STREAM_MESSAGE_ERROR)
     message_content: str = ""
+    # stream only: SSE events after the first "data: [DONE]" (OpenAI-style
+    # clients stop reading there) and the delta content among them (also part
+    # of ``content``)
+    after_done: int = 0
+    after_done_content: str = ""
 
     def brief(self) -> str:
         return (
@@ -67,6 +72,9 @@ def parse_sse(text: str) -> dict:
     Only ``choices[].delta.content`` counts as content. A chunk with a full
     ``choices[].message`` (a chat.completion dict answered to a stream request)
     goes to ``message_content`` and adds ``STREAM_MESSAGE_ERROR`` to ``errors``.
+    Events after the first ``[DONE]`` are still parsed, and also counted in
+    ``after_done`` (their delta content in ``after_done_content``): an
+    OpenAI-style client stops reading at ``[DONE]`` and never sees them.
     """
     out = {
         "content": "",
@@ -75,11 +83,15 @@ def parse_sse(text: str) -> dict:
         "done": False,
         "chunks": 0,
         "message_content": "",
+        "after_done": 0,
+        "after_done_content": "",
     }
     for line in text.splitlines():
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
+        if out["done"]:
+            out["after_done"] += 1
         if payload == "[DONE]":
             out["done"] = True
             continue
@@ -92,7 +104,10 @@ def parse_sse(text: str) -> dict:
         if isinstance(data, dict) and data.get("error"):
             out["errors"].append(data["error"])
         for choice in (data.get("choices") if isinstance(data, dict) else None) or []:
-            out["content"] += (choice.get("delta") or {}).get("content") or ""
+            delta_text = (choice.get("delta") or {}).get("content") or ""
+            out["content"] += delta_text
+            if out["done"]:
+                out["after_done_content"] += delta_text
             message = choice.get("message")
             if isinstance(message, dict):
                 out["message_content"] += message.get("content") or ""
@@ -389,6 +404,8 @@ class OWUI:
             result.done = parsed["done"]
             result.chunks = parsed["chunks"]
             result.message_content = parsed["message_content"]
+            result.after_done = parsed["after_done"]
+            result.after_done_content = parsed["after_done_content"]
             return result
         try:
             result.json = r.json()

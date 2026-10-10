@@ -179,6 +179,7 @@ class BrowserSession:
         stop_after_s: Optional[float] = None,
         stop_wait: float = 15,
         files: Optional[list] = None,
+        extra: Optional[dict] = None,
     ) -> BrowserChat:
         """Send one user message and wait until the saved answer is ``done``.
 
@@ -199,6 +200,9 @@ class BrowserSession:
         ``files``: items attached to the user message, as the web UI sends
         them (saved on the user message and sent as the request's ``files``),
         e.g. ``{"type": "chat", "id": <chat id>, "context": "full"}``.
+
+        ``extra``: more keys of the request body, e.g. ``data_sources`` as an
+        inlet filter would add them (Open WebUI hands unknown keys to the pipe).
         """
         if models:
             ids = list(models) if models[0] == model else [model, *models]
@@ -238,6 +242,8 @@ class BrowserSession:
             body["id"] = assistant_ids[0]
         if chat_id:
             body["chat_id"] = chat_id
+        if extra:
+            body.update(extra)
         status, data = await self.owui.api("POST", "/api/chat/completions", body)
         answers = [
             BrowserChat(status, data, message_id=a, model=m)

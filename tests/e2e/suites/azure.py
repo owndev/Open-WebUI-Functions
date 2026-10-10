@@ -8,8 +8,8 @@ Groups (``--only azure.<group>``)
            predefined models, fallback model
   api      API path non-stream / stream, api-key / Bearer header, path and
            api-version, allow-listed body (extra client keys dropped), tools
-           forwarded, stream_options only for streams, errors (JSON 400,
-           text/plain 500)
+           forwarded, stream_options only for streams, errors (JSON 400 with
+           exactly Azure's message, text/plain 500)
   dotted   model names containing dots reach upstream intact
   browser  browser path: saved answer, usage, full status sequence, error status
   tasks    background title task (with Azure AI Search valves: rag.tasks.*)
@@ -19,13 +19,16 @@ Groups (``--only azure.<group>``)
            token, managed identity), query generation (fallback, pause),
            strictness, merge, top-n, budget, sanitizing, prompt placement,
            citations, scores, [docX] links (also split across stream deltas,
-           already linked, URL with parentheses; API and browser), history
-           unlinking (also links saved before 2.8.0, a hostile history line),
-           only referenced sources (show-all valve), large and too large
+           already linked, URL with parentheses; API and browser; nothing
+           after [DONE]), history unlinking (also links saved before 2.8.0, a
+           hostile history line), only referenced sources (show-all valve,
+           references to documents that do not exist), large and too large
            stream events, content null, tool rounds, tasks (also without a
-           websocket session), client data_sources (an error naming the
-           removal), the removed AZURE_AI_SEARCH_MODE valve, fail-closed
-           errors, Stop; see suites/_azure_rag.py
+           websocket session), client data_sources (API stream and
+           non-stream, browser: an error naming the removal, ERROR line and
+           terminal status), the removed AZURE_AI_SEARCH_MODE valve, no On
+           Your Data retirement notice, fail-closed errors, Stop; see
+           suites/_azure_rag.py
   logs     no API key, no search key or token and no citation or search text
            in the server log
 """
@@ -155,6 +158,12 @@ STATUS_STREAM = [
 STATUS_NONSTREAM = ["Sending request to Azure AI...", "Request completed"]
 LINE_TOO_LONG = "Got more than 131072 bytes"
 STREAM_ERROR = ("function_azure:stream_processor_with_citations", "Error processing")
+# The whole answer to the mock's force-400 (content filter): Azure's message
+# and nothing appended (e.g. no On Your Data hint as in the 2.9.0 pre-releases)
+FILTERED_ERROR = (
+    "Error: The response was filtered due to the prompt triggering Azure OpenAI's "
+    "content management policy."
+)
 
 
 # First line of the task in Open WebUI's RAG template (a file attached to a
@@ -481,8 +490,9 @@ async def api(t: Suite, mock, base_valves: dict) -> None:
         t.expect_errors(mark, ("function_azure:pipe", "Error in Azure AI request: 400"))
         t.check(
             f"api.error-400.{'stream' if stream else 'nonstream'}",
-            f"upstream HTTP 400 -> readable error (stream={stream})",
-            r.status == 200 and "content management policy" in r.content,
+            f"upstream HTTP 400 -> readable error (stream={stream}): exactly "
+            "'Error: <Azure's message>', no hint appended",
+            r.status == 200 and r.content == FILTERED_ERROR,
             r.brief(),
         )
 
@@ -557,10 +567,11 @@ async def browser(t: Suite, mock) -> None:
     last = _last_status(c.status_history)
     t.check(
         "browser.error-status",
-        "browser path upstream HTTP 400: error saved, final 'Error: ...' status done",
+        "browser path upstream HTTP 400: error saved and final status done, both "
+        "exactly 'Error: <Azure's message>' (no hint appended)",
         c.done
-        and "content management policy" in c.content
-        and str(last.get("description", "")).startswith("Error:")
+        and c.content == FILTERED_ERROR
+        and last.get("description") == FILTERED_ERROR
         and last.get("done") is True,
         f"{c.brief()} statuses={_statuses(c.status_history)}",
     )

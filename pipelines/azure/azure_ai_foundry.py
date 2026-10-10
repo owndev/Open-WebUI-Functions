@@ -346,7 +346,7 @@ class Pipe:
             json_schema_extra={"input": {"type": "password"}},
         )
 
-        # Endpoint for Azure AI (e.g. "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview" or "https://<your-endpoint>/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview")
+        # Endpoint for Azure AI (e.g. "https://<your-endpoint>/chat/completions?api-version=2024-05-01-preview" or "https://<your-endpoint>/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21")
         AZURE_AI_ENDPOINT: str = Field(
             default=os.getenv(
                 "AZURE_AI_ENDPOINT",
@@ -1533,9 +1533,9 @@ class Pipe:
         self,
         citations: List[Dict[str, Any]],
         __event_emitter__: Optional[Callable[..., Any]],
-        content: str = "",
-        allow_fallback: bool = True,
-        skip: Optional[Set[int]] = None,
+        content: str,
+        allow_fallback: bool,
+        skip: Set[int],
     ) -> Set[int]:
         """
         Emit OpenWebUI citation events for citations.
@@ -1579,8 +1579,8 @@ class Pipe:
             if 1 <= index <= len(citations)
         }
 
-        # If we couldn't find any references, include all citations (backward
-        # compatibility), unless this fallback is switched off
+        # If we couldn't find any references, include all citations, unless
+        # this fallback is switched off (valve or tool call round)
         if not referenced_indices:
             if not allow_fallback:
                 log.info(
@@ -1902,7 +1902,8 @@ class Pipe:
         __event_emitter__=None,
         response: Optional[aiohttp.ClientResponse] = None,
         session: Optional[aiohttp.ClientSession] = None,
-        citation_state: Optional[Dict[str, Any]] = None,
+        *,
+        citation_state: Dict[str, Any],
     ) -> AsyncIterator[bytes]:
         """
         Enhanced stream processor that can handle Azure AI Search citations in streaming responses.
@@ -1929,8 +1930,6 @@ class Pipe:
         done_sent = False
         # Whether the answer asked for tool calls
         tool_round = False
-        if citation_state is None:
-            citation_state = {}
 
         try:
             full_response_buffer = ""

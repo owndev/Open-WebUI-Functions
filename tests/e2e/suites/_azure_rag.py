@@ -5,8 +5,10 @@ mocks/mock_search.py (Azure AI Search, managed identity tokens) and
 mocks/mock_azure.py (chat, query generation, embeddings, tool calls).
 
 The pipe no longer uses Azure OpenAI On Your Data: it never sends
-``data_sources``, and a request that carries them ends with an error that
-names the removal (``client-data-sources.*``). The checks of the former
+``data_sources``, and a request that carries them (API stream and non-stream,
+browser path as from an inlet filter) ends with an error that names the
+removal and a terminal error status (``client-data-sources.*``); it never logs
+the 2.8.1 retirement notice (``notice.none``). The checks of the former
 ``oyd`` group whose behaviour still exists (``[docX]`` links, history
 unlinking, sources and the show-all valve, scores, large and too large stream
 events, ``content: null``, background tasks also without a websocket session)
@@ -14,8 +16,9 @@ run here against the pipe's own retrieval.
 
 Order: every check that uses the function as installed, then ``mode.*``
 (saves the function again, first with the AZURE_AI_SEARCH_MODE valve of a
-2.9.0 pre-release) and last ``rag.log.debug``, which runs the staged file in
-the driver process with every logger at DEBUG.
+2.9.0 pre-release), ``rag.log.debug``, which runs the staged file in the
+driver process with every logger at DEBUG, and last ``notice.none`` over the
+server log of the whole azure suite run.
 
 Loaded by suites/azure.py when the group runs (modules starting with ``_`` are
 not suites).
@@ -110,9 +113,35 @@ CLIENT_DS_ERROR = (
     "Error: Azure AI Search: data_sources in the request is not supported: this "
     "pipeline no longer uses Azure OpenAI On Your Data (removed in 3.0.0)"
 )
+# The whole answer (and final status) of a request with client data_sources
+CLIENT_DS_ANSWER = (
+    CLIENT_DS_ERROR
+    + "; remove data_sources, the search is configured by AZURE_AI_DATA_SOURCES"
+)
+# The pipe's ERROR line for it (also required, not only tolerated)
+CLIENT_DS_LOG = (
+    "Error in Azure AI request: Azure AI Search: data_sources in the request"
+)
 CONTEXT_HINT = (
     "lower AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS or top_n_documents, or start a new chat"
 )
+# The whole answer to the mock's context-too-long: Azure's message and the
+# hint, nothing else (e.g. no On Your Data hint as in the 2.9.0 pre-releases)
+CONTEXT_LENGTH_ANSWER = (
+    "Error: This model's maximum context length is 128000 tokens. However, your "
+    "messages resulted in 131072 tokens. Please reduce the length of the "
+    f"messages. ({CONTEXT_HINT})"
+)
+# mock_azure bad-ref / mixed-ref: references to a document that does not
+# exist ([doc9], the search returns 3), alone and next to [doc1]
+BAD_REF = "The X100 charges via USB-C [doc9]."
+MIXED_REF_LINKED = (
+    "The X100 charges via USB-C [[doc1]](https://docs.example.com/x100/manual.pdf) "
+    "and [doc9]."
+)
+# The 2.8.1 On Your Data retirement notice (a WARNING of the pipe): every
+# server-log line with all of these
+OYD_NOTICE = ("On Your Data", "October 14, 2026")
 # Server-log signatures of provoked errors.
 SEARCH_ERROR = ("function_azure:pipe", "Azure AI Search")
 CHAT_ERROR = ("function_azure:pipe", "Error in Azure AI request")
@@ -276,6 +305,15 @@ def _answer(content) -> str:
     return f"answer={short(content or '', 120)}"
 
 
+def _after_done(res) -> str:
+    """SSE events an API stream sent after its first [DONE] (an OpenAI-style
+    client stops reading there and never sees them)."""
+    return (
+        f"after [DONE]: {res.after_done} events, "
+        f"content={short(res.after_done_content, 80)!r}"
+    )
+
+
 def _context(data) -> dict:
     """``choices[0].message.context`` of a non-stream API answer."""
     if isinstance(data, dict) and data.get("choices"):
@@ -340,6 +378,16 @@ def _followup(latest: str, earlier: str = LINKED) -> list:
         {"role": "user", "content": QUESTION},
         {"role": "assistant", "content": earlier},
         {"role": "user", "content": latest},
+    ]
+
+
+def _client_ds_errors(t: Suite, mark: int) -> list:
+    """The pipe's ERROR lines for a request with client data_sources since
+    ``mark``."""
+    return [
+        line
+        for line in t.log.lines(mark, CLIENT_DS_LOG)
+        if "| ERROR" in line and "function_azure" in line
     ]
 
 
@@ -478,6 +526,7 @@ async def rag(t: Suite, mock, base_valves: dict) -> None:
     # saves the function again (a fresh module)
     await rag_mode_removed(r)
     await rag_debug_log(r)
+    rag_notice_none(r)
     await t.owui.update_valves(FID, **base_valves)
 
 
@@ -800,12 +849,15 @@ async def rag_links(r: Rag) -> None:
         chat = await r.chat()
         r.check(
             sid,
-            f"API stream '{text}': references linked once, [DONE] forwarded",
+            f"API stream '{text}': references linked once (held back text "
+            "included), all of it before [DONE] and nothing after it",
             res.status == 200
             and res.content == expected
             and res.done
+            and not res.after_done
             and _grounded(chat),
-            f"{_answer(res.content)} done={res.done} {_chat_brief(chat)}",
+            f"{_answer(res.content)} done={res.done} {_after_done(res)} "
+            f"{_chat_brief(chat)}",
         )
 
     await r.reset()
@@ -1033,22 +1085,37 @@ async def rag_query_text(r: Rag) -> None:
 
 
 async def rag_no_refs(r: Rag) -> None:
+    """Sources of an answer without references, and of one whose references
+    point only to documents that do not exist ([doc9] with 3 documents: no
+    reference either) or partly ([doc1] and [doc9]: only doc1)."""
     t = r.t
     async with t.browser() as b:
-        for show_all, expected, sid in (
-            (True, ALL_SOURCES, "no-refs.default"),
-            (False, [], "no-refs.valve-false"),
+        no_refs = "answer without [docX]"
+        bad_ref = "answer citing only [doc9] of 3 documents (counts as no reference)"
+        for sid, show_all, trigger, content, expected, title in (
+            ("no-refs.default", True, "no-refs", NO_REFS, ALL_SOURCES, no_refs),
+            ("no-refs.valve-false", False, "no-refs", NO_REFS, [], no_refs),
+            ("bad-ref.default", True, "bad-ref", BAD_REF, ALL_SOURCES, bad_ref),
+            ("bad-ref.valve-false", False, "bad-ref", BAD_REF, [], bad_ref),
+            (
+                "mixed-ref",
+                True,
+                "mixed-ref",
+                MIXED_REF_LINKED,
+                REFERENCED_SOURCES[:1],
+                "answer citing [doc1] and [doc9] of 3 documents: doc1 linked, "
+                "[doc9] left as it is",
+            ),
         ):
             await r.set(**{SHOW_ALL: show_all})
             await r.reset()
-            c = await b.chat(MODEL, QUESTION + " no-refs", stream=True)
+            c = await b.chat(MODEL, QUESTION + " " + trigger, stream=True)
             chat = await r.chat()
             r.check(
                 sid,
-                f"answer without [docX], show-all valve {show_all} -> "
-                f"{len(expected)} sources",
+                f"{title}, show-all valve {show_all} -> {len(expected)} sources",
                 c.done
-                and c.content == NO_REFS
+                and c.content == content
                 and c.source_names == expected
                 and _grounded(chat),
                 f"{c.brief()} {_chat_brief(chat)}",
@@ -1197,18 +1264,21 @@ async def rag_events(r: Rag) -> None:
         "a context event of more than 128 KiB (one SSE line: 3 documents of "
         "50,000 characters, AZURE_AI_SEARCH_MAX_CONTEXT_TOKENS=0) reaches the API "
         "client, and an upstream event of ~300 KB (one SSE line) is read and "
-        "passed on: linked answer and [DONE], the citations with the full text",
+        "passed on: linked answer and [DONE] (nothing after it), the citations "
+        "with the full text",
         res.status == 200
         and res.content == LINKED
         and res.done
+        and not res.after_done
         and size > 128 * 1024
         and lengths == [50000, 50000, 50000]
         and padded > 256 * 1024
         and not too_long
         and _grounded(chat),
-        f"{_answer(res.content)} done={res.done} context_event_bytes={size} "
-        f"citation_lengths={lengths} upstream_event_bytes={padded} "
-        f"line_too_long_log={too_long} {_chat_brief(chat)}",
+        f"{_answer(res.content)} done={res.done} {_after_done(res)} "
+        f"context_event_bytes={size} citation_lengths={lengths} "
+        f"upstream_event_bytes={padded} line_too_long_log={too_long} "
+        f"{_chat_brief(chat)}",
     )
 
     await r.set()
@@ -1222,17 +1292,18 @@ async def rag_events(r: Rag) -> None:
     r.check(
         "huge-event.api",
         "an upstream event over 4 MiB (one SSE line) ends the stream with an "
-        "'Error: ... larger than 4 MiB ...' delta and [DONE], without its text "
-        "in the answer or the log",
+        "'Error: ... larger than 4 MiB ...' delta and [DONE] (nothing after "
+        "it), without its text in the answer or the log",
         res.status == 200
         and res.content.startswith("Error:")
         and "larger than 4 MiB" in res.content
         and FILLER not in res.content
         and res.done
+        and not res.after_done
         and not leaked
         and _grounded(chat),
-        f"{_answer(res.content)} done={res.done} event text in log={leaked} "
-        f"{_chat_brief(chat)}",
+        f"{_answer(res.content)} done={res.done} {_after_done(res)} "
+        f"event text in log={leaked} {_chat_brief(chat)}",
     )
 
     async with t.browser() as b:
@@ -2609,8 +2680,10 @@ async def rag_no_session(r: Rag) -> None:
 
 async def rag_client_data_sources(r: Rag) -> None:
     """data_sources sent by the client (On Your Data, removed in 3.0.0) are
-    refused (never fetched, never forwarded), with or without the valve; an
-    empty list is ignored."""
+    refused (never fetched, never forwarded), with or without the valve, in
+    streamed and non-streamed API requests and in the browser path (as an
+    inlet filter adds them), with the pipe's ERROR line and a terminal error
+    status; an empty list is ignored."""
     t = r.t
     client = [
         {
@@ -2628,24 +2701,55 @@ async def rag_client_data_sources(r: Rag) -> None:
         ("client-data-sources.no-valve", ""),
     ):
         await r.set(ds)
+        for stream in (False, True):
+            mark = await r.reset()
+            res = await t.owui.chat(MODEL, QUESTION, stream=stream, data_sources=client)
+            await r.settle_errors(mark, SEARCH_ERROR)
+            chats, recorded = await r.chats(), await r.search.requests()
+            logged = _client_ds_errors(t, mark)
+            r.check(
+                f"{sid}.stream" if stream else sid,
+                f"client data_sources (stream={stream}, "
+                f"{'valve set' if ds is None else 'no valve'}): the answer is "
+                "exactly 'Error: Azure AI Search: data_sources in the request is "
+                "not supported: this pipeline no longer uses Azure OpenAI On Your "
+                "Data (removed in 3.0.0); ...'"
+                + (" and [DONE]" if stream else "")
+                + ", the pipe's ERROR line logged once, nothing searched, nothing "
+                "sent upstream",
+                res.content == CLIENT_DS_ANSWER
+                and (res.done or not stream)
+                and len(logged) == 1
+                and not recorded
+                and not chats,
+                f"{_answer(res.content)} done={res.done} error lines={len(logged)} "
+                f"search mock requests={len(recorded)} chats={len(chats)}",
+            )
+
+    # The browser path, with data_sources in the body as an inlet filter
+    # adds them: the event emitter gets the terminal error status
+    await r.set()
+    async with t.browser() as b:
         mark = await r.reset()
-        res = await t.owui.chat(MODEL, QUESTION, stream=False, data_sources=client)
+        c = await b.chat(MODEL, QUESTION, stream=True, extra={"data_sources": client})
         await r.settle_errors(mark, SEARCH_ERROR)
-        chats, recorded = await r.chats(), await r.search.requests()
-        r.check(
-            sid,
-            "client data_sources "
-            f"({'valve set' if ds is None else 'no valve'}): 'data_sources in the "
-            "request is not supported: this pipeline no longer uses Azure OpenAI "
-            "On Your Data (removed in 3.0.0)', nothing searched, nothing sent "
-            "upstream",
-            res.content.startswith(CLIENT_DS_ERROR)
-            and "AZURE_AI_DATA_SOURCES" in res.content
-            and not recorded
-            and not chats,
-            f"{_answer(res.content)} search mock requests={len(recorded)} "
-            f"chats={len(chats)}",
-        )
+    chats, recorded = await r.chats(), await r.search.requests()
+    logged = _client_ds_errors(t, mark)
+    r.check(
+        "client-data-sources.browser",
+        "browser path with data_sources in the body (as from an inlet filter): "
+        "the error saved as the answer and as the only, final status (done), the "
+        "pipe's ERROR line logged once, nothing searched, nothing sent upstream",
+        c.done
+        and c.content == CLIENT_DS_ANSWER
+        and _statuses(c.status_history) == [(CLIENT_DS_ANSWER, True, False)]
+        and len(logged) == 1
+        and not recorded
+        and not chats,
+        f"{c.brief()} statuses={_statuses(c.status_history)} error "
+        f"lines={len(logged)} search mock requests={len(recorded)} "
+        f"chats={len(chats)}",
+    )
 
     await r.set()
     mark = await r.reset()
@@ -3263,12 +3367,9 @@ async def rag_context_length(r: Rag) -> None:
     r.check(
         "context-length",
         "chat HTTP 400 context_length_exceeded on a request with documents: "
-        "Azure's message plus the budget / new chat hint",
-        res.content.startswith("Error:")
-        and "maximum context length" in res.content
-        and CONTEXT_HINT in res.content
-        and _grounded(chat),
-        f"{_answer(res.content)} {_chat_brief(chat)}",
+        "exactly Azure's message plus the budget / new chat hint (no other hint)",
+        res.content == CONTEXT_LENGTH_ANSWER and _grounded(chat),
+        f"answer={short(res.content, 300)} {_chat_brief(chat)}",
     )
 
 
@@ -3631,6 +3732,14 @@ async def rag_debug_log(r: Rag) -> None:
             True,
             {"data_sources": client},
         ),
+        (
+            "client data_sources with a key, stream (refused)",
+            r.valves(),
+            MODEL,
+            tuple(question),
+            True,
+            {"data_sources": client},
+        ),
     )
     capture = _LogCapture()
     root = logging.getLogger()
@@ -3677,7 +3786,7 @@ async def rag_debug_log(r: Rag) -> None:
         "server logs at INFO): the API key, the search key of the valve and the "
         "JSON, the search and embedding tokens and the embedding key are in no "
         "log record (keys, tokens, managed identity, query generation, errors, "
-        "client data_sources with a key)",
+        "client data_sources with a key, refused also when streamed)",
         not failure
         and len(results) == len(cases)
         and all(ok for _, ok in results)
@@ -3691,4 +3800,26 @@ async def rag_debug_log(r: Rag) -> None:
         f"embeds={len(embeds)} tokens={len(tokens)} "
         f"chats with data_sources={len(with_ds)} "
         f"records={len(capture.records)} azure_ai_debug={debug} leaks={leaks}",
+    )
+
+
+# ------------------------------------------------------ retirement notice
+def rag_notice_none(r: Rag) -> None:
+    """3.0.0 has no On Your Data path, so the 2.8.1 retirement notice (a
+    WARNING once per loaded copy of the module) must never come back: no line
+    of the pipe in the server log of the whole suite run names On Your Data
+    together with its retirement date."""
+    t = r.t
+    notices = [
+        line.strip()
+        for line in t.log.since(t.log_start).splitlines()
+        if "function_azure" in line and all(part in line for part in OYD_NOTICE)
+    ]
+    r.check(
+        "notice.none",
+        "no On Your Data retirement notice of 2.8.1 in the server log (no line "
+        "of the pipe with 'On Your Data' and 'October 14, 2026', at any level), "
+        "although every kind of search request ran",
+        not notices,
+        f"notices={len(notices)} first={short(notices[:1], 240)}",
     )

@@ -62,6 +62,9 @@ Behaviour
       ``no-finish``      stream without a finish_reason chunk that ends on a
                          reference ("... [doc2]" without the final ".")
       ``no-refs``        (grounded) answer without any [docX] reference
+      ``bad-ref``        (grounded) answer that references only [doc9], a
+                         document the search did not return
+      ``mixed-ref``      (grounded) answer that references [doc1] and [doc9]
       ``big-event``      (grounded, stream) the first event (choices [],
                          prompt_filter_results) padded to ~300 KB: more than
                          aiohttp's default line of 128 KiB, less than the
@@ -202,6 +205,16 @@ GROUNDED_TOKENS_NO_REFS = [
     "The requested information ",
     "is not available ",
     "in the retrieved data.",
+]
+# references to a document the search did not return (3 documents)
+GROUNDED_TOKENS_BAD_REF = ["The X100 ", "charges via USB-C ", "[doc9]", "."]
+GROUNDED_TOKENS_MIXED_REF = [
+    "The X100 ",
+    "charges via USB-C ",
+    "[doc1]",
+    " and ",
+    "[doc9]",
+    ".",
 ]
 # doc 1's URL of the Search mock's paren-url trigger
 PAREN_URL = "https://docs.example.com/x100/manual_(v2).pdf"
@@ -376,6 +389,10 @@ def _grounded_tokens(text: str) -> list:
         return GROUNDED_TOKENS_SPLIT_LINK
     if "no-refs" in text:
         return GROUNDED_TOKENS_NO_REFS
+    if "bad-ref" in text:
+        return GROUNDED_TOKENS_BAD_REF
+    if "mixed-ref" in text:
+        return GROUNDED_TOKENS_MIXED_REF
     return GROUNDED_TOKENS
 
 
