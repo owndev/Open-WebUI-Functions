@@ -230,7 +230,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Provides configurable error handling and timeouts: temporary API errors are retried (`GOOGLE_RETRY_COUNT`) for streaming and non-streaming requests, and every started status (thinking, image, video) is closed when a request fails or is stopped.
 - **Advanced image processing**: Optimized image handling with configurable compression, resizing, and quality settings.
 - **Configurable parameters**: Environment variables for image optimization (quality, max dimensions, format conversion).
-- **Multi-image history**: Configurable history image limit, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
+- **Multi-image history**: Image edits across turns: the generated and uploaded images of a saved chat are sent with the edit request (temporary chats send only your own uploads). Configurable image limit that keeps the current and the newest images, hash-based deduplication, and automatic `[Image N]` labels so the model can reference earlier images.
 - **Image generation (Gemini 3)**: Configurable aspect ratio (for example `16:9` or `1:1`) and resolution (`1K`, `2K`, or `4K`) for Gemini 3 image models, with per-user valve overrides.
 - **Nano Banana image models**: `gemini-nano-banana-2.1`, `gemini-3.1-flash-image` and `gemini-3.1-flash-lite-image` are detected as image models; each generated image is uploaded once (interim thought images are skipped unless no final image arrives). API clients get generated images and videos as links in the answer. Google Search grounding is left out for the image models without Search support (`gemini-2.5-flash-image`, `gemini-3.1-flash-lite-image`). Newer image models outside Gemini 3 / Nano Banana naming can be added via `GOOGLE_IMAGE_GENERATION_MODELS` without a code change.
 - **Video generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video for all supported Veo models. Videos are automatically uploaded and embedded with playback controls.
@@ -239,7 +239,7 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`; changes show on the next model list refresh, without waiting for the model cache TTL.
 - Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
-- Native tool calling support (on Open WebUI 0.10+ set Function Calling to **Legacy** for now, see [known limitations](./docs/google-gemini-integration.md#known-limitations-on-open-webui--010))
+- [Native tool calling through Open WebUI's tool loop](./docs/google-gemini-integration.md#native-tool-calling) (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval); tool calls are returned to API clients
 - Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)

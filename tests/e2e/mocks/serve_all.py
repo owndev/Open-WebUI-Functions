@@ -6,6 +6,8 @@ Run every provider mock in one process (used by tests/e2e/run.sh).
   n8n         127.0.0.1:9103   mock_n8n.py
   infomaniak  127.0.0.1:9104   mock_infomaniak.py
   search      127.0.0.1:9106   mock_search.py (Azure AI Search + managed identity tokens)
+  tools       127.0.0.1:9111   mock_tools.py (OpenAPI tool server; no E2E_MOCK_FAULT)
+  mcp         127.0.0.1:9112   mock_tools.py (MCP tool server, optional)
 
 (9105 and 9107 are the control and managed identity ports of mock_la.py, which
 the filters suite starts.)
@@ -26,6 +28,7 @@ import mock_gemini
 import mock_infomaniak
 import mock_n8n
 import mock_search
+import mock_tools
 from common import fault_status
 
 HOST = "127.0.0.1"
@@ -35,6 +38,7 @@ MOCKS = {
     "n8n": (9103, mock_n8n.make_app),
     "infomaniak": (9104, mock_infomaniak.make_app),
     "search": (9106, mock_search.make_app),
+    "tools": (mock_tools.PORT, mock_tools.make_app),
 }
 
 
@@ -46,6 +50,13 @@ async def serve() -> None:
         await web.TCPSite(runner, HOST, port).start()
         runners.append(runner)
         print(f"mock {name} listening on http://{HOST}:{port}", flush=True)
+    try:  # optional: the MCP scenario says so when it is missing
+        mock_tools.start_mcp(mock_tools.MCP_PORT)
+        print(
+            f"mock mcp listening on http://{HOST}:{mock_tools.MCP_PORT}/mcp", flush=True
+        )
+    except Exception as exc:  # noqa: BLE001 - no mcp package in this image
+        print(f"mock mcp not started: {exc!r}", flush=True)
     if fault_status():
         print(f"E2E_MOCK_FAULT: provider routes answer {fault_status()}", flush=True)
     await asyncio.Event().wait()

@@ -13,6 +13,12 @@ for those task ids.
 
 Only this path exercises event emitters and persisted content; the API path
 (``OWUI.chat``) does not save anything.
+
+Native tool calling: Open WebUI runs the tools of a pipe that answers with
+``tool_calls`` (built-in, workspace, MCP and OpenAPI tools on the server; direct
+tools in the browser, through an ``execute:tool`` socket call that the browser
+acknowledges with the result) and saves the turn as ``output`` items
+(``function_call``, ``function_call_output``, ``reasoning``, ``message``).
 """
 
 import asyncio
@@ -25,6 +31,10 @@ from .owui import OWUI
 from .results import short
 
 DEFAULT_TITLE = "New Chat"
+# Answer to an execute:tool call (direct tools) when the scenario set none.
+NO_DIRECT_ANSWER = {"error": "no direct tool answer configured"}
+# Seconds between socket.io "heartbeat" events (the web UI sends them too).
+HEARTBEAT_INTERVAL = 20
 # The web UI always sends these feature flags (toggles in the message input).
 FRONTEND_FEATURES = {
     "image_generation": False,
@@ -59,15 +69,65 @@ class BrowserChat:
 
     @property
     def content(self) -> str:
+        """Saved content; when it is empty (tool turns: Open WebUI's final save
+        writes only ``output``) the text of the output's message items."""
         if self.message.get("content"):
             return self.message["content"]
-        parts = []  # newer Open WebUI keeps the answer in "output" items as well
-        for item in self.message.get("output") or []:
+        return self.output_text
+
+    @property
+    def output(self) -> list:
+        """Output items Open WebUI saved (function calls, reasoning, messages)."""
+        return [i for i in self.message.get("output") or [] if isinstance(i, dict)]
+
+    @property
+    def output_text(self) -> str:
+        """Text of the output's message items, joined."""
+        parts = []
+        for item in self.output:
             if item.get("type") == "message":
                 for part in item.get("content") or []:
-                    if part.get("type") == "output_text":
+                    if isinstance(part, dict) and part.get("type") == "output_text":
                         parts.append(part.get("text", ""))
         return "".join(parts)
+
+    @property
+    def function_calls(self) -> list:
+        """``[(name, status, call_id, arguments)]`` of the function_call items."""
+        return [
+            (i.get("name"), i.get("status"), i.get("call_id"), i.get("arguments"))
+            for i in self.output
+            if i.get("type") == "function_call"
+        ]
+
+    @property
+    def function_outputs(self) -> dict:
+        """``{call_id: text}`` of the function_call_output items."""
+        outputs = {}
+        for item in self.output:
+            if item.get("type") != "function_call_output":
+                continue
+            value = item.get("output")
+            if isinstance(value, list):
+                value = "".join(p.get("text", "") for p in value if isinstance(p, dict))
+            outputs[item.get("call_id")] = value if isinstance(value, str) else ""
+        return outputs
+
+    @property
+    def reasoning_items(self) -> list:
+        """``[(content text, reasoning_details)]`` of the reasoning items."""
+        return [
+            (
+                "".join(
+                    p.get("text", "")
+                    for p in i.get("content") or []
+                    if isinstance(p, dict)
+                ),
+                i.get("reasoning_details") or [],
+            )
+            for i in self.output
+            if i.get("type") == "reasoning"
+        ]
 
     @property
     def usage(self) -> Optional[dict]:
@@ -126,6 +186,13 @@ class BrowserSession:
         self.owui = owui
         self.sio = None
         self.events: list = []
+        # execute:tool calls Open WebUI made to this "browser" (direct tools) and
+        # the answer it acknowledges them with: a callable(call data) -> ack,
+        # e.g. ``lambda d: [{"value": 1}, {}]`` ([result, headers]; a plain dict
+        # is sent as JSON; None makes Open WebUI report unparsable arguments).
+        self.execute_calls: list = []
+        self.direct_tool_answer = lambda data: NO_DIRECT_ANSWER
+        self._heartbeat: Optional[asyncio.Task] = None
 
     async def __aenter__(self) -> "BrowserSession":
         await self.connect()
@@ -137,11 +204,20 @@ class BrowserSession:
     async def connect(self) -> None:
         import socketio  # python-socketio ships with the Open WebUI image
 
-        self.sio = socketio.AsyncClient(reconnection=False)
+        # handle_sigint=False: engine.io would replace the driver's SIGINT
+        # handler on the event loop with one that cancels every task and stops
+        # the loop, so an interrupted run was not reported as interrupted.
+        self.sio = socketio.AsyncClient(reconnection=False, handle_sigint=False)
 
         @self.sio.on("events")
         async def _on_events(data):
             self.events.append(data)
+            inner = data.get("data") if isinstance(data, dict) else None
+            if isinstance(inner, dict) and inner.get("type") == "execute:tool":
+                # Open WebUI waits for this ack (sio.call): the tool result
+                self.execute_calls.append(data)
+                return self.direct_tool_answer(inner.get("data") or {})
+            return None
 
         await self.sio.connect(
             self.owui.base,
@@ -150,9 +226,25 @@ class BrowserSession:
             transports=["websocket"],
             wait_timeout=15,
         )
+        self._heartbeat = asyncio.create_task(self._beat(self.sio))
         await asyncio.sleep(0.3)
 
+    @staticmethod
+    async def _beat(sio) -> None:
+        """Send ``heartbeat`` like the web UI: Open WebUI reaps a session that
+        sent none for 120 s, and server -> client calls (direct tools,
+        ``__event_call__``) to it then fail with "Client session disconnected."."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            try:
+                await sio.emit("heartbeat", {})
+            except Exception:  # noqa: BLE001 - disconnected: nothing to keep alive
+                return
+
     async def close(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.cancel()
+            self._heartbeat = None
         if self.sio is not None:
             await self.sio.disconnect()
             self.sio = None
@@ -160,7 +252,13 @@ class BrowserSession:
 
     @property
     def sid(self) -> Optional[str]:
-        return self.sio.sid if self.sio else None
+        """The Socket.IO namespace sid (what the web UI sends as ``socket.id``).
+
+        ``AsyncClient.sid`` is the engine.io sid, which Open WebUI does not know:
+        every server -> client call (direct tools, ``__event_call__``) then
+        answered "Client session disconnected."
+        """
+        return self.sio.get_sid() if self.sio else None
 
     async def chat(
         self,
@@ -178,6 +276,11 @@ class BrowserSession:
         models: Optional[list] = None,
         stop_after_s: Optional[float] = None,
         stop_wait: float = 15,
+        tool_ids: Optional[list] = None,
+        tool_servers: Optional[list] = None,
+        extra_body: Optional[dict] = None,
+        until=None,
+        user_files: Optional[list] = None,
         files: Optional[list] = None,
         extra: Optional[dict] = None,
     ) -> BrowserChat:
@@ -197,12 +300,26 @@ class BrowserSession:
         (``POST /api/tasks/stop/<task id>`` for every task); then wait up to
         ``stop_wait`` seconds for ``done`` (a stopped answer may never be done).
 
+        ``tool_ids`` (workspace tools, ``server:<id>``, ``server:mcp:<id>``) and
+        ``tool_servers`` (direct tool servers, answered through
+        ``direct_tool_answer``) go into the request as the web UI sends them;
+        ``extra_body`` is merged into the request body last. ``until`` is a
+        predicate on the saved message that also ends the wait (e.g. a tool call
+        waiting for approval: ``status == "pending"``).
+
+        ``user_files``: the file items of the user message (saved with it, e.g.
+        an upload from ``owui.upload_file``). Like the web UI, image files are
+        not sent as the request's ``files``: Open WebUI turns the image files
+        of the saved user messages into image_url parts.
+
         ``files``: items attached to the user message, as the web UI sends
-        them (saved on the user message and sent as the request's ``files``),
-        e.g. ``{"type": "chat", "id": <chat id>, "context": "full"}``.
+        them (saved on the user message after ``user_files`` and sent as the
+        request's ``files``), e.g. ``{"type": "chat", "id": <chat id>,
+        "context": "full"}``.
 
         ``extra``: more keys of the request body, e.g. ``data_sources`` as an
-        inlet filter would add them (Open WebUI hands unknown keys to the pipe).
+        inlet filter would add them (Open WebUI hands unknown keys to the pipe);
+        merged before ``extra_body``.
         """
         if models:
             ids = list(models) if models[0] == model else [model, *models]
@@ -219,6 +336,8 @@ class BrowserSession:
             "timestamp": int(time.time()),
             "models": ids,
         }
+        if user_files is not None:
+            user_message["files"] = list(user_files)
         body = {
             "model": ids[0],
             "stream": stream,
@@ -231,7 +350,7 @@ class BrowserSession:
             "background_tasks": background_tasks or {},
         }
         if files:
-            user_message["files"] = list(files)
+            user_message["files"] = [*(user_files or []), *files]
             body["files"] = list(files)
         if models:
             body["message_ids"] = [
@@ -242,8 +361,13 @@ class BrowserSession:
             body["id"] = assistant_ids[0]
         if chat_id:
             body["chat_id"] = chat_id
+        if tool_ids is not None:
+            body["tool_ids"] = list(tool_ids)
+        if tool_servers is not None:
+            body["tool_servers"] = list(tool_servers)
         if extra:
             body.update(extra)
+        body.update(extra_body or {})
         status, data = await self.owui.api("POST", "/api/chat/completions", body)
         answers = [
             BrowserChat(status, data, message_id=a, model=m)
@@ -261,13 +385,7 @@ class BrowserSession:
             await asyncio.sleep(stop_after_s)
             await self.stop(result)
             wait = min(wait, stop_wait)
-        deadline = time.time() + wait
-        while time.time() < deadline:
-            await asyncio.sleep(0.5)
-            if all([(await self._load(a)).get("done") for a in answers]):
-                break
-        # Outlet filters and late events are persisted right after "done".
-        await asyncio.sleep(1.5)
+        await self._wait(answers, wait, until)
         if wait_title:
             title_deadline = time.time() + 60
             while time.time() < title_deadline and result.title in (
@@ -279,6 +397,26 @@ class BrowserSession:
         for answer in answers[1:]:
             await self.reload(answer)
         return await self.reload(result)
+
+    async def wait(
+        self, result: BrowserChat, wait: float = 120, until=None
+    ) -> BrowserChat:
+        """Wait until the saved answer is ``done`` (or ``until(message)`` holds),
+        e.g. after resolving a tool call that waited for approval."""
+        await self._wait([result], wait, until)
+        return await self.reload(result)
+
+    async def _wait(self, answers: list, wait: float, until=None) -> None:
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            await asyncio.sleep(0.5)
+            messages = [await self._load(a) for a in answers]
+            if all(m.get("done") for m in messages):
+                break
+            if until is not None and any(until(m) for m in messages):
+                break
+        # Outlet filters and late events are persisted right after "done".
+        await asyncio.sleep(1.5)
 
     async def stop(self, result: BrowserChat) -> list:
         """Press Stop: ``POST /api/tasks/stop/<id>`` for every task of the chat

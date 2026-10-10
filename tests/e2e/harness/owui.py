@@ -53,6 +53,13 @@ class ChatResult:
     # stream only: choices[].message.content of chat.completion chunks (not part
     # of ``content``, see STREAM_MESSAGE_ERROR)
     message_content: str = ""
+    # tool calling (stream: merged deltas, see parse_sse; non-stream: message)
+    tool_calls: list = field(default_factory=list)
+    reasoning_details: list = field(default_factory=list)
+    reasoning_content: str = ""
+    finish_reasons: list = field(default_factory=list)
+    done_last: bool = False  # "data: [DONE]" is the last data line
+    openai_finish_reason: Optional[str] = None  # openai SDK's stream accumulator
     # stream only: SSE events after the first "data: [DONE]" (OpenAI-style
     # clients stop reading there) and the delta content among them (also part
     # of ``content``)
@@ -75,6 +82,13 @@ def parse_sse(text: str) -> dict:
     Events after the first ``[DONE]`` are still parsed, and also counted in
     ``after_done`` (their delta content in ``after_done_content``): an
     OpenAI-style client stops reading at ``[DONE]`` and never sees them.
+
+    Tool calling: ``tool_calls`` merged by index (id, name, arguments
+    concatenated; ``index`` None when a delta had none), every
+    ``reasoning_details`` item, the ``reasoning_content`` text, the
+    ``finish_reasons`` in order, ``done_seen`` / ``done_last`` ([DONE] seen /
+    the last data line) and ``openai_finish_reason``: what the openai SDK's
+    ``ChatCompletionStreamState`` (an OpenAI client) makes of the stream.
     """
     out = {
         "content": "",
@@ -83,17 +97,27 @@ def parse_sse(text: str) -> dict:
         "done": False,
         "chunks": 0,
         "message_content": "",
+        "tool_calls": [],
+        "reasoning_details": [],
+        "reasoning_content": "",
+        "finish_reasons": [],
+        "done_seen": False,
+        "done_last": False,
+        "openai_finish_reason": None,
         "after_done": 0,
         "after_done_content": "",
     }
+    calls: dict = {}
+    chunks: list = []  # what an OpenAI client reads (up to [DONE])
     for line in text.splitlines():
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
+        out["done_last"] = payload == "[DONE]"
         if out["done"]:
             out["after_done"] += 1
         if payload == "[DONE]":
-            out["done"] = True
+            out["done"] = out["done_seen"] = True
             continue
         try:
             data = json.loads(payload)
@@ -101,13 +125,35 @@ def parse_sse(text: str) -> dict:
             out["errors"].append(f"unparsable SSE line: {payload[:120]}")
             continue
         out["chunks"] += 1
+        if not out["done"]:
+            chunks.append(data)
         if isinstance(data, dict) and data.get("error"):
             out["errors"].append(data["error"])
         for choice in (data.get("choices") if isinstance(data, dict) else None) or []:
-            delta_text = (choice.get("delta") or {}).get("content") or ""
+            delta = choice.get("delta") or {}
+            delta_text = delta.get("content") or ""
             out["content"] += delta_text
             if out["done"]:
                 out["after_done_content"] += delta_text
+            out["reasoning_content"] += delta.get("reasoning_content") or ""
+            out["reasoning_details"] += [
+                d for d in delta.get("reasoning_details") or [] if isinstance(d, dict)
+            ]
+            for call in delta.get("tool_calls") or []:
+                index = call.get("index")
+                key = index if index is not None else f"noindex-{len(calls)}"
+                entry = calls.setdefault(
+                    key, {"index": index, "id": None, "name": "", "arguments": ""}
+                )
+                entry["id"] = call.get("id") or entry["id"]
+                function = call.get("function") or {}
+                entry["name"] += function.get("name") or ""
+                arguments = function.get("arguments")
+                if isinstance(arguments, (dict, list)):
+                    arguments = json.dumps(arguments)
+                entry["arguments"] += arguments or ""
+            if choice.get("finish_reason"):
+                out["finish_reasons"].append(choice["finish_reason"])
             message = choice.get("message")
             if isinstance(message, dict):
                 out["message_content"] += message.get("content") or ""
@@ -115,7 +161,29 @@ def parse_sse(text: str) -> dict:
                     out["errors"].append(STREAM_MESSAGE_ERROR)
         if isinstance(data, dict) and data.get("usage"):
             out["usage"] = data["usage"]
+    out["tool_calls"] = list(calls.values())
+    out["openai_finish_reason"] = openai_finish_reason(chunks)
     return out
+
+
+def openai_finish_reason(chunks: list) -> Optional[str]:
+    """finish_reason the openai SDK's stream accumulator reports for these chunks
+    (openai ships with the Open WebUI image), or ``error: ...``."""
+    try:
+        from openai.lib.streaming.chat import ChatCompletionStreamState
+        from openai.types.chat import ChatCompletionChunk
+
+        state = ChatCompletionStreamState()
+        for data in chunks:
+            if not isinstance(data, dict) or "choices" not in data:
+                continue
+            chunk = {"object": "chat.completion.chunk", "created": 0, "id": "x"}
+            chunk.update({"model": "m", **data})
+            state.handle_chunk(ChatCompletionChunk.model_validate(chunk))
+        choices = state.get_final_completion().choices
+        return choices[0].finish_reason if choices else None
+    except Exception as exc:  # noqa: BLE001 - reported in the check's detail
+        return f"error: {type(exc).__name__}: {str(exc)[:80]}"
 
 
 def completion_text(data: Any) -> Optional[str]:
@@ -404,6 +472,15 @@ class OWUI:
             result.done = parsed["done"]
             result.chunks = parsed["chunks"]
             result.message_content = parsed["message_content"]
+            for key in (
+                "tool_calls",
+                "reasoning_details",
+                "reasoning_content",
+                "finish_reasons",
+                "done_last",
+                "openai_finish_reason",
+            ):
+                setattr(result, key, parsed[key])
             result.after_done = parsed["after_done"]
             result.after_done_content = parsed["after_done_content"]
             return result
@@ -417,6 +494,12 @@ class OWUI:
         if isinstance(result.json, dict):
             result.content = completion_text(result.json) or ""
             result.usage = result.json.get("usage")
+            choice = (result.json.get("choices") or [{}])[0] or {}
+            message = choice.get("message") or {}
+            result.tool_calls = list(message.get("tool_calls") or [])
+            result.reasoning_details = list(message.get("reasoning_details") or [])
+            if choice.get("finish_reason"):
+                result.finish_reasons = [choice["finish_reason"]]
             if r.status_code != 200 or result.json.get("detail"):
                 result.errors.append(result.json.get("detail") or result.json)
         return result
@@ -440,9 +523,93 @@ class OWUI:
         _, data = await self.api("GET", f"/api/v1/chats/{chat_id}")
         return data if isinstance(data, dict) else {}
 
+    # ------------------------------------------------------------------- tools
+    async def create_tool(
+        self, tool_id: str, name: str, content: str, description: str = "e2e"
+    ) -> tuple[int, Any]:
+        """Create a workspace tool (Python), or update its code when it exists."""
+        form = {
+            "id": tool_id,
+            "name": name,
+            "content": content,
+            "meta": {"description": description},
+        }
+        status, existing = await self.api("GET", f"/api/v1/tools/id/{tool_id}")
+        if status == 200 and isinstance(existing, dict) and existing.get("id"):
+            return await self.api("POST", f"/api/v1/tools/id/{tool_id}/update", form)
+        return await self.api("POST", "/api/v1/tools/create", form)
+
+    async def delete_tool(self, tool_id: str) -> bool:
+        status, data = await self.api("DELETE", f"/api/v1/tools/id/{tool_id}/delete")
+        return status == 200 and data is True
+
+    async def tool_servers(self) -> list:
+        """The tool server connections (Admin Settings -> External Tools)."""
+        _, data = await self.api("GET", "/api/v1/configs/tool_servers")
+        if isinstance(data, dict):
+            return list(data.get("TOOL_SERVER_CONNECTIONS") or [])
+        return []
+
+    async def set_tool_servers(self, connections: list) -> list:
+        """Replace the tool server connections; returns the previous ones (to
+        restore them). Open WebUI loads each server's spec while saving."""
+        previous = await self.tool_servers()
+        status, data = await self.api(
+            "POST",
+            "/api/v1/configs/tool_servers",
+            {"TOOL_SERVER_CONNECTIONS": list(connections)},
+        )
+        if status != 200:
+            raise RuntimeError(f"configs/tool_servers: HTTP {status} {short(data)}")
+        return previous
+
+    async def chat_config(self) -> dict:
+        """Admin chat settings (``ENABLE_TOOL_PERMISSIONS``, ...)."""
+        _, data = await self.api("GET", "/api/v1/chats/config")
+        return data if isinstance(data, dict) else {}
+
+    async def set_chat_config(self, **changes: Any) -> dict:
+        """Change some chat settings (the full set is sent); returns the
+        previous settings (pass them back as ``**previous`` to restore)."""
+        previous = await self.chat_config()
+        status, data = await self.api(
+            "POST", "/api/v1/chats/config", {**previous, **changes}
+        )
+        if status != 200:
+            raise RuntimeError(f"chats/config: HTTP {status} {short(data)}")
+        return previous
+
+    async def resolve_tool_call(
+        self, chat_id: str, message_id: str, call_id: str, action: str
+    ) -> tuple[int, Any]:
+        """Approve or reject a tool call waiting for approval (``action``:
+        ``approve`` / ``reject``), like the buttons in the web UI."""
+        return await self.api(
+            "POST",
+            f"/api/v1/chats/{chat_id}/messages/{message_id}/resolve",
+            {"call_id": call_id, "action": action},
+        )
+
     async def stop_task(self, task_id: str) -> tuple[int, Any]:
         """Stop a running chat task (the web UI's Stop button)."""
         return await self.api("POST", f"/api/tasks/stop/{quote(task_id)}")
+
+    async def upload_file(
+        self, name: str, data: bytes, content_type: str, process: bool = False
+    ) -> tuple[int, Any]:
+        """Upload a file like the web UI (images with ``process=false``):
+        (HTTP status, the file record, whose ``id`` the web UI stores as the
+        ``url`` of the user message's file item)."""
+        r = await self.http.post(
+            f"/api/v1/files/?process={str(process).lower()}",
+            files={"file": (name, data, content_type)},
+            headers=self.headers,
+            timeout=120,
+        )
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, r.text
 
     async def file_status(self, url: str) -> tuple[int, str]:
         """(HTTP status, content type) of an Open WebUI file URL."""

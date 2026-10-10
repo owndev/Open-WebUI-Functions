@@ -17,9 +17,10 @@ not fail the run, but only when the failure looks like that bug:
   function (``function_<id>:``, ``outlet filter <id>``) together with the error
   so that nothing else matches. When the check passes ``since=mark``, a matching
   block logged since ``mark`` also counts as evidence. Once the bug has
-  reproduced, the suite's ``server-log`` check ignores blocks that match these
-  signatures (background tasks and later requests hit the same bug outside the
-  check); every other error still fails it.
+  reproduced, the suite's ``server-log`` check ignores ERROR and failing
+  WARNING blocks that match these signatures (background tasks and later
+  requests hit the same bug outside the check); every other error still fails
+  it.
 
 Version gating (``file`` + ``fixed_in``): a marker only applies while the staged
 copy of ``file`` (``FUNCTIONS_DIR/<file>``, the file under test) has a docstring

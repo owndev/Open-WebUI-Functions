@@ -148,18 +148,32 @@ class ServerLog:
             out.append(_summary(block))
         return out
 
-    def warnings(self, mark: int, *patterns) -> list:
+    def warnings(
+        self, mark: int, *patterns, ignore: tuple = (), ranges: tuple = ()
+    ) -> list:
         """WARNING blocks since ``mark`` (first line ... last line).
 
         Loguru ``| WARNING |`` lines, ``WARNING:`` lines and Python warnings
         (``file.py:12: UserWarning: ...``). With ``patterns`` (signatures: a
         string, or a tuple of strings that must all occur in the block) only
-        the matching blocks are returned.
+        the matching blocks are returned. Dropped like in ``errors``: blocks
+        matching an ``ignore`` signature (a known bug that reproduced) and
+        blocks that start inside one of the ``ranges`` ``(start, end,
+        signatures)`` and match one of its signatures (warnings a scenario
+        provoked on purpose).
         """
         out = []
-        for _, block in self._blocks(mark, _WARNING_START):
+        for offset, block in self._blocks(mark, _WARNING_START):
             text = "\n".join(block)
             if patterns and not any(signature_matches(text, p) for p in patterns):
+                continue
+            if any(signature_matches(text, sig) for sig in ignore):
+                continue
+            if any(
+                start <= offset < end
+                and any(signature_matches(text, sig) for sig in signatures)
+                for start, end, signatures in ranges
+            ):
                 continue
             out.append(_summary(block))
         return out

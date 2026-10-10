@@ -75,7 +75,7 @@ async def _fault_middleware(request: web.Request, handler) -> web.StreamResponse
     )
 
 
-def new_app() -> web.Application:
+def new_app(fault_injection: bool = True) -> web.Application:
     """Create an application with the request recorder and control routes.
 
     Control routes: ``GET /__requests`` (record as JSON list), ``POST /__reset``
@@ -83,10 +83,12 @@ def new_app() -> web.Application:
 
     Fault injection: with ``E2E_MOCK_FAULT=<4xx|5xx>`` in the mock process's
     environment every provider route answers with that HTTP status (used to
-    check that KNOWN results do not hide unrelated failures).
+    check that KNOWN results do not hide unrelated failures). Mocks that are not
+    provider mocks (the tool servers) pass ``fault_injection=False``.
     """
     app = web.Application(
-        client_max_size=64 * 1024 * 1024, middlewares=[_fault_middleware]
+        client_max_size=64 * 1024 * 1024,
+        middlewares=[_fault_middleware] if fault_injection else [],
     )
     app[REQUESTS_KEY] = []
     app.router.add_get("/__requests", _list_requests)

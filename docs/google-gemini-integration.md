@@ -13,10 +13,15 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 The pipeline uses the official [`google-genai`](https://pypi.org/project/google-genai/) Python SDK. Open WebUI bundled it up to version 0.11.3, but **Open WebUI 0.11.4 no longer ships it** (see "Undeclared package imports" under **Changed** in the [Open WebUI 0.11.4 release notes](https://github.com/open-webui/open-webui/releases/tag/v0.11.4)). The pipeline therefore declares it in its header:
 
 ```text
-requirements: google-genai>=1.66.0, google-genai<3
+requirements: google-genai>=1.68.0, google-genai<3
 ```
 
-Open WebUI runs `pip` for this requirement when the function is saved and again at every startup for active functions. Once the package is installed this is a no-op, but after the container is recreated (for example on an image upgrade) it is downloaded again, so Open WebUI needs access to PyPI or to a mirror configured via `PIP_OPTIONS` / `PIP_PACKAGE_INDEX_OPTIONS`. On Open WebUI 0.9.0 to 0.11.3, the bundled `google-genai` 1.66.0 already satisfies the requirement, so pip has nothing to install.
+Version 1.68.0 is the first `google-genai` release that can send Google Search grounding together with function declarations to Gemini 3 (server-side tool invocations, see [Native tool calling](#native-tool-calling)).
+
+Open WebUI runs `pip` for this requirement when the function is saved and again at every startup for active functions. Once the package is installed this is a no-op, but after the container is recreated (for example on an image upgrade) it is downloaded again, so Open WebUI needs access to PyPI or to a mirror configured via `PIP_OPTIONS` / `PIP_PACKAGE_INDEX_OPTIONS`. On Open WebUI 0.9.0 to 0.11.3, pip upgrades the bundled `google-genai` 1.66.0 when the function is saved. The pipeline reloads `google.genai` itself, so it uses the new version without a restart; other functions or tools that use `google.genai` only see the new version after a restart.
+
+> [!WARNING]
+> Without access to PyPI or a mirror (air-gapped or proxied instances), that upgrade fails on Open WebUI 0.9.0 to 0.11.3: saving version 1.18.0 then fails, Open WebUI switches the function off, and the Gemini models disappear. Before you update, either install `google-genai>=1.68.0,<3` yourself (see [Manual Installation](#manual-installation)), or set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`. In the second case the pipeline runs on the bundled 1.66.0 without Google Search grounding together with function calling: Gemini 3 with web search then uses grounding only and declares no tools in that request.
 
 > [!NOTE]
 > `google-genai` currently requires `websockets<17` ([googleapis/python-genai#2835](https://github.com/googleapis/python-genai/issues/2835)), so pip downgrades the `websockets` 17.1 shipped with Open WebUI 0.11.4 to the newest 16.x (16.1.1, the version Open WebUI 0.11.3 shipped with the same uvicorn). The downgrade applies to the whole Open WebUI environment. The pipeline reloads the affected modules itself, so Open WebUI does not need a restart after the install. Other tools or functions that imported `websockets` before the downgrade only see a consistent version again after a restart.
@@ -28,10 +33,10 @@ Open WebUI skips the automatic install when `ENABLE_PIP_INSTALL_FRONTMATTER_REQU
 ```dockerfile
 # Use the same tag you deploy, e.g. v0.11.4, v0.11.4-slim or main
 FROM ghcr.io/open-webui/open-webui:v0.11.4
-RUN pip install --no-cache-dir "google-genai>=1.66.0,<3"
+RUN pip install --no-cache-dir "google-genai>=1.68.0,<3"
 ```
 
-For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66.0,<3"` (or `uv pip install ...`) in Open WebUI's virtual environment and restart Open WebUI. Environments created without pip (for example by uv) cannot use the automatic install at all: saving the function fails with `No module named pip`, so set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` and install the SDK manually.
+For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68.0,<3"` (or `uv pip install ...`) in Open WebUI's virtual environment and restart Open WebUI. Environments created without pip (for example by uv) cannot use the automatic install at all: saving the function fails with `No module named pip`, so set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` and install the SDK manually.
 
 > [!TIP]
 > Pipeline versions before 1.16.1 cannot import `google.genai` on Open WebUI 0.11.4, and Open WebUI switches off a function that fails to load. Paste version 1.16.1 or later, save it, and switch it back on under **Admin Panel → Functions**.
@@ -63,7 +68,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
   Accepts both text and image data for more expressive interactions with configurable image optimization.
 
 - **Advanced Image Generation**  
-  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message (API clients, which have no chat message, get it as a markdown link `![Generated Image](/api/v1/files/<id>/content)` in the answer); the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached).
+  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message (API clients, which have no chat message, get it as a markdown link `![Generated Image](/api/v1/files/<id>/content)` in the answer); the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached). To edit an image, ask for the change in the same chat: the images of earlier turns, generated or uploaded, are sent along (see [Image Editing and Image History](#image-editing-and-image-history)).
 
 - **Video Generation with Google Veo**  
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
@@ -89,8 +94,8 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.66
 - **Ability to forward User Headers and change gemini base url**  
   Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. The headers always belong to the user of the request, also with concurrent requests of several users. Also, change the base URL for the Google Generative AI API if needed.
 
-- **Native tool calling support**  
-  Leverage Google genai native function calling to orchestrate the use of tools
+- **Native tool calling**  
+  Tools offered by Open WebUI (built-in, workspace, MCP, OpenAPI, terminal and direct tools) are declared to Gemini, and Open WebUI runs Gemini's tool calls, including tool approval. API clients get the calls back as OpenAI `tool_calls`. See [Native tool calling](#native-tool-calling).
 
 ## Environment Variables
 
@@ -154,7 +159,8 @@ GOOGLE_IMAGE_ENABLE_OPTIMIZATION=true
 # Default: 0.5
 GOOGLE_IMAGE_PNG_THRESHOLD_MB=0.5
 
-# Maximum number of images (history + current message) sent per request
+# Maximum number of images (history + current message) sent per request.
+# The current message's images are kept first, then the newest history images.
 # Default: 5
 GOOGLE_IMAGE_HISTORY_MAX_REFERENCES=5
 
@@ -412,6 +418,23 @@ GOOGLE_IMAGE_GENERATION_MODELS="gemini-4-flash-image"
 ```
 
 Listed models are handled like Gemini 3 image models: requests are sent without streaming and with `response_modalities` `TEXT` and `IMAGE`, the aspect ratio and resolution settings are sent as ImageConfig, `GOOGLE_THINKING_LEVEL` / `reasoning_effort` are passed through as `thinking_level` without remapping, and generated images are uploaded to the chat. The model itself must still be available in the model list (returned by the API, or added via `GOOGLE_MODEL_ADDITIONAL`).
+
+### Image Editing and Image History
+
+To edit a generated image, ask for the change in the same chat ("Change the name to Bob"). An image model gets one request with the text of your last message, followed by the images of the current message and of earlier turns, each after an `[Image N]` label (`GOOGLE_IMAGE_ADD_LABELS`). The text of earlier turns is not sent.
+
+Where the images of earlier turns come from:
+
+- **Saved chats** (the normal web UI chat): from the chat as Open WebUI stored it. That covers the generated images, which are attached to the answers as files (Open WebUI does not pass the files of earlier answers to a pipe), images you uploaded, images linked in earlier answers (pipeline versions before 1.15.2) and, when you regenerate an answer with guidance, the images of the user message whose answer you regenerate. Background tasks such as titles and follow-up suggestions get no images.
+- **API clients** (no saved chat): from the request's messages, as `image_url` parts (data URLs or Open WebUI file URLs) or markdown image links in the content, such as the `![Generated Image](/api/v1/files/<id>/content)` link the pipeline returns.
+- **Temporary chats**: Open WebUI does not save them, and the web UI sends only the images of your own messages. A generated image of an earlier turn is therefore not sent. To edit it, download it and attach it to your edit message.
+
+Which images are sent:
+
+- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat. Earlier images are read newest first and only as many as fit.
+- Identical images are sent once (`GOOGLE_IMAGE_DEDUP_HISTORY`): an image you attach again (for example a downloaded generated image) is not repeated from the history, and an image of several turns counts at its newest place. Images of earlier turns come before the current message's images unless `GOOGLE_IMAGE_HISTORY_FIRST=false`.
+- The pipeline reads only the requesting user's own files and chats (an admin may read every file and chat), also when a message or an API request names the file id of another user. Open WebUI 0.9.6 and later check the images they put into the request themselves in the same way (and also allow files shared with the user). Open WebUI 0.9.0 to 0.9.5 put the image of any file id named in a user message into the request before the pipeline runs, so update Open WebUI if users must not reach each other's files.
+- Earlier images are sent as parts of your message, which is how Gemini takes input images for editing. Earlier answers are not replayed as model turns, so no thought signatures are needed.
 
 ## Video Generation Configuration
 
@@ -717,19 +740,53 @@ Limitations:
 
 - **Chats with several models:** the filter sets the `vertex_ai_search` flag and the data store in the request's metadata, which Open WebUI shares between all models of the chat. Other Gemini models in the same chat can therefore also use Vertex AI Search grounding with that data store, even without the filter. Other pipelines ignore the flag.
 
-## Native tool calling support
+## Native tool calling
 
-Native tool calling is enabled/disabled via the standard 'Function calling' Open Web UI toggle.
+Tool calling uses Open WebUI's **Native** function calling mode, the default since Open WebUI 0.10.
 
-### Known limitations on Open WebUI >= 0.10
+### How it works
 
-Open WebUI 0.10 made **Native** the default function calling mode, so tools are passed to the pipeline unless a model or chat opts out. In that mode the pipeline hands them to the `google-genai` SDK as Python functions; the SDK declares them to Gemini and executes Gemini's function calls itself through automatic function calling (AFC). On Open WebUI 0.10 and later this has the following problems:
+1. The pipeline declares the tools of the request to Gemini. Open WebUI sends an OpenAI tool spec for every tool it offers: its built-in tools (time, knowledge, chats, notes, tasks, automations, calendar, ...), Python tools from the Tools workspace, MCP and OpenAPI tool servers, terminal tools and direct tool servers. In Native mode the built-in tools come with every chat.
+2. When Gemini answers with function calls, the pipeline ends the round and returns them as OpenAI `tool_calls`. The `google-genai` SDK never runs a tool itself (automatic function calling is off).
+3. Open WebUI runs the tools (with tool approval, citations and embeds where configured) and calls the pipeline again with the results, until Gemini answers without a tool call.
 
-- **Built-in tools come with every chat.** In Native mode Open WebUI attaches its built-in tools (time, knowledge, chat and note search, tasks, automations, calendar, ...) to every chat, so every request declares them to Gemini, even if no tool was selected. Image generation models are the exception: the pipeline sends them no tools, because they do not support function calling.
-- **Python tools from the Tools workspace** are declared to Gemini, but executing them through AFC fails: Open WebUI 0.10+ compiles them with `from __future__ import annotations`, so their type hints are strings. The SDK's argument conversion then fails with an `isinstance()` error, which it returns to Gemini as the `functionResponse` instead of running the tool.
-- **MCP and OpenAPI tool server tools** all reach the SDK with the same function name, `tool_function`, so Gemini receives duplicate function declarations and rejects the request with `400 INVALID_ARGUMENT`.
+Gemini 3 requires the thought signatures of its function calls back in the following requests. The pipeline passes them to Open WebUI as `reasoning_details`, which Open WebUI stores with the tool calls and sends back in the next round and in later turns. When the chat switches to another model, Open WebUI drops them; older turns are then sent without signatures, which Gemini accepts.
 
-Workaround: set **Function Calling** to **Legacy** in the model's advanced parameters (**Admin Panel → Settings → Models → edit model → Advanced Params**), per chat in the chat controls, or globally in the default model parameters. Open WebUI then handles tool selection itself and the pipeline receives no native tools. A fix for native tool calling is tracked in [#169](https://github.com/owndev/Open-WebUI-Functions/issues/169).
+### Display in the chat
+
+- In a turn with tool calls, Gemini's thinking appears as Open WebUI's own "Thought for N seconds" block. The duration can read 0 seconds, because the thoughts of a round arrive together with its tool calls. With `GOOGLE_INCLUDE_THOUGHTS=false` Gemini 3 still sends thought signatures, so the block appears without content for every tool round.
+- Answers without tool calls keep the `<details>` thinking summary.
+- The answer after a tool call is streamed as it arrives. It has no inline `[1]` citation markers; its Google Search sources are still attached.
+- For a chat request with `stream=false`, the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
+
+### API clients
+
+Requests to `/api/chat/completions` without a chat pass the client's `tools` to Gemini, and the client runs the calls, as with OpenAI:
+
+- Streaming: `delta.tool_calls` and `delta.reasoning_details`, then a final `finish_reason` of `tool_calls`, the usage and `[DONE]`.
+- Non-streaming: `message.tool_calls` and `message.reasoning_details` with `finish_reason` `tool_calls`.
+- Clients should send `reasoning_details` back on the assistant message with the `tool_calls`. Without them the pipeline sends Gemini 3 the placeholder signature `skip_thought_signature_validator` for the first call of each step of the current turn.
+- `tool_choice`: `"none"` sends mode `NONE`, `"required"` mode `ANY`, `{"type": "function", "function": {"name": "..."}}` mode `ANY` limited to that function, and `"auto"` or no `tool_choice` leaves Gemini's default. `parallel_tool_calls` is ignored; Gemini has no equivalent.
+
+### Grounding together with tools
+
+- Gemini 3 on the Gemini API: Google Search and URL context grounding are sent together with the function declarations (server-side tool invocations). This needs `google-genai` 1.68.0 or later; with an older SDK grounding takes precedence as below.
+- Gemini 2.x and other models, Vertex AI (including Vertex AI with `VERTEX_AI_RAG_STORE`) and Enterprise Web Search: grounding takes precedence, and the request declares no functions.
+- A round with Gemini's own Search calls is sent back complete (the search calls, their results and the function calls, stored as an extra `reasoning_details` item) only within its turn. Later turns get the round's function calls with their signatures and results, without the search parts, so a later message with web search switched off, or a switch to Vertex AI, still works.
+
+### Names and schemas
+
+Gemini accepts function names of up to 64 characters (letters, digits, `_` and `-`, starting with a letter or `_`). Other tool names, for example an OpenAPI operation `lookup.v2`, are declared with the invalid characters replaced and a short hash appended (`lookup_v2_<hash>`), and Gemini's calls are mapped back to the original name. Parameter schemas are sent as JSON Schema (`parameters_json_schema`) after a light clean-up: `$schema`, `$id`, `$comment`, `examples`, `deprecated`, `readOnly`, `writeOnly` and `x-*` keys and boolean `exclusiveMinimum` / `exclusiveMaximum` are removed, tuple `items` become `prefixItems`, and `required` only lists existing properties. Tools without parameters are declared without a schema.
+
+### Requests without tools
+
+Image generation models, background tasks (title, tag and follow-up generation) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
+
+### Limitations
+
+- Open WebUI ends the tool loop after `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS` rounds (default 256). The pipeline adds no limit of its own.
+- Tool approval on Open WebUI 0.11.4: after an approved call the saved message loses the tool result, and when Gemini calls several tools at once, only the first call is asked for and run.
+- Tool calling was verified with Open WebUI 0.11.3 and 0.11.4. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
 
 ## Default System Prompt
 
@@ -919,7 +976,7 @@ The pipeline automatically extracts token usage metadata from every Gemini respo
 
 No additional configuration is required. Token usage is tracked automatically for all models that return `usage_metadata` (all current Gemini models).
 
-Open WebUI passes no event emitter to background tasks (title, tags, follow-ups, search queries). The pipeline then skips its status and source events, leaves the thinking summary out of task answers because Open WebUI reads JSON from them, and sends no grounding tools (Google Search, URL context, Vertex AI Search) even though tasks inherit the chat's grounding flags. A Gemini model can therefore also be used as the task model.
+Open WebUI passes no event emitter to background tasks (title, tags, follow-ups, search queries). The pipeline then skips its status and source events, leaves the thinking summary out of task answers because Open WebUI reads JSON from them, and sends no grounding tools (Google Search, URL context, Vertex AI Search) even though tasks inherit the chat's grounding flags, and no function declarations. A Gemini model can therefore also be used as the task model.
 
 > [!NOTE]
 > Thinking tokens consumed during internal reasoning are **not** included in `completion_tokens` — they are captured separately by the Gemini API in `thoughts_token_count` but are not forwarded to Open WebUI at this time.
