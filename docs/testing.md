@@ -76,6 +76,8 @@ group adds about 5.5 minutes (query-generation timeouts, the query-generation pa
 and the 45 s retrieval limit are waited for; with the Azure pipeline 2.8.x of `main`,
 as in the meta-test, its requests fail at once): with the Azure pipeline 3.0.0 a full
 run took 790 s (gemini 130 s, azure 420 s, n8n 72 s, infomaniak 36 s, filters 103 s).
+The filters `ingest` group (Logs Ingestion API) adds about 2.5 minutes: 1000 s
+(gemini 150 s, azure 424 s, n8n 71 s, infomaniak 36 s, filters 259 s).
 Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -219,7 +221,7 @@ Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-
 | `filters` | 101 | 101 / 0 |
 | **all** | **463** | **462 / 1** |
 
-There is no FAIL and no obsolete marker; `v0.11.3-slim` gives the same azure counts.
+No FAIL and no obsolete marker; `v0.11.3-slim` gives the same azure and filters counts.
 `harness/known_*.py` registers one known bug, `infomaniak-name-prefix` (`NAME_PREFIX`
 is read only once, no fix yet, `fixed_in=""`): the one KNOWN. The markers of the 62
 bugs fixed by #182-#185 were dropped after the merge; their checks stay and must pass.
