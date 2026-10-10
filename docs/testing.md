@@ -50,14 +50,14 @@ Typical output (abridged):
 starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
 Open WebUI healthy after 30s (http://localhost:57765)
 Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
-function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 2.8.1, n8n.py 2.3.1, ...
+function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 3.0.0, n8n.py 2.3.1, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in <details>
 ...
 [PASS ] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
 ...
---- gemini: 302s
+--- gemini: 305s
 ...
 === infomaniak ===
 ...
@@ -67,21 +67,18 @@ function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 2.8.1, n8n.py 2.
              __init__); no fix yet
           name='Infomaniak: Mixtral Mock'
 ...
-SUMMARY: 363 PASS, 0 FAIL, 1 KNOWN in 580s
-total runtime: 609s
+SUMMARY: 530 PASS, 0 FAIL, 1 KNOWN in 1089s
+total runtime: 1123s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
-A full run of all suites took 9-11 minutes on a shared 8-CPU Docker host before the
-azure `rag` group (609 s: 20 s container start-up, then gemini 302 s with the native
-tool calling groups, azure 69 s, n8n 71 s, infomaniak 36 s, filters 102 s). The azure
-`rag` group adds about 5.5 minutes (query-generation timeouts, the query-generation
-pause and the 45 s retrieval limit are waited for; with the Azure pipeline 2.8.x of
-`main`, as in the meta-test, its requests fail at once): with the Azure pipeline 3.0.0
-and without the native tool calling groups a full run took 790 s (gemini 130 s, azure
-420 s, n8n 72 s, infomaniak 36 s, filters 103 s). The filters `ingest` group (Logs
-Ingestion API) adds about 2.5 minutes: 1000 s (gemini 150 s, azure 424 s, n8n 71 s,
-infomaniak 36 s, filters 259 s).
+A full run of all suites took about 19 minutes on a shared 8-CPU Docker host (1120-1169 s;
+1123 s: 34 s container start-up, then gemini 305 s, azure 419 s, n8n 71 s, infomaniak
+36 s, filters 256 s). Most of it is waiting: the azure `rag` group adds about 5.5
+minutes (query-generation timeouts, the query-generation pause and the 45 s retrieval
+limit are waited for; with the Azure pipeline 2.8.x of `main`, as in the meta-test, its
+requests fail at once), the gemini `tools`, `toolsapi` and `imgedit` groups about 2.5
+minutes and the filters `ingest` group (Logs Ingestion API) another 2.5 minutes.
 Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -212,11 +209,11 @@ values among them), so a DEBUG server log cannot show what the pipe logs. Instea
 query generation, errors, client `data_sources` with a key, also streamed); no log record may
 contain a key or token.
 
-Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10:
-`gemini` on branch `feature/gemini-native-tool-calling`, `google_gemini.py` 1.18.0 with
-the #194 fix and its 19 `imgedit` checks; the other suites on `main` 4b80e24 (Azure
-pipeline 3.0.0) plus the Logs Ingestion API of #188: 2 new `spec` checks, the `ingest`
-group with 41 and `log.no-secrets-debug`):
+Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10,
+`main` 4b80e24 (Azure pipeline 3.0.0) plus the Logs Ingestion API of #188 (2 new `spec`
+checks, the `ingest` group with 41 and `log.no-secrets-debug`) and native tool calling
+in `google_gemini.py` 1.18.0 with the #194 fix (the `tools` / `toolsapi` groups and the
+19 `imgedit` checks)):
 
 | Suite | Checks | PASS / KNOWN |
 | --- | ---: | ---: |
@@ -227,8 +224,8 @@ group with 41 and `log.no-secrets-debug`):
 | `filters` | 101 | 101 / 0 |
 | **all** | **531** | **530 / 1** |
 
-No FAIL and no obsolete marker; `v0.11.3-slim` gives the same gemini, azure and filters
-counts. `harness/known_*.py` registers one known bug, `infomaniak-name-prefix`
+No FAIL and no obsolete marker; `v0.11.3-slim` gives the same counts for every suite.
+`harness/known_*.py` registers one known bug, `infomaniak-name-prefix`
 (`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`): the one KNOWN. The markers
 of the 62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and
 must pass. The `imgedit` group came with its fix and carries no marker either: with
@@ -757,7 +754,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; on 2026-10-10 with `main` 3ff6cf9 (Azure pipeline 2.8.1) and the harness of the Azure pipeline 3.0.0 (azure `rag` group): 35 PASS / 327 FAIL / 0 KNOWN (466 s), and with `main` 3ff6cf9 and the suites of `feature/gemini-native-tool-calling` (the `gemini.tools` / `toolsapi` / `imgedit` groups and the `azure` `oyd.notice.*` checks): 42 PASS / 262 FAIL / 0 KNOWN. The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; on 2026-10-10 with `main` 3ff6cf9 (Azure pipeline 2.8.1) and the harness of the Azure pipeline 3.0.0 (azure `rag` group): 35 PASS / 327 FAIL / 0 KNOWN (466 s), and with `main` 4b80e24 (Azure pipeline 3.0.0, `google_gemini.py` 1.17.0) and the suites with the `gemini.tools` / `toolsapi` / `imgedit` groups: 57 PASS / 370 FAIL / 0 KNOWN (557 s). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario
