@@ -61,13 +61,9 @@ function versions: google_gemini.py 1.18.0, azure_ai_foundry.py 3.0.0, n8n.py 2.
 ...
 === infomaniak ===
 ...
-[KNOWN] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names
-          -> known infomaniak-name-prefix (found by tests/e2e, no issue filed): changing the
-             NAME_PREFIX valve does not change the model names (the prefix is read once in
-             __init__); no fix yet
-          name='Infomaniak: Mixtral Mock'
+[PASS ] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names, and changing it back restores them
 ...
-SUMMARY: 530 PASS, 0 FAIL, 1 KNOWN in 1089s
+SUMMARY: 531 PASS, 0 FAIL, 0 KNOWN in 1089s
 total runtime: 1123s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
@@ -210,24 +206,23 @@ query generation, errors, client `data_sources` with a key, also streamed); no l
 contain a key or token.
 
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10,
-`main` 4b80e24 (Azure pipeline 3.0.0) plus the Logs Ingestion API of #188 (2 new `spec`
-checks, the `ingest` group with 41 and `log.no-secrets-debug`) and native tool calling
-in `google_gemini.py` 1.18.0 with the #194 fix (the `tools` / `toolsapi` groups and the
-19 `imgedit` checks)):
+`main` d3184b9: Azure pipeline 3.0.0, Time Token Tracker 2.7.0 with the Logs Ingestion
+API, native tool calling in `google_gemini.py` 1.18.0 with the #194 fix; plus the
+`NAME_PREFIX` fix in `infomaniak.py` 2.2.2):
 
 | Suite | Checks | PASS / KNOWN |
 | --- | ---: | ---: |
 | `gemini` | 149 | 149 / 0 |
 | `azure` | 198 | 198 / 0 |
 | `n8n` | 51 | 51 / 0 |
-| `infomaniak` | 32 | 31 / 1 |
+| `infomaniak` | 32 | 32 / 0 |
 | `filters` | 101 | 101 / 0 |
-| **all** | **531** | **530 / 1** |
+| **all** | **531** | **531 / 0** |
 
 No FAIL and no obsolete marker; `v0.11.3-slim` gives the same counts for every suite.
-`harness/known_*.py` registers one known bug, `infomaniak-name-prefix`
-(`NAME_PREFIX` is read only once, no fix yet, `fixed_in=""`): the one KNOWN. The markers
-of the 62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and
+No known bug is registered (`harness/known_n8n.py` has no entry): the last one,
+`infomaniak-name-prefix` (the `NAME_PREFIX` valve was read only once), was fixed in
+`infomaniak.py` 2.2.2, and its marker went with the fix. The markers of the 62 bugs fixed by #182-#185 were dropped after the merge; their checks stay and
 must pass. The `imgedit` group came with its fix and carries no marker either: with
 `google_gemini.py` 1.18.0 before the fix (a7fc191) 15 of its 19 checks FAIL. The four
 that pass check what did not change: `imgedit.temporary` (the fallback to the
@@ -362,11 +357,11 @@ is asked and the second is not run) are only recorded in the detail of
 - `PASS` – the check held.
 - `FAIL` – the check did not hold. The run exits with 1.
 - `KNOWN` – the check did not hold because of a **known bug** registered in
-  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak;
-  re-exported by `known.py`): key, summary, issue reference, pull request with the
+  `tests/e2e/harness/known_<area>.py` (today only `known_n8n.py` for n8n + Infomaniak,
+  with no entry at the moment; re-exported by `known.py`): key, summary, issue reference, pull request with the
   pending fix, evidence, and the function `file` plus the version `fixed_in` that fixes
-  it. Printed with the bug, e.g. `known infomaniak-name-prefix (found by tests/e2e, no
-  issue filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
+  it. Printed with the bug, e.g. `known <key> (found by tests/e2e, no issue
+  filed): ...; no fix yet`, or for a bug with a pending fix `...; fix pending in
   PR #<n> (not merged yet), fixed in <file> <version>`. KNOWN does not fail the run.
 
 A tagged check only counts as KNOWN when the failure **looks like that bug**: one of the

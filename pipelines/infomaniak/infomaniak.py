@@ -5,7 +5,7 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 infomaniak_url: https://own.dev/infomaniak-com-en-hosting-ai-tools
-version: 2.2.1
+version: 2.2.2
 required_open_webui_version: 0.8.0
 license: Apache License 2.0
 description: A manifold pipeline for interacting with Infomaniak AI Tools.
@@ -351,6 +351,9 @@ class Pipe:
         Returns:
             List of dictionaries containing pipe id and name.
         """
+        # Open WebUI reads self.name after pipes() to prefix the model names;
+        # refresh it so a changed NAME_PREFIX valve applies without a restart.
+        self.name = self.valves.NAME_PREFIX
         self.validate_environment()
         return await self.get_infomaniak_models()
 
