@@ -289,6 +289,8 @@ VERTEX_AI_RAG_STORE="projects/your-project/locations/global/collections/default_
 
 The Google Gemini pipeline supports configurable aspect ratios and resolutions for image generation with **Gemini 3/3.1 image models** (e.g., `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image`, and the preview IDs `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`, `gemini-3-flash-image-preview`), the **Nano Banana** IDs (e.g., `gemini-nano-banana-2.1`) and the models listed in `GOOGLE_IMAGE_GENERATION_MODELS`.
 
+To let a Gemini *text* model create or edit images in the middle of a chat through Open WebUI's own image engine instead, see [Open WebUI's image generation and code interpreter](#open-webuis-image-generation-and-code-interpreter).
+
 > [!IMPORTANT]
 > **Model Compatibility**: The `aspect_ratio` and `image_size` parameters (ImageConfig) are **only supported by Gemini 3/3.1 and Nano Banana image models**. Gemini 2.5 image models (e.g., `gemini-2.5-flash-image-preview`) support image generation but do not support these configuration parameters. When using Gemini 2.5 image models, default aspect ratio and resolution will be used automatically.
 
@@ -781,6 +783,35 @@ Gemini accepts function names of up to 64 characters (letters, digits, `_` and `
 ### Requests without tools
 
 Image generation models, background tasks (title, tag and follow-up generation) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
+
+### Open WebUI's image generation and code interpreter
+
+In Native mode Open WebUI 0.11 offers its own image generation, image editing and code interpreter as built-in tools: `generate_image`, `edit_image` and `execute_code`. The pipeline declares them to a Gemini text model like any other tool; Gemini decides when to call them and Open WebUI runs them. No separate tool or function is needed.
+
+**Image generation and editing** with Open WebUI's Gemini image engine:
+
+1. **Admin Settings → Images**: switch on image generation, choose the engine **Gemini**, enter the API base URL `https://generativelanguage.googleapis.com/v1beta` (empty by default unless `GEMINI_API_BASE_URL` is set), a Gemini API key (default: `GEMINI_API_KEY`) and the model. The endpoint method decides the kind of model: `predict` (or empty) for an Imagen model such as `imagen-4.0-generate-001`, `generateContent` for a Gemini image model such as `gemini-2.5-flash-image`. As environment variables: `ENABLE_IMAGE_GENERATION=true`, `IMAGE_GENERATION_ENGINE=gemini`, `IMAGES_GEMINI_API_BASE_URL`, `IMAGES_GEMINI_API_KEY`, `IMAGE_GENERATION_MODEL`, `IMAGES_GEMINI_ENDPOINT_METHOD`.
+2. For `edit_image`, also switch on image editing with the engine **Gemini**, the same base URL, a key and a Gemini image model (the edit engine always uses `generateContent`): `ENABLE_IMAGE_EDIT=true`, `IMAGE_EDIT_ENGINE=gemini`, `IMAGES_EDIT_GEMINI_API_BASE_URL`, `IMAGES_EDIT_GEMINI_API_KEY`, `IMAGE_EDIT_MODEL`. Without image editing only `generate_image` is offered.
+3. In the chat, pick a Gemini text model and turn on the **Image** toggle of the message input.
+
+Gemini then calls `generate_image` with a prompt, or `edit_image` with a prompt and the URLs of the images to change. It finds those URLs in the chat: in a saved chat Open WebUI lists the files of each user message in an `<attached_files>` block of that message, and the result of an earlier `generate_image` or `edit_image` call holds the URL of its image. Open WebUI sends the request to its image engine, attaches the new image to the answer and returns its URL to Gemini, which writes the rest of the answer.
+
+**Code interpreter**: on by default (**Admin Settings → Code Execution**, `ENABLE_CODE_INTERPRETER`). Turn on the **Code Interpreter** toggle of the message input; Gemini can then call `execute_code`:
+
+- Engine `pyodide` (default): Open WebUI sends the code to the browser tab, which runs it with Pyodide, and returns stdout, stderr and the result to Gemini. Open WebUI adds a note on the Pyodide environment to the system prompt, which the pipeline sends as Gemini's system instruction. An image printed as a `data:image/png;base64,...` line (for example a plot) is uploaded and replaced with a Markdown image link.
+- Engine `jupyter`: Open WebUI runs the code on the configured Jupyter server (`CODE_INTERPRETER_JUPYTER_URL`, ...); no browser tab is involved.
+
+**When Open WebUI offers these tools.** All of the following must hold (Open WebUI 0.11, `get_builtin_tools`):
+
+- The request comes from the web UI. API clients of `/api/chat/completions` do not get Open WebUI's built-in tools, toggles or not; they send their own `tools` (see [API clients](#api-clients)).
+- Function calling is **Native** and the model capability **Builtin Tools** is on.
+- Per tool: the global switch (image generation; image editing for `edit_image`; code interpreter), the model's capability (**Image Generation** / **Code Interpreter**) and its **Builtin Tools** category, the chat toggle, and the user permission **Features → Image Generation / Code Interpreter** (admins always have it). Capabilities that are not set count as on; pipeline models have none set until you edit them under **Admin Settings → Models**.
+
+**Limits** of this setup:
+
+- Open WebUI's Gemini image engine authenticates with an API key only (`x-goog-api-key` header). It has no Vertex AI login with service account or application default credentials, as the pipeline has; its key and base URL are separate from the pipeline's valves.
+- The pipeline's own image models (marked 🎨, e.g. `gemini-3.1-flash-image`) stay available for direct use. Image models support no function calling, so the pipeline sends them no tools: with such a model selected the model makes the image itself, and Open WebUI's image engine is not called, even with the Image toggle on.
+- The e2e group `gemini.owuitools` checks these round trips against the Gemini mock, the browser path of the test harness and a Jupyter mock (see the [testing guide](./testing.md#open-webuis-image-and-code-tools-geminiowuitools)). The requests Open WebUI's image engine sends to the real Gemini and Imagen APIs come from Open WebUI, not from this pipeline, and are not tested here.
 
 ### Limitations
 
