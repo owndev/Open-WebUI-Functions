@@ -174,7 +174,7 @@ lines are removed again at the end), installs a throw-away test CA into the cont
 trust store (kept across `--reuse` runs, valid 30 days; the server certificate lists
 every mapped host and is reissued when a name is missing) and starts
 `mocks/mock_la.py` (HTTPS on 127.0.0.1:443, control routes on :9105, managed identity
-endpoints on 127.0.0.1:9106 and 127.0.0.2:9106). The `ingest` group takes about two
+endpoints on 127.0.0.1:9107 and 127.0.0.2:9107). The `ingest` group takes about two
 and a half minutes, mostly timeout, token-expiry and token back-off waits. It also creates the user
 `filters-user@example.com`; the `gemini` suite creates `e2e-gemini-user@example.com`.
 The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
@@ -406,7 +406,7 @@ suites/              one module per suite: GROUPS + async def run(t: Suite); _*.
                      helper modules (e.g. _azure_rag.py, the azure rag group), not suites
 mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 and :9106 in
                      the container); mock_la.py (Log Analytics) is started by the filters
-                     suite (:443, :9105, :9106)
+                     suite (:443, :9105, :9107)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 ```
 

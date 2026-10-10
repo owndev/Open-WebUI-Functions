@@ -29,7 +29,7 @@ because it needs the certificate and port 443.
     api-version=2023-01-01, a known, unrevoked, unexpired Bearer token of the
     host's cloud (401), Content-Type application/json, configured DCR / stream
     (404), JSON array of objects (400), at most 1 MiB (413); 204 on success.
-- Managed identity on http://127.0.0.1:9106 and http://127.0.0.2:9106 (kind
+- Managed identity on http://127.0.0.1:9107 and http://127.0.0.2:9107 (kind
   ``msi``): ``GET /msi/token`` (App Service, ``X-IDENTITY-HEADER``; a
   ``client_id`` starting with ``e2e-unknown`` gets App Service's 400
   ``{statusCode, message, correlationId}``) and
@@ -70,7 +70,7 @@ from urllib.parse import parse_qs, quote_plus
 from aiohttp import web
 
 CONTROL_PORT = 9105
-MSI_PORT = 9106
+MSI_PORT = 9107  # 9106 is mocks/mock_search.py (serve_all.py)
 MSI_HOSTS = ("127.0.0.1", "127.0.0.2")
 TARPIT_HOST = "127.0.0.3"
 TARPIT_SECONDS = 8

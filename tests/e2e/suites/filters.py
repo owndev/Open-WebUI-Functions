@@ -7,7 +7,7 @@ go to mocks/mock_la.py: this suite maps <workspace>.ods.opinsights.azure.com
 (HTTP Data Collector API), the Microsoft Entra ID login hosts and the DCR
 ingestion hosts (Logs Ingestion API) to 127.0.0.1 in /etc/hosts, installs a
 throw-away test CA into the container's system store and starts the mock (HTTPS
-on 127.0.0.1:443, control on :9105, managed identity endpoints on :9106).
+on 127.0.0.1:443, control on :9105, managed identity endpoints on :9107).
 Token counts are compared with tiktoken in the driver (same encodings, cached in
 TIKTOKEN_CACHE_DIR before the server needs them).
 
@@ -227,7 +227,7 @@ LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoftonline.us")
 STREAM = f"Custom-{LOG_TYPE}_CL"  # default stream name derived from LOG_TYPE
 DEFAULT_SCOPE = "https://monitor.azure.com/.default"
 TOKEN_PATH = f"/{TENANT}/oauth2/v2.0/token"
-MI_PORT = 9106
+MI_PORT = 9107  # MSI_PORT of mocks/mock_la.py
 MI_URL = f"http://127.0.0.1:{MI_PORT}"
 MI_IMDS_URL = f"http://127.0.0.2:{MI_PORT}"  # not covered by NO_PROXY (mi.imds)
 PROBE_ENV_FILE = f"{LA_DIR}/probe-env.json"

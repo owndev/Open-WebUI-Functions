@@ -18,7 +18,7 @@ MOCK_PORTS = {
     "azure": 9102,
     "n8n": 9103,
     "infomaniak": 9104,
-    "search": 9106,  # Azure AI Search; 9105 is the Log Analytics mock control port
+    "search": 9106,  # Azure AI Search; 9105/9107: Log Analytics mock (filters)
 }
 
 # Layout inside the container (run.sh copies tests/e2e/ to E2E_ROOT).
