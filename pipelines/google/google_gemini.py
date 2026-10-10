@@ -17,7 +17,7 @@ features:
   - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
-  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, only files of the requesting user)
+  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, each image once; the pipeline reads only files of the requesting user)
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
   - Extra image generation model IDs configurable without a code change
   - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
@@ -575,25 +575,75 @@ class Pipe:
         )
 
     # ---------------- Internal Helpers ---------------- #
-    async def _gather_history_images(
+    async def _collect_history_images(
         self,
-        messages: List[Dict[str, Any]],
-        last_user_msg: Dict[str, Any],
+        sources: List[List[str]],
+        room: int,
+        current: List[Dict[str, Any]],
         optimization_stats: List[Dict[str, Any]],
-        __user__: Optional[dict] = None,
+        __user__: Optional[dict],
     ) -> List[Dict[str, Any]]:
-        history_images: List[Dict[str, Any]] = []
-        for msg in messages:
-            if msg is last_user_msg:
-                continue
-            if msg.get("role") not in {"user", "assistant"}:
-                continue
-            _p, parts = await self._extract_images_from_message(
-                msg, stats_list=optimization_stats, __user__=__user__
-            )
-            if parts:
-                history_images.extend(parts)
-        return history_images
+        """Images of earlier messages for the ``room`` the current message's
+        images leave under IMAGE_HISTORY_MAX_REFERENCES, oldest first.
+
+        ``sources`` holds the image URLs of each earlier message, oldest message
+        first. They are read newest first and only until the room is filled, so
+        a long chat does not read and re-encode all of its images. With
+        IMAGE_DEDUP_HISTORY an image counts once, at its newest place, and an
+        image of the current message is not sent again as history.
+        """
+        if room <= 0:
+            return []
+        dedup = self.valves.IMAGE_DEDUP_HISTORY
+        seen = {self._image_part_hash(p) for p in current} if dedup else set()
+        picked: List[Dict[str, Any]] = []
+        for urls in reversed(sources):
+            for url in reversed(urls):
+                part = await self._load_image_part(url, optimization_stats, __user__)
+                if part is None:
+                    continue
+                if dedup:
+                    digest = self._image_part_hash(part)
+                    if digest in seen:
+                        continue
+                    seen.add(digest)
+                picked.append(part)
+                if len(picked) >= room:
+                    return picked[::-1]
+        return picked[::-1]
+
+    @staticmethod
+    def _image_part_hash(part: Dict[str, Any]) -> str:
+        return hashlib.sha256(
+            str((part.get("inline_data") or {}).get("data") or "").encode()
+        ).hexdigest()
+
+    @classmethod
+    def _trailing_user_messages(
+        cls, messages: List[Dict[str, Any]], saved: bool = False
+    ) -> int:
+        """How many user messages end ``messages`` (after the last answer).
+
+        In the request, Open WebUI's message with the images of tool results is
+        not counted. In a saved chain, a failed answer without content is
+        skipped: Open WebUI leaves it out of the request.
+        """
+        count = 0
+        for msg in reversed(messages):
+            role = msg.get("role")
+            if role == "user":
+                if not saved and cls._is_tool_images_message(msg):
+                    continue
+                count += 1
+            elif not (
+                saved
+                and role == "assistant"
+                and msg.get("error")
+                and not msg.get("content")
+                and not msg.get("output")
+            ):
+                break
+        return count
 
     async def _load_saved_chat_chain(
         self,
@@ -604,10 +654,11 @@ class Pipe:
         message (the last entry), as Open WebUI stores them, files included.
 
         Returns None when there is no saved chat (API clients, temporary and
-        channel chats), when the chat belongs to another user (admins may use
-        any chat, like in Open WebUI), on Open WebUI versions without
-        get_message_list and on errors: the image history then comes from the
-        request's messages.
+        channel chats), for background tasks (titles, follow-ups and the like
+        get Open WebUI's task prompt, not the chat's images), when the chat
+        belongs to another user (admins may use any chat, like in Open WebUI),
+        on Open WebUI versions without get_message_list and on errors: the
+        image history then comes from the request's messages.
         """
         metadata = __metadata__ or {}
         user = __user__ or {}
@@ -615,6 +666,7 @@ class Pipe:
         user_message_id = metadata.get("user_message_id")
         if (
             get_message_list is None
+            or metadata.get("task")
             or not chat_id
             or not user_message_id
             or not user.get("id")
@@ -655,42 +707,25 @@ class Pipe:
             return f"/api/v1/files/{file_id}/content"
         return None
 
-    async def _gather_saved_chat_images(
-        self,
-        history: List[Dict[str, Any]],
-        optimization_stats: List[Dict[str, Any]],
-        __user__: Optional[dict],
-    ) -> List[Dict[str, Any]]:
-        """Images of the earlier messages of a saved chat, oldest first.
+    def _saved_message_image_urls(self, msg: Dict[str, Any]) -> List[str]:
+        """Image URLs of a message of a saved chat, in order.
 
         Open WebUI turns the image files of user messages into image_url
         parts, but drops the files of assistant messages, and generated images
         are attached there only (not repeated as markdown in the content). So
         the image history of a saved chat is read from the chat itself: the
-        image files of user and assistant messages, plus markdown image links
-        in their content (answers of pipeline versions before 1.15.2).
+        markdown image links in the content (answers of pipeline versions
+        before 1.15.2, data: URLs of a failed upload), then the image files of
+        user and assistant messages.
         """
-        images: List[Dict[str, Any]] = []
-        for msg in history:
-            if msg.get("role") not in {"user", "assistant"}:
-                continue
-            text = msg.get("content")
-            urls = [self._saved_image_file_url(f) for f in msg.get("files") or []]
-            message = {
-                "content": [
-                    {"type": "text", "text": text if isinstance(text, str) else ""},
-                    *(
-                        {"type": "image_url", "image_url": {"url": url}}
-                        for url in urls
-                        if url
-                    ),
-                ]
-            }
-            _p, parts = await self._extract_images_from_message(
-                message, stats_list=optimization_stats, __user__=__user__
-            )
-            images.extend(parts)
-        return images
+        if msg.get("role") not in {"user", "assistant"}:
+            return []
+        text = msg.get("content")
+        _texts, urls = self._content_image_sources(
+            text if isinstance(text, str) else ""
+        )
+        files = [self._saved_image_file_url(f) for f in msg.get("files") or []]
+        return urls + [url for url in files if url]
 
     def _deduplicate_images(self, images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not self.valves.IMAGE_DEDUP_HISTORY:
@@ -836,7 +871,7 @@ class Pipe:
 
         The prompt and the current images come from the last user message of
         the request. Images of earlier turns come from the saved chat when
-        there is one (see _gather_saved_chat_images), else from the request.
+        there is one (see _saved_message_image_urls), else from the request.
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
@@ -859,26 +894,40 @@ class Pipe:
         prompt, current_images = await self._extract_images_from_message(
             last_user_msg, stats_list=optimization_stats, __user__=__user__
         )
+        current_images = self._deduplicate_images(current_images)
+
         chain = await self._load_saved_chat_chain(__metadata__, __user__)
         if chain:
-            # The chain ends with the saved current user message, unless the
-            # request's last user message is another one (Open WebUI's guided
-            # regeneration appends the guidance as a new user message): then
-            # the saved one belongs to the history as well.
-            saved = chain[-1].get("content")
-            saved_text = saved.strip() if isinstance(saved, str) else ""
-            history = chain[:-1] if saved_text in prompt else chain
-            history_images = await self._gather_saved_chat_images(
-                history, optimization_stats, __user__
+            # The chain ends with the saved current user message. Open WebUI's
+            # guided regeneration appends the guidance as one more user
+            # message after it: then the saved message is history as well.
+            end = next(
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i] is last_user_msg
             )
+            guided = (
+                self._trailing_user_messages(messages[: end + 1])
+                == self._trailing_user_messages(chain, saved=True) + 1
+            )
+            sources = [
+                self._saved_message_image_urls(m)
+                for m in (chain if guided else chain[:-1])
+            ]
         else:
-            history_images = await self._gather_history_images(
-                messages, last_user_msg, optimization_stats, __user__
-            )
-
-        # Deduplicate
-        history_images = self._deduplicate_images(history_images)
-        current_images = self._deduplicate_images(current_images)
+            sources = [
+                self._content_image_sources(m.get("content", ""))[1]
+                for m in messages
+                if m is not last_user_msg and m.get("role") in {"user", "assistant"}
+            ]
+        limit = max(1, self.valves.IMAGE_HISTORY_MAX_REFERENCES)
+        history_images = await self._collect_history_images(
+            sources,
+            limit - min(len(current_images), limit),
+            current_images,
+            optimization_stats,
+            __user__,
+        )
 
         combined, reused_flags = self._apply_order_and_limit(
             history_images, current_images
@@ -2791,65 +2840,74 @@ class Pipe:
                 image_parts: list of {"inline_data": {mime_type, data}} dicts
         """
         content = message.get("content", "")
-        text_segments: List[str] = []
-        image_parts: List[Dict[str, Any]] = []
-
-        # Helper to process a data URL or fetched file and append inline_data
-        def _add_image(data_url: str):
-            try:
-                optimized = self._optimize_image_for_api(data_url, stats_list)
-                header, b64 = optimized.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0]
-                image_parts.append({"inline_data": {"mime_type": mime, "data": b64}})
-            except Exception as e:  # pragma: no cover - defensive
-                self.log.warning(f"Skipping image (parse failure): {e}")
-
-        # Regex to extract markdown image references
-        md_pattern = re.compile(
-            r"!\[[^\]]*\]\((data:image[^)]+|/files/[^)]+|/api/v1/files/[^)]+)\)"
-        )
-
-        # Structured multimodal array
-        if isinstance(content, list):
-            for item in content:
-                if item.get("type") == "text":
-                    txt = item.get("text", "")
-                    text_segments.append(txt)
-                    # Also parse any markdown images embedded in the text
-                    for match in md_pattern.finditer(txt):
-                        url = match.group(1)
-                        if url.startswith("data:"):
-                            _add_image(url)
-                        else:
-                            b64 = await self._fetch_file_as_base64(url, __user__)
-                            if b64:
-                                _add_image(b64)
-                elif item.get("type") == "image_url":
-                    url = item.get("image_url", {}).get("url", "")
-                    if url.startswith("data:"):
-                        _add_image(url)
-                    elif "/files/" in url or "/api/v1/files/" in url:
-                        b64 = await self._fetch_file_as_base64(url, __user__)
-                        if b64:
-                            _add_image(b64)
-        # Plain string message (may include markdown images)
-        elif isinstance(content, str):
-            text_segments.append(content)
-            for match in md_pattern.finditer(content):
-                url = match.group(1)
-                if url.startswith("data:"):
-                    _add_image(url)
-                else:
-                    b64 = await self._fetch_file_as_base64(url, __user__)
-                    if b64:
-                        _add_image(b64)
-        else:
+        if not isinstance(content, (list, str)):
             self.log.debug(
                 f"Unsupported content type for image extraction: {type(content)}"
             )
+        text_segments, urls = self._content_image_sources(content)
+        image_parts: List[Dict[str, Any]] = []
+        for url in urls:
+            part = await self._load_image_part(url, stats_list, __user__)
+            if part:
+                image_parts.append(part)
 
         prompt_text = " ".join(s.strip() for s in text_segments if s.strip())
         return prompt_text, image_parts
+
+    @staticmethod
+    def _content_image_sources(content: Any) -> Tuple[List[str], List[str]]:
+        """(text segments, image URLs) of a message content, both in order.
+
+        The image URLs are data: URLs and Open WebUI file URLs, from image_url
+        parts and from markdown image links in the text.
+        """
+        md_pattern = re.compile(
+            r"!\[[^\]]*\]\((data:image[^)]+|/files/[^)]+|/api/v1/files/[^)]+)\)"
+        )
+        text_segments: List[str] = []
+        urls: List[str] = []
+        if isinstance(content, str):
+            text_segments.append(content)
+            urls.extend(match.group(1) for match in md_pattern.finditer(content))
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    txt = item.get("text") or ""
+                    text_segments.append(txt)
+                    urls.extend(match.group(1) for match in md_pattern.finditer(txt))
+                elif item.get("type") == "image_url":
+                    url = (item.get("image_url") or {}).get("url") or ""
+                    if url.startswith("data:") or "/files/" in url:
+                        urls.append(url)
+        return text_segments, urls
+
+    async def _load_image_part(
+        self,
+        url: str,
+        stats_list: Optional[List[Dict[str, Any]]],
+        __user__: Optional[dict],
+    ) -> Optional[Dict[str, Any]]:
+        """The inline_data part of one image URL (a data: URL, or an Open WebUI
+        file the user may read), optimized in a worker thread so that decoding
+        large images does not block the event loop; None if it is unreadable."""
+        if url.startswith("data:"):
+            data_url: Optional[str] = url
+        else:
+            data_url = await self._fetch_file_as_base64(url, __user__)
+        if not data_url:
+            return None
+        try:
+            optimized = await asyncio.to_thread(
+                self._optimize_image_for_api, data_url, stats_list
+            )
+            header, b64 = optimized.split(",", 1)
+            mime = header.split(":", 1)[1].split(";", 1)[0]
+            return {"inline_data": {"mime_type": mime, "data": b64}}
+        except Exception as e:  # pragma: no cover - defensive
+            self.log.warning(f"Skipping image (parse failure): {e}")
+            return None
 
     def _optimize_image_for_api(
         self, image_data: str, stats_list: Optional[List[Dict[str, Any]]] = None
@@ -3104,8 +3162,10 @@ class Pipe:
                 and file_obj.user_id != user.get("id")
                 and user.get("role") != "admin"
             ):
+                # the file id of another user stays out of the log
                 self.log.warning(
-                    f"Not reading file {fid}: it does not belong to the requesting user"
+                    f"Not reading a file for user {user.get('id') or '?'}: it "
+                    "does not belong to the requesting user"
                 )
                 return None
             if file_obj and file_obj.path:

@@ -31,9 +31,12 @@ Groups (``--only gemini.<group>``)
   concurrency  forwarded user headers belong to the requesting user
   streamimg    inline image from a model the pipe does not detect (stream path)
   imgedit      image editing across turns (#194): generated images and uploads of
-               a saved chat sent with the edit request, guided regeneration,
-               IMAGE_HISTORY_MAX_REFERENCES keeps the current image, temporary
-               chats use the request, files of another user are not read
+               a saved chat sent with the edit request (in order, each once),
+               follow-up tasks without them, guided regeneration,
+               IMAGE_HISTORY_MAX_REFERENCES keeps the current and the newest
+               images, older saved forms (data: URL files, markdown links),
+               temporary chats and database errors use the request, files of
+               another user are read only for an admin (also on the Veo path)
   toolsapi    native tool calling, API path: client tools -> tool_calls (stream,
                non-stream, finish_reason), text answers, streaming valve off,
                malformed / unexpected calls, continuation with signatures and
@@ -896,16 +899,56 @@ async def images_history(t: Suite, mock) -> None:
     await mock.reset()
     r2 = await t.owui.chat(IMAGE_PREVIEW, history, stream=False)
     second = await sent()
+    await _set(
+        t,
+        IMAGE_HISTORY_MAX_REFERENCES=5,
+        IMAGE_ADD_LABELS=True,
+        IMAGE_HISTORY_FIRST=True,
+    )
+    await mock.reset()
+    r3 = await t.owui.chat(IMAGE_PREVIEW, history, stream=False)
+    third = await sent()
     t.check(
         "images.history",
-        "image history: duplicates dropped, IMAGE_HISTORY_MAX_REFERENCES=2 keeps "
-        "the current image and the newest history image, [Image N] labels, "
-        "history first; IMAGE_ADD_LABELS / IMAGE_HISTORY_FIRST off",
+        "image history: IMAGE_HISTORY_MAX_REFERENCES=2 keeps the current image "
+        "and the newest history image, [Image N] labels, history first; "
+        "IMAGE_ADD_LABELS / IMAGE_HISTORY_FIRST off; limit 5: duplicates dropped",
         r1.status == 200
         and r2.status == 200
+        and r3.status == 200
         and first == ["Combine", "[Image 1]", "C", "[Image 2]", "B"]
-        and second == ["Combine", "B", "C"],
-        f"labels+history_first={first} plain+current_first={second}",
+        and second == ["Combine", "B", "C"]
+        and third == ["Combine", "[Image 1]", "A", "[Image 2]", "C", "[Image 3]", "B"],
+        f"limit2,labels,history_first={first} plain,current_first={second} "
+        f"limit5={third}",
+    )
+
+    # More images in the current message than the limit: the first ones only
+    d = _png(40, 40, 40)
+    labels[d] = "D"
+    many = [
+        {"role": "user", "content": [{"type": "text", "text": "First"}, image(d)]},
+        {"role": "assistant", "content": "Nice image."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Three"},
+                image(a),
+                image(b),
+                image(c),
+            ],
+        },
+    ]
+    await _set(t, IMAGE_HISTORY_MAX_REFERENCES=2)
+    await mock.reset()
+    r4 = await t.owui.chat(IMAGE_PREVIEW, many, stream=False)
+    fourth = await sent()
+    t.check(
+        "images.history-current",
+        "IMAGE_HISTORY_MAX_REFERENCES=2 with 3 images in the current message: "
+        "the first 2 are sent, no history image",
+        r4.status == 200 and fourth == ["Three", "[Image 1]", "A", "[Image 2]", "B"],
+        f"HTTP {r4.status} sent={fourth}",
     )
 
 
@@ -1682,20 +1725,66 @@ IMGEDIT_USER = "e2e-imgedit-user@example.com"
 UPLOAD_PNG_1 = _png(40, 80, 120)
 UPLOAD_PNG_2 = _png(120, 80, 40)
 FOREIGN_PNG = _png(200, 0, 200)
+SAVED_PNG = _png(10, 120, 60)  # a data: URL image file of a saved user message
+LINKED_PNG = _png(60, 10, 120)  # a data: URL markdown image of a saved answer
+# final images of the mock's "final-image-<n>" trigger, one per turn
+GEN_PNGS = {n: _png(255, 255, n) for n in (1, 2, 3)}
 EDIT_NAMES = {
     **PNG_NAMES,
     UPLOAD_PNG_1: "upload1",
     UPLOAD_PNG_2: "upload2",
     FOREIGN_PNG: "foreign",
+    SAVED_PNG: "saved",
+    LINKED_PNG: "linked",
+    **{png: f"gen{n}" for n, png in GEN_PNGS.items()},
 }
+# Test-only filter for imgedit.db-error: after its inlet, the next chat lookup
+# for the marked chat fails once. Open WebUI loads the chat before the inlet
+# filters run, so the lookup that fails is the pipe's.
+DB_FAULT_FILTER_ID = "e2e_db_fault"
+DB_FAULT_FILTER = '''"""
+title: E2E DB Fault
+author: owndev
+version: 0.1.0
+license: Apache License 2.0
+description: Test-only filter for tests/e2e (gemini imgedit.db-error). When the last user message contains "db-fault", the next Chats.get_messages_map_by_chat_id call for that chat raises RuntimeError("e2e db fault"), once.
+"""
+
+from typing import Optional
+
+
+class Filter:
+    async def inlet(self, body: dict, __metadata__: Optional[dict] = None) -> dict:
+        chat_id = (__metadata__ or {}).get("chat_id")
+        messages = body.get("messages") or []
+        content = messages[-1].get("content") if messages else ""
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text") or "" for p in content if isinstance(p, dict)
+            )
+        if not chat_id or "db-fault" not in str(content):
+            return body
+        from open_webui.models.chats import Chats
+
+        original = type(Chats).get_messages_map_by_chat_id
+
+        async def fail_once(id, *args, **kwargs):
+            if id != chat_id:
+                return await original(Chats, id, *args, **kwargs)
+            vars(Chats).pop("get_messages_map_by_chat_id", None)
+            raise RuntimeError("e2e db fault")
+
+        Chats.get_messages_map_by_chat_id = fail_once
+        return body
+'''
 
 
 async def _edit_request(mock) -> dict:
-    """What the last generate request sent: the number of contents, the parts
-    of the last content (texts, images by name, "?" for an unknown image) and
-    the image names alone (Open WebUI puts an <attached_files> text in front of
-    a user message with an upload)."""
-    reqs = await mock.requests(_gen)
+    """What the last generate request (background tasks left out) sent: the
+    number of contents, the parts of the last content (texts, images by name,
+    "?" for an unknown image) and the image names alone (Open WebUI puts an
+    <attached_files> text in front of a user message with an upload)."""
+    reqs = [e for e in await mock.requests(_gen) if "### Task:" not in _last_text(e)]
     contents = (_body(reqs[-1]).get("contents") or []) if reqs else []
     parts = (contents[-1].get("parts") or []) if contents else []
     sent, images = [], []
@@ -1728,6 +1817,39 @@ async def _upload_png(owui, data: str, name: str) -> dict:
         "size": len(raw),
         "content_type": "image/png",
     }
+
+
+async def _saved_message(t: Suite, chat_id: str, message_id: str) -> dict:
+    """A message of a saved chat as Open WebUI stores it."""
+    saved = (await t.owui.get_chat(chat_id)).get("chat") or {}
+    return ((saved.get("history") or {}).get("messages") or {}).get(message_id) or {}
+
+
+async def _grant_read(t: Suite, model: str, name: str) -> int:
+    """Let every user read a pipe model (a non-admin user only reaches a pipe
+    model with a read grant); remove it with ``t.owui.delete_model``."""
+    status, _ = await t.owui.api(
+        "POST",
+        "/api/v1/models/model/access/update",
+        {
+            "id": model,
+            "name": name,
+            "access_grants": [
+                {"principal_type": "user", "principal_id": "*", "permission": "read"}
+            ],
+        },
+    )
+    return status
+
+
+async def _video_image(mock) -> str:
+    """Name of the image the last Veo request sent as instances[0].image
+    ("" without one)."""
+    started = await mock.requests(lambda e: e.get("action") == "predictLongRunning")
+    instance = (_body(started[-1]).get("instances") or [{}])[0] if started else {}
+    picture = instance.get("image") or {}
+    data = _b64(picture.get("bytesBase64Encoded") or picture.get("imageBytes"))
+    return EDIT_NAMES.get(data, "?") if data else ""
 
 
 async def _temporary_chat(
@@ -1820,23 +1942,77 @@ async def imgedit(t: Suite, mock) -> None:
             f"turn1_done={c1.done} turn1_files={len(c1.files)} {c2.brief()} "
             f"{_edit_report(req)} {report}",
         )
+    await imgedit_task(t, mock)
     await imgedit_upload(t, mock)
+    await imgedit_guided(t, mock)
+    await imgedit_dedup(t, mock)
+    await imgedit_saved(t, mock)
     await imgedit_temporary(t, mock)
+    await imgedit_db_error(t, mock)
     await imgedit_foreign(t, mock)
 
 
+async def imgedit_task(t: Suite, mock) -> None:
+    """Open WebUI copies the chat's metadata (chat id, user message id) into its
+    background tasks, and the task model is the chat's model by default."""
+    async with t.browser() as b:
+        await mock.reset()
+        c1 = await b.chat(IMAGE_GA, "Draw a certificate", params=LEGACY)
+        await mock.reset()
+        c2 = await b.chat(
+            IMAGE_GA,
+            "Change the name to Bob",
+            params=LEGACY,
+            chat_id=c1.chat_id,
+            parent_id=c1.message_id,
+            background_tasks={"follow_up_generation": True},
+        )
+        task_reqs = []
+        for _ in range(40):  # the follow-up task runs after the answer
+            task_reqs = [
+                e for e in await mock.requests(_gen) if "### Task:" in _last_text(e)
+            ]
+            if task_reqs:
+                break
+            await asyncio.sleep(0.5)
+        req = await _edit_request(mock)
+    task_images = [
+        sum(
+            "inlineData" in part
+            for content in _body(e).get("contents") or []
+            for part in content.get("parts") or []
+        )
+        for e in task_reqs
+    ]
+    t.check(
+        "imgedit.task",
+        "follow-up task of an image model in a saved chat: sent without the "
+        "chat's images (the edit request has them)",
+        c1.done
+        and c2.done
+        and req["sent"] == ["Change the name to Bob", "[Image 1]", "final"]
+        and task_reqs
+        and not any(task_images),
+        f"edit: {_edit_report(req)} task_requests={len(task_reqs)} "
+        f"task_images={task_images} turn2: {c2.brief()}",
+    )
+
+
 async def imgedit_upload(t: Suite, mock) -> None:
-    """An upload between generated turns, guided regeneration, the image limit."""
+    """An upload between generated turns, guided regeneration, the image limit,
+    in the web UI's default mode (Open WebUI puts an <attached_files> text in
+    front of a user message with an upload). Each turn generates another image
+    (the mock's final-image-<n> trigger), so their order shows."""
     logo = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
     photo = await _upload_png(t.owui, UPLOAD_PNG_2, "photo.png")
     async with t.browser() as b:
         await mock.reset()
-        c1 = await b.chat(IMAGE_GA, "Draw a certificate", params=LEGACY)
-        turn = {"params": LEGACY, "chat_id": c1.chat_id}
+        c1 = await b.chat(IMAGE_GA, "Draw a certificate final-image-1")
+        turn = {"chat_id": c1.chat_id}
         await mock.reset()
         c2 = await b.chat(
             IMAGE_GA,
-            "Put this logo on it",
+            "Put this logo on it final-image-2",
             parent_id=c1.message_id,
             user_files=[logo],
             **turn,
@@ -1844,14 +2020,15 @@ async def imgedit_upload(t: Suite, mock) -> None:
         r2 = await _edit_request(mock)
         await mock.reset()
         c3 = await b.chat(
-            IMAGE_GA, "Make the border red", parent_id=c2.message_id, **turn
+            IMAGE_GA,
+            "Make the border red final-image-3",
+            parent_id=c2.message_id,
+            **turn,
         )
         r3 = await _edit_request(mock)
         # Guided regeneration of turn 2: the web UI sends the saved user message
         # again, Open WebUI appends the guidance as a new user message.
-        saved = (await t.owui.get_chat(c1.chat_id)).get("chat") or {}
-        messages = (saved.get("history") or {}).get("messages") or {}
-        user2 = messages.get(c2.message.get("parentId")) or {}
+        user2 = await _saved_message(t, c1.chat_id, c2.message.get("parentId"))
         guidance = "Make the logo bigger"
         await mock.reset()
         g = await b.chat(
@@ -1887,16 +2064,24 @@ async def imgedit_upload(t: Suite, mock) -> None:
     uploads = f"uploads={bool(logo['id'])},{bool(photo['id'])}"
     t.check(
         "imgedit.upload",
-        "browser, an upload in turn 2: turn 2 sends the generated image of turn 1 "
-        "and the upload, turn 3 both again from the saved chat (the generated "
-        "image of turn 2, the same PNG, deduplicated)",
+        "browser (default mode), an upload in turn 2: turn 2 sends the generated "
+        "image of turn 1 and the upload once each, turn 3 the images of turns "
+        "1 and 2 in their order from the saved chat",
         c1.done
         and c2.done
         and c3.done
-        and r2["images"] == ["final", "upload1"]
+        and r2["images"] == ["gen1", "upload1"]
         and "Put this logo on it" in (r2["sent"] or [""])[0]
         and r3["sent"]
-        == ["Make the border red", "[Image 1]", "final", "[Image 2]", "upload1"],
+        == [
+            "Make the border red final-image-3",
+            "[Image 1]",
+            "gen1",
+            "[Image 2]",
+            "upload1",
+            "[Image 3]",
+            "gen2",
+        ],
         f"{uploads} turn2: {_edit_report(r2)} turn3_done={c3.done} turn3: "
         f"{_edit_report(r3)}",
     )
@@ -1905,19 +2090,261 @@ async def imgedit_upload(t: Suite, mock) -> None:
         "guided regeneration of turn 2 (the guidance is a new user message): the "
         "generated image of turn 1 and the upload of turn 2 are sent",
         g.done
-        and rg["sent"] == [guidance, "[Image 1]", "final", "[Image 2]", "upload1"],
+        and rg["sent"] == [guidance, "[Image 1]", "gen1", "[Image 2]", "upload1"],
         f"{uploads} saved_user_message={bool(user2)} done={g.done} {_edit_report(rg)}",
     )
     t.check(
         "imgedit.limit",
         "IMAGE_HISTORY_MAX_REFERENCES=1: the upload of the edit message is kept, "
-        "the history dropped; without an upload the newest history image is "
-        "kept (history after dedup: final, upload1)",
+        "the history dropped; without an upload the image generated in the "
+        "latest turn is kept",
         c4.done
         and c5.done
         and r4["images"] == ["upload2"]
-        and r5["sent"] == ["Make it brighter", "[Image 1]", "upload1"],
+        and r5["sent"] == ["Make it brighter", "[Image 1]", "gen3"],
         f"{uploads} with_upload: {_edit_report(r4)} without: {_edit_report(r5)}",
+    )
+
+
+async def imgedit_guided(t: Suite, mock) -> None:
+    """Guided regeneration of a user message whose saved text is empty (only an
+    upload) or contained in the guidance."""
+    logo = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    for label, text, guidance, title in (
+        ("image-only", "", "Make it a watercolor", "an image-only user message"),
+        ("text-in-guidance", "Bob", "Change Bob to Alice", "a text in the guidance"),
+    ):
+        async with t.browser() as b:
+            await mock.reset()
+            c1 = await b.chat(IMAGE_GA, text, user_files=[logo])
+            user1 = await _saved_message(t, c1.chat_id, c1.message.get("parentId"))
+            await mock.reset()
+            g = await b.chat(
+                IMAGE_GA,
+                guidance,
+                chat_id=c1.chat_id,
+                extra_body={"user_message": user1, "regeneration_prompt": guidance},
+            )
+            rg = await _edit_request(mock)
+        t.check(
+            f"imgedit.guided-{label}",
+            f"guided regeneration of {title} ({text!r} with an upload, guidance "
+            f"{guidance!r}): the upload is sent",
+            c1.done and g.done and rg["sent"] == [guidance, "[Image 1]", "upload1"],
+            f"upload={bool(logo['id'])} turn1_done={c1.done} "
+            f"saved_user_message={bool(user1)} done={g.done} {_edit_report(rg)}",
+        )
+
+
+async def imgedit_dedup(t: Suite, mock) -> None:
+    """An image of an earlier turn attached again (like a downloaded generated
+    image): sent once, and counted at its newest place."""
+    logo = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    photo = await _upload_png(t.owui, UPLOAD_PNG_2, "photo.png")
+    again = await _upload_png(t.owui, UPLOAD_PNG_1, "logo-again.png")  # new file
+    async with t.browser() as b:
+        await mock.reset()
+        c1 = await b.chat(
+            IMAGE_GA,
+            "Draw with this logo final-image-1",
+            params=LEGACY,
+            user_files=[logo],
+        )
+        turn = {"params": LEGACY, "chat_id": c1.chat_id}
+        c2 = await b.chat(
+            IMAGE_GA,
+            "Add this photo final-image-2",
+            parent_id=c1.message_id,
+            user_files=[photo],
+            **turn,
+        )
+        await mock.reset()
+        c3 = await b.chat(
+            IMAGE_GA,
+            "Put the logo back final-image-3",
+            parent_id=c2.message_id,
+            user_files=[again],
+            **turn,
+        )
+        r3 = await _edit_request(mock)
+        await _set(t, IMAGE_HISTORY_MAX_REFERENCES=2)
+        try:
+            await mock.reset()
+            c4 = await b.chat(
+                IMAGE_GA, "Make it brighter", parent_id=c3.message_id, **turn
+            )
+            r4 = await _edit_request(mock)
+        finally:
+            await _set(
+                t,
+                IMAGE_HISTORY_MAX_REFERENCES=DEFAULTS["IMAGE_HISTORY_MAX_REFERENCES"],
+            )
+        await _set(t, IMAGE_DEDUP_HISTORY=False)
+        try:  # default mode: the prompt gets an <attached_files> text in front
+            await mock.reset()
+            c5 = await b.chat(
+                IMAGE_GA,
+                "Use the photo again",
+                chat_id=c1.chat_id,
+                parent_id=c3.message_id,
+                user_files=[photo],
+            )
+            r5 = await _edit_request(mock)
+        finally:
+            await _set(t, IMAGE_DEDUP_HISTORY=DEFAULTS["IMAGE_DEDUP_HISTORY"])
+    uploads = f"uploads={bool(logo['id'])},{bool(photo['id'])},{bool(again['id'])}"
+    t.check(
+        "imgedit.dedup-current",
+        "the logo of turn 1 attached again in turn 3: sent once, as the current "
+        "image, after the other images of turns 1 and 2",
+        c1.done
+        and c2.done
+        and c3.done
+        and r3["sent"]
+        == [
+            "Put the logo back final-image-3",
+            "[Image 1]",
+            "gen1",
+            "[Image 2]",
+            "upload2",
+            "[Image 3]",
+            "gen2",
+            "[Image 4]",
+            "upload1",
+        ],
+        f"{uploads} done={c1.done},{c2.done},{c3.done} turn3: {_edit_report(r3)}",
+    )
+    t.check(
+        "imgedit.dedup-newest",
+        "IMAGE_HISTORY_MAX_REFERENCES=2: the logo counts at its newest place "
+        "(turn 3) and is kept with the image of turn 3",
+        c4.done
+        and r4["sent"]
+        == ["Make it brighter", "[Image 1]", "upload1", "[Image 2]", "gen3"],
+        f"{uploads} done={c4.done} turn4: {_edit_report(r4)}",
+    )
+    t.check(
+        "imgedit.no-dedup",
+        "IMAGE_DEDUP_HISTORY=false, default mode, the photo of turn 2 attached "
+        "again: sent from turn 2 and as the current image, the 4 newest earlier "
+        "images kept (the saved edit message is not history)",
+        c5.done
+        and "Use the photo again" in (r5["sent"] or [""])[0]
+        and r5["sent"][1:]
+        == [
+            "[Image 1]",
+            "upload2",
+            "[Image 2]",
+            "gen2",
+            "[Image 3]",
+            "upload1",
+            "[Image 4]",
+            "gen3",
+            "[Image 5]",
+            "upload2",
+        ],
+        f"{uploads} done={c5.done} {_edit_report(r5)}",
+    )
+
+
+async def imgedit_saved(t: Suite, mock) -> None:
+    """A saved chat with image forms the web UI of today does not create (made
+    through the chats API): a data: URL image file and a text file in a user
+    message, markdown image links (an Open WebUI file as pipeline versions
+    before 1.15.2 wrote it, a data: URL as after a failed upload) in an answer,
+    next to the image file of today's answers (Open WebUI never passes it)."""
+    linked = await _upload_png(t.owui, UPLOAD_PNG_2, "linked.png")
+    generated = await _upload_png(t.owui, GEN_PNGS[1], "generated.png")
+    notes_status, notes = await t.owui.upload_file(
+        "notes.txt", b"meeting notes", "text/plain"
+    )
+    notes_id = notes.get("id", "") if isinstance(notes, dict) else ""
+    user_id, answer_id, now = str(uuid.uuid4()), str(uuid.uuid4()), int(time.time())
+    user1 = {
+        "id": user_id,
+        "parentId": None,
+        "childrenIds": [answer_id],
+        "role": "user",
+        "content": "Draw a certificate like this",
+        "timestamp": now,
+        "models": [IMAGE_GA],
+        "files": [
+            {"type": "image", "url": _image_url(SAVED_PNG)},
+            {
+                "type": "file",
+                "id": notes_id,
+                "url": notes_id,
+                "name": "notes.txt",
+                "status": "uploaded",
+                "size": 13,
+                "content_type": "text/plain",
+            },
+        ],
+    }
+    answer1 = {
+        "id": answer_id,
+        "parentId": user_id,
+        "childrenIds": [],
+        "role": "assistant",
+        "content": "Here is your image.\n\n"
+        f"![Generated Image](/api/v1/files/{linked['id']}/content)\n\n"
+        f"![Generated Image]({_image_url(LINKED_PNG)})",
+        "files": [{"type": "image", "url": f"/api/v1/files/{generated['id']}/content"}],
+        "model": IMAGE_GA,
+        "done": True,
+        "timestamp": now,
+    }
+    status, chat = await t.owui.api(
+        "POST",
+        "/api/v1/chats/new",
+        {
+            "chat": {
+                "title": "E2E saved image chat",
+                "models": [IMAGE_GA],
+                "history": {
+                    "currentId": answer_id,
+                    "messages": {user_id: user1, answer_id: answer1},
+                },
+                "messages": [user1, answer1],
+            }
+        },
+    )
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    c2, req = None, {"contents": 0, "sent": [], "images": []}
+    if status == 200 and chat_id:
+        async with t.browser() as b:
+            await mock.reset()
+            c2 = await b.chat(
+                IMAGE_GA,
+                "Change the name to Bob",
+                params=LEGACY,
+                chat_id=chat_id,
+                parent_id=answer_id,
+            )
+            req = await _edit_request(mock)
+    t.check(
+        "imgedit.saved",
+        "saved chat: the data: URL image file of a user message, the markdown "
+        "image links of an answer (an Open WebUI file, a data: URL) and its image "
+        "file are sent in their order, the text file is not",
+        bool(linked["id"])
+        and bool(generated["id"])
+        and notes_status == 200
+        and getattr(c2, "done", False)
+        and req["sent"]
+        == [
+            "Change the name to Bob",
+            "[Image 1]",
+            "saved",
+            "[Image 2]",
+            "upload2",
+            "[Image 3]",
+            "linked",
+            "[Image 4]",
+            "gen1",
+        ],
+        f"chat: HTTP {status} notes: HTTP {notes_status} "
+        f"done={getattr(c2, 'done', None)} {_edit_report(req)}",
     )
 
 
@@ -1957,30 +2384,73 @@ async def imgedit_temporary(t: Suite, mock) -> None:
     )
 
 
+async def imgedit_db_error(t: Suite, mock) -> None:
+    """A database error while the pipe loads the saved chat (injected by the
+    test-only filter DB_FAULT_FILTER): the image history comes from the
+    request, which has the upload but not the generated image of turn 1."""
+    logo = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    status, _ = await t.owui.install_function(
+        DB_FAULT_FILTER_ID, "E2E DB Fault", DB_FAULT_FILTER
+    )
+    active = await t.owui.set_active(DB_FAULT_FILTER_ID, True)
+    attached = await t.owui.upsert_model(
+        IMAGE_GA, "Gemini 3.1 Flash Image", [DB_FAULT_FILTER_ID]
+    )
+    c1 = c2 = None
+    req = {"contents": 0, "sent": [], "images": []}
+    mark = t.mark()
+    try:
+        async with t.browser() as b:
+            await mock.reset()
+            c1 = await b.chat(IMAGE_GA, "Draw a certificate", params=LEGACY)
+            await mock.reset()
+            c2 = await b.chat(
+                IMAGE_GA,
+                "Change the name to Bob db-fault",
+                params=LEGACY,
+                chat_id=c1.chat_id,
+                parent_id=c1.message_id,
+                user_files=[logo],
+            )
+            req = await _edit_request(mock)
+    finally:
+        await t.owui.delete_model(IMAGE_GA)
+        await t.owui.api("DELETE", f"/api/v1/functions/id/{DB_FAULT_FILTER_ID}/delete")
+    await t.log.settle(0.5)
+    failed = t.log.lines(mark, "for image history")
+    t.check(
+        "imgedit.db-error",
+        "database error while the pipe loads the saved chat: logged, the answer "
+        "completes and the request's images are sent (the upload)",
+        status == 200
+        and active is True
+        and attached == 200
+        and getattr(c1, "done", False)
+        and getattr(c2, "done", False)
+        and "Here is your image." in (c2.content or "")
+        and req["sent"] == ["Change the name to Bob db-fault", "[Image 1]", "upload1"]
+        and any("e2e db fault" in line for line in failed),
+        f"filter: HTTP {status} active={active} model: HTTP {attached} "
+        f"{_edit_report(req)} log={[short(line, 120) for line in failed[:1]]} "
+        f"turn2: {c2.brief() if c2 else '-'}",
+    )
+
+
 async def imgedit_foreign(t: Suite, mock) -> None:
-    """Files of another user are never read: a message can name any file id."""
-    setup_error, grant, denied = "", None, 0
-    c1 = c2 = ru = ra = None
-    r1 = r2 = user_req = admin_req = {"contents": 0, "sent": [], "images": []}
+    """Files of another user are never read: a message can name any file id.
+    An admin may read them (also when continuing the user's chat)."""
+    setup_error, grants, denied, video_denied, id_logged = "", [], 0, 0, []
+    c1 = c2 = c3 = ru = ra = vo = vf = None
+    empty = {"contents": 0, "sent": [], "images": []}
+    r1 = r2 = r3 = user_req = admin_req = empty
+    own_image = foreign_image = ""
     other = None
     try:
         other = await t.owui.create_user("E2E Image Edit User", IMGEDIT_USER)
-        # a non-admin user only reaches a pipe model with a read grant
-        grant, _ = await t.owui.api(
-            "POST",
-            "/api/v1/models/model/access/update",
-            {
-                "id": IMAGE_GA,
-                "name": "Gemini 3.1 Flash Image",
-                "access_grants": [
-                    {
-                        "principal_type": "user",
-                        "principal_id": "*",
-                        "permission": "read",
-                    }
-                ],
-            },
-        )
+        grants = [
+            await _grant_read(t, IMAGE_GA, "Gemini 3.1 Flash Image"),
+            await _grant_read(t, VEO, "Veo 3.1 Generate Preview"),
+        ]
         await t.owui.models(refresh=True)
         foreign = await _upload_png(t.owui, FOREIGN_PNG, "foreign.png")  # admin's
         url = f"/api/v1/files/{foreign['id']}/content"
@@ -2009,6 +2479,16 @@ async def imgedit_foreign(t: Suite, mock) -> None:
                 parent_id=c1.message_id,
             )
             r2 = await _edit_request(mock)
+        async with t.browser() as b:  # the admin continues the user's chat
+            await mock.reset()
+            c3 = await b.chat(
+                IMAGE_GA,
+                "Make it blue",
+                params=LEGACY,
+                chat_id=c1.chat_id,
+                parent_id=c2.message_id,
+            )
+            r3 = await _edit_request(mock)
         history = [
             {"role": "user", "content": "Draw a certificate"},
             {
@@ -2023,44 +2503,102 @@ async def imgedit_foreign(t: Suite, mock) -> None:
         user_req = await _edit_request(mock)
         await t.log.settle(0.5)
         denied = len(t.log.lines(mark, "does not belong to the requesting user"))
+        id_logged = [
+            line
+            for line in t.log.lines(mark, foreign["id"])
+            if "function_gemini" in line
+        ]
         await mock.reset()
         ra = await t.owui.chat(IMAGE_GA, history, stream=False)
         admin_req = await _edit_request(mock)
+        # Veo image-to-video: markdown links to the user's own upload and to the
+        # admin's file
+        own = await _upload_png(other, UPLOAD_PNG_1, "frame.png")
+        await mock.reset()
+        vo = await other.chat(
+            VEO,
+            f"Animate this ![frame](/api/v1/files/{own['id']}/content)",
+            stream=False,
+            timeout=180,
+        )
+        own_image = await _video_image(mock)
+        mark = t.mark()
+        await mock.reset()
+        vf = await other.chat(
+            VEO, f"Animate this ![frame]({url})", stream=False, timeout=180
+        )
+        foreign_image = await _video_image(mock)
+        await t.log.settle(0.5)
+        video_denied = len(t.log.lines(mark, "does not belong to the requesting user"))
     except Exception as exc:  # noqa: BLE001 - reported in the checks
         setup_error = f"setup failed: {exc!r} "
     finally:
         if other is not None:
             await other.close()
         await t.owui.delete_model(IMAGE_GA)
+        await t.owui.delete_model(VEO)
     t.check(
         "imgedit.foreign",
         "browser, a non-admin user with an image file of another user in the "
         "chat: turn 1 does not send it as the current image, turn 2 sends only "
         "the user's own generated image",
         not setup_error
-        and grant == 200
+        and grants == [200, 200]
         and c1.done
         and c2.done
         and r1["images"] == []
         and "Draw a certificate like this" in (r1["sent"] or [""])[0]
         and r2["sent"] == ["Change the name to Bob", "[Image 1]", "final"],
-        f"{setup_error}grant={grant} turn1_done={getattr(c1, 'done', None)} "
+        f"{setup_error}grants={grants} turn1_done={getattr(c1, 'done', None)} "
         f"turn1: {_edit_report(r1)} turn2_done={getattr(c2, 'done', None)} "
         f"turn2: {_edit_report(r2)}",
     )
     t.check(
+        "imgedit.admin",
+        "browser, an admin continues the user's chat: the chat is read, the "
+        "admin's file of turn 1 and the user's generated image are sent",
+        not setup_error
+        and getattr(c3, "done", False)
+        and r3["sent"]
+        == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"],
+        f"{setup_error}turn3_done={getattr(c3, 'done', None)} "
+        f"turn3: {_edit_report(r3)}",
+    )
+    t.check(
         "imgedit.api-foreign",
         "API path: a markdown link to another user's file in the history is not "
-        "read for a non-admin user (logged), an admin's request reads it",
+        "read for a non-admin user (logged without the file id), an admin's "
+        "request reads it",
         not setup_error
         and getattr(ru, "status", None) == 200
         and getattr(ra, "status", None) == 200
         and user_req["sent"] == ["Change the name to Bob"]
         and admin_req["sent"] == ["Change the name to Bob", "[Image 1]", "foreign"]
-        and denied > 0,
+        and denied > 0
+        and not id_logged,
         f"{setup_error}user: HTTP {getattr(ru, 'status', None)} "
         f"{_edit_report(user_req)} admin: HTTP {getattr(ra, 'status', None)} "
-        f"{_edit_report(admin_req)} denied_logged={denied}",
+        f"{_edit_report(admin_req)} denied_logged={denied} file_id_logged={id_logged}",
+    )
+    t.check(
+        "imgedit.video-file",
+        "Veo image-to-video, API path, non-admin user: a markdown link to the "
+        "user's own upload is sent as instances[0].image",
+        not setup_error
+        and getattr(vo, "status", None) == 200
+        and own_image == "upload1",
+        f"{setup_error}HTTP {getattr(vo, 'status', None)} image={own_image!r}",
+    )
+    t.check(
+        "imgedit.video-foreign",
+        "Veo image-to-video, API path, non-admin user: a markdown link to another "
+        "user's file is not read (logged), the video is made from the text",
+        not setup_error
+        and getattr(vf, "status", None) == 200
+        and foreign_image == ""
+        and video_denied > 0,
+        f"{setup_error}HTTP {getattr(vf, 'status', None)} image={foreign_image!r} "
+        f"denied_logged={video_denied}",
     )
 
 

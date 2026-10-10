@@ -57,6 +57,9 @@ part that is not Open WebUI's tool-image message, see ``_turn_text``)
   image-safety         image models: thought images only, finishReason IMAGE_SAFETY
   duplicate-image      image models: the final image twice
   two-final-images     image models: two different final images (FINAL_PNG, PNG_B64)
+  final-image-<n>      image models (non-stream): the final image is the PNG of
+                       colour (255, 255, n) instead of FINAL_PNG (n = 1-255), so
+                       the images of the turns of a chat differ
   slow-video           Veo: the operation stays pending for SLOW_VIDEO_POLLS polls
 
 Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
@@ -187,6 +190,15 @@ def png_b64(r: int, g: int, b: int) -> str:
 THOUGHT_PNG_1 = png_b64(0, 0, 255)
 THOUGHT_PNG_2 = png_b64(0, 255, 0)
 FINAL_PNG = png_b64(255, 255, 0)
+FINAL_IMAGE_TRIGGER = re.compile(r"\bfinal-image-(\d{1,3})\b")
+
+
+def _final_png(text: str) -> str:
+    """The final image of an image model: FINAL_PNG, or for the trigger
+    ``final-image-<n>`` (1-255) the PNG of colour (255, 255, n)."""
+    match = FINAL_IMAGE_TRIGGER.search(text)
+    n = int(match.group(1)) if match else 0
+    return png_b64(255, 255, n) if 0 < n < 256 else FINAL_PNG
 
 
 def _camel(key: str) -> str:
@@ -846,7 +858,7 @@ def _answer(model: str, body) -> dict:
         elif "two-final-images" in text:
             parts += [{"text": "Here are your images."}, _img(FINAL_PNG), _img(PNG_B64)]
         else:
-            parts += [{"text": "Here is your image."}, _img(FINAL_PNG)]
+            parts += [{"text": "Here is your image."}, _img(_final_png(text))]
         return _chunk(parts, body, True, USAGE_IMAGE)
     parts = [{"text": "Mock thinking.", "thought": True}] if thoughts else []
     answer = "Hello from mock (non-stream)."

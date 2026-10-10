@@ -425,15 +425,15 @@ To edit a generated image, ask for the change in the same chat ("Change the name
 
 Where the images of earlier turns come from:
 
-- **Saved chats** (the normal web UI chat): from the chat as Open WebUI stored it. That covers the generated images, which are attached to the answers as files (Open WebUI does not pass the files of earlier answers to a pipe), images you uploaded, images linked in earlier answers (pipeline versions before 1.15.2) and, when you regenerate an answer with guidance, the images of the message you regenerate.
+- **Saved chats** (the normal web UI chat): from the chat as Open WebUI stored it. That covers the generated images, which are attached to the answers as files (Open WebUI does not pass the files of earlier answers to a pipe), images you uploaded, images linked in earlier answers (pipeline versions before 1.15.2) and, when you regenerate an answer with guidance, the images of the user message whose answer you regenerate. Background tasks such as titles and follow-up suggestions get no images.
 - **API clients** (no saved chat): from the request's messages, as `image_url` parts (data URLs or Open WebUI file URLs) or markdown image links in the content, such as the `![Generated Image](/api/v1/files/<id>/content)` link the pipeline returns.
 - **Temporary chats**: Open WebUI does not save them, and the web UI sends only the images of your own messages. A generated image of an earlier turn is therefore not sent. To edit it, download it and attach it to your edit message.
 
 Which images are sent:
 
-- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat.
-- Identical images are sent once (`GOOGLE_IMAGE_DEDUP_HISTORY`). Images of earlier turns come before the current message's images unless `GOOGLE_IMAGE_HISTORY_FIRST=false`.
-- Only the requesting user's own files and chats are read (an admin may read every file and chat), also when a message or an API request names the file id of another user.
+- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat. Earlier images are read newest first and only as many as fit.
+- Identical images are sent once (`GOOGLE_IMAGE_DEDUP_HISTORY`): an image you attach again (for example a downloaded generated image) is not repeated from the history, and an image of several turns counts at its newest place. Images of earlier turns come before the current message's images unless `GOOGLE_IMAGE_HISTORY_FIRST=false`.
+- The pipeline reads only the requesting user's own files and chats (an admin may read every file and chat), also when a message or an API request names the file id of another user. Open WebUI 0.9.6 and later check the images they put into the request themselves in the same way (and also allow files shared with the user). Open WebUI 0.9.0 to 0.9.5 put the image of any file id named in a user message into the request before the pipeline runs, so update Open WebUI if users must not reach each other's files.
 - Earlier images are sent as parts of your message, which is how Gemini takes input images for editing. Earlier answers are not replayed as model turns, so no thought signatures are needed.
 
 ## Video Generation Configuration
