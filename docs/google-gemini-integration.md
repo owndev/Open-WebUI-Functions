@@ -68,7 +68,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
   Accepts both text and image data for more expressive interactions with configurable image optimization.
 
 - **Advanced Image Generation**  
-  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message (API clients, which have no chat message, get it as a markdown link `![Generated Image](/api/v1/files/<id>/content)` in the answer); the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached).
+  Support for text-to-image and image-to-image generation with the Gemini image models ("Nano Banana"): `gemini-nano-banana-2.1`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` and `gemini-2.5-flash-image`, plus their preview IDs. Each generated image is uploaded once and attached to the message (API clients, which have no chat message, get it as a markdown link `![Generated Image](/api/v1/files/<id>/content)` in the answer); the interim images that Gemini 3 image models create while thinking are not uploaded, unless a response contains no final image (then the last interim image is attached). To edit an image, ask for the change in the same chat: the images of earlier turns, generated or uploaded, are sent along (see [Image Editing and Image History](#image-editing-and-image-history)).
 
 - **Video Generation with Google Veo**  
   Generate videos using Veo 3.1, 3, and 2 models with configurable aspect ratio, resolution, duration, and more. Supports text-to-video and image-to-video (Veo 3.1). Videos are automatically uploaded and embedded with playback controls.
@@ -159,7 +159,8 @@ GOOGLE_IMAGE_ENABLE_OPTIMIZATION=true
 # Default: 0.5
 GOOGLE_IMAGE_PNG_THRESHOLD_MB=0.5
 
-# Maximum number of images (history + current message) sent per request
+# Maximum number of images (history + current message) sent per request.
+# The current message's images are kept first, then the newest history images.
 # Default: 5
 GOOGLE_IMAGE_HISTORY_MAX_REFERENCES=5
 
@@ -417,6 +418,23 @@ GOOGLE_IMAGE_GENERATION_MODELS="gemini-4-flash-image"
 ```
 
 Listed models are handled like Gemini 3 image models: requests are sent without streaming and with `response_modalities` `TEXT` and `IMAGE`, the aspect ratio and resolution settings are sent as ImageConfig, `GOOGLE_THINKING_LEVEL` / `reasoning_effort` are passed through as `thinking_level` without remapping, and generated images are uploaded to the chat. The model itself must still be available in the model list (returned by the API, or added via `GOOGLE_MODEL_ADDITIONAL`).
+
+### Image Editing and Image History
+
+To edit a generated image, ask for the change in the same chat ("Change the name to Bob"). An image model gets one request with the text of your last message, followed by the images of the current message and of earlier turns, each after an `[Image N]` label (`GOOGLE_IMAGE_ADD_LABELS`). The text of earlier turns is not sent.
+
+Where the images of earlier turns come from:
+
+- **Saved chats** (the normal web UI chat): from the chat as Open WebUI stored it. That covers the generated images, which are attached to the answers as files (Open WebUI does not pass the files of earlier answers to a pipe), images you uploaded, images linked in earlier answers (pipeline versions before 1.15.2) and, when you regenerate an answer with guidance, the images of the message you regenerate.
+- **API clients** (no saved chat): from the request's messages, as `image_url` parts (data URLs or Open WebUI file URLs) or markdown image links in the content, such as the `![Generated Image](/api/v1/files/<id>/content)` link the pipeline returns.
+- **Temporary chats**: Open WebUI does not save them, and the web UI sends only the images of your own messages. A generated image of an earlier turn is therefore not sent. To edit it, download it and attach it to your edit message.
+
+Which images are sent:
+
+- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat.
+- Identical images are sent once (`GOOGLE_IMAGE_DEDUP_HISTORY`). Images of earlier turns come before the current message's images unless `GOOGLE_IMAGE_HISTORY_FIRST=false`.
+- Only the requesting user's own files and chats are read (an admin may read every file and chat), also when a message or an API request names the file id of another user.
+- Earlier images are sent as parts of your message, which is how Gemini takes input images for editing. Earlier answers are not replayed as model turns, so no thought signatures are needed.
 
 ## Video Generation Configuration
 

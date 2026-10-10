@@ -17,6 +17,7 @@ features:
   - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
+  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, only files of the requesting user)
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
   - Extra image generation model IDs configurable without a code change
   - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
@@ -96,8 +97,14 @@ from fastapi import Request, UploadFile, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from open_webui.routers.files import upload_file
 from open_webui.models.chats import Chats
+from open_webui.models.files import Files
 from open_webui.models.users import UserModel, Users
 from starlette.datastructures import Headers
+
+try:  # Open WebUI 0.9+: the message chain of a saved chat (image history)
+    from open_webui.utils.misc import get_message_list
+except ImportError:  # without it, image history comes from the request only
+    get_message_list = None
 
 
 def _unload_stale_modules() -> None:
@@ -180,6 +187,10 @@ REASONING_FORMAT_CONTENT = "google-gemini-v1-content"
 TOOL_IMAGES_TEXT = (
     "Here are the images from the tool results above. Please analyze them."
 )
+
+# Chat ids Open WebUI does not save: temporary chats (also the legacy "local:"
+# prefix) and channel messages. Their history exists only in the request.
+UNSAVED_CHAT_ID_PREFIXES = ("temporary:", "local:", "channel:")
 
 
 def _gemini_function_name(name: str) -> str:
@@ -509,7 +520,7 @@ class Pipe:
         )
         IMAGE_HISTORY_MAX_REFERENCES: int = Field(
             default=int(os.getenv("GOOGLE_IMAGE_HISTORY_MAX_REFERENCES", "5")),
-            description="Maximum total number of images (history + current message) to include in a generation call",
+            description="Maximum total number of images (history + current message) to include in a generation call; the current message's images are kept, then the newest history images",
         )
         IMAGE_ADD_LABELS: bool = Field(
             default=os.getenv("GOOGLE_IMAGE_ADD_LABELS", "true").lower() == "true",
@@ -569,6 +580,7 @@ class Pipe:
         messages: List[Dict[str, Any]],
         last_user_msg: Dict[str, Any],
         optimization_stats: List[Dict[str, Any]],
+        __user__: Optional[dict] = None,
     ) -> List[Dict[str, Any]]:
         history_images: List[Dict[str, Any]] = []
         for msg in messages:
@@ -577,11 +589,108 @@ class Pipe:
             if msg.get("role") not in {"user", "assistant"}:
                 continue
             _p, parts = await self._extract_images_from_message(
-                msg, stats_list=optimization_stats
+                msg, stats_list=optimization_stats, __user__=__user__
             )
             if parts:
                 history_images.extend(parts)
         return history_images
+
+    async def _load_saved_chat_chain(
+        self,
+        __metadata__: Optional[Dict[str, Any]],
+        __user__: Optional[dict],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """The messages of a saved chat from the first one to the current user
+        message (the last entry), as Open WebUI stores them, files included.
+
+        Returns None when there is no saved chat (API clients, temporary and
+        channel chats), when the chat belongs to another user (admins may use
+        any chat, like in Open WebUI), on Open WebUI versions without
+        get_message_list and on errors: the image history then comes from the
+        request's messages.
+        """
+        metadata = __metadata__ or {}
+        user = __user__ or {}
+        chat_id = str(metadata.get("chat_id") or "")
+        user_message_id = metadata.get("user_message_id")
+        if (
+            get_message_list is None
+            or not chat_id
+            or not user_message_id
+            or not user.get("id")
+            or chat_id.startswith(UNSAVED_CHAT_ID_PREFIXES)
+        ):
+            return None
+        try:
+            if user.get("role") != "admin" and not await Chats.is_chat_owner(
+                chat_id, user["id"]
+            ):
+                return None
+            messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+            chain = get_message_list(messages_map or {}, user_message_id)
+        except Exception as e:
+            self.log.warning(f"Could not load chat {chat_id} for image history: {e}")
+            return None
+        return [m for m in chain if isinstance(m, dict)] or None
+
+    @staticmethod
+    def _saved_image_file_url(file: Any) -> Optional[str]:
+        """Where to read an image file of a saved message from.
+
+        data: URLs stay as they are, Open WebUI file URLs
+        (/api/v1/files/<id>/content, the generated images) too, and a bare file
+        id (what the web UI stores for an upload) becomes such a URL. Other
+        files and URLs give None.
+        """
+        if not isinstance(file, dict):
+            return None
+        content_type = str(file.get("content_type") or "")
+        if file.get("type") != "image" and not content_type.startswith("image/"):
+            return None
+        url = str(file.get("url") or "")
+        if url.startswith("data:image") or "/files/" in url:
+            return url
+        file_id = url or str(file.get("id") or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", file_id):
+            return f"/api/v1/files/{file_id}/content"
+        return None
+
+    async def _gather_saved_chat_images(
+        self,
+        history: List[Dict[str, Any]],
+        optimization_stats: List[Dict[str, Any]],
+        __user__: Optional[dict],
+    ) -> List[Dict[str, Any]]:
+        """Images of the earlier messages of a saved chat, oldest first.
+
+        Open WebUI turns the image files of user messages into image_url
+        parts, but drops the files of assistant messages, and generated images
+        are attached there only (not repeated as markdown in the content). So
+        the image history of a saved chat is read from the chat itself: the
+        image files of user and assistant messages, plus markdown image links
+        in their content (answers of pipeline versions before 1.15.2).
+        """
+        images: List[Dict[str, Any]] = []
+        for msg in history:
+            if msg.get("role") not in {"user", "assistant"}:
+                continue
+            text = msg.get("content")
+            urls = [self._saved_image_file_url(f) for f in msg.get("files") or []]
+            message = {
+                "content": [
+                    {"type": "text", "text": text if isinstance(text, str) else ""},
+                    *(
+                        {"type": "image_url", "image_url": {"url": url}}
+                        for url in urls
+                        if url
+                    ),
+                ]
+            }
+            _p, parts = await self._extract_images_from_message(
+                message, stats_list=optimization_stats, __user__=__user__
+            )
+            images.extend(parts)
+        return images
 
     def _deduplicate_images(self, images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not self.valves.IMAGE_DEDUP_HISTORY:
@@ -642,28 +751,26 @@ class Pipe:
     ) -> Tuple[List[Dict[str, Any]], List[bool]]:
         """Combine history & current image parts honoring order & global limit.
 
+        Over IMAGE_HISTORY_MAX_REFERENCES the oldest history images are dropped
+        first: the current message's images are always kept (only more of them
+        than the limit are cut), the rest of the limit goes to the newest
+        history images, so an edit request keeps the image it refers to. Both
+        lists keep their order (oldest first).
+
         Returns:
             (combined_parts, reused_flags) where reused_flags[i] == True indicates
             the image originated from history, False if from current message.
         """
-        history_first = self.valves.IMAGE_HISTORY_FIRST
         limit = max(1, self.valves.IMAGE_HISTORY_MAX_REFERENCES)
-        combined: List[Dict[str, Any]] = []
-        reused_flags: List[bool] = []
-
-        def append(parts: List[Dict[str, Any]], reused: bool):
-            for p in parts:
-                if len(combined) >= limit:
-                    break
-                combined.append(p)
-                reused_flags.append(reused)
-
-        if history_first:
-            append(history, True)
-            append(current, False)
+        current = current[:limit]
+        room = limit - len(current)
+        history = history[-room:] if room > 0 else []
+        if self.valves.IMAGE_HISTORY_FIRST:
+            combined = history + current
+            reused_flags = [True] * len(history) + [False] * len(current)
         else:
-            append(current, False)
-            append(history, True)
+            combined = current + history
+            reused_flags = [False] * len(current) + [True] * len(history)
         return combined, reused_flags
 
     async def _emit_image_stats(
@@ -722,8 +829,14 @@ class Pipe:
         self,
         messages: List[Dict[str, Any]],
         __event_emitter__: Optional[Callable],
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __user__: Optional[dict] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
+
+        The prompt and the current images come from the last user message of
+        the request. Images of earlier turns come from the saved chat when
+        there is one (see _gather_saved_chat_images), else from the request.
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
@@ -743,12 +856,25 @@ class Pipe:
             raise ValueError("No user message found")
 
         optimization_stats: List[Dict[str, Any]] = []
-        history_images = await self._gather_history_images(
-            messages, last_user_msg, optimization_stats
-        )
         prompt, current_images = await self._extract_images_from_message(
-            last_user_msg, stats_list=optimization_stats
+            last_user_msg, stats_list=optimization_stats, __user__=__user__
         )
+        chain = await self._load_saved_chat_chain(__metadata__, __user__)
+        if chain:
+            # The chain ends with the saved current user message, unless the
+            # request's last user message is another one (Open WebUI's guided
+            # regeneration appends the guidance as a new user message): then
+            # the saved one belongs to the history as well.
+            saved = chain[-1].get("content")
+            saved_text = saved.strip() if isinstance(saved, str) else ""
+            history = chain[:-1] if saved_text in prompt else chain
+            history_images = await self._gather_saved_chat_images(
+                history, optimization_stats, __user__
+            )
+        else:
+            history_images = await self._gather_history_images(
+                messages, last_user_msg, optimization_stats, __user__
+            )
 
         # Deduplicate
         history_images = self._deduplicate_images(history_images)
@@ -2651,11 +2777,13 @@ class Pipe:
         message: Dict[str, Any],
         *,
         stats_list: Optional[List[Dict[str, Any]]] = None,
+        __user__: Optional[dict] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """Extract prompt text and ALL images from a single user message.
 
         This replaces the previous single-image _find_image logic for image-capable
-        models so that multi-image prompts are respected.
+        models so that multi-image prompts are respected. Open WebUI files are
+        read only when they belong to ``__user__`` (see _fetch_file_as_base64).
 
         Returns:
             (prompt_text, image_parts)
@@ -2693,7 +2821,7 @@ class Pipe:
                         if url.startswith("data:"):
                             _add_image(url)
                         else:
-                            b64 = await self._fetch_file_as_base64(url)
+                            b64 = await self._fetch_file_as_base64(url, __user__)
                             if b64:
                                 _add_image(b64)
                 elif item.get("type") == "image_url":
@@ -2701,7 +2829,7 @@ class Pipe:
                     if url.startswith("data:"):
                         _add_image(url)
                     elif "/files/" in url or "/api/v1/files/" in url:
-                        b64 = await self._fetch_file_as_base64(url)
+                        b64 = await self._fetch_file_as_base64(url, __user__)
                         if b64:
                             _add_image(b64)
         # Plain string message (may include markdown images)
@@ -2712,7 +2840,7 @@ class Pipe:
                 if url.startswith("data:"):
                     _add_image(url)
                 else:
-                    b64 = await self._fetch_file_as_base64(url)
+                    b64 = await self._fetch_file_as_base64(url, __user__)
                     if b64:
                         _add_image(b64)
         else:
@@ -2943,15 +3071,22 @@ class Pipe:
                 return image_data
             return f"data:image/jpeg;base64,{encoded if 'encoded' in locals() else image_data}"
 
-    async def _fetch_file_as_base64(self, file_url: str) -> Optional[str]:
+    async def _fetch_file_as_base64(
+        self, file_url: str, __user__: Optional[dict] = None
+    ) -> Optional[str]:
         """
         Fetch a file from Open WebUI's file system and convert to base64.
 
+        Only files of the requesting user are read (an admin may read every
+        file), like Open WebUI's own image resolver: a message can name any
+        file id, for example in a markdown link sent by an API client.
+
         Args:
             file_url: File URL from Open WebUI
+            __user__: The requesting user (without one no file is read)
 
         Returns:
-            Base64 encoded file data or None if file not found
+            Base64 encoded file data or None if file not found or not readable
         """
         try:
             if "/api/v1/files/" in file_url:
@@ -2960,10 +3095,19 @@ class Pipe:
                 fid = file_url.split("/files/")[-1].split("/")[0].split("?")[0]
 
             from pathlib import Path
-            from open_webui.models.files import Files
             from open_webui.storage.provider import Storage
 
             file_obj = await Files.get_file_by_id(fid)
+            user = __user__ or {}
+            if (
+                file_obj
+                and file_obj.user_id != user.get("id")
+                and user.get("role") != "admin"
+            ):
+                self.log.warning(
+                    f"Not reading file {fid}: it does not belong to the requesting user"
+                )
+                return None
             if file_obj and file_obj.path:
                 file_path = await asyncio.to_thread(Storage.get_file, file_obj.path)
                 file_path = Path(file_path)
@@ -2971,7 +3115,7 @@ class Pipe:
                     async with aiofiles.open(file_path, "rb") as fp:
                         raw = await fp.read()
                     enc = base64.b64encode(raw).decode()
-                    mime = file_obj.meta.get("content_type", "image/png")
+                    mime = (file_obj.meta or {}).get("content_type") or "image/png"
                     return f"data:{mime};base64,{enc}"
         except Exception as e:
             self.log.warning(f"Could not fetch file {file_url}: {e}")
@@ -4958,7 +5102,9 @@ class Pipe:
         if not last_user_msg:
             return "Error: No user message found for video generation"
 
-        prompt, images = await self._extract_images_from_message(last_user_msg)
+        prompt, images = await self._extract_images_from_message(
+            last_user_msg, __user__=__user__
+        )
         if not prompt:
             return "Error: No prompt provided for video generation"
 
@@ -5347,7 +5493,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__
+                        messages, __event_emitter__, __metadata__, __user__
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)

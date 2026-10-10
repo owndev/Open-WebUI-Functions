@@ -280,6 +280,7 @@ class BrowserSession:
         tool_servers: Optional[list] = None,
         extra_body: Optional[dict] = None,
         until=None,
+        user_files: Optional[list] = None,
     ) -> BrowserChat:
         """Send one user message and wait until the saved answer is ``done``.
 
@@ -303,6 +304,11 @@ class BrowserSession:
         ``extra_body`` is merged into the request body last. ``until`` is a
         predicate on the saved message that also ends the wait (e.g. a tool call
         waiting for approval: ``status == "pending"``).
+
+        ``user_files``: the file items of the user message (saved with it, e.g.
+        an upload from ``owui.upload_file``). Like the web UI, image files are
+        not sent as the request's ``files``: Open WebUI turns the image files
+        of the saved user messages into image_url parts.
         """
         if models:
             ids = list(models) if models[0] == model else [model, *models]
@@ -319,6 +325,8 @@ class BrowserSession:
             "timestamp": int(time.time()),
             "models": ids,
         }
+        if user_files is not None:
+            user_message["files"] = list(user_files)
         body = {
             "model": ids[0],
             "stream": stream,

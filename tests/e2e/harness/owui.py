@@ -577,6 +577,23 @@ class OWUI:
         """Stop a running chat task (the web UI's Stop button)."""
         return await self.api("POST", f"/api/tasks/stop/{quote(task_id)}")
 
+    async def upload_file(
+        self, name: str, data: bytes, content_type: str, process: bool = False
+    ) -> tuple[int, Any]:
+        """Upload a file like the web UI (images with ``process=false``):
+        (HTTP status, the file record, whose ``id`` the web UI stores as the
+        ``url`` of the user message's file item)."""
+        r = await self.http.post(
+            f"/api/v1/files/?process={str(process).lower()}",
+            files={"file": (name, data, content_type)},
+            headers=self.headers,
+            timeout=120,
+        )
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, r.text
+
     async def file_status(self, url: str) -> tuple[int, str]:
         """(HTTP status, content type) of an Open WebUI file URL."""
         path = url[len(self.base) :] if url.startswith(self.base) else url

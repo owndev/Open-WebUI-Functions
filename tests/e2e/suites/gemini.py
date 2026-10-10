@@ -30,7 +30,11 @@ Groups (``--only gemini.<group>``)
                system prompt, user headers, API version, params, valve names
   concurrency  forwarded user headers belong to the requesting user
   streamimg    inline image from a model the pipe does not detect (stream path)
-  toolsapi     native tool calling, API path: client tools -> tool_calls (stream,
+  imgedit      image editing across turns (#194): generated images and uploads of
+               a saved chat sent with the edit request, guided regeneration,
+               IMAGE_HISTORY_MAX_REFERENCES keeps the current image, temporary
+               chats use the request, files of another user are not read
+  toolsapi    native tool calling, API path: client tools -> tool_calls (stream,
                non-stream, finish_reason), text answers, streaming valve off,
                malformed / unexpected calls, continuation with signatures and
                without, odd client histories, tool_choice, name mapping,
@@ -54,9 +58,12 @@ import base64
 import random
 import re
 import struct
+import time
+import uuid
 import zlib
 
-from harness import Suite, short
+from harness import BrowserSession, Suite, short
+from harness.browser import FRONTEND_FEATURES
 
 GROUPS = (
     "models",
@@ -80,6 +87,7 @@ GROUPS = (
     "valves",
     "concurrency",
     "streamimg",
+    "imgedit",
     "toolsapi",
     "tools",
 )
@@ -450,6 +458,7 @@ async def run(t: Suite) -> None:
         ("valves", valves),
         ("concurrency", concurrency),
         ("streamimg", streamimg),
+        ("imgedit", imgedit),
         ("toolsapi", toolsapi_group),
         ("tools", tools_group),
     ):
@@ -889,12 +898,13 @@ async def images_history(t: Suite, mock) -> None:
     second = await sent()
     t.check(
         "images.history",
-        "image history: duplicates dropped, IMAGE_HISTORY_MAX_REFERENCES=2, "
-        "[Image N] labels, history first; IMAGE_ADD_LABELS / IMAGE_HISTORY_FIRST off",
+        "image history: duplicates dropped, IMAGE_HISTORY_MAX_REFERENCES=2 keeps "
+        "the current image and the newest history image, [Image N] labels, "
+        "history first; IMAGE_ADD_LABELS / IMAGE_HISTORY_FIRST off",
         r1.status == 200
         and r2.status == 200
-        and first == ["Combine", "[Image 1]", "A", "[Image 2]", "C"]
-        and second == ["Combine", "B", "A"],
+        and first == ["Combine", "[Image 1]", "C", "[Image 2]", "B"]
+        and second == ["Combine", "B", "C"],
         f"labels+history_first={first} plain+current_first={second}",
     )
 
@@ -1661,6 +1671,396 @@ async def streamimg(t: Suite, mock) -> None:
         and "Here is your image." in c.content
         and "![" not in c.content,
         c.brief() + f" upstream={_actions(reqs)} {report}",
+    )
+
+
+# ----------------------------------------------------------------- imgedit
+# Image editing across turns (#194): Open WebUI drops the files of assistant
+# messages before it calls a pipe, and generated images are attached there only,
+# so the pipe reads the image history of a saved chat from the chat itself.
+IMGEDIT_USER = "e2e-imgedit-user@example.com"
+UPLOAD_PNG_1 = _png(40, 80, 120)
+UPLOAD_PNG_2 = _png(120, 80, 40)
+FOREIGN_PNG = _png(200, 0, 200)
+EDIT_NAMES = {
+    **PNG_NAMES,
+    UPLOAD_PNG_1: "upload1",
+    UPLOAD_PNG_2: "upload2",
+    FOREIGN_PNG: "foreign",
+}
+
+
+async def _edit_request(mock) -> dict:
+    """What the last generate request sent: the number of contents, the parts
+    of the last content (texts, images by name, "?" for an unknown image) and
+    the image names alone (Open WebUI puts an <attached_files> text in front of
+    a user message with an upload)."""
+    reqs = await mock.requests(_gen)
+    contents = (_body(reqs[-1]).get("contents") or []) if reqs else []
+    parts = (contents[-1].get("parts") or []) if contents else []
+    sent, images = [], []
+    for part in parts:
+        if "text" in part:
+            sent.append(part["text"])
+            continue
+        data = _b64((part.get("inlineData") or {}).get("data"))
+        images.append(EDIT_NAMES.get(data, "?"))
+        sent.append(images[-1])
+    return {"contents": len(contents), "sent": sent, "images": images}
+
+
+def _edit_report(req: dict) -> str:
+    return f"contents={req['contents']} sent={[short(s, 60) for s in req['sent']]}"
+
+
+async def _upload_png(owui, data: str, name: str) -> dict:
+    """Upload a PNG and return the file item the web UI saves with the user
+    message (type "file", content type image/png, the file id as url)."""
+    raw = base64.b64decode(data)
+    status, record = await owui.upload_file(name, raw, "image/png")
+    file_id = record.get("id", "") if isinstance(record, dict) else ""
+    return {
+        "type": "file",
+        "id": file_id if status == 200 else "",
+        "url": file_id if status == 200 else "",
+        "name": name,
+        "status": "uploaded",
+        "size": len(raw),
+        "content_type": "image/png",
+    }
+
+
+async def _temporary_chat(
+    b: BrowserSession, model: str, messages: list, wait: float = 120
+) -> tuple:
+    """A turn of a temporary chat like the web UI: chat id
+    "temporary:<socket id>", the history in the request's ``messages``. Open
+    WebUI saves nothing, so the answer comes from the socket events.
+    Returns (HTTP status, data of the final chat:completion event or {})."""
+    assistant_id = str(uuid.uuid4())
+    text = messages[-1].get("content")
+    body = {
+        "model": model,
+        "stream": True,
+        "messages": messages,
+        "session_id": b.sid,
+        "chat_id": f"temporary:{b.sid}",
+        "id": assistant_id,
+        "parent_id": None,
+        "user_message": {
+            "id": str(uuid.uuid4()),
+            "parentId": None,
+            "childrenIds": [assistant_id],
+            "role": "user",
+            "content": text if isinstance(text, str) else "",
+            "timestamp": int(time.time()),
+            "models": [model],
+        },
+        "features": dict(FRONTEND_FEATURES),
+        "params": dict(LEGACY),
+        "background_tasks": {},
+    }
+    status, _ = await b.owui.api("POST", "/api/chat/completions", body)
+    deadline = time.time() + wait
+    while status == 200 and time.time() < deadline:
+        for event in list(b.events):
+            data = event.get("data") or {}
+            done = data.get("data") or {}
+            if (
+                event.get("message_id") == assistant_id
+                and data.get("type") == "chat:completion"
+                and done.get("done")
+            ):
+                return status, done
+        await asyncio.sleep(0.5)
+    return status, {}
+
+
+def _completion_text(data: dict) -> str:
+    """Answer text of a chat:completion event (content, else the output text)."""
+    if data.get("content"):
+        return str(data["content"])
+    return "".join(
+        part.get("text", "")
+        for item in data.get("output") or []
+        if isinstance(item, dict) and item.get("type") == "message"
+        for part in item.get("content") or []
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    )
+
+
+async def imgedit(t: Suite, mock) -> None:
+    """The issue's flow on both models: draw, then edit in the same chat."""
+    for model in (IMAGE_GA, NANO):
+        short_id = model.split(".", 1)[1]
+        async with t.browser() as b:
+            await mock.reset()
+            c1 = await b.chat(model, "Draw a certificate for Alice", params=LEGACY)
+            await mock.reset()
+            c2 = await b.chat(
+                model,
+                "Change the name to Bob",
+                params=LEGACY,
+                chat_id=c1.chat_id,
+                parent_id=c1.message_id,
+            )
+            req = await _edit_request(mock)
+        names, urls_ok, report = await _image_files(t, c2, [FINAL_PNG])
+        t.check(
+            f"imgedit.{short_id}",
+            f"{short_id}, browser follow-up: the image of turn 1 (attached as a "
+            "file only) is sent with the edit request as [Image 1] after the "
+            "prompt, the edit gets its own image file",
+            c1.done
+            and c2.done
+            and req["contents"] == 1
+            and req["sent"] == ["Change the name to Bob", "[Image 1]", "final"]
+            and names == ["final"]
+            and urls_ok,
+            f"turn1_done={c1.done} turn1_files={len(c1.files)} {c2.brief()} "
+            f"{_edit_report(req)} {report}",
+        )
+    await imgedit_upload(t, mock)
+    await imgedit_temporary(t, mock)
+    await imgedit_foreign(t, mock)
+
+
+async def imgedit_upload(t: Suite, mock) -> None:
+    """An upload between generated turns, guided regeneration, the image limit."""
+    logo = await _upload_png(t.owui, UPLOAD_PNG_1, "logo.png")
+    photo = await _upload_png(t.owui, UPLOAD_PNG_2, "photo.png")
+    async with t.browser() as b:
+        await mock.reset()
+        c1 = await b.chat(IMAGE_GA, "Draw a certificate", params=LEGACY)
+        turn = {"params": LEGACY, "chat_id": c1.chat_id}
+        await mock.reset()
+        c2 = await b.chat(
+            IMAGE_GA,
+            "Put this logo on it",
+            parent_id=c1.message_id,
+            user_files=[logo],
+            **turn,
+        )
+        r2 = await _edit_request(mock)
+        await mock.reset()
+        c3 = await b.chat(
+            IMAGE_GA, "Make the border red", parent_id=c2.message_id, **turn
+        )
+        r3 = await _edit_request(mock)
+        # Guided regeneration of turn 2: the web UI sends the saved user message
+        # again, Open WebUI appends the guidance as a new user message.
+        saved = (await t.owui.get_chat(c1.chat_id)).get("chat") or {}
+        messages = (saved.get("history") or {}).get("messages") or {}
+        user2 = messages.get(c2.message.get("parentId")) or {}
+        guidance = "Make the logo bigger"
+        await mock.reset()
+        g = await b.chat(
+            IMAGE_GA,
+            guidance,
+            parent_id=c1.message_id,
+            extra_body={"user_message": user2, "regeneration_prompt": guidance},
+            **turn,
+        )
+        rg = await _edit_request(mock)
+        # Turn 4 twice (siblings), with and without an upload
+        await _set(t, IMAGE_HISTORY_MAX_REFERENCES=1)
+        try:
+            await mock.reset()
+            c4 = await b.chat(
+                IMAGE_GA,
+                "Use this photo instead",
+                parent_id=c3.message_id,
+                user_files=[photo],
+                **turn,
+            )
+            r4 = await _edit_request(mock)
+            await mock.reset()
+            c5 = await b.chat(
+                IMAGE_GA, "Make it brighter", parent_id=c3.message_id, **turn
+            )
+            r5 = await _edit_request(mock)
+        finally:
+            await _set(
+                t,
+                IMAGE_HISTORY_MAX_REFERENCES=DEFAULTS["IMAGE_HISTORY_MAX_REFERENCES"],
+            )
+    uploads = f"uploads={bool(logo['id'])},{bool(photo['id'])}"
+    t.check(
+        "imgedit.upload",
+        "browser, an upload in turn 2: turn 2 sends the generated image of turn 1 "
+        "and the upload, turn 3 both again from the saved chat (the generated "
+        "image of turn 2, the same PNG, deduplicated)",
+        c1.done
+        and c2.done
+        and c3.done
+        and r2["images"] == ["final", "upload1"]
+        and "Put this logo on it" in (r2["sent"] or [""])[0]
+        and r3["sent"]
+        == ["Make the border red", "[Image 1]", "final", "[Image 2]", "upload1"],
+        f"{uploads} turn2: {_edit_report(r2)} turn3_done={c3.done} turn3: "
+        f"{_edit_report(r3)}",
+    )
+    t.check(
+        "imgedit.guided",
+        "guided regeneration of turn 2 (the guidance is a new user message): the "
+        "generated image of turn 1 and the upload of turn 2 are sent",
+        g.done
+        and rg["sent"] == [guidance, "[Image 1]", "final", "[Image 2]", "upload1"],
+        f"{uploads} saved_user_message={bool(user2)} done={g.done} {_edit_report(rg)}",
+    )
+    t.check(
+        "imgedit.limit",
+        "IMAGE_HISTORY_MAX_REFERENCES=1: the upload of the edit message is kept, "
+        "the history dropped; without an upload the newest history image is "
+        "kept (history after dedup: final, upload1)",
+        c4.done
+        and c5.done
+        and r4["images"] == ["upload2"]
+        and r5["sent"] == ["Make it brighter", "[Image 1]", "upload1"],
+        f"{uploads} with_upload: {_edit_report(r4)} without: {_edit_report(r5)}",
+    )
+
+
+async def imgedit_temporary(t: Suite, mock) -> None:
+    """A temporary chat is not saved: the image history comes from the request,
+    which the web UI builds without the files of assistant messages."""
+    history = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Draw a certificate like this"},
+                {"type": "image_url", "image_url": {"url": _image_url(UPLOAD_PNG_1)}},
+            ],
+        },
+        {"role": "assistant", "content": "Here is your image."},
+        {"role": "user", "content": "Change the name to Bob"},
+    ]
+    mark = t.mark()
+    async with t.browser() as b:
+        await mock.reset()
+        status, done = await _temporary_chat(b, IMAGE_GA, history)
+        req = await _edit_request(mock)
+    await t.log.settle(0.5)
+    chat_lookups = t.log.lines(mark, "for image history")
+    answer = _completion_text(done)
+    t.check(
+        "imgedit.temporary",
+        "temporary chat (not saved): the image history comes from the request "
+        "(the earlier upload is sent; the generated image is not, the web UI "
+        "sends no assistant files)",
+        status == 200
+        and "Here is your image." in answer
+        and req["sent"] == ["Change the name to Bob", "[Image 1]", "upload1"]
+        and not chat_lookups,
+        f"HTTP {status} done={bool(done)} answer={short(answer)} "
+        f"{_edit_report(req)} chat_lookups={chat_lookups}",
+    )
+
+
+async def imgedit_foreign(t: Suite, mock) -> None:
+    """Files of another user are never read: a message can name any file id."""
+    setup_error, grant, denied = "", None, 0
+    c1 = c2 = ru = ra = None
+    r1 = r2 = user_req = admin_req = {"contents": 0, "sent": [], "images": []}
+    other = None
+    try:
+        other = await t.owui.create_user("E2E Image Edit User", IMGEDIT_USER)
+        # a non-admin user only reaches a pipe model with a read grant
+        grant, _ = await t.owui.api(
+            "POST",
+            "/api/v1/models/model/access/update",
+            {
+                "id": IMAGE_GA,
+                "name": "Gemini 3.1 Flash Image",
+                "access_grants": [
+                    {
+                        "principal_type": "user",
+                        "principal_id": "*",
+                        "permission": "read",
+                    }
+                ],
+            },
+        )
+        await t.owui.models(refresh=True)
+        foreign = await _upload_png(t.owui, FOREIGN_PNG, "foreign.png")  # admin's
+        url = f"/api/v1/files/{foreign['id']}/content"
+        async with BrowserSession(other) as b:
+            await mock.reset()
+            c1 = await b.chat(
+                IMAGE_GA,
+                "Draw a certificate like this",
+                params=LEGACY,
+                user_files=[
+                    {
+                        "type": "image",
+                        "url": url,
+                        "name": "foreign.png",
+                        "content_type": "image/png",
+                    }
+                ],
+            )
+            r1 = await _edit_request(mock)
+            await mock.reset()
+            c2 = await b.chat(
+                IMAGE_GA,
+                "Change the name to Bob",
+                params=LEGACY,
+                chat_id=c1.chat_id,
+                parent_id=c1.message_id,
+            )
+            r2 = await _edit_request(mock)
+        history = [
+            {"role": "user", "content": "Draw a certificate"},
+            {
+                "role": "assistant",
+                "content": f"Here is your image.\n\n![Generated Image]({url})",
+            },
+            {"role": "user", "content": "Change the name to Bob"},
+        ]
+        mark = t.mark()
+        await mock.reset()
+        ru = await other.chat(IMAGE_GA, history, stream=False)
+        user_req = await _edit_request(mock)
+        await t.log.settle(0.5)
+        denied = len(t.log.lines(mark, "does not belong to the requesting user"))
+        await mock.reset()
+        ra = await t.owui.chat(IMAGE_GA, history, stream=False)
+        admin_req = await _edit_request(mock)
+    except Exception as exc:  # noqa: BLE001 - reported in the checks
+        setup_error = f"setup failed: {exc!r} "
+    finally:
+        if other is not None:
+            await other.close()
+        await t.owui.delete_model(IMAGE_GA)
+    t.check(
+        "imgedit.foreign",
+        "browser, a non-admin user with an image file of another user in the "
+        "chat: turn 1 does not send it as the current image, turn 2 sends only "
+        "the user's own generated image",
+        not setup_error
+        and grant == 200
+        and c1.done
+        and c2.done
+        and r1["images"] == []
+        and "Draw a certificate like this" in (r1["sent"] or [""])[0]
+        and r2["sent"] == ["Change the name to Bob", "[Image 1]", "final"],
+        f"{setup_error}grant={grant} turn1_done={getattr(c1, 'done', None)} "
+        f"turn1: {_edit_report(r1)} turn2_done={getattr(c2, 'done', None)} "
+        f"turn2: {_edit_report(r2)}",
+    )
+    t.check(
+        "imgedit.api-foreign",
+        "API path: a markdown link to another user's file in the history is not "
+        "read for a non-admin user (logged), an admin's request reads it",
+        not setup_error
+        and getattr(ru, "status", None) == 200
+        and getattr(ra, "status", None) == 200
+        and user_req["sent"] == ["Change the name to Bob"]
+        and admin_req["sent"] == ["Change the name to Bob", "[Image 1]", "foreign"]
+        and denied > 0,
+        f"{setup_error}user: HTTP {getattr(ru, 'status', None)} "
+        f"{_edit_report(user_req)} admin: HTTP {getattr(ra, 'status', None)} "
+        f"{_edit_report(admin_req)} denied_logged={denied}",
     )
 
 
