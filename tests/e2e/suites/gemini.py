@@ -4,8 +4,11 @@ Gemini suite: pipelines/google/google_gemini.py against mocks/mock_gemini.py
 
 Groups (``--only gemini.<group>``)
   models       model list, image / video indicators
-  api          API path (no websocket): non-stream, stream (thinking in <details>)
-  thinking     summaries not replayed (#176), budget / level / include / strip valves
+  api          API path (no websocket): non-stream, stream (thinking in a
+               <details type="reasoning" done="true" duration="N"> block)
+  thinking     summaries not replayed (#176, old and 1.19.0 shapes), budget / level /
+               include / strip valves; browser: live done="false" block, duration
+               up to the answer, Stop while thinking
   browser      browser path: saved answer + usage, stream and non-stream
   tasks        title task (direct, automatic), task answers without <details>,
                tasks of a web_search chat without grounding tools
@@ -20,7 +23,7 @@ Groups (``--only gemini.<group>``)
   nostream     GOOGLE_STREAMING_ENABLED=false with stream=true (#170)
   video        Veo: text + video saved, request shape, image-to-video
   grounding    google_search_tool filter -> googleSearch + urlContext, sources,
-               citations; no grounding without web_search
+               citations, search statuses; no grounding without web_search
   vertex       Vertex AI Search sources (retrievedContext.text)
   errors       upstream 400 / 500 (retry) / blocked prompt / SAFETY finish / image
                error status / streamed answer starting with "data:"
@@ -58,6 +61,7 @@ the image handling itself; the tools sent to image models are checked by
 
 import asyncio
 import base64
+import json
 import random
 import re
 import struct
@@ -359,6 +363,71 @@ def _last_status(chat, action: str) -> dict:
     return entries[-1] if entries else {}
 
 
+# The pipe's thinking block (1.19.0): Open WebUI's native reasoning <details>,
+# done="true" with the duration, or done="false" (live) without it
+BLOCK_RE = re.compile(
+    r'<details type="reasoning" done="(true|false)"(?: duration="(\d+)")?>\n'
+    r"<summary>Thought \((\d+)s\)</summary>\n\n(.*?)\n\n</details>",
+    re.DOTALL,
+)
+
+
+def _block(content) -> dict:
+    """The thinking block at the start of ``content``: ``done``, ``duration``
+    (None without the attribute), ``summary_s`` (N of "Thought (Ns)"),
+    ``thoughts`` and the text after it (``rest``); {} without such a block."""
+    m = BLOCK_RE.match(content if isinstance(content, str) else "")
+    if not m:
+        return {}
+    return {
+        "done": m.group(1),
+        "duration": int(m.group(2)) if m.group(2) is not None else None,
+        "summary_s": int(m.group(3)),
+        "thoughts": m.group(4),
+        "rest": content[m.end() :],
+    }
+
+
+def _block_ok(content, thought: str, answer: str) -> bool:
+    """``content`` is a finished thinking block holding ``thought`` (duration
+    attribute = the summary's seconds) followed by the answer ``answer``."""
+    b = _block(content)
+    return (
+        b.get("done") == "true"
+        and b.get("duration") is not None
+        and b["duration"] == b["summary_s"]
+        and thought in b["thoughts"]
+        and answer in b["rest"]
+    )
+
+
+def _block_report(content) -> str:
+    b = _block(content)
+    if not b:
+        return f"block=None head={short(content, 80)}"
+    return (
+        f"block=done:{b['done']},duration:{b['duration']},summary:{b['summary_s']}s "
+        f"rest={short(b['rest'], 60)}"
+    )
+
+
+def _live_view(events: list) -> list:
+    """Replay the message's content events the way the web UI does (replace /
+    chat:message set the content, chat:message:delta / message append to it):
+    one ``(event type, content afterwards)`` per content event."""
+    content, view = "", []
+    for event in events:
+        kind, data = event.get("type"), event.get("data") or {}
+        if kind in ("replace", "chat:message"):
+            content = data.get("content") or ""
+        elif kind in ("chat:message:delta", "message"):
+            content += data.get("content") or ""
+        else:
+            continue
+        view.append((kind, content))
+    return view
+
+
 def _image_url(content: str):
     return f"data:image/png;base64,{content}"
 
@@ -511,12 +580,11 @@ async def api(t: Suite, mock) -> None:
     req = await mock.last(_gen)
     t.check(
         "api.nonstream",
-        "API non-stream: answer with thinking wrapped in <details>",
+        'API non-stream: answer with thinking in a <details type="reasoning" '
+        'done="true" duration="N"> block (summary "Thought (Ns)")',
         r.status == 200
-        and "Hello from mock (non-stream)." in r.content
-        and "<details>" in r.content
-        and "Mock thinking." in r.content,
-        r.brief(),
+        and _block_ok(r.content, "Mock thinking.", "Hello from mock (non-stream)."),
+        r.brief() + " " + _block_report(r.content),
     )
     t.check(
         "api.nonstream.usage",
@@ -538,15 +606,14 @@ async def api(t: Suite, mock) -> None:
     await t.log.settle(0.5)
     t.check(
         "api.stream",
-        "API stream without websocket session: answer streamed, thinking in <details>",
+        "API stream without websocket session: answer streamed, thinking in the "
+        '<details type="reasoning" done="true" duration="N"> block',
         r.status == 200
         and r.done
-        and "Hello from mock (stream)." in r.content
-        and "<details>" in r.content
-        and "Mock pondering." in r.content
+        and _block_ok(r.content, "Mock pondering.", "Hello from mock (stream).")
         and "Error" not in r.content
         and not r.errors,
-        r.brief() + f" upstream={req.get('action')}",
+        r.brief() + f" upstream={req.get('action')} " + _block_report(r.content),
     )
     t.check(
         "api.stream.usage",
@@ -581,11 +648,42 @@ async def thinking(t: Suite, mock) -> None:
     parts = replayed(await mock.last(_gen))
     t.check(
         "thinking.strip",
-        "thinking summary of earlier turns is not replayed to Gemini (#176)",
+        "thinking summary of earlier turns is not replayed to Gemini (#176): the "
+        "plain <details> block of chats saved before 1.19.0",
         r.status == 200
         and any("First answer." in p for p in parts)
         and not any("SECRET-THOUGHT" in p for p in parts),
         f"model parts sent upstream={parts}",
+    )
+
+    # The 1.19.0 shapes: a real answer of the pipe (done="true") and the live
+    # block (done="false") that an answer stopped while thinking keeps
+    await mock.reset()
+    real = await t.owui.chat(TEXT, "Hello Gemini", stream=True)
+    stopped = (
+        '<details type="reasoning" done="false">\n<summary>Thought (2s)</summary>'
+        "\n\n> STOPPED-THOUGHT\n\n</details>Partial answer."
+    )
+    native_history = [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": real.content},
+        {"role": "user", "content": "Second question"},
+        {"role": "assistant", "content": stopped},
+        {"role": "user", "content": "Third question"},
+    ]
+    await mock.reset()
+    r = await t.owui.chat(TEXT, native_history, stream=False)
+    parts = replayed(await mock.last(_gen))
+    t.check(
+        "thinking.strip-reasoning",
+        'the <details type="reasoning"> blocks of earlier turns (the pipe\'s own '
+        'done="true" block, a stopped done="false" block) are not replayed',
+        r.status == 200
+        and _block_ok(real.content, "Mock pondering.", "Hello from mock (stream).")
+        and any("Hello from mock (stream)." in p for p in parts)
+        and any("Partial answer." in p for p in parts)
+        and not any("Mock pondering." in p or "STOPPED-THOUGHT" in p for p in parts),
+        f"model parts sent upstream={parts} " + _block_report(real.content),
     )
 
     await _set(t, THINKING_BUDGET=0)
@@ -636,7 +734,7 @@ async def thinking(t: Suite, mock) -> None:
         "INCLUDE_THOUGHTS=false: no includeThoughts upstream, no <details> in the answer",
         r.status == 200
         and not think.get("includeThoughts")
-        and "<details>" not in r.content
+        and "<details" not in r.content
         and "Hello from mock (non-stream)." in r.content,
         f"thinkingConfig={think} {r.brief()}",
     )
@@ -652,6 +750,153 @@ async def thinking(t: Suite, mock) -> None:
         f"model parts sent upstream={parts}",
     )
 
+    await _set(t, STRIP_THINKING_FROM_HISTORY=True)
+    async with t.browser() as b:
+        await thinking_live(t, mock, b)
+        await thinking_stop(t, mock, b, replayed)
+        await thinking_tool_round(t, mock, b)
+
+
+PACED_THOUGHTS = [f"Paced thought {i}." for i in range(1, 11)]  # mock_gemini.PACED
+
+
+async def thinking_live(t: Suite, mock, b) -> None:
+    """Browser stream: the live thinking block (paced-thinking: ten thoughts 0.15 s
+    apart, then the answer in three parts 1.2 s apart)."""
+    await mock.reset()
+    c = await b.chat(TEXT, "paced-thinking please", stream=True)
+    view = _live_view(c.events)
+    thinking_statuses = [
+        s
+        for s in [e.get("data") or {} for e in c.events if e.get("type") == "status"]
+        + c.status_history
+        if s.get("action") == "thinking"
+    ]
+    kinds = [k for k, _ in view]
+    first_delta = (
+        kinds.index("chat:message:delta") if "chat:message:delta" in kinds else 0
+    )
+    live = [_block(x) for k, x in view[:first_delta] if k == "replace"]
+    while_thinking = [x for x in live if x.get("done") == "false"]
+    switch = live[-1] if live else {}
+    # content the web UI shows once every event before the final replace arrived
+    shown = view[-3][1] if len(view) >= 3 else ""
+    report = (
+        f"content_events={len(view)} live={len(while_thinking)} "
+        f"live_rest={[x.get('rest') for x in while_thinking][:3]} "
+        f"live_duration={[x.get('duration') for x in while_thinking][:3]} "
+        f"switch={short(switch.get('done'))}/{short(switch.get('rest'))} "
+        f"thinking_statuses={len(thinking_statuses)} shown_is_saved={shown == c.content} "
+        + _block_report(c.content)
+    )
+    t.check(
+        "thinking.live",
+        "browser stream: while thinking, throttled replace events with a <details "
+        'type="reasoning" done="false"> block (no thinking status); the first answer '
+        'part switches it to done="true" with all thoughts, then deltas; the result '
+        "is the saved answer",
+        c.done
+        and not c.error
+        and bool(view)
+        and _block(view[0][1]).get("done") == "false"
+        and 2 <= len(while_thinking) < len(PACED_THOUGHTS)
+        and all(
+            x.get("duration") is None and x.get("rest") == "" for x in while_thinking
+        )
+        and "Paced thought 1." in while_thinking[0].get("thoughts", "")
+        and len(live) == len(while_thinking) + 1
+        and switch.get("done") == "true"
+        and all(text in switch.get("thoughts", "") for text in PACED_THOUGHTS)
+        and switch.get("rest") == "Paced "
+        and kinds[first_delta:]
+        == ["chat:message:delta"] * 2 + ["replace", "chat:message"]
+        and shown == c.content
+        and _block_ok(c.content, PACED_THOUGHTS[-1], "Paced answer done.")
+        and not thinking_statuses,
+        report,
+    )
+    duration = _block(c.content).get("duration")
+    t.check(
+        "thinking.duration",
+        "streamed thinking lasts from the first thought to the first answer part "
+        "(1.5 s), not to the end of the stream (3.9 s)",
+        c.done and duration is not None and 1 <= duration <= 2,
+        f"duration={duration} " + _block_report(c.content),
+    )
+
+
+async def thinking_stop(t: Suite, mock, b, replayed) -> None:
+    """Stop while Gemini thinks (slow-thinking: twelve thoughts 0.5 s apart): the
+    saved done="false" block is left out of the next turn's history."""
+    await mock.reset()
+    c = await b.chat(
+        TEXT, "slow-thinking please", stream=True, stop_after_s=3.5, stop_wait=10
+    )
+    await asyncio.sleep(2)
+    c = await b.reload(c)
+    saved = c.message.get("content") or ""
+    block = _block(saved)
+    stop_ok = bool(c.stopped) and all(code == 200 for code, _ in c.stopped)
+    await mock.reset()
+    follow = await b.chat(
+        TEXT, "Next question", stream=True, chat_id=c.chat_id, parent_id=c.message_id
+    )
+    reqs = [e for e in await mock.requests(_gen) if "### Task:" not in _last_text(e)]
+    parts = replayed(reqs[0]) if reqs else []
+    t.check(
+        "thinking.stop",
+        'Stop while thinking: the saved content is the done="false" block with the '
+        "thoughts so far (no answer, no thinking status); the next turn sends "
+        "neither the block nor its thoughts",
+        stop_ok
+        and c.done
+        and block.get("done") == "false"
+        and "Slow thought 1." in block.get("thoughts", "")
+        and block.get("rest") == ""
+        and "Slow answer." not in saved
+        and not any(s.get("action") == "thinking" for s in c.status_history)
+        and follow.done
+        and bool(reqs)
+        and "Next question" in _last_text(reqs[0])
+        and not any("Slow thought" in p for p in parts),
+        f"stop_ok={stop_ok} done={c.done} {_block_report(saved)} "
+        f"thoughts={short(block.get('thoughts'), 60)} statuses={c.status_descriptions} "
+        f"next_turn_model_parts={parts} follow={follow.brief()}",
+    )
+
+
+async def thinking_tool_round(t: Suite, mock, b) -> None:
+    """A browser turn whose first round ends with a tool call (the mock's
+    MOCKTOOLS directive, Open WebUI's built-in get_current_timestamp): the live
+    block of that round is cleared, Open WebUI's output items take over."""
+    await mock.reset()
+    rounds = [[{"name": "get_current_timestamp", "args": {}}]]
+    c = await b.chat(PRO3, "MOCKTOOLS:" + json.dumps({"rounds": rounds}), stream=True)
+    if c.task_ids and not c.done:  # keep its tool loop away from later scenarios
+        await b.stop(c)
+    view = _live_view(c.events)
+    first = _block(view[0][1]) if view else {}
+    reasoning = [text for text, _ in c.reasoning_items]
+    saved = c.message.get("content") or ""
+    t.check(
+        "thinking.tool-round",
+        'tool turn: the first round shows the live done="false" block, then '
+        "clears it (replace with empty content) when it ends with a tool call; the "
+        "saved turn has the thoughts in a reasoning item and no <details> block",
+        c.done
+        and [k for k, _ in view] == ["replace", "replace"]
+        and first.get("done") == "false"
+        and "Mock pondering." in first.get("thoughts", "")
+        and view[-1][1] == ""
+        and any("Mock pondering." in text for text in reasoning)
+        and c.output_text.startswith("MOCK-FINAL get_current_timestamp=")
+        and "<details" not in saved
+        and "<details" not in c.output_text,
+        f"content_events={[(k, short(x, 50)) for k, x in view]} "
+        f"reasoning={[short(x, 30) for x in reasoning]} saved={short(saved, 80)} "
+        f"output_text={short(c.output_text, 80)}",
+    )
+
 
 # ----------------------------------------------------------------- browser
 async def browser(t: Suite, mock) -> None:
@@ -665,13 +910,10 @@ async def browser(t: Suite, mock) -> None:
             name = "stream" if stream else "nonstream"
             t.check(
                 f"browser.{name}",
-                f"browser path stream={stream}: answer + <details> thinking saved",
-                c.done
-                and answer in c.content
-                and "<details>" in c.content
-                and thought in c.content
-                and not c.error,
-                c.brief(),
+                f"browser path stream={stream}: answer + thinking block "
+                '(<details type="reasoning" done="true" duration="N">) saved',
+                c.done and _block_ok(c.content, thought, answer) and not c.error,
+                c.brief() + " " + _block_report(c.content),
             )
             t.check(
                 f"browser.{name}.usage",
@@ -1340,6 +1582,27 @@ async def grounding(t: Suite, mock) -> None:
                 and any(s == GROUNDING_URI for s in _strings(c.sources))
                 and "[1]" in c.content,
                 c.brief() + f" tool_kinds={req.get('tool_kinds')}",
+            )
+            queries = _last_status(c, "web_search_queries_generated")
+            sites = _last_status(c, "web_search")
+            t.check(
+                "grounding.status",
+                "search statuses in Open WebUI's own localized shape: "
+                "web_search_queries_generated with the queries, then web_search "
+                "'Searched {{count}} sites' with items (title, link) and no urls; "
+                "the last status stays visible",
+                c.done
+                and queries.get("queries") == ["mock search query"]
+                and queries.get("done") is True
+                and sites.get("description") == "Searched {{count}} sites"
+                and sites.get("items")
+                == [{"title": "Example A", "link": GROUNDING_URI}]
+                and "urls" not in sites
+                and sites.get("done") is True
+                and bool(c.status_history)
+                and c.status_history[-1] == sites
+                and not any(s.get("hidden") for s in c.status_history),
+                f"statuses={short(c.status_history, 400)}",
             )
             await mock.reset()
             c = await b.chat(TEXT, "Search the web", features={"web_search": False})

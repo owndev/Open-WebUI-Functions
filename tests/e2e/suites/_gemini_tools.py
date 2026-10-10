@@ -1828,7 +1828,7 @@ async def api_unchanged(ctx: Ctx) -> None:
         r.status == 200
         and r.done
         and "Hello from mock (stream)." in r.content
-        and "<details>" in r.content
+        and '<details type="reasoning"' in r.content
         and _usage(r.usage) == USAGE_STREAM
         and not r.tool_calls
         and r.openai_finish_reason == "stop",
