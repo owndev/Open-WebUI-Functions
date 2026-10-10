@@ -76,8 +76,8 @@ A full run of all suites took about 19 minutes on a shared 8-CPU Docker host (11
 1123 s: 34 s container start-up, then gemini 305 s, azure 419 s, n8n 71 s, infomaniak
 36 s, filters 256 s). Most of it is waiting: the azure `rag` group adds about 5.5
 minutes (query-generation timeouts, the query-generation pause and the 45 s retrieval
-limit are waited for; with the Azure pipeline 2.8.x of `main`, as in the meta-test, its
-requests fail at once), the gemini `tools`, `toolsapi` and `imgedit` groups about 2.5
+limit are waited for; in the meta-test, where every mock answers HTTP 500, its requests
+fail at once), the gemini `tools`, `toolsapi` and `imgedit` groups about 2.5
 minutes and the filters `ingest` group (Logs Ingestion API) another 2.5 minutes.
 Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
