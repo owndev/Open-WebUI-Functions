@@ -2,9 +2,9 @@
 Registry of known bugs that make scenarios fail on ``main`` today.
 
 The entries live in one module per area, ``known_<area>.py`` (today only
-``known_n8n.py`` for n8n + Infomaniak), and are re-exported here, so suites write
-``known.INFOMANIAK_NAME_PREFIX``. A new area module needs its own import at the
-bottom of this file.
+``known_n8n.py`` for n8n + Infomaniak, with no entry at the moment), and are
+re-exported here, so suites write ``known.<NAME>``. A new area module needs its
+own import at the bottom of this file.
 
 A failing scenario that carries a ``KnownIssue`` is reported as KNOWN and does
 not fail the run, but only when the failure looks like that bug:

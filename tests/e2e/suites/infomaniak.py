@@ -13,7 +13,7 @@ Groups (``--only infomaniak.<group>``)
   tasks    background title task
 """
 
-from harness import Suite, known, short
+from harness import Suite, short
 
 GROUPS = ("models", "api", "browser", "tasks")
 FID = "infomaniak"
@@ -107,17 +107,19 @@ async def models(t: Suite) -> None:
         and str(listed.get(model("mixtral"))).startswith(PREFIX),
         f"listed={[(k, v) for k, v in listed.items() if k.startswith(FID + '.')]}",
     )
+    base = str(listed.get(model("mixtral")))[len(PREFIX) :]
     await t.owui.update_valves(FID, NAME_PREFIX="IK> ")
     listed = {m["id"]: m.get("name") for m in await t.owui.models()}
     name = listed.get(model("mixtral"))
+    await t.owui.update_valves(FID, NAME_PREFIX=PREFIX)
+    listed = {m["id"]: m.get("name") for m in await t.owui.models()}
+    restored = listed.get(model("mixtral"))
     t.check(
         "models.name-prefix",
-        "NAME_PREFIX valve changes the model names",
-        str(name).startswith("IK> "),
-        f"name={name!r}",
-        known=known.INFOMANIAK_NAME_PREFIX,
+        "NAME_PREFIX valve changes the model names, and changing it back restores them",
+        bool(base) and name == f"IK> {base}" and restored == f"{PREFIX}{base}",
+        f"name={name!r} restored={restored!r}",
     )
-    await t.owui.update_valves(FID, NAME_PREFIX=PREFIX)
 
 
 async def api(t: Suite, mock) -> None:
