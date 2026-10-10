@@ -76,6 +76,8 @@ group adds about 5.5 minutes (query-generation timeouts, the query-generation pa
 and the 45 s retrieval limit are waited for; with the Azure pipeline 2.8.x of `main`,
 as in the meta-test, its requests fail at once): with the Azure pipeline 3.0.0 a full
 run took 790 s (gemini 130 s, azure 420 s, n8n 72 s, infomaniak 36 s, filters 103 s).
+The filters `ingest` group (Logs Ingestion API) adds about 2.5 minutes: 1000 s
+(gemini 150 s, azure 424 s, n8n 71 s, infomaniak 36 s, filters 259 s).
 Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -149,19 +151,35 @@ events), a **background title task** and that the server log has no unexpected
 | `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; answers prompts with a `<documents>` block like a plain model, without `context`; query generation, embeddings, tool calls, a ~300 KB and a > 4 MiB stream event, `content: null`), `mock_search.py` (Azure AI Search and an App Service managed identity token endpoint, see below) | `valves` (from 3.0.0 also the `AZURE_AI_SEARCH_*` valves, their defaults, enums and the password input of the key, and no `AZURE_AI_SEARCH_MODE`), `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 (exactly Azure's message, nothing appended) and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status with exactly Azure's message), `tasks` (title task, also with Azure AI Search valves, #123), `rag` (the pipe's own Azure AI Search retrieval, 3.0.0, #187; `suites/_azure_rag.py`: API and browser path, stream and non-stream, Foundry `/models` endpoint; search request body per `query_type`, query text rules, embeddings for `deployment_name` (v1 route, gateway prefix, Bearer) and `endpoint` (api-version, own key or access token, chat key only on the same scheme, host and port), integrated vectorizer; `fields_mapping` with `select`, separator and fallback, list-valued titles; `filter`, `top_n_documents` (2 x candidates), `strictness` (per query), the api-version valve, the document budget (auto, also with a large `top_n_documents`, valve, unlimited, dropping a document); prompt placement, one block and one system message, `in_scope` and the tool-results clause, `role_information`, sanitizing (also nested tags, titles and file names), list and image-only content, Open WebUI's tool-images message, an attached file (`<attached_files>` and RAG template around the prompt); citations, `context` event and `message.context`, scores per score type and with `AZURE_AI_INCLUDE_SEARCH_SCORES` off; `[docX]` → links, also split across stream deltas (API and browser, also without a finish chunk; in API streams all text before `[DONE]` and nothing after it), already linked or with parentheses in the URL (stream and non-stream), with a dotted deployment name; links in the history sent back as `[docX]` (also links saved before 2.8.0 with `)` in the URL; a hostile history line in linear time); only referenced sources saved and the show-all valve (also for an answer that cites only a document the search did not return, `[doc9]`, or one next to `[doc1]`); a context event over 128 KiB, an upstream event of ~300 KB (read and passed on) and one over 4 MiB (an error, API and browser); `content: null`; tool rounds (one search, reused only by a tool round of the same message with unchanged valves, no duplicate sources also when the tool round references a document, a non-stream tool call), tools and `stream_options` forwarded, tasks without retrieval and without `data_sources` (also for a saved chat without a websocket session); query generation (follow-ups, `always` / `off`, transcript with Open WebUI's conversation summary, max queries, `<think>` with draft queries, fallback also for JSON nested too deep, partial and all-failed results, merge order by reciprocal rank fusion and reranker score, model in the body, the pause after 3 timeouts in a row: per model, reset by a success, still on after 16 s); auth: key, key valve, access token, system- and user-assigned managed identity (`mi_res_id`), token errors; fail-closed errors with a terminal status (HTTP 500/403/402/404/400/302/429/503, connection, retries, the 45 s retrieval limit, an answer larger than 16 MB, configuration errors, client `data_sources` (API stream and non-stream and the browser path as from an inlet filter: the error naming the removal of On Your Data in 3.0.0, the pipe's ERROR line and the terminal error status, nothing forwarded; an empty list is ignored), `context_length_exceeded` (exactly Azure's message and the budget hint)); Stop during a search and during query generation; `AZURE_AI_SEARCH_MODE=on_your_data` stored by a 2.9.0 pre-release or set in the environment is ignored; `log.debug`: the staged file run in the driver process with every logger at DEBUG logs no key or token, see below; `notice.none`: no On Your Data retirement notice of 2.8.1 in the server log), `logs` (no API key, no search key or token, no citation text, no generated queries, document titles or URLs in the server log at INFO and above) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
-| `filters` | `filters/*.py` + probe pipe | `mock_la.py` (Azure Log Analytics Data Collector API; the suite starts it, see below) | `model` / `global` (filters attached per model via `meta.filterIds` and as global filters: `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path with exact token counts, its status in the browser path, background task without `__event_emitter__`), `spec` (`SEND_TO_LOG_ANALYTICS` env parsing, encrypted shared key, valve names), `la` (Log Analytics records: signature, headers, payload and exact counts on the API and browser path, special tokens, multi-turn averages, sending switched off, HTTP errors, a slow and a hanging endpoint do not delay the answer, estimate marker), `valves` (compact status), `correlation` (inlet/outlet correlation when Open WebUI rewrites the last user message, concurrent identical requests), `encoding` (model-specific encoding, `gpt-4o` → `o200k_base`), `offline` (the tiktoken download hangs: estimates, one load at a time, retry, server not blocked), `multimodel` (multi-model chat and the features dict the models share), `search` (`google_search_tool` with features `{}`, `null` or without web_search, other feature keys kept, no per-user permission check), `vertex` (per-request data store, store only with the feature, `features: null`) |
+| `filters` | `filters/*.py` + probe pipe | `mock_la.py` (Azure Log Analytics: HTTP Data Collector API, Logs Ingestion API, Microsoft Entra ID token endpoint, managed identity endpoints; the suite starts it, see below) | `model` / `global` (filters attached per model via `meta.filterIds` and as global filters: `features.web_search` → `__metadata__.features.google_search_tool`, `vertex_ai_search` + `VERTEX_AI_RAG_STORE`, API request without `features`, `time_token_tracker` outlet on the API path with exact token counts, its status in the browser path, background task without `__event_emitter__`), `spec` (`SEND_TO_LOG_ANALYTICS` env parsing, encrypted shared key and client secret, Logs Ingestion valve defaults, valve names), `la` (Log Analytics records through the HTTP Data Collector API: signature, headers, payload and exact counts on the API and browser path, special tokens, multi-turn averages, sending switched off, HTTP errors, a slow and a hanging endpoint do not delay the answer, estimate marker), `ingest` (Logs Ingestion API, #188: request shape and 204, token cache (scope and tenant in its key) / concurrency / refresh, refresh failure with a still-valid token (also inside the back-off), the 30 s token back-off (still on after 20 s) and its end, token and HTTP errors with one log line each including a second revocation, a late 401 for a replaced token and a persistent 401, a secret echoed across the cut points of an error text, undecryptable secret, https-only endpoint and authority and other invalid settings, slow / hanging / unreachable endpoints, mode selection and fallback, `both` (also with one side incomplete), deprecation warning, sovereign cloud valves, App Service (also its `{statusCode, message, correlationId}` error) / IMDS (without proxy) / workload identity, no secret or token in the log, DEBUG lines included), `valves` (compact status), `correlation` (inlet/outlet correlation when Open WebUI rewrites the last user message, concurrent identical requests), `encoding` (model-specific encoding, `gpt-4o` → `o200k_base`), `offline` (the tiktoken download hangs: estimates, one load at a time, retry, server not blocked), `multimodel` (multi-model chat and the features dict the models share), `search` (`google_search_tool` with features `{}`, `null` or without web_search, other feature keys kept, no per-user permission check), `vertex` (per-request data store, store only with the feature, `features: null`) |
 
 The **probe pipe** (`tests/e2e/probe/probe_pipe.py`) answers with a JSON report of what
 Open WebUI handed it (body keys, model and messages, `__metadata__` features / params /
 model id, `__task__`, whether an `__event_emitter__` exists), so filter → pipe coupling
 is tested without a provider. `PROBE_SLEEP=<s>` in the last user message delays its
 answer (overlapping requests), `PROBE_SLEEP[<model>]=<s>` only that model's answer
-(multi-model chats).
+(multi-model chats). `PROBE_ENV=<file>` sets (or, for `null`, removes) the environment
+variables of a JSON object in that file in the server process, for an allow-list of
+managed identity, workload identity and proxy variables only; the `ingest` group uses
+it to switch between App Service, IMDS and workload identity without a restart and
+puts the container's own `IDENTITY_ENDPOINT` / `IDENTITY_HEADER` (set by `run.sh` for
+the azure suite) back at its end. The values go through the file, never through the
+chat text. `PROBE_LOG=<file>` writes
+everything the `time_token_tracker` logger logs, DEBUG included, to that file
+(`PROBE_LOG=off` stops it): the server log runs at INFO, so the `filters` suite captures
+the tracker's DEBUG output while its Log Analytics groups run (`tracker_debug.log` in
+the output directory) and checks it for plaintext secrets (`log.no-secrets-debug`).
 
 The `filters` suite sets up the Log Analytics mock itself: it maps the workspace host
-`<id>.ods.opinsights.azure.com` to 127.0.0.1 in the container's `/etc/hosts`, installs
-a throw-away test CA into the container's trust store and starts `mocks/mock_la.py`
-(HTTPS on 127.0.0.1:443, control routes on :9105). It also creates the user
+`<id>.ods.opinsights.azure.com`, the login hosts `login.microsoftonline.com` /
+`login.microsoftonline.us` and two DCR ingestion hosts to 127.0.0.1 and an
+unreachable DCR host to 127.0.0.9 in the container's `/etc/hosts` (the login and DCR
+lines are removed again at the end), installs a throw-away test CA into the container's
+trust store (kept across `--reuse` runs, valid 30 days; the server certificate lists
+every mapped host and is reissued when a name is missing) and starts
+`mocks/mock_la.py` (HTTPS on 127.0.0.1:443, control routes on :9105, managed identity
+endpoints on 127.0.0.1:9107 and 127.0.0.2:9107). The `ingest` group takes about two
+and a half minutes, mostly timeout, token-expiry and token back-off waits. It also creates the user
 `filters-user@example.com`; the `gemini` suite creates `e2e-gemini-user@example.com`.
 The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
 process), so do not rerun it with `--reuse`.
@@ -190,8 +208,9 @@ values among them), so a DEBUG server log cannot show what the pipe logs. Instea
 query generation, errors, client `data_sources` with a key, also streamed); no log record may
 contain a key or token.
 
-Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10 on
-branch `feature/azure-search-pipeline-mode` with the Azure pipeline 3.0.0):
+Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10,
+`main` 4b80e24 (Azure pipeline 3.0.0) plus the Logs Ingestion API of #188: 2 new
+`spec` checks, the `ingest` group with 41 and `log.no-secrets-debug`):
 
 | Suite | Checks | PASS / KNOWN |
 | --- | ---: | ---: |
@@ -199,10 +218,10 @@ branch `feature/azure-search-pipeline-mode` with the Azure pipeline 3.0.0):
 | `azure` | 198 | 198 / 0 |
 | `n8n` | 51 | 51 / 0 |
 | `infomaniak` | 32 | 31 / 1 |
-| `filters` | 57 | 57 / 0 |
-| **all** | **419** | **418 / 1** |
+| `filters` | 101 | 101 / 0 |
+| **all** | **463** | **462 / 1** |
 
-There is no FAIL and no obsolete marker; `v0.11.3-slim` gives the same azure counts.
+No FAIL and no obsolete marker; `v0.11.3-slim` gives the same azure and filters counts.
 `harness/known_*.py` registers one known bug, `infomaniak-name-prefix` (`NAME_PREFIX`
 is read only once, no fix yet, `fixed_in=""`): the one KNOWN. The markers of the 62
 bugs fixed by #182-#185 were dropped after the merge; their checks stay and must pass.
@@ -290,6 +309,7 @@ The output directory contains:
 | `summary.md` | Markdown summary (used as GitHub Actions job summary), with notes on partial results and cut-short mock answers |
 | `server.log` | output of the Open WebUI server (`/tmp/e2e/server.log` in the container, the same text as `docker logs`) |
 | `mocks.txt` | output of the mock servers |
+| `mock_la.txt`, `tracker_debug.log` | `filters` suite only: output of the Log Analytics mock, and what `time_token_tracker` logged (DEBUG included) while the Log Analytics groups ran |
 | `functions/` | the exact function files that were tested (converted to LF line endings), plus `SOURCES.txt` (where they came from) |
 
 `results.json` and `summary.md` are also written when the run is cut short (Ctrl-C,
@@ -390,7 +410,7 @@ suites/              one module per suite: GROUPS + async def run(t: Suite); _*.
                      helper modules (e.g. _azure_rag.py, the azure rag group), not suites
 mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 and :9106 in
                      the container); mock_la.py (Log Analytics) is started by the filters
-                     suite (:443, :9105)
+                     suite (:443, :9105, :9107)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 ```
 
