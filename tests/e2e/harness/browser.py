@@ -18,7 +18,9 @@ Native tool calling: Open WebUI runs the tools of a pipe that answers with
 ``tool_calls`` (built-in, workspace, MCP and OpenAPI tools on the server; direct
 tools in the browser, through an ``execute:tool`` socket call that the browser
 acknowledges with the result) and saves the turn as ``output`` items
-(``function_call``, ``function_call_output``, ``reasoning``, ``message``).
+(``function_call``, ``function_call_output``, ``reasoning``, ``message``). The
+built-in ``execute_code`` tool with the pyodide engine runs the code in the
+browser the same way (``execute:python``, see ``python_answer``).
 """
 
 import asyncio
@@ -192,6 +194,13 @@ class BrowserSession:
         # is sent as JSON; None makes Open WebUI report unparsable arguments).
         self.execute_calls: list = []
         self.direct_tool_answer = lambda data: NO_DIRECT_ANSWER
+        # execute:python calls (Open WebUI's execute_code tool with the pyodide
+        # engine runs the code in the browser) and their answer: a callable(call
+        # data) -> ack. The web UI acks with its pyodide result, e.g.
+        # ``{"stdout": "4\n", "stderr": None, "result": None}``; the default None
+        # is an empty ack (no pyodide here).
+        self.python_calls: list = []
+        self.python_answer = lambda data: None
         self._heartbeat: Optional[asyncio.Task] = None
 
     async def __aenter__(self) -> "BrowserSession":
@@ -217,6 +226,9 @@ class BrowserSession:
                 # Open WebUI waits for this ack (sio.call): the tool result
                 self.execute_calls.append(data)
                 return self.direct_tool_answer(inner.get("data") or {})
+            if isinstance(inner, dict) and inner.get("type") == "execute:python":
+                self.python_calls.append(data)
+                return self.python_answer(inner.get("data") or {})
             return None
 
         await self.sio.connect(

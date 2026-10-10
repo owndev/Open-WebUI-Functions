@@ -1,5 +1,6 @@
 """
-Tool server mocks for the native tool calling scenarios (``gemini.tools``).
+Tool server mocks for the native tool calling scenarios (``gemini.tools``,
+``gemini.owuitools``).
 
 These are tools Open WebUI runs itself, not provider APIs: they are NOT behind
 ``E2E_MOCK_FAULT`` (a provider fault must not break the tools).
@@ -10,8 +11,20 @@ These are tools Open WebUI runs itself, not provider APIs: they are NOT behind
                             GET  /lookup?key=    operationId lookup.v2 (a name
                                                  Gemini does not accept: the pipe
                                                  maps it)
-           GET /__requests, POST /__reset       record of the OpenAPI calls and of
-                                                 the MCP tool calls (path mcp:<tool>)
+  Jupyter  127.0.0.1:9111   /jupyter/            the subset of a Jupyter server that
+                                                 Open WebUI's code interpreter engine
+                                                 "jupyter" uses: POST api/kernels,
+                                                 the kernel websocket
+                                                 api/kernels/<id>/channels (an
+                                                 execute_request is answered with
+                                                 stdout JUPYTER_STDOUT, the result
+                                                 JUPYTER_RESULT and status idle; the
+                                                 code is recorded, path
+                                                 jupyter:execute), DELETE
+                                                 api/kernels/<id>
+           GET /__requests, POST /__reset       record of the OpenAPI calls, the
+                                                 Jupyter requests and the MCP tool
+                                                 calls (path mcp:<tool>)
   MCP      127.0.0.1:9112   /mcp                 FastMCP streamable HTTP (the image's
                                                  ``mcp`` package): mcp_echo, mcp_sum.
                                                  Optional: when it cannot start,
@@ -23,12 +36,14 @@ usage: python mock_tools.py [--port 9111] [--mcp-port 9112]
 
 import argparse
 import asyncio
+import itertools
+import json
 import logging
 import threading
 import time
 import warnings
 
-from aiohttp import web
+from aiohttp import WSMsgType, web
 
 from common import REQUESTS_KEY, new_app, record
 
@@ -39,8 +54,13 @@ MCP_PORT = 9112
 # as the tool name, the pipe declares it as _gemini_function_name("lookup.v2").
 LOOKUP_OPERATION = "lookup.v2"
 
+# What the Jupyter mock answers an execute_request with (stdout, text/plain result)
+JUPYTER_STDOUT = "JUPYTER-MOCK-STDOUT"
+JUPYTER_RESULT = "'JUPYTER-MOCK-RESULT'"
+
 # record of the running process (shared by the OpenAPI app and the MCP thread)
 _CALLS: list = []
+_kernel_ids = itertools.count(1)
 
 
 def spec(port: int = PORT) -> dict:
@@ -135,6 +155,66 @@ async def lookup(request: web.Request) -> web.Response:
     return web.json_response({"key": request.query.get("key"), "found": True})
 
 
+# ------------------------------------------------------------------- Jupyter
+async def jupyter_start_kernel(request: web.Request) -> web.Response:
+    await record(request)
+    return web.json_response({"id": f"e2e-kernel-{next(_kernel_ids)}", "name": "py"})
+
+
+async def jupyter_delete_kernel(request: web.Request) -> web.Response:
+    await record(request)
+    return web.Response(status=204)
+
+
+def _jupyter_message(parent: dict, msg_type: str, content: dict) -> str:
+    return json.dumps(
+        {
+            "header": {"msg_id": f"mock-{time.time_ns()}", "msg_type": msg_type},
+            "parent_header": parent,
+            "msg_type": msg_type,
+            "metadata": {},
+            "content": content,
+            "channel": "iopub",
+        }
+    )
+
+
+async def jupyter_channels(request: web.Request) -> web.WebSocketResponse:
+    """Kernel websocket: answer every execute_request like a kernel would."""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    async for message in ws:
+        if message.type != WSMsgType.TEXT:
+            continue
+        try:
+            data = json.loads(message.data)
+        except ValueError:
+            continue
+        header = data.get("header") or {}
+        if header.get("msg_type") != "execute_request":
+            continue
+        _CALLS.append(
+            {
+                "t": time.time(),
+                "method": "WS",
+                "path": "jupyter:execute",
+                "kernel": request.match_info["kernel"],
+                "body": {"code": (data.get("content") or {}).get("code")},
+            }
+        )
+        for msg_type, content in (
+            ("status", {"execution_state": "busy"}),
+            ("stream", {"name": "stdout", "text": JUPYTER_STDOUT + "\n"}),
+            (
+                "execute_result",
+                {"data": {"text/plain": JUPYTER_RESULT}, "execution_count": 1},
+            ),
+            ("status", {"execution_state": "idle"}),
+        ):
+            await ws.send_str(_jupyter_message(header, msg_type, content))
+    return ws
+
+
 def make_app(port: int = PORT) -> web.Application:
     app = new_app(fault_injection=False)
     app[REQUESTS_KEY] = _CALLS  # the MCP tools record into the same list
@@ -143,6 +223,9 @@ def make_app(port: int = PORT) -> web.Application:
     app.router.add_get("/weather", weather)
     app.router.add_post("/convert", convert)
     app.router.add_get("/lookup", lookup)
+    app.router.add_post("/jupyter/api/kernels", jupyter_start_kernel)
+    app.router.add_get("/jupyter/api/kernels/{kernel}/channels", jupyter_channels)
+    app.router.add_delete("/jupyter/api/kernels/{kernel}", jupyter_delete_kernel)
     return app
 
 

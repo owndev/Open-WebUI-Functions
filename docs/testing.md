@@ -63,20 +63,20 @@ function versions: google_gemini.py 1.19.0, azure_ai_foundry.py 3.0.0, n8n.py 2.
 ...
 [PASS ] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names, and changing it back restores them
 ...
-SUMMARY: 537 PASS, 0 FAIL, 0 KNOWN in 1110s
+SUMMARY: 547 PASS, 0 FAIL, 0 KNOWN in 1110s
 total runtime: 1147s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
-A full run of all suites took about 19 minutes on a shared 8-CPU Docker host (1120-1169 s;
-1147 s with `google_gemini.py` 1.19.0: 37 s container start-up, then gemini 322 s, azure
-422 s, n8n 71 s, infomaniak 36 s, filters 257 s). Most of it is waiting: the azure `rag`
-group adds about 5.5 minutes (query-generation timeouts, the query-generation pause and
-the 45 s retrieval limit are waited for; in the meta-test, where every mock answers HTTP
-500, its requests fail at once), the gemini `tools`, `toolsapi` and `imgedit` groups about 2.5
-minutes and the filters `ingest` group (Logs Ingestion API) another 2.5 minutes. The
-browser scenarios of the gemini `thinking` group (paced streams for the live block and
-its duration, Stop while thinking, a tool round) take about 20 s.
+A full run of all suites took about 19 minutes on a shared 8-CPU Docker host (1147 s:
+37 s container start-up, then gemini 322 s, azure 422 s, n8n 71 s, infomaniak 36 s,
+filters 257 s). Most of it is waiting: the azure `rag` group adds about 5.5 minutes (query-generation timeouts, the query-generation pause and the
+45 s retrieval limit are waited for; in the meta-test, where every mock answers HTTP
+500, its requests fail at once), the gemini `tools`, `toolsapi`, `imgedit` and
+`owuitools` groups about three minutes and the filters `ingest` group (Logs Ingestion
+API) another 2.5 minutes. The browser scenarios of the gemini `thinking` group (paced
+streams for the live block and its duration, Stop while thinking, a tool round) take
+about 20 s.
 Network downloads on first use come on top
 (`pip install google-genai` when the Gemini function is created, the tiktoken encodings
 the `filters` suite caches before its first scenario). How many checks each suite has
@@ -146,7 +146,7 @@ events), a **background title task** and that the server log has no unexpected
 
 | Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
-| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py` | `models` (image / video indicators, display names #172), `api` (thinking in the `<details type="reasoning" done="true" duration="N">` block, full usage), `thinking` (summaries not replayed #176: the plain block of chats saved before 1.19.0 and the `type="reasoning"` blocks, also a stopped `done="false"` one; budget, level, include and strip valves; browser path: the live `done="false"` block through throttled `replace` events, no thinking status, the switch to `done="true"` with all thoughts on the first answer part and deltas after it, the duration up to the first answer part (mock trigger `paced-thinking`), Stop while thinking and the next turn without the block (`slow-thinking`), a tool round that clears its live block), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file, the thinking block), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history, where the limit keeps the current and the newest images and cuts more current images than it allows; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations, Open WebUI's search statuses (the queries, then `Searched {{count}} sites` with `items` and no `urls`); no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `imgedit` (image editing across turns, #194: in a saved chat the image of turn 1, attached as a file only, is sent with the edit request on `gemini-3.1-flash-image` and `gemini-nano-banana-2.1`; the follow-up task gets no images; uploads between generated turns in the default mode, with another image per turn (the mock's `final-image-<n>` trigger) so their order shows; guided regeneration, also of an image-only message and of a text contained in the guidance; `IMAGE_HISTORY_MAX_REFERENCES` keeps the upload of the edit message, else the newest images; an image attached again is sent once and counts at its newest place (with `IMAGE_DEDUP_HISTORY=false` it is sent each time); older saved forms (a data: URL image file, markdown links to a file and to a data: URL; a text file is not sent); a temporary chat and a database error (injected by a test-only filter) take the history from the request; an image file of another user in a non-admin user's chat, in a markdown link on the API path and on the Veo path is not read (logged without its id), an admin continuing the user's chat reads it), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), a text answer to a request with tools (`finish_reason` `stop`), `GOOGLE_STREAMING_ENABLED=false`, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` streamed and non-streamed, continuation with and without signatures and with `reasoning_details` under `provider_specific_fields`, older turns with a thinking summary, empty arguments, content parts, a numeric id and a `function` that is not an object, `tool_choice` (also an undeclared name and with Search grounding on Gemini 3), name mapping (also a trailing newline) and duplicates, the `default_api.` prefix, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls (responses in call order), two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, a tool result with an image, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 (the sources of both rounds, the next turn without web search) and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off, `GOOGLE_STREAMING_ENABLED=false`; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)) |
+| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py`, `mock_tools.py` (tool servers, Jupyter) | `models` (image / video indicators, display names #172), `api` (thinking in the `<details type="reasoning" done="true" duration="N">` block, full usage), `thinking` (summaries not replayed #176: the plain block of chats saved before 1.19.0 and the `type="reasoning"` blocks, also a stopped `done="false"` one; budget, level, include and strip valves; browser path: the live `done="false"` block through throttled `replace` events, no thinking status, the switch to `done="true"` with all thoughts on the first answer part and deltas after it, the duration up to the first answer part (mock trigger `paced-thinking`), Stop while thinking and the next turn without the block (`slow-thinking`), a tool round that clears its live block), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file, the thinking block), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history, where the limit keeps the current and the newest images and cuts more current images than it allows; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations, Open WebUI's search statuses (the queries, then `Searched {{count}} sites` with `items` and no `urls`); no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `imgedit` (image editing across turns, #194: in a saved chat the image of turn 1, attached as a file only, is sent with the edit request on `gemini-3.1-flash-image` and `gemini-nano-banana-2.1`; the follow-up task gets no images; uploads between generated turns in the default mode, with another image per turn (the mock's `final-image-<n>` trigger) so their order shows; guided regeneration, also of an image-only message and of a text contained in the guidance; `IMAGE_HISTORY_MAX_REFERENCES` keeps the upload of the edit message, else the newest images; an image attached again is sent once and counts at its newest place (with `IMAGE_DEDUP_HISTORY=false` it is sent each time); older saved forms (a data: URL image file, markdown links to a file and to a data: URL; a text file is not sent); a temporary chat and a database error (injected by a test-only filter) take the history from the request; an image file of another user in a non-admin user's chat, in a markdown link on the API path and on the Veo path is not read (logged without its id), an admin continuing the user's chat reads it), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), a text answer to a request with tools (`finish_reason` `stop`), `GOOGLE_STREAMING_ENABLED=false`, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` streamed and non-streamed, continuation with and without signatures and with `reasoning_details` under `provider_specific_fields`, older turns with a thinking summary, empty arguments, content parts, a numeric id and a `function` that is not an object, `tool_choice` (also an undeclared name and with Search grounding on Gemini 3), name mapping (also a trailing newline) and duplicates, the `default_api.` prefix, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls (responses in call order), two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, a tool result with an image, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 (the sources of both rounds, the next turn without web search) and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off, `GOOGLE_STREAMING_ENABLED=false`; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)), `owuitools` (Open WebUI's built-in `generate_image`, `edit_image` and `execute_code` called by a Gemini text model: declared only with the chat toggles and for browser sessions, `edit_image` only with image editing on; the image engine `gemini` with `generateContent` and with `predict` (Imagen), editing an upload and the image of the previous turn, the image saved with the answer and its URL sent back to Gemini; a pipe image model makes its own image; the code interpreter with pyodide (the browser runs the code) and with Jupyter; see [Open WebUI's image and code tools](#open-webuis-image-and-code-tools-geminiowuitools)) |
 | `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; answers prompts with a `<documents>` block like a plain model, without `context`; query generation, embeddings, tool calls, a ~300 KB and a > 4 MiB stream event, `content: null`), `mock_search.py` (Azure AI Search and an App Service managed identity token endpoint, see below) | `valves` (from 3.0.0 also the `AZURE_AI_SEARCH_*` valves, their defaults, enums and the password input of the key, and no `AZURE_AI_SEARCH_MODE`), `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 (exactly Azure's message, nothing appended) and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status with exactly Azure's message), `tasks` (title task, also with Azure AI Search valves, #123), `rag` (the pipe's own Azure AI Search retrieval, 3.0.0, #187; `suites/_azure_rag.py`: API and browser path, stream and non-stream, Foundry `/models` endpoint; search request body per `query_type`, query text rules, embeddings for `deployment_name` (v1 route, gateway prefix, Bearer) and `endpoint` (api-version, own key or access token, chat key only on the same scheme, host and port), integrated vectorizer; `fields_mapping` with `select`, separator and fallback, list-valued titles; `filter`, `top_n_documents` (2 x candidates), `strictness` (per query), the api-version valve, the document budget (auto, also with a large `top_n_documents`, valve, unlimited, dropping a document); prompt placement, one block and one system message, `in_scope` and the tool-results clause, `role_information`, sanitizing (also nested tags, titles and file names), list and image-only content, Open WebUI's tool-images message, an attached file (`<attached_files>` and RAG template around the prompt); citations, `context` event and `message.context`, scores per score type and with `AZURE_AI_INCLUDE_SEARCH_SCORES` off; `[docX]` → links, also split across stream deltas (API and browser, also without a finish chunk; in API streams all text before `[DONE]` and nothing after it), already linked or with parentheses in the URL (stream and non-stream), with a dotted deployment name; links in the history sent back as `[docX]` (also links saved before 2.8.0 with `)` in the URL; a hostile history line in linear time); only referenced sources saved and the show-all valve (also for an answer that cites only a document the search did not return, `[doc9]`, or one next to `[doc1]`); a context event over 128 KiB, an upstream event of ~300 KB (read and passed on) and one over 4 MiB (an error, API and browser); `content: null`; tool rounds (one search, reused only by a tool round of the same message with unchanged valves, no duplicate sources also when the tool round references a document, a non-stream tool call), tools and `stream_options` forwarded, tasks without retrieval and without `data_sources` (also for a saved chat without a websocket session); query generation (follow-ups, `always` / `off`, transcript with Open WebUI's conversation summary, max queries, `<think>` with draft queries, fallback also for JSON nested too deep, partial and all-failed results, merge order by reciprocal rank fusion and reranker score, model in the body, the pause after 3 timeouts in a row: per model, reset by a success, still on after 16 s); auth: key, key valve, access token, system- and user-assigned managed identity (`mi_res_id`), token errors; fail-closed errors with a terminal status (HTTP 500/403/402/404/400/302/429/503, connection, retries, the 45 s retrieval limit, an answer larger than 16 MB, configuration errors, client `data_sources` (API stream and non-stream and the browser path as from an inlet filter: the error naming the removal of On Your Data in 3.0.0, the pipe's ERROR line and the terminal error status, nothing forwarded; an empty list is ignored), `context_length_exceeded` (exactly Azure's message and the budget hint)); Stop during a search and during query generation; `AZURE_AI_SEARCH_MODE=on_your_data` stored by a 2.9.0 pre-release or set in the environment is ignored; `log.debug`: the staged file run in the driver process with every logger at DEBUG logs no key or token, see below; `notice.none`: no On Your Data retirement notice of 2.8.1 in the server log), `logs` (no API key, no search key or token, no citation text, no generated queries, document titles or URLs in the server log at INFO and above) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
@@ -208,27 +208,26 @@ query generation, errors, client `data_sources` with a key, also streamed); no l
 contain a key or token.
 
 Checks per suite on Open WebUI v0.11.4-slim in strict known mode (observed 2026-10-10,
-`main` d3184b9: Azure pipeline 3.0.0, Time Token Tracker 2.7.0 with the Logs Ingestion
-API, native tool calling in `google_gemini.py` 1.18.0 with the #194 fix; plus the
-`NAME_PREFIX` fix in `infomaniak.py` 2.2.2; `main` ecac3fb plus `google_gemini.py`
-1.19.0 with the native reasoning block, 6 more gemini checks):
+`main` 2fc7bcc: Azure pipeline 3.0.0, Time Token Tracker 2.7.0 with the Logs Ingestion
+API, native tool calling in `google_gemini.py` 1.18.0 with the #194 fix, the
+`NAME_PREFIX` fix in `infomaniak.py` 2.2.2 and the 10 `gemini.owuitools` checks; plus
+`google_gemini.py` 1.19.0 with the native reasoning block, 6 more gemini checks):
 
 | Suite | Checks | PASS / KNOWN |
 | --- | ---: | ---: |
-| `gemini` | 155 | 155 / 0 |
+| `gemini` | 165 | 165 / 0 |
 | `azure` | 198 | 198 / 0 |
 | `n8n` | 51 | 51 / 0 |
 | `infomaniak` | 32 | 32 / 0 |
 | `filters` | 101 | 101 / 0 |
-| **all** | **537** | **537 / 0** |
+| **all** | **547** | **547 / 0** |
 
 No FAIL and no obsolete marker; `v0.11.3-slim` gives the same counts for every suite
-(with `google_gemini.py` 1.19.0 the gemini suite was rerun there: 155 / 0). The checks of
-the 1.19.0 thinking block and search statuses carry no marker either: with
-`google_gemini.py` 1.18.0, 12 of the 32 checks of `--only
-'gemini.(api|thinking|browser|grounding|image)$'` FAIL (`api.nonstream` / `.stream`,
-`browser.stream` / `.nonstream`, `image.browser-preview` / `-ga`,
-`thinking.strip-reasoning`, `.live`, `.duration`, `.stop`, `.tool-round` and
+(measured there for the gemini suite: 165 / 0). The checks of the 1.19.0 thinking block
+and search statuses carry no marker either: with `google_gemini.py` 1.18.0, 12 of the 32
+checks of `--only 'gemini.(api|thinking|browser|grounding|image)$'` FAIL
+(`api.nonstream` / `.stream`, `browser.stream` / `.nonstream`, `image.browser-preview` /
+`-ga`, `thinking.strip-reasoning`, `.live`, `.duration`, `.stop`, `.tool-round` and
 `grounding.status`); `toolsapi.unchanged` checks the same block shape.
 No known bug is registered (`harness/known_n8n.py` has no entry): the last one,
 `infomaniak-name-prefix` (the `NAME_PREFIX` valve was read only once), was fixed in
@@ -347,6 +346,48 @@ their checks as FAIL (42 of the 48 with 1.17.0). Open WebUI 0.11.4's approval de
 (an approved call loses its result in the saved message; with two calls only the first
 is asked and the second is not run) are only recorded in the detail of
 `tools.approval-parallel`, never asserted.
+
+### Open WebUI's image and code tools (`gemini.owuitools`)
+
+The group lives in `tests/e2e/suites/_gemini_owuitools.py` (run by `suites/gemini.py`
+after `tools`). It checks that Open WebUI's own built-in tools `generate_image`,
+`edit_image` (Open WebUI's image engine `gemini`) and `execute_code` (code interpreter)
+work with a Gemini text model through Open WebUI's tool loop. It switches on **Admin
+Settings → Images** with the engine `gemini` against the Gemini mock
+(`IMAGES_GEMINI_API_BASE_URL=<mock>/v1beta`, keys `mock-images-key` and
+`mock-images-edit-key`, by which the mock record tells the engine's requests from the
+pipe's), image editing with `gemini-3.1-flash-image` and the code interpreter with the
+engine pyodide, and restores both settings at its end. The `MOCKTOOLS:` directive makes
+Gemini call the tool:
+
+| Check | What it shows |
+| --- | --- |
+| `owuitools.api` | API path with both feature flags on: none of the three tools is declared (Open WebUI adds built-in tools for browser sessions only); `pyodide_note=` records, without asserting it, that Open WebUI still adds its pyodide note to the system prompt |
+| `owuitools.declared` | browser path: with `features.image_generation` and `features.code_interpreter` (the chat toggles) all three are declared and Open WebUI's pyodide note is in the system instruction; without them none |
+| `owuitools.declared-noedit` | `ENABLE_IMAGE_EDIT=false`: `generate_image` without `edit_image` |
+| `owuitools.generate` | `generate_image` with the endpoint method `generateContent` (`gemini-2.5-flash-image`): the engine request (path, key, prompt), the image saved with the answer (message `files`, `chat:message:files`) with the bytes the mock returned, the tool result with its URL in the continuation, the final answer |
+| `owuitools.generate-predict` | the same with `predict` (`imagen-4.0-generate-001`, the mock's `:predict` route) |
+| `owuitools.edit` | `edit_image` on an upload: the request to Gemini names the file's URL in `<attached_files>`, the edit engine gets the uploaded image, the edited image is saved |
+| `owuitools.edit-followup` | `edit_image` in the next turn on the image of `owuitools.generate`: the replayed tool result holds its URL, the edit engine gets that image |
+| `owuitools.image-model` | a pipe image model with the Image toggle on: no function declarations, its own image is saved, the engine is not called |
+| `owuitools.code` | `execute_code`, engine pyodide: the browser session gets `execute:python` (the code, its session id), its stdout is the tool result; an image line in it is uploaded and linked |
+| `owuitools.code-jupyter` | engine jupyter: the Jupyter mock starts a kernel, runs the code and deletes the kernel; no `execute:python`, no pyodide note; stdout and result reach Gemini |
+
+The Jupyter mock is part of `mocks/mock_tools.py` (`http://127.0.0.1:9111/jupyter/`:
+`POST api/kernels`, the kernel websocket `api/kernels/<id>/channels`, which answers an
+`execute_request` with stdout `JUPYTER-MOCK-STDOUT`, the result `'JUPYTER-MOCK-RESULT'`
+and status idle, and `DELETE api/kernels/<id>`; the executed code is recorded with the
+path `jupyter:execute`). `BrowserSession` acks `execute:python` with
+`python_answer(data)` (default `None`, an empty ack; the web UI acks with the result of
+its pyodide worker, `{stdout, stderr, result}`) and records the calls in
+`python_calls`. `mock_gemini.py` answers the image engine: the `generateContent`
+request of an image model like any image request (without thoughts, the engine asks for
+none), `:predict` with `predictions` (the `final-image-<n>` trigger in the prompt picks
+the PNG). Details start with `mock_ok=` as in the tool groups; the extra tokens are
+`engine=[action:model:key]`, `file_ok=` and `sent_ok=`. Against `google_gemini.py`
+1.17.0, which handed the tools to google-genai's automatic function calling, 6 of the
+10 checks FAIL (`generate`, `generate-predict`, `edit`, `edit-followup`, `code`,
+`code-jupyter`).
 
 ### API path vs. browser path
 
@@ -533,11 +574,12 @@ harness/             driver library: owui.py (REST client, API-path chat, valves
                      suite.py, config.py
 suites/              one module per suite: GROUPS + async def run(t: Suite); _*.py are
                      helper modules of a suite, not suites (_azure_rag.py: the azure rag
-                     group; _gemini_tools.py: gemini.tools / toolsapi)
+                     group; _gemini_tools.py: gemini.tools / toolsapi;
+                     _gemini_owuitools.py: gemini.owuitools)
 mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 and :9106 in
-                     the container), tool servers mock_tools.py (OpenAPI :9111, MCP :9112, no
-                     E2E_MOCK_FAULT); mock_la.py (Log Analytics) is started by the filters
-                     suite (:443, :9105, :9107)
+                     the container), tool servers mock_tools.py (OpenAPI and Jupyter :9111,
+                     MCP :9112, no E2E_MOCK_FAULT); mock_la.py (Log Analytics) is started
+                     by the filters suite (:443, :9105, :9107)
 probe/probe_pipe.py  test-only pipe reporting what Open WebUI passes to a pipe
 probe/workspace_tool.py  test-only workspace Python tool (gemini.tools)
 ```
