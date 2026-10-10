@@ -9,7 +9,8 @@ Run every provider mock in one process (used by tests/e2e/run.sh).
   tools       127.0.0.1:9111   mock_tools.py (OpenAPI tool server; no E2E_MOCK_FAULT)
   mcp         127.0.0.1:9112   mock_tools.py (MCP tool server, optional)
 
-(9105 is the control port of mock_la.py, which the filters suite starts.)
+(9105 and 9107 are the control and managed identity ports of mock_la.py, which
+the filters suite starts.)
 
 usage:
   python serve_all.py              # serve until stopped

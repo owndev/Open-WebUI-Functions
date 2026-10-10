@@ -268,10 +268,10 @@ The functions include a built-in encryption mechanism for sensitive information:
 - Falls back to an estimate (about 4 characters per token) while no `tiktoken` encoding is loaded, for example on offline installations without a `tiktoken` cache, so the chat still goes through. The encoding is downloaded in the background; requests do not wait for it (the very first one at most 5 seconds). Estimated counts are marked: `tokensEstimated` in the Log Analytics record and the log line, `~` in the status message.
 - Also works for API requests. Since Open WebUI 0.10, the filter's outlet step runs for them too. There is no chat window to show a status message, but the metrics are still logged and sent to Log Analytics.
 - On Open WebUI 0.11, response time and request tokens stay correct when Open WebUI adds RAG context or a code interpreter prompt to the user message after the filter's inlet step.
-- Optionally sends logs to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`). The record is sent in the background with a 10 second timeout, so responses do not wait for Log Analytics.
+- Optionally sends a record per response to an [Azure Log Analytics Workspace](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/log-analytics-workspace-overview) (`SEND_TO_LOG_ANALYTICS=true`) in the background (10 second timeout), so responses do not wait for Log Analytics: through the **Logs Ingestion API** (data collection rule; Microsoft Entra ID with a client secret, a managed identity on App Service / Functions / Container Apps / VMs, or AKS workload identity), or through the deprecated HTTP Data Collector API as a fallback. `LOG_ANALYTICS_INGESTION_API` selects `auto` (default), `logs_ingestion`, `data_collector` or `both`.
 
 > [!WARNING]
-> The filter uses the Azure Monitor HTTP Data Collector API. Microsoft ended support for it on September 14, 2026; ingestion still works, but not for workspaces behind Azure Monitor Private Link (AMPLS). The [Logs ingestion API](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/custom-logs-migrate) that replaces it is not supported yet. See [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md).
+> Microsoft ended support for the HTTP Data Collector API on September 14, 2026; ingestion still works (TLS 1.2+), but not with Azure Monitor Private Link (AMPLS). Since 2.7.0 the filter supports the [Logs Ingestion API](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-ingestion-api-overview) that replaces it, and logs a one-time warning while it still uses the Data Collector API. See [How to set up Azure Log Analytics](./docs/setup-azure-log-analytics.md), including how to migrate the existing `OpenWebuiMetrics_CL` table and keep its column names.
 
 🔗 [Time Token Tracker in Open WebUI](https://openwebui.com/f/owndev/time_token_tracker)
 
@@ -323,7 +323,7 @@ tests/e2e/run.sh --image v0.11.3-slim gemini  # one suite on another Open WebUI 
 tests/e2e/check_owui_api.sh latest            # static check of the Open WebUI APIs the functions use
 ```
 
-The five suites (gemini, azure, n8n, infomaniak, filters) run about 300 checks in 7-10 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
+The five suites (gemini, azure, n8n, infomaniak, filters) run about 500 checks in 15-20 minutes. Results are reported as `PASS`, `FAIL` or `KNOWN` (a failure that matches a registered known bug, shown with its issue and the branch with the pending fix). See the [testing guide](./docs/testing.md) for options, debugging and how to add scenarios.
 
 ## 💪 Contributing
 
