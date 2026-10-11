@@ -805,9 +805,13 @@ It reads every `from open_webui... import ...` and `import open_webui...` in
 `pipelines/` and `filters/`, fetches the corresponding Open WebUI backend modules at that
 tag (`gh api` when authenticated, otherwise `curl` from raw.githubusercontent.com) and
 checks that each imported module and symbol, each method called on it
-(`Users.get_user_by_id`, ...) and each injected `__param__` still exists; definitions
+(`Users.get_user_by_id`, ...) and each injected `__param__` still exists. An imported
+name may also be a submodule (`from open_webui.utils.access_control import files`); then
+the functions called on it (or on its `as` alias) are checked like methods. Definitions
 marked legacy/deprecated are reported as `WARN` (for example `SRC_LOG_LEVELS` is an empty
-legacy dict since 0.10, so per-module log levels have no effect). It also prints the
+legacy dict since 0.10, so per-module log levels have no effect), and so is a missing
+method that the function looks up with `getattr(obj, "name")` first and works without
+(`Chats.get_accessible_chat_by_id`, new in 0.12, is missing on 0.11.x). It also prints the
 frontmatter of every function, the event types Open WebUI persists and the versions of
 shared dependencies. A fetch that fails for another reason than "not found" is tried
 3 times; if it still fails the result is `incomplete` (exit 2) rather than a missing
