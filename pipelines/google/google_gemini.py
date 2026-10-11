@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.19.1
+version: 1.20.0
 required_open_webui_version: 0.9.0
 requirements: google-genai>=1.68.0, google-genai<3
 license: Apache License 2.0
@@ -17,7 +17,8 @@ features:
   - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
-  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, each image once; the pipeline reads only files of the requesting user)
+  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, each image once; only files the requesting user may read)
+  - Shared chats with "Allow replies" (Open WebUI 0.12+): participants edit the images of the chat too; who may continue a chat and read its files follows Open WebUI's own access checks, generated images are linked to the chat like Open WebUI's own
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
   - Extra image generation model IDs configurable without a code change
   - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
@@ -72,6 +73,7 @@ import copy
 import hashlib
 import importlib
 import importlib.metadata
+import inspect
 import json
 import logging
 import io
@@ -106,6 +108,44 @@ try:  # Open WebUI 0.9+: the message chain of a saved chat (image history)
     from open_webui.utils.misc import get_message_list
 except ImportError:  # without it, image history comes from the request only
     get_message_list = None
+
+try:  # Open WebUI's own file access check (used as _shared_chat_access says)
+    from open_webui.utils.access_control import files as owui_file_access
+except Exception:  # without it, files are read for their owner and admins only
+    owui_file_access = None
+
+
+def _shared_chat_access() -> bool:
+    """Whether Open WebUI's own checks decide who may continue a chat and read
+    the files of other users.
+
+    Open WebUI 0.12 lets a chat or folder be shared with "Allow replies": its
+    participants write in the owner's chat. Its checks are then
+    Chats.get_accessible_chat_by_id(id, user, permission="write") for continuing
+    a chat (what chat_completion asks before it calls a pipe) and, for a file
+    that is not the user's own, has_access_to_file(file_id, "read", user).
+    Detected by their shape, not by a version: get_accessible_chat_by_id with a
+    ``permission`` keyword (0.12+) and an async has_access_to_file (0.11 has
+    one too, without the shared chats and folders of 0.12, so it is used only
+    together with the chat check). Without them the pipeline keeps its own
+    rule: the owner or an admin, as Open WebUI up to 0.11.
+    """
+    check_chat = getattr(Chats, "get_accessible_chat_by_id", None)
+    check_file = getattr(owui_file_access, "has_access_to_file", None)
+    if check_chat is None or check_file is None:
+        return False
+    try:
+        parameters = inspect.signature(check_chat).parameters
+    except (TypeError, ValueError):
+        return False
+    return (
+        "permission" in parameters
+        and inspect.iscoroutinefunction(check_chat)
+        and inspect.iscoroutinefunction(check_file)
+    )
+
+
+OWUI_SHARED_CHAT_ACCESS = _shared_chat_access()
 
 
 def _unload_stale_modules() -> None:
@@ -662,10 +702,10 @@ class Pipe:
 
         Returns None when there is no saved chat (API clients, temporary and
         channel chats), for background tasks (titles, follow-ups and the like
-        get Open WebUI's task prompt, not the chat's images), when the chat
-        belongs to another user (admins may use any chat, like in Open WebUI),
-        on Open WebUI versions without get_message_list and on errors: the
-        image history then comes from the request's messages.
+        get Open WebUI's task prompt, not the chat's images), when the user
+        may not continue the chat (see _may_continue_chat), on Open WebUI
+        versions without get_message_list and on errors (also of the access
+        check): the image history then comes from the request's messages.
         """
         metadata = __metadata__ or {}
         user = __user__ or {}
@@ -681,9 +721,7 @@ class Pipe:
         ):
             return None
         try:
-            if user.get("role") != "admin" and not await Chats.is_chat_owner(
-                chat_id, user["id"]
-            ):
+            if not await self._may_continue_chat(chat_id, user):
                 return None
             messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
             chain = get_message_list(messages_map or {}, user_message_id)
@@ -691,6 +729,62 @@ class Pipe:
             self.log.warning(f"Could not load chat {chat_id} for image history: {e}")
             return None
         return [m for m in chain if isinstance(m, dict)] or None
+
+    @staticmethod
+    async def _may_continue_chat(chat_id: str, user: Dict[str, Any]) -> bool:
+        """Whether ``user`` may continue the saved chat, so that its history
+        (files of other users included) may be read for the image history.
+
+        With Open WebUI's own checks (_shared_chat_access, Open WebUI 0.12+)
+        exactly what Open WebUI asks before it calls the pipe:
+        Chats.get_accessible_chat_by_id(chat_id, user, permission="write"),
+        which allows the owner and the participants of a chat or folder shared
+        with "Allow replies" (users or groups), but an admin only like any
+        other user (read access to other users' chats does not allow
+        continuing them). Otherwise the owner or an admin, as Open WebUI up to
+        0.11. Errors propagate; the caller refuses then.
+        """
+        if OWUI_SHARED_CHAT_ACCESS:
+            account = await Users.get_user_by_id(user["id"])
+            if account is None:
+                return False
+            chat = await Chats.get_accessible_chat_by_id(
+                chat_id, account, permission="write"
+            )
+            return bool(chat)
+        if user.get("role") == "admin":
+            return True
+        return bool(await Chats.is_chat_owner(chat_id, user["id"]))
+
+    async def _may_read_file(self, file_obj: Any, user: Dict[str, Any]) -> bool:
+        """Whether ``user`` may read an Open WebUI file (``file_obj``, whose id a
+        message may name freely, e.g. in a markdown link of an API client).
+
+        Like Open WebUI's own GET /api/v1/files/{id}/content: the owner, an
+        admin and, with Open WebUI's own checks (_shared_chat_access, Open WebUI
+        0.12+), whoever has_access_to_file(id, "read", user) lets read the file
+        (e.g. the participants of a shared chat it is attached to, the members
+        of a knowledge base or channel). Errors refuse, and the file id stays
+        out of the log.
+        """
+        user_id = user.get("id")
+        if (user_id and file_obj.user_id == user_id) or user.get("role") == "admin":
+            return True
+        if not user_id or not OWUI_SHARED_CHAT_ACCESS:
+            return False
+        try:
+            account = await Users.get_user_by_id(user_id)
+            if account is None:
+                return False
+            allowed = await owui_file_access.has_access_to_file(
+                file_obj.id, "read", account
+            )
+        except Exception as e:
+            self.log.warning(
+                f"File access check failed for user {user_id}: {type(e).__name__}"
+            )
+            return False
+        return allowed is True
 
     @staticmethod
     def _saved_image_file_url(file: Any) -> Optional[str]:
@@ -1820,6 +1914,51 @@ class Pipe:
             self.log.warning(f"Failed to emit generated image files: {emit_error}")
             return False
 
+    async def _link_chat_files(
+        self,
+        files: List[Dict[str, Any]],
+        __metadata__: Optional[Dict[str, Any]],
+    ) -> None:
+        """Link uploaded generated files to their chat message (chat_file rows).
+
+        Open WebUI does the same for the images of its own image generation
+        (routers/images.py upload_image) and for uploads, and this pipeline for
+        Veo videos. Open WebUI's file access follows these links: the
+        participants of a chat shared with "Allow replies" (and the viewers of
+        a shared chat) may then read the images, in the web UI and in the image
+        history of their turns. Open WebUI links a file only when the user may
+        read it. Saved chats only.
+        """
+        metadata = __metadata__ or {}
+        chat_id = str(metadata.get("chat_id") or "")
+        message_id = metadata.get("message_id")
+        user_id = metadata.get("user_id")
+        if (
+            not chat_id
+            or not message_id
+            or not user_id
+            or chat_id.startswith(UNSAVED_CHAT_ID_PREFIXES)
+        ):
+            return
+        file_ids = []
+        for entry in files:
+            match = re.search(r"/files/([A-Za-z0-9_-]+)", str(entry.get("url") or ""))
+            if match and match.group(1) not in file_ids:
+                file_ids.append(match.group(1))
+        if not file_ids:
+            return
+        try:
+            await Chats.insert_chat_files(
+                chat_id=chat_id,
+                message_id=message_id,
+                file_ids=file_ids,
+                user_id=user_id,
+            )
+        except Exception as e:
+            self.log.warning(
+                f"Failed to link generated image files to the chat message: {e}"
+            )
+
     async def _emit_generated_video_files(
         self,
         video_files: List[Dict[str, Any]],
@@ -1933,6 +2072,8 @@ class Pipe:
             files_emitted = await self._emit_generated_image_files(
                 generated_image_files, __event_emitter__
             )
+            if files_emitted:
+                await self._link_chat_files(generated_image_files, __metadata__)
 
         if generated_image_files and not files_emitted:
             generated_images.extend(
@@ -3144,9 +3285,11 @@ class Pipe:
         """
         Fetch a file from Open WebUI's file system and convert to base64.
 
-        Only files of the requesting user are read (an admin may read every
-        file), like Open WebUI's own image resolver: a message can name any
-        file id, for example in a markdown link sent by an API client.
+        Only files the requesting user may read are read (see _may_read_file:
+        the user's own files, every file for an admin, and on Open WebUI 0.12+
+        the files Open WebUI lets the user read, e.g. those of a chat shared
+        with the user): a message can name any file id, for example in a
+        markdown link sent by an API client.
 
         Args:
             file_url: File URL from Open WebUI
@@ -3166,15 +3309,16 @@ class Pipe:
 
             file_obj = await Files.get_file_by_id(fid)
             user = __user__ or {}
-            if (
-                file_obj
-                and file_obj.user_id != user.get("id")
-                and user.get("role") != "admin"
-            ):
+            if file_obj and not await self._may_read_file(file_obj, user):
                 # the file id of another user stays out of the log
                 self.log.warning(
                     f"Not reading a file for user {user.get('id') or '?'}: it "
                     "does not belong to the requesting user"
+                    + (
+                        " and Open WebUI grants no read access to it"
+                        if OWUI_SHARED_CHAT_ACCESS
+                        else ""
+                    )
                 )
                 return None
             if file_obj and file_obj.path:
