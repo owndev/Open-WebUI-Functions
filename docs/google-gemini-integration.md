@@ -95,7 +95,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
   Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. The headers always belong to the user of the request, also with concurrent requests of several users. Also, change the base URL for the Google Generative AI API if needed.
 
 - **Native tool calling**  
-  Tools offered by Open WebUI (built-in, workspace, MCP, OpenAPI, terminal and direct tools) are declared to Gemini, and Open WebUI runs Gemini's tool calls, including tool approval. API clients get the calls back as OpenAI `tool_calls`. See [Native tool calling](#native-tool-calling).
+  Tools offered by Open WebUI (built-in, workspace, MCP, OpenAPI, terminal and direct tools) are declared to Gemini, and Open WebUI runs Gemini's tool calls, including tool approval. API clients get the calls back as OpenAI `tool_calls`. Works with Open WebUI 0.12's Tool Search and with context compaction between tool rounds. See [Native tool calling](#native-tool-calling).
 
 ## Environment Variables
 
@@ -759,7 +759,7 @@ Gemini 3 requires the thought signatures of its function calls back in the follo
 - In a turn with tool calls, Gemini's thinking appears as Open WebUI's own "Thought for N seconds" block. The duration can read 0 seconds, because the thoughts of a round arrive together with its tool calls. With `GOOGLE_INCLUDE_THOUGHTS=false` Gemini 3 still sends thought signatures, so the block appears without content for every tool round.
 - Answers without tool calls show the thinking as a `<details type="reasoning">` block in the answer, which Open WebUI renders as the same localized block (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 - The answer after a tool call is streamed as it arrives. It has no inline `[1]` citation markers; its Google Search sources are still attached.
-- For a chat request with `stream=false`, the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
+- For a chat request with `stream=false` (**Stream Chat Response** off in the chat's Controls, which Open WebUI 0.12 honours per chat, or in the model's Advanced Params), the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. Open WebUI 0.12 saves a non-streamed reply with tool calls as finished, but still does not run its tools (0.11 left it generating). With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
 
 ### API clients
 
@@ -780,9 +780,23 @@ Requests to `/api/chat/completions` without a chat pass the client's `tools` to 
 
 Gemini accepts function names of up to 64 characters (letters, digits, `_` and `-`, starting with a letter or `_`). Other tool names, for example an OpenAPI operation `lookup.v2`, are declared with the invalid characters replaced and a short hash appended (`lookup_v2_<hash>`), and Gemini's calls are mapped back to the original name. Parameter schemas are sent as JSON Schema (`parameters_json_schema`) after a light clean-up: `$schema`, `$id`, `$comment`, `examples`, `deprecated`, `readOnly`, `writeOnly` and `x-*` keys and boolean `exclusiveMinimum` / `exclusiveMaximum` are removed, tuple `items` become `prefixItems`, and `required` only lists existing properties. Tools without parameters are declared without a schema.
 
+### Tool Search (Open WebUI 0.12)
+
+With **Tool Search** on (experimental, **Admin Settings → Interface**, `ENABLE_TOOL_SEARCH`), Open WebUI leaves tools whose definition is longer than the **Deferral Threshold** (`TOOL_SEARCH_DEFER_THRESHOLD`, characters) out of the request, unless they match **Always Loaded Tools** (`TOOL_SEARCH_ALWAYS_LOADED`); with **Defer Built-in Tools** (`TOOL_SEARCH_DEFER_BUILTIN_TOOLS`, default on) its built-in tools count too. It lists them by name and a short description in an `<available_tools>` block of the system prompt and adds its `search_tools` tool, which returns the full definitions of the tools that match a query. The model is then expected to call a found tool by name.
+
+Gemini only calls functions that are declared in the request. From version 1.20.0 the pipeline therefore also declares every deferred tool that a `search_tools` result in the conversation names, with the definition Open WebUI runs. A tool found in one round can be called in the next round, and in later turns of the chat while its search result is in the history. Without this (1.19.1 and older) Gemini could not call the found tool. Names Gemini does not accept are mapped as for any other tool (see [Names and schemas](#names-and-schemas)).
+
+### Context compaction during tool runs
+
+With context compaction on (**Admin Settings → Interface**, `ENABLE_CONTEXT_COMPACTION`) Open WebUI replaces older messages with a summary once the chat passes the token threshold. Open WebUI 0.12 also does this between the rounds of a long tool run: the next request then holds the system prompt with a `[CONVERSATION SUMMARY]` block, the current user message and the most recent tool rounds. Open WebUI keeps every tool call together with its results and keeps their `reasoning_details`, so the pipeline sends Gemini 3 each remaining call with its thought signature. Rounds that were compacted away are only in the summary.
+
+The summary itself comes from the compaction model, by default the chat's model, i.e. this pipeline. That request carries no tools and gets no thinking block. When it fails (for example HTTP 429 or 500) or Gemini returns no text (for example because its thinking used up the task's `max_tokens`, 1000 unless the task model parameters set another value), the pipeline answers it with an empty text from version 1.20.0, and Open WebUI uses its own summary of the compacted messages. Up to 1.19.1 the pipeline's error text or `[No content generated]` became the conversation summary; when Open WebUI compacts before a reply, it saves that summary with the chat, so later turns saw the error text in place of the earlier messages.
+
+Open WebUI may move the current user message before tool rounds of an earlier turn when the compaction boundary falls into that turn. The pipeline still sends a valid request; the order is Open WebUI's.
+
 ### Requests without tools
 
-Image generation models, background tasks (title, tag and follow-up generation) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
+Image generation models, background tasks (title, tag and follow-up generation, context compaction) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
 
 ### Open WebUI's image generation and code interpreter
 
@@ -817,7 +831,7 @@ Gemini then calls `generate_image` with a prompt, or `edit_image` with a prompt 
 
 - Open WebUI ends the tool loop after `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS` rounds (default 256). The pipeline adds no limit of its own.
 - Tool approval on Open WebUI 0.11.4: after an approved call the saved message loses the tool result, and when Gemini calls several tools at once, only the first call is asked for and run.
-- Tool calling was verified with Open WebUI 0.11.3 and 0.11.4. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
+- Tool calling was verified with Open WebUI 0.11.3, 0.11.4 and 0.12.0. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
 
 ## Default System Prompt
 
@@ -986,6 +1000,20 @@ response = client.models.generate_content(
 )
 print(response.text)
 ```
+
+### Setting the per-chat values in Open WebUI
+
+The pipeline reads three request parameters:
+
+| Parameter | Models | Effect |
+| --- | --- | --- |
+| `reasoning_effort` | Gemini 3 and Nano Banana | thinking level, checked against the model's levels as above; overrides `GOOGLE_THINKING_LEVEL` |
+| `thinking_budget` | Gemini 2.5 and other models without thinking levels | overrides `GOOGLE_THINKING_BUDGET` |
+| `include_thoughts` | all thinking models | `false` hides the thoughts; `GOOGLE_INCLUDE_THOUGHTS=false` always wins |
+
+Set them as **Advanced Params** of a model (**Workspace → Models** or **Admin Settings → Models**: **Reasoning Effort** has its own field, the others go under **Custom Parameters**) or in a chat's **Controls**, whose values win over the model's. `reasoning_effort` does not change the thinking budget of Gemini 2.5 models.
+
+The **model controls** of Open WebUI 0.12 (named controls in the model editor whose options set custom parameters) cannot be used for this pipeline: Open WebUI refuses them for pipe models and for workspace models based on one ("Model controls require a server-managed provider model.").
 
 ## Token Usage Tracking
 
