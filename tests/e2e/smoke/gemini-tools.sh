@@ -4,7 +4,7 @@
 # harness cannot confirm. Manual and opt-in: it needs a Gemini API key and
 # makes billed requests (about 40 small ones).
 #
-#   GOOGLE_API_KEY=... tests/e2e/smoke/gemini-tools.sh [--image v0.11.4-slim] \
+#   GOOGLE_API_KEY=... tests/e2e/smoke/gemini-tools.sh [--image v0.12.0-slim] \
 #       [--model gemini-3-flash-preview] [--model-25 gemini-2.5-flash]
 #   tests/e2e/smoke/gemini-tools.sh --dry-run-mock   # no key: against the e2e mock
 #

@@ -25,7 +25,7 @@ Container and volume are removed afterwards.
 
 - **Docker** (Docker Desktop on Windows/macOS, Docker Engine on Linux).
 - **bash**: Linux/macOS shell, or **Git Bash** on Windows.
-- Network access for the first image pull (`ghcr.io/open-webui/open-webui:v0.11.4-slim`,
+- Network access for the first image pull (`ghcr.io/open-webui/open-webui:v0.12.0-slim`,
   ~1 GB), for `pip install google-genai` when the Gemini pipe is installed and, in the
   `filters` suite, for the tiktoken encodings (`cl100k_base`, `o200k_base`) the driver
   downloads into the container's `TIKTOKEN_CACHE_DIR` (without them the suite fails).
@@ -37,19 +37,19 @@ Open WebUI container, whose Python already ships `aiohttp`, `httpx`,
 ## Quick start
 
 ```bash
-tests/e2e/run.sh                 # all suites against ghcr.io/open-webui/open-webui:v0.11.4-slim
+tests/e2e/run.sh                 # all suites against ghcr.io/open-webui/open-webui:v0.12.0-slim
 tests/e2e/run.sh gemini          # one suite (gemini, azure, n8n, infomaniak, filters)
 tests/e2e/run.sh azure n8n       # several suites
-tests/e2e/run.sh --image v0.11.3-slim gemini   # another Open WebUI version
+tests/e2e/run.sh --image v0.11.4-slim gemini   # another Open WebUI version
 pixi run e2e gemini              # same via pixi (Linux)
 ```
 
 Typical output (abridged):
 
 ```text
-starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
+starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.12.0-slim
 Open WebUI healthy after 20s (http://localhost:57765)
-Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
+Open WebUI 0.12.0, suites: gemini, azure, n8n, infomaniak, filters
 function versions: google_gemini.py 1.20.0, azure_ai_foundry.py 3.0.1, n8n.py 2.3.1, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
@@ -57,14 +57,14 @@ function versions: google_gemini.py 1.20.0, azure_ai_foundry.py 3.0.1, n8n.py 2.
 ...
 [PASS ] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
 ...
---- gemini: 415s
+--- gemini: 525s
 ...
 === infomaniak ===
 ...
 [PASS ] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names, and changing it back restores them
 ...
-SUMMARY: 565 PASS, 0 FAIL, 0 KNOWN in 1213s
-total runtime: 1249s
+SUMMARY: 580 PASS, 0 FAIL, 0 KNOWN in 1263s
+total runtime: 1299s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
@@ -97,7 +97,7 @@ SIGTERM the script exits with `130` / `143`; see [Interrupted runs](#interrupted
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `[suite ...]`, `-s, --suites a,b` | `all` | `gemini`, `azure`, `n8n`, `infomaniak`, `filters` (the modules in `tests/e2e/suites/`), `all` |
-| `-i, --image IMAGE` | `$OWUI_IMAGE` or `ghcr.io/open-webui/open-webui:v0.11.4-slim` | image, or just a tag (`v0.11.3-slim`) |
+| `-i, --image IMAGE` | `$OWUI_IMAGE` or `ghcr.io/open-webui/open-webui:v0.12.0-slim` | image, or just a tag (`v0.11.4-slim`) |
 | `--only REGEX` | – | only scenario groups whose `<suite>.<group>` matches (Python regex), e.g. `--only gemini.api`; see below |
 | `--ref REF` | – | test the function files as of a git ref (`git show REF:path`): a branch, tag or commit |
 | `--src DIR` | – | test the function files from another checkout / worktree (not together with `--ref`) |
@@ -796,9 +796,9 @@ Python under `tests/e2e/` follows the repo's Ruff settings:
 ## Static Open WebUI API check
 
 ```bash
-tests/e2e/check_owui_api.sh            # against v0.11.4
+tests/e2e/check_owui_api.sh            # against v0.12.0
 tests/e2e/check_owui_api.sh latest     # against the latest Open WebUI release
-tests/e2e/check_owui_api.sh v0.12.0    # any tag or branch
+tests/e2e/check_owui_api.sh v0.11.4    # any tag or branch
 ```
 
 It reads every `from open_webui... import ...` and `import open_webui...` in
@@ -836,7 +836,7 @@ and makes billed requests (about 40 small ones on flash models, with the default
 
 ```bash
 export GOOGLE_API_KEY=...                       # from the environment only, never as an argument
-tests/e2e/smoke/gemini-tools.sh                 # v0.11.4-slim, gemini-3-flash-preview + gemini-2.5-flash
+tests/e2e/smoke/gemini-tools.sh                 # v0.12.0-slim, gemini-3-flash-preview + gemini-2.5-flash
 tests/e2e/smoke/gemini-tools.sh --image v0.11.3-slim --only R3,R14   # some risks, another image
 tests/e2e/smoke/gemini-tools.sh --dry-run-mock  # no key: the same run against the e2e Gemini mock
 ```
