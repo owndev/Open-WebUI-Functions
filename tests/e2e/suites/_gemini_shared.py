@@ -24,12 +24,21 @@ and Y in a folder shared read-only with D) and outsider C. Chat X: A's turn
 with the upload "upload1" (generated image "final"), then B, A and G write in
 it. Chat Y: two turns of A (upload "upload2", generated "gen1").
 
+Chat X2 of A, shared with "Allow replies" with B, covers the access fixes of
+the security review (see _security): a file B names in a message is read on
+A's turn only if B may read it too (shared.deputy), the images of earlier
+messages looked at per request are capped (shared.history-cap) and generated
+images are linked only to a chat the user may continue (shared.link-chat).
+
 The test-only global filter REDIRECT_FILTER hands the pipe another chat in
 ``__metadata__`` (``e2e-chat=<chat id>/<user message id>`` in the prompt of an
-API request), as if Open WebUI had called it for that chat without its own
-check: so the pipe's own check is tested also for the users Open WebUI turns
-away before the pipe (the admin, the read-only viewer, the outsider). Its
-fault markers make the pipe's next call of an access helper raise.
+API request; ``e2e-link=<chat id>`` with a new message id, so the pipe emits
+and links its images as for a chat message), as if Open WebUI had called it
+for that chat without its own check: so the pipe's own check is tested also
+for the users Open WebUI turns away before the pipe (the admin, the read-only
+viewer, the outsider). Its fault markers make the pipe's next call of an
+access helper raise, or (``e2e-chat-truthy=``) the chat check return True
+instead of the chat.
 
 On Open WebUI before 0.12 (no "Allow replies") the group records
 ``shared.unsupported`` (PASS) and ``shared.legacy``: the pipe keeps its owner /
@@ -67,6 +76,15 @@ EDIT = "Change the name to Bob"
 # what the edit request sends with the history of chat X's first turn
 WITH_HISTORY = [EDIT, "[Image 1]", "upload1", "[Image 2]", "final"]
 FILE_REFUSED = "does not belong to the requesting user"
+# the pipe's refusals of a file (any reason) and of one named by another user
+ANY_REFUSED = "Not reading a file for user"
+AUTHOR_REFUSED = "who may not read it"
+LINK_REFUSED = "Not linking generated files to chat"
+FILE_URL = "/api/v1/files/{}/content"
+# images of earlier messages the pipe looks at per request: 4 x
+# IMAGE_HISTORY_MAX_REFERENCES (5); shared.history-cap plants more links
+HISTORY_CAP = 4 * 5
+PLANTED = 30
 
 REDIRECT_FILTER_ID = "e2e_chat_redirect"
 REDIRECT_FILTER = '''"""
@@ -74,39 +92,46 @@ title: E2E Chat Redirect
 author: owndev
 version: 0.1.0
 license: Apache License 2.0
-description: Test-only filter for tests/e2e (gemini shared). In an API request (no message id), "e2e-chat=<chat id>/<user message id>" in the last user message puts that chat id and user message id into the pipe's __metadata__. "e2e-chat-fault=<chat id>" / "e2e-file-fault=<file id>" make the next call of Chats.get_accessible_chat_by_id / has_access_to_file for that id from the Gemini function raise RuntimeError, once (within 60 s). The markers are removed from the message.
+description: Test-only filter for tests/e2e (gemini shared). In an API request (no message id), "e2e-chat=<chat id>/<user message id>" in the last user message puts that chat id and user message id into the pipe's __metadata__, and "e2e-link=<chat id>" that chat id and a new message id (the pipe then emits and links its images as for a chat message). "e2e-chat-fault=<chat id>" / "e2e-file-fault=<file id>" make the next call of Chats.get_accessible_chat_by_id / has_access_to_file for that id from the Gemini function raise RuntimeError, "e2e-chat-truthy=<chat id>" the next call of Chats.get_accessible_chat_by_id return True (a truthy value that is not the chat), once (within 60 s). The markers are removed from the message.
 """
 
 import functools
 import re
 import sys
 import time
+import uuid
 from typing import Optional
 
 REDIRECT = re.compile(r"\\s*e2e-chat=([A-Za-z0-9-]+)/([A-Za-z0-9-]+)")
+LINK = re.compile(r"\\s*e2e-link=([A-Za-z0-9-]+)")
 FAULT = re.compile(r"\\s*e2e-(chat|file)-fault=([A-Za-z0-9-]+)")
+TRUTHY = re.compile(r"\\s*e2e-chat-truthy=([A-Za-z0-9-]+)")
 
 
-def _arm(owner, name: str, key: str, message: str) -> None:
+def _arm(owner, name: str, key: str, outcome) -> None:
     """Wrap owner.<name> once (an async wrapper with the same signature, so the
     pipe's feature detection still sees the helper; it stays in place, inert
-    unless armed) and arm it for ``key`` (its first argument)."""
+    unless armed) and arm it for ``key`` (its first argument): its next call
+    from the Gemini function raises ``outcome`` (an exception) or returns it."""
     wrapper = getattr(owner, name)
-    if not hasattr(wrapper, "e2e_armed"):
+    if not hasattr(wrapper, "e2e_outcomes"):
         original = wrapper
 
         @functools.wraps(original)
         async def wrapper(*args, **kwargs):
             caller = sys._getframe(1).f_globals.get("__name__", "")
-            armed = wrapper.e2e_armed
+            armed = wrapper.e2e_outcomes
             if caller.startswith("function_gemini") and args and args[0] in armed:
-                if time.time() < armed.pop(args[0]):
-                    raise RuntimeError(message)
+                deadline, result = armed.pop(args[0])
+                if time.time() < deadline:
+                    if isinstance(result, BaseException):
+                        raise result
+                    return result
             return await original(*args, **kwargs)
 
-        wrapper.e2e_armed = {}
+        wrapper.e2e_outcomes = {}
         setattr(owner, name, wrapper)
-    wrapper.e2e_armed[key] = time.time() + 60
+    wrapper.e2e_outcomes[key] = (time.time() + 60, outcome)
 
 
 class Filter:
@@ -115,20 +140,29 @@ class Filter:
         text = messages[-1].get("content") if messages else None
         if __metadata__ is None or not isinstance(text, str):
             return body
+        from open_webui.models.chats import Chats
+
         for kind, key in FAULT.findall(text):
             if kind == "chat":
-                from open_webui.models.chats import Chats
-
-                _arm(Chats, "get_accessible_chat_by_id", key, "e2e chat access fault")
+                error = RuntimeError("e2e chat access fault")
+                _arm(Chats, "get_accessible_chat_by_id", key, error)
             else:
                 from open_webui.utils.access_control import files
 
-                _arm(files, "has_access_to_file", key, "e2e file access fault")
-        text = FAULT.sub("", text)
+                error = RuntimeError("e2e file access fault")
+                _arm(files, "has_access_to_file", key, error)
+        for key in TRUTHY.findall(text):
+            _arm(Chats, "get_accessible_chat_by_id", key, True)
+        text = TRUTHY.sub("", FAULT.sub("", text))
         match = REDIRECT.search(text)
         if match and not __metadata__.get("message_id"):
             __metadata__["chat_id"], __metadata__["user_message_id"] = match.groups()
             text = REDIRECT.sub("", text)
+        link = LINK.search(text)
+        if link and not __metadata__.get("message_id"):
+            __metadata__["chat_id"] = link.group(1)
+            __metadata__["message_id"] = str(uuid.uuid4())
+            text = LINK.sub("", text)
         messages[-1]["content"] = text.strip()
         return body
 '''
@@ -220,6 +254,147 @@ def _brief(chat) -> str:
     if chat is None:
         return "-"
     return f"HTTP {chat.http_status} done={chat.done}"
+
+
+async def _file_ids(client) -> set:
+    """Ids of the user's newest files (the first page of GET /api/v1/files/)."""
+    _, data = await client.api("GET", "/api/v1/files/?content=false")
+    items = data.get("items") if isinstance(data, dict) else data
+    return {f.get("id") for f in items or [] if isinstance(f, dict)}
+
+
+async def _security(t: Suite, mock, owner, part, outsider, private, admin_file):
+    """Chat X2 of the owner A, shared with "Allow replies" with the participant
+    B, for the checks of the access fixes in 1.20.0:
+
+    - deputy: B names A's private file in a message of X2. A's next turn must
+      not send it (B may not read it, so A's rights must not be used for it);
+      A's own link to it, in A's own message, is sent;
+    - history cap: B plants PLANTED links to files A may not use (the admin's
+      file and A's private file); A's next turn checks at most HISTORY_CAP
+      images of earlier messages;
+    - linking: the test filter hands the pipe X2 with a new message id; B's
+      generated image is linked to X2 (A may read it), the outsider C's
+      images are not (C may not continue X2), with and without the decision of
+      the image history (``e2e-chat=``).
+
+    Returns what the checks need; ``error`` is set when the flow broke."""
+    r: dict = {"error": "", "a3": {}, "a4": {}, "a5": {}, "a7": {}}
+    try:
+        upload = await _upload_png(owner, UPLOAD_PNG_1, "upload1.png")
+        url = FILE_URL.format(private["id"])
+        async with BrowserSession(owner) as b:
+            await mock.reset()
+            a1 = await b.chat(
+                IMAGE_GA,
+                "Draw a certificate like this",
+                params=LEGACY,
+                user_files=[upload],
+            )
+        r["shares"] = await _share(
+            owner, a1.chat_id, [_grant("user", part.user["id"])], replies=True
+        )
+        r["before"] = await _file_status(part, private["id"])
+        async with BrowserSession(part) as b:
+            await mock.reset()
+            b2 = await b.chat(
+                IMAGE_GA,
+                f"Nice ![p]({url}) final-image-2",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=a1.message_id,
+            )
+        r["b2"] = _brief(b2)
+        await t.log.settle(0.5)
+        mark = t.mark()
+        async with BrowserSession(owner) as b:
+            await mock.reset()
+            a3 = await b.chat(
+                IMAGE_GA,
+                "Make it blue final-image-3",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=b2.message_id,
+            )
+            r["a3"], r["a3_done"] = await _edit_request(mock), a3.done
+            await t.log.settle(0.5)
+            r["a3_refused"] = len(t.log.lines(mark, AUTHOR_REFUSED))
+            await mock.reset()
+            a4 = await b.chat(
+                IMAGE_GA,
+                f"Use this one ![p]({url}) final-image-1",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=a3.message_id,
+            )
+            r["a4"] = await _edit_request(mock)
+            await mock.reset()
+            a5 = await b.chat(
+                IMAGE_GA,
+                "Make it red",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=a4.message_id,
+            )
+            r["a5"], r["a5_done"] = await _edit_request(mock), a5.done
+        r["after"] = await _file_status(part, private["id"])
+
+        planted = " ".join(
+            f"![x]({FILE_URL.format(fid)})"
+            for fid in [admin_file["id"], private["id"]] * (PLANTED // 2)
+        )
+        async with BrowserSession(part) as b:
+            await mock.reset()
+            b6 = await b.chat(
+                IMAGE_GA,
+                f"Look {planted} final-image-2",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=a5.message_id,
+            )
+        r["b6"] = _brief(b6)
+        await t.log.settle(0.5)
+        mark = t.mark()
+        async with BrowserSession(owner) as b:
+            await mock.reset()
+            a7 = await b.chat(
+                IMAGE_GA,
+                "Make it green",
+                params=LEGACY,
+                chat_id=a1.chat_id,
+                parent_id=b6.message_id,
+            )
+            r["a7"], r["a7_brief"] = await _edit_request(mock), _brief(a7)
+        await t.log.settle(0.5)
+        r["a7_done"] = a7.done
+        r["cap_refused"] = len(t.log.lines(mark, ANY_REFUSED))
+
+        before_b, before_c = await _file_ids(part), await _file_ids(outsider)
+        mark = t.mark()
+        await mock.reset()
+        link = f"e2e-link={a1.chat_id}"
+        r["link_status"] = [
+            getattr(await client.chat(IMAGE_GA, text, stream=False), "status", None)
+            for client, text in (
+                (part, f"Draw a star {link}"),
+                (outsider, f"Draw a star {link}"),
+                (outsider, f"Draw a star {_target(a5)} {link}"),
+            )
+        ]
+        await t.log.settle(0.5)
+        r["link_refused"] = len(t.log.lines(mark, LINK_REFUSED))
+        t.expect_warnings(mark, ("function_gemini", LINK_REFUSED))
+        r["owner_reads_b"] = [
+            await _file_status(owner, fid)
+            for fid in sorted((await _file_ids(part)) - before_b)
+        ]
+        r["owner_reads_c"] = [
+            await _file_status(owner, fid)
+            for fid in sorted((await _file_ids(outsider)) - before_c)
+        ]
+    except Exception as exc:  # noqa: BLE001 - reported in the checks
+        r["error"] = f"setup failed: {exc!r} "
+    return r
 
 
 async def legacy(t: Suite, mock, version: str) -> None:
@@ -322,6 +497,7 @@ async def shared(t: Suite, mock) -> None:
     denied = chat_fault_logged = file_fault_logged = 0
     ids_logged: list = []
     group_id = ""
+    sec: dict = {"error": "not run ", "a3": {}, "a4": {}, "a5": {}, "a7": {}}
     try:
         for key, name, email in (
             ("owner", "E2E Shared Owner", OWNER),
@@ -452,6 +628,8 @@ async def shared(t: Suite, mock) -> None:
             ("admin", t.owui, _target(cb)),
             ("viewer", users["viewer"], _target(cy2)),
             ("outsider", users["outsider"], _target(cb)),
+            # the chat check answers True (not the chat) for the admin
+            ("truthy", t.owui, f"{_target(cb)} e2e-chat-truthy={cb.chat_id}"),
         ):
             redirected[key] = await _api_edit(client, mock, f"{EDIT} {target}")
         mark = t.mark()
@@ -505,6 +683,9 @@ async def shared(t: Suite, mock) -> None:
             timeout=180,
         )
         video_image = await _video_image(mock)
+        sec = await _security(
+            t, mock, owner, part, users["outsider"], private, admin_file
+        )
     except Exception as exc:  # noqa: BLE001 - reported in the checks
         error = f"setup failed: {exc!r} "
     finally:
@@ -593,6 +774,12 @@ async def shared(t: Suite, mock) -> None:
             "a user the chat is not shared with: nothing of the chat is read",
             [EDIT],
         ),
+        (
+            "truthy",
+            "the admin, and the chat check answers a truthy value that is not "
+            "the chat: nothing of the chat is read",
+            [EDIT],
+        ),
     ):
         result, req = redirected.get(key, (None, empty))
         t.check(
@@ -646,4 +833,55 @@ async def shared(t: Suite, mock) -> None:
         "shared chat: it is sent as instances[0].image",
         ready and getattr(video, "status", None) == 200 and video_image == "upload1",
         f"{setup} HTTP {getattr(video, 'status', None)} image={video_image!r}",
+    )
+    sec_ready = ready and not sec["error"] and sec.get("shares") == [200, 200]
+    sec_setup = f"{setup} {sec['error']}x2_shares={sec.get('shares')}"
+    a3, a4, a5, a7 = sec["a3"], sec["a4"], sec["a5"], sec["a7"]
+    t.check(
+        "shared.deputy",
+        "browser, a participant names a private file of the owner in a message "
+        "of the shared chat: the owner's next turn does not send it (logged), the "
+        "file stays unreadable for the participant; the owner's own link to it "
+        "is sent, in the owner's message and later from the history",
+        sec_ready
+        and sec.get("before") == 404
+        and sec.get("after") == 404
+        and sec.get("a3_done")
+        and a3.get("images") == ["upload1", "final", "gen2"]
+        and sec.get("a3_refused", 0) > 0
+        and "saved" in (a4.get("images") or [])
+        and sec.get("a5_done")
+        and a5.get("images") == ["final", "gen2", "gen3", "saved", "gen1"],
+        f"{sec_setup} participant: private HTTP {sec.get('before')} -> "
+        f"{sec.get('after')} turn: {sec.get('b2')} owner: images={a3.get('images')} "
+        f"refused_logged={sec.get('a3_refused')} own link: {a4.get('images')} "
+        f"then {a5.get('images')}",
+    )
+    t.check(
+        "shared.history-cap",
+        f"browser, a participant plants {PLANTED} links to files the owner may "
+        f"not use: the owner's next turn looks at no more than {HISTORY_CAP} "
+        "images of earlier messages (4 x IMAGE_HISTORY_MAX_REFERENCES), logs no "
+        "more refusals and completes",
+        sec_ready
+        and sec.get("a7_done")
+        and 0 < sec.get("cap_refused", 0) <= HISTORY_CAP
+        and a7.get("images") == ["gen2"],
+        f"{sec_setup} plant: {sec.get('b6')} owner: {sec.get('a7_brief')} "
+        f"images={a7.get('images')} refused_logged={sec.get('cap_refused')}",
+    )
+    t.check(
+        "shared.link-chat",
+        "API, the pipe called for a chat message of another chat (test filter): "
+        "a participant's generated image is linked to that chat (the owner may "
+        "read it), an outsider's are not (logged; with and without the decision "
+        "of the image history)",
+        sec_ready
+        and sec.get("link_status") == [200, 200, 200]
+        and sec.get("owner_reads_b") == [200]
+        and sec.get("owner_reads_c") == [404, 404]
+        and sec.get("link_refused") == 2,
+        f"{sec_setup} HTTP {sec.get('link_status')} owner reads participant's "
+        f"{sec.get('owner_reads_b')} outsider's {sec.get('owner_reads_c')} "
+        f"refused_logged={sec.get('link_refused')}",
     )

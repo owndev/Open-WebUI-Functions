@@ -17,8 +17,8 @@ features:
   - Retries of temporary API errors for streaming and non-streaming requests
   - Advanced multimodal input support (text and images)
   - Unified image generation and editing with Gemini 2.5 Flash Image Preview
-  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, each image once; only files the requesting user may read)
-  - Shared chats with "Allow replies" (Open WebUI 0.12+): participants edit the images of the chat too; who may continue a chat and read its files follows Open WebUI's own access checks, generated images are linked to the chat like Open WebUI's own
+  - Image editing across turns: earlier generated and uploaded images of a saved chat are sent with the edit request (the newest kept within the image limit, each image once; only files the requesting user, and the author of the message that names them, may read)
+  - Shared chats with "Allow replies" (Open WebUI 0.12+): participants edit the images of the chat too; who may continue a chat and read its files follows Open WebUI's own access checks, a file named in another participant's message is used only if that participant may read it too, generated images are linked to the chat (only one the user may continue) like Open WebUI's own
   - Nano Banana image models (gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-nano-banana-2.1)
   - Extra image generation model IDs configurable without a code change
   - Interim thought images skipped, so each generated image is uploaded once (the last one is kept if no final image arrives)
@@ -233,6 +233,41 @@ TOOL_IMAGES_TEXT = (
 # Chat ids Open WebUI does not save: temporary chats (also the legacy "local:"
 # prefix) and channel messages. Their history exists only in the request.
 UNSAVED_CHAT_ID_PREFIXES = ("temporary:", "local:", "channel:")
+
+# Images of earlier messages looked at per request, at most this many per
+# image IMAGE_HISTORY_MAX_REFERENCES allows (and at least the minimum): a file
+# that is skipped (not readable, a duplicate, missing) does not fill the limit,
+# so without this cap every link in a chat would be checked on every turn.
+IMAGE_HISTORY_CANDIDATES_PER_IMAGE = 4
+IMAGE_HISTORY_MIN_CANDIDATES = 8
+
+
+class _RequestAccess:
+    """What the access checks of one request looked up. A local of that
+    request, never an attribute of the Pipe (it serves concurrent requests).
+
+    ``accounts``: Users.get_user_by_id per user id (the requesting user and the
+    authors of the messages that name files), fetched once per request.
+    ``chats``: per chat id whether the requesting user may continue it and
+    the chat's owner (see Pipe._may_continue_chat), decided once per request,
+    so linking the generated images reuses the decision of the image history.
+    """
+
+    def __init__(self) -> None:
+        self.accounts: Dict[str, Any] = {}
+        self.chats: Dict[str, Tuple[bool, Optional[str]]] = {}
+
+    async def account(self, user_id: str) -> Any:
+        """The user's account (None if there is none); errors propagate."""
+        if user_id not in self.accounts:
+            self.accounts[user_id] = await Users.get_user_by_id(user_id)
+        return self.accounts[user_id]
+
+    def chat_owner(self, chat_id: str) -> Optional[str]:
+        """Owner of a chat the requesting user may continue (else None)."""
+        allowed, owner = self.chats.get(chat_id, (False, None))
+        return owner if allowed else None
+
 
 # Open WebUI's Tool Search (0.12+, utils/tool_search.py): the tool that returns
 # the definitions of the tools left out of body["tools"].
@@ -637,29 +672,61 @@ class Pipe:
     # ---------------- Internal Helpers ---------------- #
     async def _collect_history_images(
         self,
-        sources: List[List[str]],
+        sources: List[Tuple[Optional[str], List[str]]],
         room: int,
         current: List[Dict[str, Any]],
         optimization_stats: List[Dict[str, Any]],
         __user__: Optional[dict],
+        access: Optional[_RequestAccess] = None,
     ) -> List[Dict[str, Any]]:
         """Images of earlier messages for the ``room`` the current message's
         images leave under IMAGE_HISTORY_MAX_REFERENCES, oldest first.
 
-        ``sources`` holds the image URLs of each earlier message, oldest message
-        first. They are read newest first and only until the room is filled, so
-        a long chat does not read and re-encode all of its images. With
+        ``sources`` holds, per earlier message (oldest first), who wrote it and
+        its image URLs. They are read newest first and only until the room is
+        filled, so a long chat does not read and re-encode all of its images,
+        and at most IMAGE_HISTORY_CANDIDATES_PER_IMAGE per image of the limit
+        are looked at (a skipped image does not fill the room). With
         IMAGE_DEDUP_HISTORY an image counts once, at its newest place, and an
         image of the current message is not sent again as history.
+
+        A file named by a message of another user is read only when that user
+        may read it too (see _fetch_file_as_base64), so a participant of a
+        shared chat cannot have the pipe read a file with the rights of the
+        user whose turn it is. Without a known author (None) a message's files
+        are not read; its data: URLs are part of the chat anyway.
         """
         if room <= 0:
             return []
+        access = access or _RequestAccess()
+        requester = (__user__ or {}).get("id") or "?"
+        limit = max(1, self.valves.IMAGE_HISTORY_MAX_REFERENCES)
+        cap = max(
+            IMAGE_HISTORY_CANDIDATES_PER_IMAGE * limit, IMAGE_HISTORY_MIN_CANDIDATES
+        )
+        candidates = cap
         dedup = self.valves.IMAGE_DEDUP_HISTORY
         seen = {self._image_part_hash(p) for p in current} if dedup else set()
         picked: List[Dict[str, Any]] = []
-        for urls in reversed(sources):
+        for author, urls in reversed(sources):
             for url in reversed(urls):
-                part = await self._load_image_part(url, optimization_stats, __user__)
+                if candidates <= 0:
+                    self.log.info(
+                        f"Image history: looked at the newest {cap} images of "
+                        f"earlier messages for user {requester}, older ones are "
+                        "left out"
+                    )
+                    return picked[::-1]
+                candidates -= 1
+                if author is None and not url.startswith("data:"):
+                    self.log.warning(
+                        f"Not reading a file for user {requester}: the author of "
+                        "the message that names it is unknown"
+                    )
+                    continue
+                part = await self._load_image_part(
+                    url, optimization_stats, __user__, access=access, author=author
+                )
                 if part is None:
                     continue
                 if dedup:
@@ -711,6 +778,7 @@ class Pipe:
         self,
         __metadata__: Optional[Dict[str, Any]],
         __user__: Optional[dict],
+        access: Optional[_RequestAccess] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """The messages of a saved chat from the first one to the current user
         message (the last entry), as Open WebUI stores them, files included.
@@ -736,7 +804,9 @@ class Pipe:
         ):
             return None
         try:
-            if not await self._may_continue_chat(chat_id, user):
+            if not await self._may_continue_chat(
+                chat_id, user, access or _RequestAccess()
+            ):
                 return None
             messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
             chain = get_message_list(messages_map or {}, user_message_id)
@@ -746,9 +816,40 @@ class Pipe:
         return [m for m in chain if isinstance(m, dict)] or None
 
     @staticmethod
-    async def _may_continue_chat(chat_id: str, user: Dict[str, Any]) -> bool:
+    def _message_authors(
+        chain: List[Dict[str, Any]], owner: Optional[str]
+    ) -> List[Optional[str]]:
+        """Who wrote each message of a saved chain (None when unknown), whose
+        access then counts for the files the message names.
+
+        A user message: its ``user_id``. Open WebUI 0.12 stores it with every
+        message (insert_chat_turn sets it to the user who sent the message,
+        also for the participants of a shared chat); where it is missing
+        (Open WebUI up to 0.11 leaves it out of the message map, messages
+        saved before) the chat's owner, as Open WebUI itself reads it
+        (``message.get("user_id") or chat.user_id``). Up to 0.11 only the owner
+        and admins write in a chat. An answer: the author of the user message
+        it answers, whose prompt it was made for (its parent, the message
+        before it in the chain: get_message_list follows parentId); None when
+        that is not a user message.
+        """
+        authors: List[Optional[str]] = []
+        for index, msg in enumerate(chain):
+            if msg.get("role") == "user":
+                authors.append(str(msg.get("user_id") or owner or "") or None)
+            elif index and chain[index - 1].get("role") == "user":
+                authors.append(authors[index - 1])
+            else:
+                authors.append(None)
+        return authors
+
+    @staticmethod
+    async def _may_continue_chat(
+        chat_id: str, user: Dict[str, Any], access: _RequestAccess
+    ) -> bool:
         """Whether ``user`` may continue the saved chat, so that its history
-        (files of other users included) may be read for the image history.
+        (files of other users included) may be read for the image history and
+        generated files may be linked to it.
 
         With Open WebUI's own checks (_shared_chat_access, Open WebUI 0.12+)
         exactly what Open WebUI asks before it calls the pipe:
@@ -756,22 +857,88 @@ class Pipe:
         which allows the owner and the participants of a chat or folder shared
         with "Allow replies" (users or groups), but an admin only like any
         other user (read access to other users' chats does not allow
-        continuing them). Otherwise the owner or an admin, as Open WebUI up to
-        0.11. Errors propagate; the caller refuses then.
-        """
-        if OWUI_SHARED_CHAT_ACCESS:
-            account = await Users.get_user_by_id(user["id"])
-            if account is None:
-                return False
-            chat = await Chats.get_accessible_chat_by_id(
-                chat_id, account, permission="write"
-            )
-            return bool(chat)
-        if user.get("role") == "admin":
-            return True
-        return bool(await Chats.is_chat_owner(chat_id, user["id"]))
+        continuing them). Only the chat itself allows: any other value, also a
+        truthy one, refuses. Otherwise the owner or an admin, as Open WebUI up
+        to 0.11.
 
-    async def _may_read_file(self, file_obj: Any, user: Dict[str, Any]) -> bool:
+        The decision and the chat's owner (see _message_authors) are kept in
+        ``access`` for the rest of the request. Errors propagate (and are not
+        kept); the caller refuses then.
+        """
+        if chat_id in access.chats:
+            return access.chats[chat_id][0]
+        allowed, owner = False, None
+        if OWUI_SHARED_CHAT_ACCESS:
+            account = await access.account(user["id"])
+            if account is not None:
+                chat = await Chats.get_accessible_chat_by_id(
+                    chat_id, account, permission="write"
+                )
+                allowed = getattr(chat, "id", None) == chat_id
+                owner = getattr(chat, "user_id", None) if allowed else None
+        elif await Chats.is_chat_owner(chat_id, user["id"]):
+            allowed, owner = True, user["id"]
+        elif user.get("role") == "admin":
+            # an admin may continue any chat; the owner's id is needed for
+            # the messages without user_id (see _message_authors)
+            chat = await Chats.get_chat_by_id(chat_id)
+            allowed = getattr(chat, "id", None) == chat_id
+            owner = getattr(chat, "user_id", None) if allowed else None
+        access.chats[chat_id] = (allowed, str(owner) if owner else None)
+        return allowed
+
+    async def _chat_to_link(
+        self,
+        __metadata__: Optional[Dict[str, Any]],
+        access: Optional[_RequestAccess] = None,
+    ) -> Optional[Tuple[str, str, str]]:
+        """(chat id, message id, user id) to link generated files to, or None.
+
+        Saved chats only, and only a chat the requesting user may continue
+        (_may_continue_chat, decided once per request): Open WebUI's
+        insert_chat_files checks that the user may read the files, not that
+        the user may write in the chat, and a linked file can be read by
+        everyone with access to the chat.
+        """
+        metadata = __metadata__ or {}
+        chat_id = str(metadata.get("chat_id") or "")
+        message_id = str(metadata.get("message_id") or "")
+        user_id = str(metadata.get("user_id") or "")
+        if (
+            not chat_id
+            or not message_id
+            or not user_id
+            or chat_id.startswith(UNSAVED_CHAT_ID_PREFIXES)
+        ):
+            return None
+        access = access or _RequestAccess()
+        try:
+            account = await access.account(user_id)
+            allowed = account is not None and await self._may_continue_chat(
+                chat_id,
+                {"id": user_id, "role": getattr(account, "role", None)},
+                access,
+            )
+        except Exception as e:
+            self.log.warning(
+                f"Not linking generated files to chat {chat_id}: the access "
+                f"check failed: {type(e).__name__}"
+            )
+            return None
+        if not allowed:
+            self.log.warning(
+                f"Not linking generated files to chat {chat_id}: user {user_id} "
+                "may not continue it"
+            )
+            return None
+        return chat_id, message_id, user_id
+
+    async def _may_read_file(
+        self,
+        file_obj: Any,
+        user: Dict[str, Any],
+        access: Optional[_RequestAccess] = None,
+    ) -> bool:
         """Whether ``user`` may read an Open WebUI file (``file_obj``, whose id a
         message may name freely, e.g. in a markdown link of an API client).
 
@@ -779,17 +946,23 @@ class Pipe:
         admin and, with Open WebUI's own checks (_shared_chat_access, Open WebUI
         0.12+), whoever has_access_to_file(id, "read", user) lets read the file
         (e.g. the participants of a shared chat it is attached to, the members
-        of a knowledge base or channel). Errors refuse, and the file id stays
-        out of the log.
+        of a knowledge base or channel). ``user`` is ``__user__`` or, for the
+        author of a message, ``{"id": ...}`` (the role then comes from the
+        account, fetched once per request with ``access``). Errors refuse, and
+        the file id stays out of the log.
         """
         user_id = user.get("id")
         if (user_id and file_obj.user_id == user_id) or user.get("role") == "admin":
             return True
-        if not user_id or not OWUI_SHARED_CHAT_ACCESS:
+        if not user_id or ("role" in user and not OWUI_SHARED_CHAT_ACCESS):
             return False
         try:
-            account = await Users.get_user_by_id(user_id)
+            account = await (access or _RequestAccess()).account(user_id)
             if account is None:
+                return False
+            if getattr(account, "role", None) == "admin":
+                return True
+            if not OWUI_SHARED_CHAT_ACCESS:
                 return False
             allowed = await owui_file_access.has_access_to_file(
                 file_obj.id, "read", account
@@ -982,15 +1155,21 @@ class Pipe:
         __event_emitter__: Optional[Callable],
         __metadata__: Optional[Dict[str, Any]] = None,
         __user__: Optional[dict] = None,
+        access: Optional[_RequestAccess] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """Construct the contents payload for image-capable models.
 
         The prompt and the current images come from the last user message of
         the request. Images of earlier turns come from the saved chat when
         there is one (see _saved_message_image_urls), else from the request.
+        The files a saved message names are read for its author too (see
+        _message_authors and _collect_history_images); the request's messages
+        are the requesting user's own.
 
         Returns tuple (contents, system_instruction) where system_instruction is extracted from system messages.
         """
+        access = access or _RequestAccess()
+        requester = (__user__ or {}).get("id")
         # Extract user-defined system instruction first
         user_system_instruction = next(
             (msg["content"] for msg in messages if msg.get("role") == "system"),
@@ -1008,11 +1187,15 @@ class Pipe:
 
         optimization_stats: List[Dict[str, Any]] = []
         prompt, current_images = await self._extract_images_from_message(
-            last_user_msg, stats_list=optimization_stats, __user__=__user__
+            last_user_msg,
+            stats_list=optimization_stats,
+            __user__=__user__,
+            access=access,
         )
         current_images = self._deduplicate_images(current_images)
 
-        chain = await self._load_saved_chat_chain(__metadata__, __user__)
+        sources: List[Tuple[Optional[str], List[str]]]
+        chain = await self._load_saved_chat_chain(__metadata__, __user__, access)
         if chain:
             # The chain ends with the saved current user message. Open WebUI's
             # guided regeneration appends the guidance as one more user
@@ -1026,13 +1209,16 @@ class Pipe:
                 self._trailing_user_messages(messages[: end + 1])
                 == self._trailing_user_messages(chain, saved=True) + 1
             )
+            authors = self._message_authors(
+                chain, access.chat_owner(str((__metadata__ or {}).get("chat_id")))
+            )
             sources = [
-                self._saved_message_image_urls(m)
-                for m in (chain if guided else chain[:-1])
+                (authors[i], self._saved_message_image_urls(m))
+                for i, m in enumerate(chain if guided else chain[:-1])
             ]
         else:
             sources = [
-                self._content_image_sources(m.get("content", ""))[1]
+                (requester, self._content_image_sources(m.get("content", ""))[1])
                 for m in messages
                 if m is not last_user_msg and m.get("role") in {"user", "assistant"}
             ]
@@ -1043,6 +1229,7 @@ class Pipe:
             current_images,
             optimization_stats,
             __user__,
+            access,
         )
 
         combined, reused_flags = self._apply_order_and_limit(
@@ -1975,6 +2162,7 @@ class Pipe:
         self,
         files: List[Dict[str, Any]],
         __metadata__: Optional[Dict[str, Any]],
+        access: Optional[_RequestAccess] = None,
     ) -> None:
         """Link uploaded generated files to their chat message (chat_file rows).
 
@@ -1984,19 +2172,9 @@ class Pipe:
         participants of a chat shared with "Allow replies" (and the viewers of
         a shared chat) may then read the images, in the web UI and in the image
         history of their turns. Open WebUI links a file only when the user may
-        read it. Saved chats only.
+        read it; the pipeline links only to a saved chat the user may continue
+        (see _chat_to_link; ``access`` holds the decision of the image history).
         """
-        metadata = __metadata__ or {}
-        chat_id = str(metadata.get("chat_id") or "")
-        message_id = metadata.get("message_id")
-        user_id = metadata.get("user_id")
-        if (
-            not chat_id
-            or not message_id
-            or not user_id
-            or chat_id.startswith(UNSAVED_CHAT_ID_PREFIXES)
-        ):
-            return
         file_ids = []
         for entry in files:
             match = re.search(r"/files/([A-Za-z0-9_-]+)", str(entry.get("url") or ""))
@@ -2004,6 +2182,10 @@ class Pipe:
                 file_ids.append(match.group(1))
         if not file_ids:
             return
+        target = await self._chat_to_link(__metadata__, access)
+        if target is None:
+            return
+        chat_id, message_id, user_id = target
         try:
             await Chats.insert_chat_files(
                 chat_id=chat_id,
@@ -2117,6 +2299,7 @@ class Pipe:
         generated_image_files: List[Dict[str, Any]],
         __event_emitter__: Optional[Callable],
         __metadata__: Optional[Dict[str, Any]] = None,
+        access: Optional[_RequestAccess] = None,
     ) -> str:
         """Attach collected images to the message and return the final content.
 
@@ -2130,7 +2313,7 @@ class Pipe:
                 generated_image_files, __event_emitter__
             )
             if files_emitted:
-                await self._link_chat_files(generated_image_files, __metadata__)
+                await self._link_chat_files(generated_image_files, __metadata__, access)
 
         if generated_image_files and not files_emitted:
             generated_images.extend(
@@ -3034,12 +3217,15 @@ class Pipe:
         *,
         stats_list: Optional[List[Dict[str, Any]]] = None,
         __user__: Optional[dict] = None,
+        access: Optional[_RequestAccess] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """Extract prompt text and ALL images from a single user message.
 
         This replaces the previous single-image _find_image logic for image-capable
-        models so that multi-image prompts are respected. Open WebUI files are
-        read only when they belong to ``__user__`` (see _fetch_file_as_base64).
+        models so that multi-image prompts are respected. The message is the
+        requesting user's own (the request's last user message): Open WebUI
+        files are read only when ``__user__`` may read them (see
+        _fetch_file_as_base64).
 
         Returns:
             (prompt_text, image_parts)
@@ -3053,8 +3239,9 @@ class Pipe:
             )
         text_segments, urls = self._content_image_sources(content)
         image_parts: List[Dict[str, Any]] = []
+        access = access or _RequestAccess()
         for url in urls:
-            part = await self._load_image_part(url, stats_list, __user__)
+            part = await self._load_image_part(url, stats_list, __user__, access=access)
             if part:
                 image_parts.append(part)
 
@@ -3095,14 +3282,20 @@ class Pipe:
         url: str,
         stats_list: Optional[List[Dict[str, Any]]],
         __user__: Optional[dict],
+        *,
+        access: Optional[_RequestAccess] = None,
+        author: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """The inline_data part of one image URL (a data: URL, or an Open WebUI
-        file the user may read), optimized in a worker thread so that decoding
-        large images does not block the event loop; None if it is unreadable."""
+        file the user, and the ``author`` of the message that names it, may
+        read), optimized in a worker thread so that decoding large images does
+        not block the event loop; None if it is unreadable."""
         if url.startswith("data:"):
             data_url: Optional[str] = url
         else:
-            data_url = await self._fetch_file_as_base64(url, __user__)
+            data_url = await self._fetch_file_as_base64(
+                url, __user__, access=access, author=author
+            )
         if not data_url:
             return None
         try:
@@ -3337,7 +3530,12 @@ class Pipe:
             return f"data:image/jpeg;base64,{encoded if 'encoded' in locals() else image_data}"
 
     async def _fetch_file_as_base64(
-        self, file_url: str, __user__: Optional[dict] = None
+        self,
+        file_url: str,
+        __user__: Optional[dict] = None,
+        *,
+        access: Optional[_RequestAccess] = None,
+        author: Optional[str] = None,
     ) -> Optional[str]:
         """
         Fetch a file from Open WebUI's file system and convert to base64.
@@ -3346,11 +3544,19 @@ class Pipe:
         the user's own files, every file for an admin, and on Open WebUI 0.12+
         the files Open WebUI lets the user read, e.g. those of a chat shared
         with the user): a message can name any file id, for example in a
-        markdown link sent by an API client.
+        markdown link sent by an API client. A file named by a message of
+        another user (``author``) is read only when that user may read it too:
+        otherwise a participant of a shared chat could name a file only the
+        requesting user may read, and the pipe would send it to Gemini on that
+        user's turn (and link the image made from it to the chat).
 
         Args:
             file_url: File URL from Open WebUI
             __user__: The requesting user (without one no file is read)
+            access: What the access checks of this request looked up
+            author: Who wrote the message that names the file, when that is
+                not the requesting user's own message (None: the requesting
+                user's own message, e.g. the current one)
 
         Returns:
             Base64 encoded file data or None if file not found or not readable
@@ -3366,16 +3572,27 @@ class Pipe:
 
             file_obj = await Files.get_file_by_id(fid)
             user = __user__ or {}
-            if file_obj and not await self._may_read_file(file_obj, user):
+            access = access or _RequestAccess()
+            refused = ""
+            if file_obj and not await self._may_read_file(file_obj, user, access):
+                refused = "it does not belong to the requesting user" + (
+                    " and Open WebUI grants no read access to it"
+                    if OWUI_SHARED_CHAT_ACCESS
+                    else ""
+                )
+            elif (
+                file_obj
+                and author
+                and author != user.get("id")
+                and not await self._may_read_file(file_obj, {"id": author}, access)
+            ):
+                refused = (
+                    f"it is named in a message of user {author}, who may not read it"
+                )
+            if refused:
                 # the file id of another user stays out of the log
                 self.log.warning(
-                    f"Not reading a file for user {user.get('id') or '?'}: it "
-                    "does not belong to the requesting user"
-                    + (
-                        " and Open WebUI grants no read access to it"
-                        if OWUI_SHARED_CHAT_ACCESS
-                        else ""
-                    )
+                    f"Not reading a file for user {user.get('id') or '?'}: {refused}"
                 )
                 return None
             if file_obj and file_obj.path:
@@ -3631,6 +3848,7 @@ class Pipe:
         __user__: dict,
         __event_emitter__: Optional[Callable],
         __metadata__: Optional[Dict[str, Any]] = None,
+        access: Optional[_RequestAccess] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Upload video with status updates and data-URL fallback.
 
@@ -3650,9 +3868,11 @@ class Pipe:
                 },
             )
 
-            user = await Users.get_user_by_id(__user__["id"])
-            chat_id = __metadata__.get("chat_id") if __metadata__ else None
-            message_id = __metadata__.get("message_id") if __metadata__ else None
+            access = access or _RequestAccess()
+            user = await access.account(__user__["id"])
+            # linked only to a saved chat the user may continue (_chat_to_link)
+            target = await self._chat_to_link(__metadata__, access)
+            chat_id, message_id = (target[0], target[1]) if target else (None, None)
             video_url, file_entry = await self._upload_video(
                 __request__=__request__,
                 user=user,
@@ -5456,11 +5676,14 @@ class Pipe:
         __user__: Optional[dict] = None,
         __metadata__: Optional[Dict[str, Any]] = None,
         user: Optional[UserModel] = None,
+        access: Optional[_RequestAccess] = None,
     ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
         """Generate video using Google Veo models (long-running operation with polling).
 
-        `user` is the requesting user for the forwarded user info headers.
+        `user` is the requesting user for the forwarded user info headers;
+        `access` what the access checks of this request looked up.
         """
+        access = access or _RequestAccess()
 
         async def emit_status(description: str, done: bool) -> None:
             if not __event_emitter__:
@@ -5487,7 +5710,7 @@ class Pipe:
             return "Error: No user message found for video generation"
 
         prompt, images = await self._extract_images_from_message(
-            last_user_msg, __user__=__user__
+            last_user_msg, __user__=__user__, access=access
         )
         if not prompt:
             return "Error: No prompt provided for video generation"
@@ -5526,6 +5749,7 @@ class Pipe:
                 __request__=__request__,
                 __user__=__user__,
                 __metadata__=__metadata__,
+                access=access,
             )
         finally:
             # The client is per request: close it after polling and the
@@ -5545,6 +5769,7 @@ class Pipe:
         __request__: Optional[Request],
         __user__: Optional[dict],
         __metadata__: Optional[Dict[str, Any]],
+        access: Optional[_RequestAccess] = None,
     ) -> Union[str, Dict[str, Any], AsyncIterator[Union[str, Dict[str, Any]]]]:
         """Start a Veo operation, poll it, then upload and attach the videos."""
         try:
@@ -5667,6 +5892,7 @@ class Pipe:
                     __user__,
                     __event_emitter__,
                     __metadata__,
+                    access,
                 )
             else:
                 video_data_b64 = base64.b64encode(video_bytes).decode("utf-8")
@@ -5873,8 +6099,11 @@ class Pipe:
         # The requesting user for the forwarded user info headers. A local, not
         # an attribute: the Pipe instance is shared by concurrent requests.
         user: Optional[UserModel] = None
+        # What the access checks of this request look up (accounts, whether the
+        # user may continue the chat), also a local
+        access = _RequestAccess()
         if __user__ and self.valves.ENABLE_FORWARD_USER_INFO_HEADERS:
-            user = await Users.get_user_by_id(__user__["id"])
+            user = await access.account(__user__["id"])
 
         # Remember statuses that are still running, to close them if the request
         # is stopped or fails (see finally).
@@ -5902,6 +6131,7 @@ class Pipe:
                     __user__,
                     __metadata__,
                     user=user,
+                    access=access,
                 )
 
             # Check if this model supports image generation
@@ -5930,7 +6160,7 @@ class Pipe:
                         contents,
                         system_instruction,
                     ) = await self._build_image_generation_contents(
-                        messages, __event_emitter__, __metadata__, __user__
+                        messages, __event_emitter__, __metadata__, __user__, access
                     )
                     # For image generation, system_instruction is integrated into the prompt
                     # so it will be None here (this is expected and correct)
@@ -6218,6 +6448,7 @@ class Pipe:
                         generated_image_files,
                         __event_emitter__,
                         __metadata__,
+                        access,
                     )
 
                     content = full_response if full_response else NO_CONTENT_TEXT

@@ -40,10 +40,14 @@ Groups (``--only gemini.<group>``)
                IMAGE_HISTORY_MAX_REFERENCES keeps the current and the newest
                images, older saved forms (data: URL files, markdown links),
                temporary chats and database errors use the request, files of
-               another user are read only for an admin (also on the Veo path)
+               another user are read only for an admin (also on the Veo path),
+               a file named in another user's message only if that user may
+               read it too
   shared       chats shared with "Allow replies" (Open WebUI 0.12): participants
-               edit with the chat's images, access as Open WebUI decides it
-               (suites/_gemini_shared.py)
+               edit with the chat's images, access as Open WebUI decides it,
+               files named by another participant only with that participant's
+               access too, a cap on the files checked, links only to chats the
+               user may continue (suites/_gemini_shared.py)
   toolsapi    native tool calling, API path: client tools -> tool_calls (stream,
                non-stream, finish_reason), text answers, streaming valve off,
                malformed / unexpected calls, continuation with signatures and
@@ -192,6 +196,7 @@ WARNINGS = tuple(
         # shared chats (1.20.0)
         "Failed to link generated image files",
         "File access check failed",
+        "Not linking generated files",
     )
 )
 # Valves and UserValves of google_gemini.py 1.16.1 with their defaults (valve
@@ -2857,8 +2862,11 @@ async def imgedit_db_error(t: Suite, mock) -> None:
 
 async def imgedit_foreign(t: Suite, mock) -> None:
     """Files of another user are never read: a message can name any file id.
-    An admin may read them (also when continuing the user's chat, which Open
-    WebUI allows up to 0.11)."""
+    An admin may read them in the admin's own requests. When an admin
+    continues the user's chat (Open WebUI allows it up to 0.11), a file named
+    in the user's message is read only if the user may read it too (1.20.0):
+    otherwise the user could have the pipe read the admin's files on the
+    admin's turn."""
     setup_error, grants, denied, video_denied, id_logged = "", [], 0, 0, []
     c1 = c2 = c3 = ru = ra = vo = vf = None
     empty = {"contents": 0, "sent": [], "images": []}
@@ -2980,7 +2988,9 @@ async def imgedit_foreign(t: Suite, mock) -> None:
     # user, permission="write"), which needs the owner, a chat shared with
     # share_mode "continue" or a shared folder (models/chats.py), and answers
     # 404, so the pipe is never called. Up to 0.11 it allowed the owner or any
-    # admin (Chats.is_chat_owner(...) or user.role == "admin").
+    # admin (Chats.is_chat_owner(...) or user.role == "admin"). The admin's
+    # file in the user's turn 1 is not sent then: the user wrote that message
+    # and may not read the file (1.20.0, the author's access counts too).
     admin_refused = owui_version >= (0, 12)
     t.check(
         "imgedit.admin",
@@ -2990,15 +3000,15 @@ async def imgedit_foreign(t: Suite, mock) -> None:
             "the pipe is not called"
             if admin_refused
             else "browser, an admin continues the user's chat: the chat is read, "
-            "the admin's file of turn 1 and the user's generated image are sent"
+            "the user's generated image is sent, the admin's file named in the "
+            "user's turn 1 is not (the user may not read it)"
         ),
         not setup_error
         and (
             getattr(c3, "http_status", None) == 404 and r3["contents"] == 0
             if admin_refused
             else getattr(c3, "done", False)
-            and r3["sent"]
-            == ["Make it blue", "[Image 1]", "foreign", "[Image 2]", "final"]
+            and r3["sent"] == ["Make it blue", "[Image 1]", "final"]
         ),
         f"{setup_error}owui={'.'.join(map(str, owui_version)) or '?'} "
         f"turn3: HTTP {getattr(c3, 'http_status', None)} "
