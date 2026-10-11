@@ -41,6 +41,9 @@ Groups (``--only gemini.<group>``)
                images, older saved forms (data: URL files, markdown links),
                temporary chats and database errors use the request, files of
                another user are read only for an admin (also on the Veo path)
+  shared       chats shared with "Allow replies" (Open WebUI 0.12): participants
+               edit with the chat's images, access as Open WebUI decides it
+               (suites/_gemini_shared.py)
   toolsapi    native tool calling, API path: client tools -> tool_calls (stream,
                non-stream, finish_reason), text answers, streaming valve off,
                malformed / unexpected calls, continuation with signatures and
@@ -100,6 +103,7 @@ GROUPS = (
     "concurrency",
     "streamimg",
     "imgedit",
+    "shared",
     "toolsapi",
     "tools",
     "owuitools",
@@ -179,6 +183,9 @@ WARNINGS = tuple(
         "Dropping unmatched tool result",
         "Could not restore stored model content",
         "Invalid tool call arguments",
+        # shared chats (1.20.0)
+        "Failed to link generated image files",
+        "File access check failed",
     )
 )
 # Valves and UserValves of google_gemini.py 1.16.1 with their defaults (valve
@@ -537,6 +544,7 @@ async def run(t: Suite) -> None:
         ("concurrency", concurrency),
         ("streamimg", streamimg),
         ("imgedit", imgedit),
+        ("shared", shared_group),
         ("toolsapi", toolsapi_group),
         ("tools", tools_group),
         ("owuitools", owuitools_group),
@@ -2984,6 +2992,13 @@ async def tools_group(t: Suite, mock) -> None:
     from . import _gemini_tools
 
     await _gemini_tools.tools(t, mock)
+
+
+# Chats shared with "Allow replies" (Open WebUI 0.12): suites/_gemini_shared.py
+async def shared_group(t: Suite, mock) -> None:
+    from . import _gemini_shared
+
+    await _gemini_shared.shared(t, mock)
 
 
 # Open WebUI's built-in image and code interpreter tools: suites/_gemini_owuitools.py
