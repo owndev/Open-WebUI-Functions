@@ -31,8 +31,8 @@ Open WebUI runs `pip` for this requirement when the function is saved and again 
 Open WebUI skips the automatic install when `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` or `OFFLINE_MODE=true` is set. In that case, and generally for production, multi-worker or multi-replica deployments, install the SDK yourself. For Docker, bake it into your image, which also avoids the in-process `websockets` downgrade:
 
 ```dockerfile
-# Use the same tag you deploy, e.g. v0.11.4, v0.11.4-slim or main
-FROM ghcr.io/open-webui/open-webui:v0.11.4
+# Use the same tag you deploy, e.g. v0.12.0, v0.12.0-slim or main
+FROM ghcr.io/open-webui/open-webui:v0.12.0
 RUN pip install --no-cache-dir "google-genai>=1.68.0,<3"
 ```
 

@@ -2,7 +2,7 @@
 # Static compatibility check: does an Open WebUI release still provide every
 # open_webui.* symbol, method and injected __param__ the functions in this repo use?
 #
-# usage: tests/e2e/check_owui_api.sh [TAG]      TAG: v0.11.4 (default) | latest | any git ref
+# usage: tests/e2e/check_owui_api.sh [TAG]      TAG: v0.12.0 (default) | latest | any git ref
 #
 # Reads pipelines/**/*.py and filters/*.py, fetches the matching Open WebUI backend
 # modules at TAG (via `gh api` when authenticated, otherwise raw.githubusercontent.com
@@ -25,7 +25,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-TAG=${1:-v0.11.4}
+TAG=${1:-v0.12.0}
 GH_REPO=open-webui/open-webui
 CACHE=$(mktemp -d)
 trap 'rm -rf "$CACHE"' EXIT

@@ -25,7 +25,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 
 # Default Open WebUI image (.github/workflows/e2e.yml reads this line).
-DEFAULT_IMAGE=ghcr.io/open-webui/open-webui:v0.11.4-slim
+DEFAULT_IMAGE=ghcr.io/open-webui/open-webui:v0.12.0-slim
 
 FUNCTION_FILES=(
   pipelines/google/google_gemini.py
