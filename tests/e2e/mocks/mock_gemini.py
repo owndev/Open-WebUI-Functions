@@ -75,6 +75,16 @@ part that is not Open WebUI's tool-image message, see ``_turn_text``)
   slow-thinking        streaming text models: twelve thought parts "Slow thought <i>."
                        0.5 s apart, then the answer "Slow answer."
 
+Open WebUI's context compaction prompt ("Summarize the conversation history
+that will be compacted ..."; before a reply and, from Open WebUI 0.12, between
+tool rounds) is answered with "MOCK-SUMMARY of <ids>", the mock's call ids
+(mock-call-<r>-<k>) in its "Messages Being Compacted" section in order ("no
+calls" without any). Triggers in that prompt (the chat's messages are part of
+it, so a word in the user message reaches only the summary request):
+  summary-400          HTTP 400 INVALID_ARGUMENT for the summary request
+  summary-empty        a summary without text: the thought part only (when
+                       requested), finishReason MAX_TOKENS
+
 Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
   {"rounds": [[{"name": "get_current_timestamp", "args": {}}], [...]],
    "text_before": "Let me check.", "split": false, "noid": false, "nosig": false,
@@ -120,8 +130,8 @@ declaration, recorded before any key normalisation), ``tool_config``,
 ``fc_mode``, ``allowed_names``, ``include_flag``, ``kinds`` (role and part kinds
 per content), ``fc`` / ``fr`` (function call / response parts with content
 index, id, name, args / response; ``sig`` of a call is none, skip, issued or
-bad), ``round``, ``directive``, ``answer`` (fc, final, text, malformed,
-mock-error, http-<status>), ``issued``, ``server_echoed``,
+bad), ``round``, ``directive``, ``answer`` (fc, final, text, summary,
+malformed, mock-error, http-<status>), ``issued``, ``server_echoed``,
 ``synthetic_ids_upstream`` and ``orphan_fr``.
 
 usage: python mock_gemini.py [--port 9101]
@@ -199,6 +209,12 @@ PACED = {
     ),
 }
 STREAM_PAUSE = 0.05  # seconds after every streamed chunk
+# Open WebUI's context compaction prompt (DEFAULT_CONTEXT_COMPACTION_PROMPT)
+COMPACTION_TASK = "Summarize the conversation history that will be compacted"
+COMPACTED_SECTION = re.compile(
+    r"### Messages Being Compacted:(.*?)(?:### Recent Messages Kept In Context:|$)",
+    re.DOTALL,
+)
 
 
 def png_b64(r: int, g: int, b: int) -> str:
@@ -771,9 +787,35 @@ def _first_since_reset(request: web.Request, trigger: str) -> bool:
     return len(seen) == 1
 
 
+def _compaction_summary(text: str) -> Optional[str]:
+    """The answer to Open WebUI's context compaction prompt (None for other
+    prompts): "MOCK-SUMMARY of" the mock's call ids in the messages being
+    compacted, in order."""
+    if COMPACTION_TASK not in text:
+        return None
+    match = COMPACTED_SECTION.search(text)
+    ids = re.findall(r"mock-call-\d+-\d+", match.group(1) if match else "")
+    return "MOCK-SUMMARY of " + (",".join(dict.fromkeys(ids)) or "no calls")
+
+
+def _summary_answer(model: str, body, summary: str, usage: dict) -> dict:
+    """GenerateContentResponse for a compaction prompt (``summary-empty``: no
+    text, finishReason MAX_TOKENS)."""
+    parts = (
+        [{"text": "Summary thinking.", "thought": True}]
+        if _thoughts(model, body)
+        else []
+    )
+    if "summary-empty" in _turn_text(body):
+        return _chunk(parts, body, True, usage, "MAX_TOKENS")
+    return _chunk(parts + [{"text": summary}], body, True, usage)
+
+
 def _reject(request: web.Request, model: str, body: dict) -> Optional[web.Response]:
     """Errors on purpose (triggers) and tools a model does not support (400)."""
     text = _turn_text(body)
+    if "summary-400" in text and _compaction_summary(text) is not None:
+        return _error(400, "mock: summary-400", "INVALID_ARGUMENT")
     if "force-400" in text:
         return _error(400, "mock: force-400", "INVALID_ARGUMENT")
     if "force-500-once" in text:
@@ -873,6 +915,9 @@ def _answer(model: str, body) -> dict:
     if blocked:
         return blocked
     thoughts = _thoughts(model, body)
+    summary = _compaction_summary(text)
+    if summary is not None:
+        return _summary_answer(model, body, summary, USAGE_TEXT)
     task = task_answer(text)
     if task:
         parts = [{"text": "Task thinking.", "thought": True}] if thoughts else []
@@ -916,6 +961,9 @@ def _stream_chunks(model: str, body) -> list:
             _chunk([{"text": "Here is your image."}], body, True, USAGE_IMAGE)
         )
         return chunks
+    summary = _compaction_summary(text)
+    if summary is not None:
+        return [_summary_answer(model, body, summary, USAGE_STREAM)]
     task = task_answer(text)
     paced = next((key for key in PACED if key in text), None)
     if paced and not task:
@@ -973,11 +1021,12 @@ async def model_action(request: web.Request) -> web.StreamResponse:
             annotate(request, answer=f"http-{rejected.status}")
             return rejected
         text = _turn_text(body)
-        if not (task_answer(text) or _blocked(text)):
+        summary = _compaction_summary(text) is not None
+        if not (summary or task_answer(text) or _blocked(text)):
             plan = _tool_plan(model, view)
         annotate(
             request,
-            answer=plan["answer"] if plan else "text",
+            answer="summary" if summary else plan["answer"] if plan else "text",
             issued=(plan or {}).get("issued"),
         )
     if action == "generateContent":
