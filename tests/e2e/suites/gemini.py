@@ -57,6 +57,11 @@ Groups (``--only gemini.<group>``)
   owuitools    Open WebUI's built-in image generation / editing (image engine
                "gemini" on the mock) and code interpreter tools called by a
                Gemini text model
+  owui012      Open WebUI 0.12 features with native tool calling: context
+               compaction between tool rounds (and a failed or empty summary,
+               also before a reply), Tool Search, model controls and custom
+               params, Stream Chat Response off per chat and per model
+               (suites/_gemini_owui012.py; version-gated)
 
 The browser path sends the web UI's default params, i.e. native function
 calling with Open WebUI's built-in tools (functionDeclarations). The "images"
@@ -107,6 +112,7 @@ GROUPS = (
     "toolsapi",
     "tools",
     "owuitools",
+    "owui012",
 )
 FID = "gemini"
 PATH = "pipelines/google/google_gemini.py"
@@ -548,6 +554,7 @@ async def run(t: Suite) -> None:
         ("toolsapi", toolsapi_group),
         ("tools", tools_group),
         ("owuitools", owuitools_group),
+        ("owui012", owui012_group),
     ):
         if t.selected(group):
             try:
@@ -3006,3 +3013,11 @@ async def owuitools_group(t: Suite, mock) -> None:
     from . import _gemini_owuitools
 
     await _gemini_owuitools.owuitools(t, mock)
+
+
+# Open WebUI 0.12 features (compaction, Tool Search, model controls, streaming
+# per chat): suites/_gemini_owui012.py
+async def owui012_group(t: Suite, mock) -> None:
+    from . import _gemini_owui012
+
+    await _gemini_owui012.owui012(t, mock)

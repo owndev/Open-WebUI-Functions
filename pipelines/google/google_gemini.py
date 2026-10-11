@@ -38,6 +38,7 @@ features:
   - Intelligent grounding with Google search integration, shown with Open WebUI's own localized search statuses (queries, searched sites)
   - Vertex AI Search grounding for RAG
   - Native tool calling through Open WebUI's tool loop (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval)
+  - Tools found by Open WebUI's Tool Search (search_tools) declared to Gemini from the next round on, so they can be called
   - Thought signatures carried across tool rounds and turns
   - Tool calls returned to API clients as OpenAI tool_calls (streaming and non-streaming)
   - Google Search grounding together with function calling on Gemini 3
@@ -60,7 +61,7 @@ features:
   - Image-to-video generation support for Veo models
   - Negative prompt and person generation controls for video
   - Token usage reporting for streaming and non-streaming responses
-  - Usable as task model for title, tag and follow-up generation
+  - Usable as task model for title, tag and follow-up generation and for context compaction (a failed or empty summary leaves Open WebUI's own summary in place of an error text)
 """
 
 import os
@@ -232,6 +233,17 @@ TOOL_IMAGES_TEXT = (
 # Chat ids Open WebUI does not save: temporary chats (also the legacy "local:"
 # prefix) and channel messages. Their history exists only in the request.
 UNSAVED_CHAT_ID_PREFIXES = ("temporary:", "local:", "channel:")
+
+# Open WebUI's Tool Search (0.12+, utils/tool_search.py): the tool that returns
+# the definitions of the tools left out of body["tools"].
+TOOL_SEARCH_NAME = "search_tools"
+
+# __metadata__["task"] of Open WebUI's context compaction request, whose answer
+# becomes the conversation summary (utils/context_compaction.py).
+CONTEXT_COMPACTION_TASK = "context_compaction"
+
+# Placeholder answer when Gemini returned no text.
+NO_CONTENT_TEXT = "[No content generated]"
 
 # Seconds between two updates of the live thinking block in the chat (Open WebUI
 # saves the message content on every update).
@@ -3725,7 +3737,8 @@ class Pipe:
         Open WebUI puts an OpenAI tool spec into body["tools"] for every tool it
         offers in Native mode (built-in, workspace, MCP, OpenAPI, terminal and
         direct tools) and runs Gemini's function calls itself; API clients send
-        their own tools and run the calls themselves.
+        their own tools and run the calls themselves. With Tool Search, the
+        deferred tools that search_tools found are added (_searched_tool_specs).
 
         Returns:
             (declarations, {gemini_name: open_webui_name}), rebuilt per request
@@ -3753,6 +3766,7 @@ class Pipe:
 
         declarations: List[types.FunctionDeclaration] = []
         name_map: Dict[str, str] = {}
+        tools = tools + self._searched_tool_specs(body.get("messages"), metadata, tools)
         for entry in tools:
             if (
                 not isinstance(entry, dict)
@@ -3778,6 +3792,80 @@ class Pipe:
                 declaration["parameters_json_schema"] = schema
             declarations.append(types.FunctionDeclaration(**declaration))
         return declarations, name_map
+
+    def _searched_tool_specs(
+        self, messages: Any, metadata: Dict[str, Any], tools: List[Any]
+    ) -> List[Dict[str, Any]]:
+        """Tool specs of the deferred tools that Open WebUI's Tool Search
+        returned in this conversation (Open WebUI 0.12+).
+
+        With Tool Search on, Open WebUI leaves tools with long definitions out
+        of body["tools"] (__metadata__["deferred_tools"]), lists them in the
+        system prompt and declares search_tools, which returns their
+        definitions; the model is expected to call a tool it found by name.
+        Gemini only calls declared functions, so every deferred tool named in a
+        search_tools result of the messages is declared as well, with the spec
+        of the tool Open WebUI runs (__metadata__["tools"]).
+        """
+        deferred = metadata.get("deferred_tools")
+        available = metadata.get("tools")
+        if not (
+            isinstance(deferred, list)
+            and deferred
+            and isinstance(available, dict)
+            and isinstance(messages, list)
+        ):
+            return []
+        declared = {
+            entry["function"].get("name")
+            for entry in tools
+            if isinstance(entry, dict) and isinstance(entry.get("function"), dict)
+        }
+        names: List[str] = []
+        search_ids: set = set()
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "assistant":
+                # The tool messages after it answer this message's calls
+                search_ids = {
+                    self._tool_call_id(call.get("id"))
+                    for call in message.get("tool_calls") or []
+                    if isinstance(call, dict)
+                    and self._tool_call_function(call).get("name") == TOOL_SEARCH_NAME
+                }
+                continue
+            if (
+                message.get("role") != "tool"
+                or self._tool_call_id(message.get("tool_call_id")) not in search_ids
+            ):
+                continue
+            try:
+                result = json.loads(self._tool_result_text(message.get("content")))
+            except ValueError:
+                continue
+            found = result.get("tools") if isinstance(result, dict) else None
+            for spec in found if isinstance(found, list) else []:
+                name = spec.get("name") if isinstance(spec, dict) else None
+                if (
+                    isinstance(name, str)
+                    and name in deferred
+                    and name not in declared
+                    and name not in names
+                ):
+                    names.append(name)
+        specs: List[Dict[str, Any]] = []
+        for name in names:
+            tool = available.get(name)
+            spec = tool.get("spec") if isinstance(tool, dict) else None
+            if isinstance(spec, dict) and spec.get("name") == name:
+                specs.append({"type": "function", "function": spec})
+        if specs:
+            self.log.debug(
+                f"Declaring {len(specs)} tool(s) found by {TOOL_SEARCH_NAME}: "
+                f"{[spec['function']['name'] for spec in specs]}"
+            )
+        return specs
 
     def _map_tool_choice(
         self, tool_choice: Any, name_map: Dict[str, str]
@@ -5661,6 +5749,59 @@ class Pipe:
         StreamingResponse,
     ]:
         """
+        Entry point Open WebUI calls (see _pipe for the request path).
+
+        Open WebUI's context compaction request gets an empty answer when
+        Gemini gave no summary (see _compaction_summary).
+        """
+        result = await self._pipe(
+            body, __metadata__, __event_emitter__, __request__, __user__
+        )
+        if (__metadata__ or {}).get("task") == CONTEXT_COMPACTION_TASK and not body.get(
+            "stream"
+        ):
+            return self._compaction_summary(result, body.get("model", ""))
+        return result
+
+    def _compaction_summary(self, result: Any, model: str) -> Any:
+        """The answer to Open WebUI's context compaction request.
+
+        Open WebUI uses the answer text as the conversation summary: it replaces
+        the compacted messages in the request and, when compacting before a
+        reply, is saved with the chat for every later request. An error text, a
+        safety notice or the "[No content generated]" placeholder must not
+        become that summary, so they are answered with an empty text; Open
+        WebUI then uses its own summary of the compacted messages.
+        """
+        content = None
+        if isinstance(result, dict):
+            choices = result.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            message = choice.get("message") if isinstance(choice, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content.strip() and content != NO_CONTENT_TEXT:
+            return result
+        self.log.warning(
+            "No summary for Open WebUI's context compaction (the request failed or "
+            "Gemini returned no text); Open WebUI uses its own summary of the "
+            "compacted messages"
+        )
+        return self._build_non_stream_result("", None, model, False)
+
+    async def _pipe(
+        self,
+        body: Dict[str, Any],
+        __metadata__: dict[str, Any],
+        __event_emitter__: Optional[Callable],
+        __request__: Optional[Request] = None,
+        __user__: Optional[dict] = None,
+    ) -> Union[
+        str,
+        Dict[str, Any],
+        AsyncIterator[Union[str, Dict[str, Any]]],
+        StreamingResponse,
+    ]:
+        """
         Main method for sending requests to the Google Gemini endpoint.
 
         Tools are declared from body["tools"] (the OpenAI tool specs Open WebUI
@@ -6034,9 +6175,7 @@ class Pipe:
                         __metadata__,
                     )
 
-                    content = (
-                        full_response if full_response else "[No content generated]"
-                    )
+                    content = full_response if full_response else NO_CONTENT_TEXT
 
                     # Return content and usage in the shape that matches the request
                     # (dict for stream=false, content + usage chunks for stream=true)

@@ -236,11 +236,12 @@ The functions include a built-in encryption mechanism for sensitive information:
 - **Nano Banana image models**: `gemini-nano-banana-2.1`, `gemini-3.1-flash-image` and `gemini-3.1-flash-lite-image` are detected as image models; each generated image is uploaded once (interim thought images are skipped unless no final image arrives). API clients get generated images and videos as links in the answer. Google Search grounding is left out for the image models without Search support (`gemini-2.5-flash-image`, `gemini-3.1-flash-lite-image`). Newer image models outside Gemini 3 / Nano Banana naming can be added via `GOOGLE_IMAGE_GENERATION_MODELS` without a code change.
 - **Video generation (Veo)**: Generate videos with Google Veo models (3.1, 3, 2). Configurable aspect ratio, resolution, duration, negative prompt, and person generation controls. Supports text-to-video and image-to-video for all supported Veo models. Videos are automatically uploaded and embedded with playback controls.
 - **Token usage tracking**: Returns prompt, completion, and total token counts to Open WebUI for automatic persistence in the database, for streaming and non-streaming responses.
-- **Background tasks**: Works as the Open WebUI task model for title, tag and follow-up generation (without Google Search grounding, even when the chat uses it).
+- **Background tasks**: Works as the Open WebUI task model for title, tag and follow-up generation (without Google Search grounding, even when the chat uses it) and for context compaction, where a failed or empty summary leaves Open WebUI's own summary of the compacted messages instead of an error text.
 - **Model whitelist & additional models**: Restrict the visible model list via `GOOGLE_MODEL_WHITELIST` and add SDK-unsupported models via `GOOGLE_MODEL_ADDITIONAL`; changes show on the next model list refresh, without waiting for the model cache TTL.
 - Grounding with Google Search via the [google_search_tool.py filter](./filters/google_search_tool.py)
 - Grounding with Vertex AI Search via the [vertex_ai_search_tool.py filter](./filters/vertex_ai_search_tool.py)
 - [Native tool calling through Open WebUI's tool loop](./docs/google-gemini-integration.md#native-tool-calling) (built-in, workspace, MCP, OpenAPI, terminal and direct tools, tool approval); tool calls are returned to API clients
+- Works with Open WebUI 0.12's [Tool Search](./docs/google-gemini-integration.md#tool-search-open-webui-012) (tools found by `search_tools` are declared to Gemini so it can call them) and [compaction during long tool runs](./docs/google-gemini-integration.md#context-compaction-during-tool-runs)
 - Configurable API version support
 
 🔗 [Google Gemini Pipeline in Open WebUI](https://openwebui.com/f/owndev/google_gemini)
