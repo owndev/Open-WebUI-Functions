@@ -8,9 +8,12 @@
 # modules at TAG (via `gh api` when authenticated, otherwise raw.githubusercontent.com
 # with curl) and reports
 #   - every `from open_webui.X import a, b` symbol defined (or re-exported) in X;
+#     (or a submodule X.a, whose called functions are checked like methods);
 #     definitions marked "legacy"/"deprecated" are flagged as WARN
 #   - every module imported as `import open_webui.X [as y]`
 #   - every method called on an imported class object (Users.get_user_by_id(...))
+#     or function called on an imported submodule (files.has_access_to_file(...));
+#     a missing one the function looks up with getattr(obj, "name") first is a WARN
 #   - every __dunder__ parameter the functions declare still injected by Open WebUI
 #   - frontmatter (version / required_open_webui_version / requirements) per file
 #   - event types Open WebUI persists from __event_emitter__, versions of shared deps
@@ -125,6 +128,7 @@ SYMBOLS=$(echo "$IMPORTS" | awk -F'\t' 'NF == 3 {
 echo
 echo "== open_webui imports"
 B='([^A-Za-z0-9_]|$)'
+SUBMODULES=""  # "from open_webui.X import submodule": "X.submodule" per line
 while IFS=$'\t' read -r mod name users; do
   [ -n "$name" ] || continue
   src=$(module_file "$mod")
@@ -137,7 +141,10 @@ while IFS=$'\t' read -r mod name users; do
     continue
   fi
   def=$(grep -Em1 "^(async[[:space:]]+)?def[[:space:]]+${name}[[:space:]]*\(|^class[[:space:]]+$name$B|^[[:space:]]*${name}[[:space:]]*(:[^=]*)?=([^=]|$)|^[[:space:]]*(from[[:space:]].*)?import[[:space:]].*[[:space:],(]$name$B|^[[:space:]]+$name,?[[:space:]]*$" "$src" || true)
-  if [ -z "$def" ]; then
+  if [ -z "$def" ] && [ -s "$(module_file "$mod.$name")" ]; then
+    ok "$mod.$name (module)"
+    SUBMODULES="$SUBMODULES$mod.$name"$'\n'
+  elif [ -z "$def" ]; then
     bad "$mod.$name <- $users"
   elif echo "$def" | grep -qiE "legacy|deprecated"; then
     warn "$mod.$name is marked legacy/deprecated: $(echo "$def" | sed 's/^[[:space:]]*//' | cut -c1-90) <- $users"
@@ -174,18 +181,38 @@ done <<<"$MODULES"
 echo
 echo "== methods called on imported objects"
 while IFS=$'\t' read -r mod name users; do
-  case "$name" in [A-Z][a-z]*) ;; *) continue ;; esac
-  src=$(module_file "$mod")
+  if echo "$SUBMODULES" | grep -qxF "$mod.$name"; then
+    # a submodule: its functions, called through the name or its alias
+    where=$mod.$name
+    modre=$(echo "$mod" | sed 's/[.]/[.]/g')
+    # shellcheck disable=SC2046 # the file list is split into words on purpose
+    objs=$(cd "$REPO" && cat $(echo "$users" | tr , ' ') | tr -d '\r' \
+      | sed -nE "s/^[[:space:]]*from[[:space:]]+$modre[[:space:]]+import[[:space:]]+(.*[[:space:],(])?$name[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\2/p" \
+      | sort -u)
+    [ -n "$objs" ] || objs=$name
+  else
+    case "$name" in [A-Z][a-z]*) ;; *) continue ;; esac
+    where=$mod
+    objs=$name
+  fi
+  src=$(module_file "$where")
   [ -s "$src" ] || continue
-  # shellcheck disable=SC2046 # the file list is split into words on purpose
-  for method in $(cd "$REPO" && cat $(echo "$users" | tr , ' ') \
-      | grep -oE "(^|[^A-Za-z0-9_.])$name\.[a-z_][a-z0-9_]*\(" \
-      | sed -E "s/.*$name\.([a-z0-9_]+)\(/\1/" | sort -u); do
-    if grep -Eq "^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+${method}[[:space:]]*\(" "$src"; then
-      ok "$name.$method() ($mod)"
-    else
-      bad "$name.$method() not found in $mod <- $users"
-    fi
+  for obj in $objs; do
+    # shellcheck disable=SC2046 # the file list is split into words on purpose
+    for method in $(cd "$REPO" && cat $(echo "$users" | tr , ' ') \
+        | grep -oE "(^|[^A-Za-z0-9_.])$obj\.[a-z_][a-z0-9_]*\(" \
+        | sed -E "s/.*$obj\.([a-z0-9_]+)\(/\1/" | sort -u); do
+      if grep -Eq "^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+${method}[[:space:]]*\(" "$src"; then
+        ok "$obj.$method() ($where)"
+      # shellcheck disable=SC2046 # the file list is split into words on purpose
+      elif (cd "$REPO" && grep -qE "getattr\($obj,[[:space:]]*[\"']$method[\"']" \
+          $(echo "$users" | tr , ' ')); then
+        # feature detection: the function checks for it and works without it
+        warn "$obj.$method() not in $where (optional, checked with getattr) <- $users"
+      else
+        bad "$obj.$method() not found in $where <- $users"
+      fi
+    done
   done
 done <<<"$SYMBOLS"
 

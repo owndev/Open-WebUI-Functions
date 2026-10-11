@@ -50,32 +50,33 @@ Typical output (abridged):
 starting owui-e2e-111759-1234 from ghcr.io/open-webui/open-webui:v0.11.4-slim
 Open WebUI healthy after 20s (http://localhost:57765)
 Open WebUI 0.11.4, suites: gemini, azure, n8n, infomaniak, filters
-function versions: google_gemini.py 1.19.1, azure_ai_foundry.py 3.0.1, n8n.py 2.3.1, ...
+function versions: google_gemini.py 1.20.0, azure_ai_foundry.py 3.0.1, n8n.py 2.3.1, ...
 === gemini ===
 [PASS ] gemini.load  pipelines/google/google_gemini.py loads (create, import, activate)
 [PASS ] gemini.api.stream  API stream without websocket session: answer streamed, thinking in the <details type="reasoning" done="true" duration="N"> block
 ...
 [PASS ] gemini.tools.builtin  built-in tool, browser stream=True: Open WebUI runs it, ...
 ...
---- gemini: 343s
+--- gemini: 415s
 ...
 === infomaniak ===
 ...
 [PASS ] infomaniak.models.name-prefix  NAME_PREFIX valve changes the model names, and changing it back restores them
 ...
-SUMMARY: 549 PASS, 0 FAIL, 0 KNOWN in 1121s
-total runtime: 1148s
+SUMMARY: 565 PASS, 0 FAIL, 0 KNOWN in 1213s
+total runtime: 1249s
 output: tests/e2e/out/20261009-111759-owui-e2e-111759-1234
 ```
 
-A full run of all suites took about 19 minutes on a shared 8-CPU Docker host (1148 s on
-v0.11.4-slim: 27 s container start-up, then gemini 343 s, azure 417 s, n8n 71 s,
-infomaniak 36 s, filters 253 s; 1046 s on v0.12.0-slim, where azure takes 301 s because
-the browser path's answers are saved as done sooner). Most of it is waiting: the azure
-`rag` group adds about 5.5 minutes (query-generation timeouts, the query-generation
-pause and the 45 s retrieval limit are waited for; in the meta-test, where every mock answers HTTP 500, its requests fail at
-once), the gemini `tools`, `toolsapi`, `imgedit` and `owuitools` groups about three
-minutes and the filters `ingest` group (Logs Ingestion API) another 2.5 minutes. The
+A full run of all suites took about 20 minutes on a shared 8-CPU Docker host (2026-10-11,
+`google_gemini.py` 1.20.0: 1213 s on `v0.11.4-slim`, 1263 s on `v0.12.0-slim`; up to 30 minutes
+while other runs share the host).
+Most of it is waiting: the azure `rag` group adds about 5.5 minutes (query-generation
+timeouts, the query-generation pause and the 45 s retrieval limit are waited for; in the
+meta-test, where every mock answers HTTP 500, its requests fail at once), the gemini
+`tools`, `toolsapi`, `imgedit` and `owuitools` groups about three minutes, the gemini
+`owui012` group about one minute, `shared` about one minute on 0.12, and the filters `ingest`
+group (Logs Ingestion API) another 2.5 minutes. The
 browser scenarios of the gemini `thinking` group (paced streams for the live block and
 its duration, Stop while thinking, a tool round) take about 20 s.
 Network downloads on first use come on top
@@ -147,7 +148,7 @@ events), a **background title task** and that the server log has no unexpected
 
 | Suite | Function(s) | Mock | Groups (`--only <suite>.<group>`) and file-specific scenarios |
 | --- | --- | --- | --- |
-| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py`, `mock_tools.py` (tool servers, Jupyter) | `models` (image / video indicators, display names #172), `api` (thinking in the `<details type="reasoning" done="true" duration="N">` block, full usage), `thinking` (summaries not replayed #176: the plain block of chats saved before 1.19.0 and the `type="reasoning"` blocks, also a stopped `done="false"` one; budget, level, include and strip valves; browser path: the live `done="false"` block through throttled `replace` events, no thinking status, the switch to `done="true"` with all thoughts on the first answer part and deltas after it, the duration up to the first answer part (mock trigger `paced-thinking`), Stop while thinking and the next turn without the block (`slow-thinking`), a tool round that clears its live block), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file, the thinking block), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history, where the limit keeps the current and the newest images and cuts more current images than it allows; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations, Open WebUI's search statuses (the queries, then `Searched {{count}} sites` with `items` and no `urls`); no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `imgedit` (image editing across turns, #194: in a saved chat the image of turn 1, attached as a file only, is sent with the edit request on `gemini-3.1-flash-image` and `gemini-nano-banana-2.1`; the follow-up task gets no images; uploads between generated turns in the default mode, with another image per turn (the mock's `final-image-<n>` trigger) so their order shows; guided regeneration, also of an image-only message and of a text contained in the guidance; no guided regeneration after an empty answer, which Open WebUI 0.12 leaves out of the request (`imgedit.empty-answer`, 1.19.1); `IMAGE_HISTORY_MAX_REFERENCES` keeps the upload of the edit message, else the newest images; an image attached again is sent once and counts at its newest place (with `IMAGE_DEDUP_HISTORY=false` it is sent each time); older saved forms (a data: URL image file, markdown links to a file and to a data: URL; a text file is not sent); a temporary chat and a database error (injected by a test-only filter) take the history from the request; an image file of another user in a non-admin user's chat, in a markdown link on the API path and on the Veo path is not read (logged without its id), an admin continuing the user's chat reads it (up to Open WebUI 0.11; 0.12 gives an admin only read access to another user's chat and answers the admin's turn with HTTP 404 before the pipe runs, which `imgedit.admin` checks there instead)), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), a text answer to a request with tools (`finish_reason` `stop`), `GOOGLE_STREAMING_ENABLED=false`, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` streamed and non-streamed, continuation with and without signatures and with `reasoning_details` under `provider_specific_fields`, older turns with a thinking summary, empty arguments, content parts, a numeric id and a `function` that is not an object, `tool_choice` (also an undeclared name and with Search grounding on Gemini 3), name mapping (also a trailing newline) and duplicates, the `default_api.` prefix, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls (responses in call order), two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, a tool result with an image, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 (the sources of both rounds, the next turn without web search) and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off, `GOOGLE_STREAMING_ENABLED=false`; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)), `owuitools` (Open WebUI's built-in `generate_image`, `edit_image` and `execute_code` called by a Gemini text model: declared only with the chat toggles and for browser sessions, `edit_image` only with image editing on; the image engine `gemini` with `generateContent` and with `predict` (Imagen), editing an upload and the image of the previous turn, the image saved with the answer and its URL sent back to Gemini; a pipe image model makes its own image; the code interpreter with pyodide (the browser runs the code) and with Jupyter; see [Open WebUI's image and code tools](#open-webuis-image-and-code-tools-geminiowuitools)) |
+| `gemini` | `pipelines/google/google_gemini.py` (+ `google_search_tool`) | `mock_gemini.py`, `mock_tools.py` (tool servers, Jupyter) | `models` (image / video indicators, display names #172), `api` (thinking in the `<details type="reasoning" done="true" duration="N">` block, full usage), `thinking` (summaries not replayed #176: the plain block of chats saved before 1.19.0 and the `type="reasoning"` blocks, also a stopped `done="false"` one; budget, level, include and strip valves; browser path: the live `done="false"` block through throttled `replace` events, no thinking status, the switch to `done="true"` with all thoughts on the first answer part and deltas after it, the duration up to the first answer part (mock trigger `paced-thinking`), Stop while thinking and the next turn without the block (`slow-thinking`), a tool round that clears its live block), `browser`, `tasks` (no `<details>` in task answers, no grounding tools for the tasks of a web_search chat), `image` (image models forced non-stream, exactly one saved file, the thinking block), `images` (thought images skipped, used as fallback, not used after IMAGE_SAFETY; dedup; two final images; image link for API clients; image history, where the limit keeps the current and the newest images and cuts more current images than it allows; optimization), `nano` (`gemini-nano-banana-2.1`), `imgvalve` (`IMAGE_GENERATION_MODELS`), `imgconfig` (ImageConfig valves, user valve, body), `imgtools` (tools per image model with web_search), `nostream` (`GOOGLE_STREAMING_ENABLED=false` with `stream=true`, #170), `video` (Veo: text and video saved, request shape, image-to-video), `grounding` (`google_search_tool` → googleSearch + urlContext, sources, `[1]` citations, Open WebUI's search statuses (the queries, then `Searched {{count}} sites` with `items` and no `urls`); no grounding without web_search), `vertex` (Vertex AI Search sources), `errors` (400, 500 with retry, blocked prompt, SAFETY finish, image error status, a streamed answer starting with `data:`), `retry` (`RETRY_COUNT` for streams), `status` (Stop leaves no running status), `valves` (model cache vs. valve changes, safety, whitelist, additional models, system prompt, user headers, API version, params, valve names and defaults), `concurrency` (forwarded user headers belong to the requesting user), `streamimg` (inline image in a stream), `imgedit` (image editing across turns, #194: in a saved chat the image of turn 1, attached as a file only, is sent with the edit request on `gemini-3.1-flash-image` and `gemini-nano-banana-2.1`; the follow-up task gets no images; uploads between generated turns in the default mode, with another image per turn (the mock's `final-image-<n>` trigger) so their order shows; guided regeneration, also of an image-only message and of a text contained in the guidance; no guided regeneration after an empty answer, which Open WebUI 0.12 leaves out of the request (`imgedit.empty-answer`, 1.19.1); `IMAGE_HISTORY_MAX_REFERENCES` keeps the upload of the edit message, else the newest images; an image attached again is sent once and counts at its newest place (with `IMAGE_DEDUP_HISTORY=false` it is sent each time); older saved forms (a data: URL image file, markdown links to a file and to a data: URL; a text file is not sent); a temporary chat and a database error (injected by a test-only filter) take the history from the request; an image file of another user in a non-admin user's chat, in a markdown link on the API path and on the Veo path is not read (logged without its id), an admin continuing the user's chat reads the chat, but not the admin's file named in the user's message, which the user may not read (up to Open WebUI 0.11; 0.12 gives an admin only read access to another user's chat and answers the admin's turn with HTTP 404 before the pipe runs, which `imgedit.admin` checks there instead)), `shared` (chats shared with "Allow replies", Open WebUI 0.12, `google_gemini.py` 1.20.0; see [Shared chats](#shared-chats-geminishared)), `toolsapi` (native tool calling for API clients: client tools → `tool_calls` + `reasoning_details` streamed and non-streamed with `finish_reason` `tool_calls` (also as the openai SDK reads the stream), a text answer to a request with tools (`finish_reason` `stop`), `GOOGLE_STREAMING_ENABLED=false`, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` streamed and non-streamed, continuation with and without signatures and with `reasoning_details` under `provider_specific_fields`, older turns with a thinking summary, empty arguments, content parts, a numeric id and a `function` that is not an object, `tool_choice` (also an undeclared name and with Search grounding on Gemini 3), name mapping (also a trailing newline) and duplicates, the `default_api.` prefix, schema clean-up, synthetic `owui_` ids, unchanged answers without tools), `tools` (native tool calling through Open WebUI's tool loop: built-in tool streamed and non-streamed, parallel calls (responses in call order), two rounds with summed usage, merged rounds without signatures, text before a call, thinking on / off, workspace Python tool, a tool result with an image, OpenAPI and MCP tool servers, direct tools of the browser, tool approval (approve, reject, two calls), follow-up turns on Gemini 3 / 2.5 / 3 and after an approved call, unknown tool, `MALFORMED_FUNCTION_CALL`, Search grounding with functions on Gemini 3 (the sources of both rounds, the next turn without web search) and grounding only on 2.5, title task, Legacy mode, `builtin_tools` off, `GOOGLE_STREAMING_ENABLED=false`; see [Native tool calling](#native-tool-calling-geminitools-geminitoolsapi)), `owuitools` (Open WebUI's built-in `generate_image`, `edit_image` and `execute_code` called by a Gemini text model: declared only with the chat toggles and for browser sessions, `edit_image` only with image editing on; the image engine `gemini` with `generateContent` and with `predict` (Imagen), editing an upload and the image of the previous turn, the image saved with the answer and its URL sent back to Gemini; a pipe image model makes its own image; the code interpreter with pyodide (the browser runs the code) and with Jupyter; see [Open WebUI's image and code tools](#open-webuis-image-and-code-tools-geminiowuitools)), `owui012` (Open WebUI 0.12 features with native tool calling, version-gated: on 0.11 a missing feature passes with "feature not in Open WebUI <version>"; context compaction between tool rounds (the summary request without tools; afterwards the summary, the user message and the kept rounds with their signatures; a follow-up turn whose boundary falls into the earlier turn), a failed or empty summary request between tool rounds and before a reply (also the summary saved with the chat, also on 0.11) leaves Open WebUI's own summary (1.20.0), Tool Search (`search_tools` and the `<available_tools>` list, the found tool declared and run in the next round and in the next turn, a mapped OpenAPI name; 1.20.0), model controls refused for pipe models and the custom params a control would set, Stream Chat Response off per chat and per model in a tool turn; see [Open WebUI 0.12 features](#open-webui-012-features-geminiowui012)) |
 | `azure` | `pipelines/azure/azure_ai_foundry.py` | `mock_azure.py` (requires `api-version`; answers prompts with a `<documents>` block like a plain model, without `context`; query generation, embeddings, tool calls, a ~300 KB and a > 4 MiB stream event, `content: null`), `mock_search.py` (Azure AI Search and an App Service managed identity token endpoint, see below) | `valves` (from 3.0.0 also the `AZURE_AI_SEARCH_*` valves, their defaults, enums and the password input of the key, and no `AZURE_AI_SEARCH_MODE`), `models` (`AZURE_AI_MODEL` lists separated by `;`, `,` or spaces with exact names, `AZURE_AI_PIPELINE_PREFIX`, model from an `*.openai.azure.com` URL, predefined and fallback models), `api` (api-key and Bearer header, path and api-version, allow-listed body: extra client keys dropped, tools forwarded, `stream_options` only for streams; JSON 400 (exactly Azure's message, nothing appended) and text/plain 500 errors), `dotted` (`gpt-4.1`, `Phi-3.5-mini-instruct` reach upstream intact, model in header or body), `browser` (full status sequence, error status with exactly Azure's message), `tasks` (title task, also with Azure AI Search valves, #123), `rag` (the pipe's own Azure AI Search retrieval, 3.0.0, #187; `suites/_azure_rag.py`: API and browser path, stream and non-stream, Foundry `/models` endpoint; search request body per `query_type`, query text rules, embeddings for `deployment_name` (v1 route, gateway prefix, Bearer) and `endpoint` (api-version, own key or access token, chat key only on the same scheme, host and port), integrated vectorizer; `fields_mapping` with `select`, separator and fallback, list-valued titles; `filter`, `top_n_documents` (2 x candidates), `strictness` (per query), the api-version valve, the document budget (auto, also with a large `top_n_documents`, valve, unlimited, dropping a document); prompt placement, one block and one system message, `in_scope` and the tool-results clause, `role_information`, sanitizing (also nested tags, titles and file names), list and image-only content, Open WebUI's tool-images message, an attached file (`<attached_files>` and RAG template around the prompt; the search text is the typed prompt from `__metadata__`: `base_user_prompt` of Open WebUI 0.12 or `user_prompt` of 0.11, both also checked with the staged file in the driver process, `query-text.metadata`); citations, `context` event and `message.context`, scores per score type and with `AZURE_AI_INCLUDE_SEARCH_SCORES` off; `[docX]` → links, also split across stream deltas (API and browser, also without a finish chunk; in API streams all text before `[DONE]` and nothing after it), already linked or with parentheses in the URL (stream and non-stream), with a dotted deployment name; links in the history sent back as `[docX]` (also links saved before 2.8.0 with `)` in the URL; a hostile history line in linear time); only referenced sources saved and the show-all valve (also for an answer that cites only a document the search did not return, `[doc9]`, or one next to `[doc1]`); a context event over 128 KiB, an upstream event of ~300 KB (read and passed on) and one over 4 MiB (an error, API and browser); `content: null`; tool rounds (one search, reused only by a tool round of the same message with unchanged valves, no duplicate sources also when the tool round references a document, a non-stream tool call), tools and `stream_options` forwarded, tasks without retrieval and without `data_sources` (also for a saved chat without a websocket session); query generation (follow-ups, `always` / `off`, transcript with Open WebUI's conversation summary, max queries, `<think>` with draft queries, fallback also for JSON nested too deep, partial and all-failed results, merge order by reciprocal rank fusion and reranker score, model in the body, the pause after 3 timeouts in a row: per model, reset by a success, still on after 16 s); auth: key, key valve, access token, system- and user-assigned managed identity (`mi_res_id`), token errors; fail-closed errors with a terminal status (HTTP 500/403/402/404/400/302/429/503, connection, retries, the 45 s retrieval limit, an answer larger than 16 MB, configuration errors, client `data_sources` (API stream and non-stream and the browser path as from an inlet filter: the error naming the removal of On Your Data in 3.0.0, the pipe's ERROR line and the terminal error status, nothing forwarded; an empty list is ignored), `context_length_exceeded` (exactly Azure's message and the budget hint)); Stop during a search and during query generation; `AZURE_AI_SEARCH_MODE=on_your_data` stored by a 2.9.0 pre-release or set in the environment is ignored; `log.debug`: the staged file run in the driver process with every logger at DEBUG logs no key or token, see below; `notice.none`: no On Your Data retirement notice of 2.8.1 in the server log), `logs` (no API key, no search key or token, no citation text, no generated queries, document titles or URLs in the server log at INFO and above) |
 | `n8n` | `pipelines/n8n/n8n.py` | `mock_n8n.py` | `api` (request payload contract, bearer / Cloudflare headers, usage, `intermediateSteps` tool display with verbosity and truncation, `<think>` blocks, history / `INPUT_FIELD` / `RESPONSE_FIELD` valves, plain text, NDJSON, SSE streams in separate and coalesced writes with plain lines and `event:` / `id:` / `retry:` fields, OpenAI-style chunks, UTF-8 characters split across writes, braces inside strings, a large object trickling in as small writes (server CPU), webhook error), `browser` (saved answer, usage and final status for JSON, NDJSON, UTF-8, an n8n error chunk, a broken stream and a webhook error; chat context sent to the workflow for chat turns vs. background tasks; Stop during a stream and a non-stream request), `tasks` (title task without and with a chat id) |
 | `infomaniak` | `pipelines/infomaniak/infomaniak.py` | `mock_infomaniak.py` | `models` (llm models only, `NAME_PREFIX`), `api` (product id and bearer key, allow-listed body, SSE stream normal, coalesced into one write and split mid-JSON; OpenAI-style and Infomaniak `error.description` errors with one log line each), `browser` (saved answer, usage and status events for those streams plus no final newline, CRLF, a broken stream and an upstream error; Stop during the stream and while waiting for the response headers), `tasks` |
@@ -180,7 +181,10 @@ every mapped host and is reissued when a name is missing) and starts
 `mocks/mock_la.py` (HTTPS on 127.0.0.1:443, control routes on :9105, managed identity
 endpoints on 127.0.0.1:9107 and 127.0.0.2:9107). The `ingest` group takes about two
 and a half minutes, mostly timeout, token-expiry and token back-off waits. It also creates the user
-`filters-user@example.com`; the `gemini` suite creates `e2e-gemini-user@example.com`.
+`filters-user@example.com`; the `gemini` suite creates `e2e-gemini-user@example.com`,
+`e2e-imgedit-user@example.com` and, in its `shared` group, the non-admin users
+`e2e-shared-*@example.com`, a folder of the owner and the group `E2E Shared Chats`
+(deleted at the group's end).
 The `offline` group needs a fresh container (tiktoken keeps loaded encodings per
 process), so do not rerun it with `--reuse`.
 
@@ -208,24 +212,31 @@ values among them), so a DEBUG server log cannot show what the pipe logs. Instea
 query generation, errors, client `data_sources` with a key, also streamed); no log record may
 contain a key or token.
 
-Checks per suite in strict known mode, the same on Open WebUI **v0.12.0-slim**,
-**v0.11.4-slim** and **v0.11.3-slim** (observed 2026-10-11 with the Open WebUI 0.12
-compatibility changes: `azure_ai_foundry.py` 3.0.1, `google_gemini.py` 1.19.1, Time
-Token Tracker 2.7.0, `infomaniak.py` 2.2.2; 547 checks before them, plus
-`azure.rag.query-text.metadata` and `gemini.imgedit.empty-answer`):
+Checks per suite in strict known mode on Open WebUI **v0.12.0-slim**, **v0.11.4-slim**
+and **v0.11.3-slim** (observed 2026-10-11 with `google_gemini.py` 1.20.0 and the
+`gemini.shared` and `gemini.owui012` groups, `azure_ai_foundry.py` 3.0.1, Time Token
+Tracker 2.7.0, `infomaniak.py` 2.2.2; before the two groups 549 checks on every version,
+with `google_gemini.py` 1.19.1; with the thinking level checks
+`thinking.level-models` and `.params-robust` and the 4 checks of the security review
+fixes of 1.20.0, which run on 0.12 only):
 
-| Suite | Checks | PASS / KNOWN |
-| --- | ---: | ---: |
-| `gemini` | 166 | 166 / 0 |
-| `azure` | 199 | 199 / 0 |
-| `n8n` | 51 | 51 / 0 |
-| `infomaniak` | 32 | 32 / 0 |
-| `filters` | 101 | 101 / 0 |
-| **all** | **549** | **549 / 0** |
+| Suite | Checks on v0.12.0 | Checks on v0.11.4 / v0.11.3 | PASS / KNOWN |
+| --- | ---: | ---: | ---: |
+| `gemini` | 197 | 182 | all / 0 |
+| `azure` | 199 | 199 | all / 0 |
+| `n8n` | 51 | 51 | all / 0 |
+| `infomaniak` | 32 | 32 | all / 0 |
+| `filters` | 101 | 101 | all / 0 |
+| **all** | **580** | **565** | **all / 0** |
 
-No FAIL and no obsolete marker on any of the three versions. Two checks differ by
-version: `gemini.imgedit.admin` expects on 0.12 that Open WebUI refuses an admin's turn in
-another user's chat (HTTP 404), and on 0.11 that the pipe reads that chat. Before the
+No FAIL and no obsolete marker on any of the three versions. The `gemini.shared` group
+has 17 checks on 0.12 and two before (`shared.unsupported`, `shared.legacy`), see
+[Shared chats](#shared-chats-geminishared); the 12 `gemini.owui012` checks run on every
+version, and on 0.11 a check of a 0.12 feature checks what 0.11 does instead (see [Open
+WebUI 0.12 features](#open-webui-012-features-geminiowui012)). `gemini.imgedit.admin`
+expects on 0.12 that Open WebUI refuses an admin's turn in another user's chat (HTTP
+404), and on 0.11 that the pipe reads that chat: the user's generated image, not the
+admin's file the user named in turn 1 (the user may not read it). Before the
 compatibility changes, `main` (31a4e7d) had 542 PASS and 5 FAIL on v0.12.0-slim: the
 `server-log` checks of azure, n8n and infomaniak (the module names), `imgedit.admin` and
 `azure.rag.query-text.attached`. The checks of the 1.19.0 thinking block
@@ -291,7 +302,7 @@ content of the current turn without the issued signature or
 `fc_mode`, `allowed_names`, `include_flag`, `kinds` (role and part kinds per content),
 `fc` / `fr` (calls with id, name, args and signature state `none` / `skip` / `issued` /
 `bad`; responses with id, name and response), `round`, `directive`, `answer` (`fc`,
-`final`, `text`, `malformed`, `mock-error`, `http-<status>`), `issued`,
+`final`, `text`, `summary`, `malformed`, `mock-error`, `http-<status>`), `issued`,
 `server_echoed`, `synthetic_ids_upstream` and `orphan_fr`.
 
 **Tool mocks.** `mocks/mock_tools.py`, started by `serve_all.py`, is an OpenAPI tool
@@ -393,6 +404,126 @@ the PNG). Details start with `mock_ok=` as in the tool groups; the extra tokens 
 1.17.0, which handed the tools to google-genai's automatic function calling, 6 of the
 10 checks FAIL (`generate`, `generate-predict`, `edit`, `edit-followup`, `code`,
 `code-jupyter`).
+
+### Shared chats (`gemini.shared`)
+
+The group lives in `tests/e2e/suites/_gemini_shared.py` (run by `suites/gemini.py`
+after `imgedit`). Open WebUI 0.12 shares a chat with users or groups (`POST
+/api/v1/chats/<id>/share` with `share_mode: "continue"` for "Allow replies", then `POST
+/api/v1/chats/shared/<id>/access/update` with the grants) or a folder (`POST
+/api/v1/folders/<id>/access/update`). The group drives these APIs with five non-admin
+users: the owner A, a participant B (user grant on chat X, "Allow replies"), a member G
+of a group with a grant on X, a viewer D (chat Y shared "Clone only" with D, and Y in a
+folder of A shared read-only with D) and an outsider C. Chat X starts with A's turn on
+`gemini-3.1-flash-image` with the upload `upload1` (generated image `final`); B, A and
+G then write in it (the mock's `final-image-<n>` trigger gives each turn its own image).
+A second chat X2 of A, shared with B with "Allow replies", covers the fixes of the
+security review of 1.20.0: B names A's private file (`saved`) in a message, A then edits
+twice with A's own link to it, B plants 30 links to files A may not use, A edits again.
+
+A test-only global filter (`e2e_chat_redirect`, installed for the group) hands the pipe
+another chat when an API request's prompt carries `e2e-chat=<chat id>/<user message
+id>`: it sets `chat_id` and `user_message_id` of `__metadata__`, as if Open WebUI had
+called the pipe for that chat without its own check. So the pipe's own check is tested
+also for the users Open WebUI turns away before the pipe. `e2e-link=<chat id>` sets
+`chat_id` and a new `message_id`, so the pipe emits and links its generated images as
+for a message of that chat. `e2e-chat-fault=<chat id>`
+and `e2e-file-fault=<file id>` make the pipe's next call of
+`Chats.get_accessible_chat_by_id` / `has_access_to_file` for that id raise, and
+`e2e-chat-truthy=<chat id>` the next call of `Chats.get_accessible_chat_by_id` return
+`True`, a truthy value that is not the chat (an inert, signature-preserving async
+wrapper stays installed in the server process, so the pipe's feature detection still
+sees the helpers on a later load).
+
+| Check | What it shows |
+| --- | --- |
+| `shared.visible` | Open WebUI lets B read A's upload and the generated image of X (`GET /api/v1/files/<id>/content`): the pipe links its images to the chat |
+| `shared.participant` | B's browser turn in X sends `upload1` and `final` (the edit request as in `imgedit`) |
+| `shared.owner` | A's next turn also sends B's generated image (`gen2`, a file of B) |
+| `shared.group` | G's turn sends every image of X |
+| `shared.refused` | D's turn in Y and C's turn in X: Open WebUI answers HTTP 404, no request reaches the mock |
+| `shared.pipe-participant` | filter: B is handed X, the images are sent (shows that the filter works) |
+| `shared.pipe-admin` | filter: the admin (read access to every chat in 0.12, no write access) gets none of X |
+| `shared.pipe-viewer` | filter: D (read access to Y through the Clone only share and the read-only folder) gets none of Y |
+| `shared.pipe-outsider` | filter: C gets none of X |
+| `shared.pipe-truthy` | filter, `e2e-chat-truthy`: the chat check answers `True` instead of the chat for the admin: none of X is sent (only the chat itself allows) |
+| `shared.chat-fault` | the chat check raises for B: nothing of X is sent, the error is logged, the answer completes |
+| `shared.links` | B's API request with markdown links: A's upload of X is read; a file of the admin and a file of A outside X are not (logged twice, without their ids) |
+| `shared.file-fault` | the file check raises for B's link to A's upload: it is not read, logged without its id |
+| `shared.video` | Veo image-to-video: B's markdown link to A's upload of X is sent as `instances[0].image` |
+| `shared.deputy` | X2: A's turn after B's message with a link to A's private file sends `upload1`, `final` and `gen2`, not the private file (B may not read it; logged), which stays HTTP 404 for B; A's own link to it is sent in A's turn and, from A's message, in A's next turn |
+| `shared.history-cap` | X2: after B's 30 planted links (the admin's file and A's private file) A's turn looks at no more than 20 images of earlier messages (4 x `IMAGE_HISTORY_MAX_REFERENCES`): at most 20 refusals logged, only B's newest generated image sent, the answer completes |
+| `shared.link-chat` | filter, `e2e-link` to X2: B's generated image is linked to X2 (A may read it), C's two images are not (HTTP 404 for A; `Not linking generated files` logged twice), once decided by the image history (`e2e-chat=`) and once by the linking itself |
+
+On Open WebUI before 0.12 the group records `shared.unsupported` (PASS, `feature not in
+Open WebUI 0.11.4`) and `shared.legacy`: A's chat shared with B through a 0.11 share
+link with a user grant, Open WebUI lets B read the upload and the generated image, but the
+pipe keeps its owner / admin rule and does not read B's markdown link to the upload.
+With `google_gemini.py` 1.19.1 on v0.12.0-slim, 10 of the first 13 checks FAIL; `refused`,
+`pipe-viewer` and `pipe-outsider` pass (1.19.1 allowed only the owner or an admin).
+With 1.20.0 before the security review fixes (3443671) the four checks of the fixes
+FAIL and the other 13 pass: `pipe-truthy` (the admin got X's images), `deputy` (A's
+turn sent `saved`), `history-cap` (15 refusals, but the private links were read as A's
+own and filled the limit) and `link-chat` (A could read C's images, HTTP 200).
+The group takes about one minute on 0.12 and a few seconds on 0.11.
+
+A mutation round on the access logic (2026-10-11, `--only 'gemini.(shared|imgedit)$'`)
+killed every mutant: the chat check always allowing (`pipe-admin`, `pipe-viewer`: the
+file check still refuses the outsider), `permission="read"` (`pipe-admin`,
+`pipe-viewer`), chat check errors allowing (`chat-fault`), the file check allowing
+after `has_access_to_file` (`links` and `imgedit.foreign`, `.api-foreign`,
+`.video-foreign`), file check errors allowing (`file-fault`), the feature detection
+always off (9 `shared` checks), an admin bypass of the chat check (`pipe-admin`), no
+linking of generated images (`visible`, `participant`, `owner`, `group`,
+`pipe-participant`; on 0.11.4 `legacy`); on v0.11.4-slim the feature detection always on
+(13 `imgedit` checks and `legacy`) and `has_access_to_file` used without the 0.12
+detection (`legacy`). The last two cannot differ on 0.12.
+
+A second round on the fixes of the security review (2026-10-11, same `--only`, each
+mutant through `--file`) killed every mutant as well: the author check off and the
+author check using the requesting user (`deputy` and `history-cap` on v0.12.0-slim,
+`imgedit.admin` on v0.11.4-slim), linking without the chat check (`link-chat`), no
+cap on the images of earlier messages (`history-cap`: 30 refusals logged) and the chat
+check back to `bool(chat)` (`pipe-truthy`).
+
+### Open WebUI 0.12 features (`gemini.owui012`)
+
+The group lives in `tests/e2e/suites/_gemini_owui012.py` (run by `suites/gemini.py`
+after `owuitools`). Through `/api/v1/chats/config` it switches on context compaction
+(threshold and cap 1 token) for the compaction scenarios and Tool Search (deferral
+threshold 0, `get_current_timestamp` always loaded, built-in tools deferred) for the
+Tool Search scenarios; it creates the workspace models `e2e-g012-*`, and at its end it
+restores the chat settings and the tool server connections and deletes the models.
+A check of a 0.12 feature passes on 0.11 with "feature not in Open WebUI <version>"
+in its title and checks what that version does instead (no compaction between tool
+rounds, no `search_tools`, `model_controls` stored as an ordinary parameter). Details
+start with `mock_ok=` (the preflight of the tool groups) and `owui=<version>`.
+
+| Check | What it shows |
+| --- | --- |
+| `owui012.compaction` | three tool rounds on `gemini-3-pro-preview`: 0.12 compacts before the third and the fourth request; both summary requests reach the pipe without tools (`summaries=['summary', 'summary']`); the next request has `[CONVERSATION SUMMARY]` and the mock's summary in the system instruction, the user message and the last round only (`kinds=[user:text,model:fc,user:fr]`, the call with its issued signature, no orphan response); all rounds stay saved |
+| `owui012.compaction-followup` | a tool turn after a turn with two rounds: the boundary falls into the earlier turn and Open WebUI puts the current user message before that turn's kept round and answer (`prompt_first=True`, `kinds=`); the request is still valid (every call with its response, first calls signed) |
+| `owui012.summary-error`, `owui012.summary-empty` | the summary request between tool rounds fails (mock trigger `summary-400`) or has no text (`summary-empty`: the thought part only, `MAX_TOKENS`): the next request carries Open WebUI's fallback summary (`- user: ...`), not the pipe's error text or `[No content generated]` |
+| `owui012.saved-summary` | compaction before the third reply (0.11 and 0.12), the summary request fails: the `contextSummary` Open WebUI saves on the second user message and the summary it sends are its fallback, not the error text |
+| `owui012.toolsearch` | `search_tools` and `get_current_timestamp` declared, the deferred `calculate_timestamp` only in `<available_tools>`; after `search_tools` returned it, it is declared in the next request, called and run |
+| `owui012.toolsearch-followup` | the next turn calls the found tool directly: it is declared from the search result in the history |
+| `owui012.toolsearch-mapped` | the deferred OpenAPI tool `lookup.v2`: declared as `lookup_v2_<hash>` after the search, the tool server gets the call |
+| `owui012.controls` | 0.12 refuses model controls on a workspace model of a pipe model (HTTP 400 "Model controls require a server-managed provider model.") |
+| `owui012.custom-params` | custom params of a workspace model (`reasoning_effort=low`, `include_thoughts=false`; `thinking_budget=1024` on 2.5) reach the pipe and the chat's custom params win (`reasoning_effort=high`); `reasoning_effort_25=` records, without asserting it, that `reasoning_effort` leaves a 2.5 budget unchanged |
+| `owui012.stream-chat` | Stream Chat Response off for the chat (`stream=false`, `params.stream_response=false`), two tool rounds: the first request is not streamed, both tools run, the turn is done |
+| `owui012.stream-model` | Stream Chat Response off in the model's Advanced Params: Open WebUI sends `stream=false`; the tool round runs, the turn is done |
+
+The Gemini mock answers Open WebUI's compaction prompt ("Summarize the conversation
+history that will be compacted ...") with `MOCK-SUMMARY of <call ids>`, the mock's call
+ids in its "Messages Being Compacted" section (`answer=summary` in the record); the
+triggers `summary-400` and `summary-empty` in the user message reach only that request,
+because the prompt contains the chat's messages. With `google_gemini.py` 1.19.1 six
+checks FAIL on 0.12.0: `summary-error`, `summary-empty`, `saved-summary`, `toolsearch`,
+`toolsearch-followup` and `toolsearch-mapped`; on 0.11.4 `saved-summary` FAILs too
+(`stored=["Error generating content: 400 INVALID_ARGUMENT. ..."]`). A copy of 1.20.0 that answers a
+`stream=false` tool round of a chat with a `chat.completion` instead of a stream fails
+`stream-chat` and `stream-model` on 0.12.0 (the turn is done, but the tool never runs)
+and on 0.11.4 (the turn never ends): the pipe's stream for such rounds is still needed.
 
 ### API path vs. browser path
 
@@ -580,7 +711,9 @@ harness/             driver library: owui.py (REST client, API-path chat, valves
 suites/              one module per suite: GROUPS + async def run(t: Suite); _*.py are
                      helper modules of a suite, not suites (_azure_rag.py: the azure rag
                      group; _gemini_tools.py: gemini.tools / toolsapi;
-                     _gemini_owuitools.py: gemini.owuitools)
+                     _gemini_owuitools.py: gemini.owuitools;
+                     _gemini_shared.py: gemini.shared;
+                     _gemini_owui012.py: gemini.owui012)
 mocks/               aiohttp provider mocks + serve_all.py (127.0.0.1:9101-9104 and :9106 in
                      the container), tool servers mock_tools.py (OpenAPI and Jupyter :9111,
                      MCP :9112, no E2E_MOCK_FAULT); mock_la.py (Log Analytics) is started
@@ -672,9 +805,13 @@ It reads every `from open_webui... import ...` and `import open_webui...` in
 `pipelines/` and `filters/`, fetches the corresponding Open WebUI backend modules at that
 tag (`gh api` when authenticated, otherwise `curl` from raw.githubusercontent.com) and
 checks that each imported module and symbol, each method called on it
-(`Users.get_user_by_id`, ...) and each injected `__param__` still exists; definitions
+(`Users.get_user_by_id`, ...) and each injected `__param__` still exists. An imported
+name may also be a submodule (`from open_webui.utils.access_control import files`); then
+the functions called on it (or on its `as` alias) are checked like methods. Definitions
 marked legacy/deprecated are reported as `WARN` (for example `SRC_LOG_LEVELS` is an empty
-legacy dict since 0.10, so per-module log levels have no effect). It also prints the
+legacy dict since 0.10, so per-module log levels have no effect), and so is a missing
+method that the function looks up with `getattr(obj, "name")` first and works without
+(`Chats.get_accessible_chat_by_id`, new in 0.12, is missing on 0.11.x). It also prints the
 frontmatter of every function, the event types Open WebUI persists and the versions of
 shared dependencies. A fetch that fails for another reason than "not found" is tried
 3 times; if it still fails the result is `incomplete` (exit 2) rather than a missing
@@ -801,9 +938,9 @@ runner and the script both took 10 values from the file and found none in the ou
 **Dry run.** `--dry-run-mock` checks the runner itself without a key: every scenario runs
 end to end against the e2e Gemini mock, which answers the `MOCKTOOLS:` directive instead
 of following the prompt. Observed 2026-10-09 on v0.11.4-slim (and 2026-10-10 with
-`google_gemini.py` 1.19.0): 15 PASS (R1-R8, R10, R12-R15,
+`google_gemini.py` 1.19.0, 2026-10-11 with 1.20.0): 15 PASS (R1-R8, R10, R12-R15,
 `LOG`, `SECRETS`), 0 FAIL, 2 SKIP (R9 without Vertex credentials, R11 note), 38
-generate requests (the mock received the same 38), 90-160 s including the container
+generate requests (the mock received the same 38), 76-160 s including the container
 start. The mock always follows the directive, so no retry happens. Its answers prove
 only the mechanics: real results can differ. With `--max-requests 5` the proxy forwarded
 the two preflight requests and three of R1, answered R1's fourth with HTTP 429 (the mock
@@ -820,7 +957,7 @@ demand (*Actions → E2E → Run workflow*, with an image tag and a suites input
 | Job | What it does |
 | --- | --- |
 | `e2e` | `run.sh` with all suites in **strict known mode** (`E2E_STRICT_KNOWN=1`) against the default image, which is read from the `DEFAULT_IMAGE=` line of `run.sh` (the only place it is defined). The weekly run adds `ghcr.io/open-webui/open-webui:latest-slim`; a manual run uses the image tag input. Output directory as artifact, `summary.md` as job summary |
-| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; on 2026-10-10 with `main` 3ff6cf9 (Azure pipeline 2.8.1) and the harness of the Azure pipeline 3.0.0 (azure `rag` group): 35 PASS / 327 FAIL / 0 KNOWN (466 s), and with `main` 4b80e24 (Azure pipeline 3.0.0, `google_gemini.py` 1.17.0) and the suites with the `gemini.tools` / `toolsapi` / `imgedit` groups: 57 PASS / 370 FAIL / 0 KNOWN (557 s); with `main` 2fc7bcc (`google_gemini.py` 1.18.0, `infomaniak.py` 2.2.2, no known bug registered) and the suites with the `owuitools` group and the checks of 1.19.0: 57 PASS / 386 FAIL / 0 KNOWN (545 s); on 2026-10-11 with `main` 31a4e7d (`google_gemini.py` 1.19.0, Azure pipeline 3.0.0) and the harness of the Open WebUI 0.12 changes (2 more checks): 57 PASS / 388 FAIL / 0 KNOWN (518 s). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
+| `meta` | **Meta-test**: `main`'s function files (`--ref origin/main`) with every provider mock answering HTTP 500 (`E2E_MOCK_FAULT=500`), suites `gemini azure n8n infomaniak`. Nearly everything fails, and it must give **no KNOWN**: a KNOWN means the `evidence` of that known bug also matches an unrelated failure and would hide it. `REQUEST_SIDE_KNOWN` in the workflow may list bugs that can only show in the request the pipe sends upstream (they reproduce whatever the mock answers); it is empty, because the evidence of every registered bug also needs proof that the upstream answered (e.g. `HTTP 200` and the mock's answer). Observed 2026-10-09 (`main` 53b8495): 38 PASS / 197 FAIL / 0 KNOWN; on 2026-10-10 with `main` 3ff6cf9 (Azure pipeline 2.8.1) and the harness of the Azure pipeline 3.0.0 (azure `rag` group): 35 PASS / 327 FAIL / 0 KNOWN (466 s), and with `main` 4b80e24 (Azure pipeline 3.0.0, `google_gemini.py` 1.17.0) and the suites with the `gemini.tools` / `toolsapi` / `imgedit` groups: 57 PASS / 370 FAIL / 0 KNOWN (557 s); with `main` 2fc7bcc (`google_gemini.py` 1.18.0, `infomaniak.py` 2.2.2, no known bug registered) and the suites with the `owuitools` group and the checks of 1.19.0: 57 PASS / 386 FAIL / 0 KNOWN (545 s); on 2026-10-11 with `main` 31a4e7d (`google_gemini.py` 1.19.0, Azure pipeline 3.0.0) and the harness of the Open WebUI 0.12 changes (2 more checks): 57 PASS / 388 FAIL / 0 KNOWN (518 s); with `main` 6b99dcf (`google_gemini.py` 1.19.1) and the harness with the `gemini.shared` group (2 more checks on the default image): 58 PASS / 389 FAIL / 0 KNOWN (536 s); with `main` 6b99dcf (`google_gemini.py` 1.19.1) and the harness with the `gemini.owui012` group (12 more checks): 58 PASS / 399 FAIL / 0 KNOWN (527 s; `owui012.controls` passes, it needs no provider answer); with `main` 6b99dcf and the harness of `google_gemini.py` 1.20.0 (`thinking.level-models`, `thinking.params-robust` and the shared-chat checks of the security review): 59 PASS / 402 FAIL / 0 KNOWN (595 s). The `filters` suite is left out because it uses no provider mock (its known bugs reproduce for real) |
 | `api` | `check_owui_api.sh latest` |
 
 `E2E_TIMEOUT` and the steps' `timeout-minutes` bound every job, so a hanging scenario

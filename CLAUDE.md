@@ -76,7 +76,7 @@ Expose a `Filter` class with `inlet(body)` and/or `outlet(body)`, mutating the r
 
 ## Invariants to preserve
 
-- **Valve names are the public API.** Never rename or remove one; add new valves with backward-compatible defaults.
+- **Valve names and types are the public API.** Never rename or remove one; add new valves with backward-compatible defaults. Do not change a valve's type either: since Open WebUI 0.12, saving a function validates its stored valves against the new `Valves` model, so a type change can block the update for users who set that valve.
 - **Secrets:** assigning to an `EncryptedStr` field encrypts (stored with an `encrypted:` prefix). Call `EncryptedStr.decrypt(...)` only at the point of use — never store the decrypted value on `self`, never log it.
 - **Body allow-list:** `pipe()` filters the incoming body through an explicit `allowed_params` set before forwarding upstream. Add new provider params to that set deliberately; do not forward `body` wholesale.
 - **Status events:** emit via `__event_emitter__` with `{"type": "status"|"chat:*", "data": {...}}` at start, at streaming start, and on completion *or* error. Never leave a request without a terminal status.

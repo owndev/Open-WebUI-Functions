@@ -59,10 +59,10 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
 > Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 models (the levels each model supports, see [Thinking Levels](#thinking-levels-gemini-3-models)) and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 
   > [!Note]
-  > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
+  > **Thinking Levels vs Thinking Budgets**: Gemini 3 models use `thinking_level` ("minimal", "low", "medium" or "high", depending on the model), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
 
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions with configurable image optimization.
@@ -95,7 +95,7 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
   Forward user information headers (like Name, Id, Email and Role) to Google API or LiteLLM for better context and analytics. The headers always belong to the user of the request, also with concurrent requests of several users. Also, change the base URL for the Google Generative AI API if needed.
 
 - **Native tool calling**  
-  Tools offered by Open WebUI (built-in, workspace, MCP, OpenAPI, terminal and direct tools) are declared to Gemini, and Open WebUI runs Gemini's tool calls, including tool approval. API clients get the calls back as OpenAI `tool_calls`. See [Native tool calling](#native-tool-calling).
+  Tools offered by Open WebUI (built-in, workspace, MCP, OpenAPI, terminal and direct tools) are declared to Gemini, and Open WebUI runs Gemini's tool calls, including tool approval. API clients get the calls back as OpenAI `tool_calls`. Works with Open WebUI 0.12's Tool Search and with context compaction between tool rounds. See [Native tool calling](#native-tool-calling).
 
 ## Environment Variables
 
@@ -220,7 +220,9 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=true
 GOOGLE_THINKING_BUDGET=-1
 
 # Thinking level for Gemini 3 models only
-# Most Gemini 3 models accept "low" or "high"
+# gemini-3-pro accepts "low" or "high"; gemini-3-flash all four ("minimal", "low",
+# "medium", "high"); gemini-3.1-pro "low", "medium" or "high"; other Gemini 3 text
+# models "low" or "high" (see "Thinking Levels" below for the full list)
 # gemini-3.1-flash-image(-preview) and gemini-3.1-flash-lite-image accept "minimal" or "high"
 # gemini-nano-banana-2.1 accepts "minimal", "medium" or "high"
 # The pipeline automatically maps unsupported values to the closest supported level
@@ -430,12 +432,19 @@ Where the images of earlier turns come from:
 - **Saved chats** (the normal web UI chat): from the chat as Open WebUI stored it. That covers the generated images, which are attached to the answers as files (Open WebUI does not pass the files of earlier answers to a pipe), images you uploaded, images linked in earlier answers (pipeline versions before 1.15.2) and, when you regenerate an answer with guidance, the images of the user message whose answer you regenerate. Background tasks such as titles and follow-up suggestions get no images.
 - **API clients** (no saved chat): from the request's messages, as `image_url` parts (data URLs or Open WebUI file URLs) or markdown image links in the content, such as the `![Generated Image](/api/v1/files/<id>/content)` link the pipeline returns.
 - **Temporary chats**: Open WebUI does not save them, and the web UI sends only the images of your own messages. A generated image of an earlier turn is therefore not sent. To edit it, download it and attach it to your edit message.
+- **Shared chats with "Allow replies"** (Open WebUI 0.12 and later): the people a chat or its folder is shared with in this mode write in the owner's chat, and their edit requests get the images of the whole chat like the owner's: the owner's uploads, the generated images of every answer and the images of the other participants. Since 1.20.0 the pipeline links the images it generates to their chat (on every Open WebUI version), as Open WebUI does for its own image generation and for uploads, so Open WebUI also shows them to the participants and to the people a chat is shared with. It links them only to a chat the user may continue. Images generated before pipeline 1.20.0 are not linked: Open WebUI shows them only to their owner and admins, and the pipeline does not send them for the other participants. A file that another participant names in a message (an image link in the text, an attached file) is sent on your turn only if that participant may read it too, so nobody can have your turn send your private files (see the access rules below). A "Clone only" share or a read-only folder share lets people read the chat but not write in it: Open WebUI refuses their messages before the pipeline runs.
 
 Which images are sent:
 
-- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat. Earlier images are read newest first and only as many as fit.
+- `GOOGLE_IMAGE_HISTORY_MAX_REFERENCES` (default 5) limits the images per request. The images of the current message are always kept, the rest of the limit goes to the newest images of earlier turns, and older ones are dropped first. So the image you want to edit stays in the request in a long chat. Earlier images are read newest first and only as many as fit. An image that is skipped (one the user may not read, a duplicate, a deleted file) does not count toward the limit, so the pipeline looks at no more than 4 images of earlier turns per image of the limit (at least 8; 20 with the default) and leaves older ones out.
 - Identical images are sent once (`GOOGLE_IMAGE_DEDUP_HISTORY`): an image you attach again (for example a downloaded generated image) is not repeated from the history, and an image of several turns counts at its newest place. Images of earlier turns come before the current message's images unless `GOOGLE_IMAGE_HISTORY_FIRST=false`.
-- The pipeline reads only the requesting user's own files and chats (an admin may read every file and chat), also when a message or an API request names the file id of another user. Open WebUI 0.9.6 and later check the images they put into the request themselves in the same way (and also allow files shared with the user). Open WebUI 0.9.0 to 0.9.5 put the image of any file id named in a user message into the request before the pipeline runs, so update Open WebUI if users must not reach each other's files.
+- Access follows Open WebUI: the pipeline never reads a chat or file that Open WebUI would not let the requesting user use, also when a message or an API request names the file id of another user.
+  - Open WebUI 0.12 and later (detected by its access checks, not by the version): the history of a saved chat is read when Open WebUI lets the user continue the chat (`Chats.get_accessible_chat_by_id(..., permission="write")`, which Open WebUI itself checks before it calls the pipeline): the owner and the participants of a chat or folder shared with "Allow replies", users or groups. An admin is no exception: Open WebUI 0.12 gives admins read access to other users' chats, not write access. A file is read when it is the user's own, the user is an admin, or Open WebUI's `has_access_to_file` lets the user read it (for example through a shared chat or folder it is attached to, a knowledge base, a channel or a shared model), the same rule as Open WebUI's own file download.
+  - Older Open WebUI versions: only the requesting user's own files and chats (an admin may read every file and chat).
+  - Whose access counts for a file in the chat's history: the requesting user's, and also the access of the user who wrote the message that names the file, when that is someone else. A participant who names your private file in a message of a shared chat therefore cannot have your next turn send it to Gemini (and get the image made from it, which is linked to the chat). The author of a user message is the user Open WebUI stores with it (`user_id`, set for every message since Open WebUI 0.12), else the chat's owner, as Open WebUI reads it; the author of an answer is the author of the user message it answers. A file whose author is not known is not read. Up to Open WebUI 0.11 only the owner and admins write in a chat: when an admin continues a user's chat there, a file named in the user's messages is read only if the user may read it too. Your own messages, the current message and the messages an API client sends count as yours.
+  - A file the user may not read is skipped and logged without its id. An error in an access check counts as a refusal: such a file is skipped, and for the chat check the images of earlier turns come from the request, as for API clients.
+  - Generated images and videos are linked to the chat (Open WebUI's `chat_file` links, through which the people with access to the chat may read them) only when the requesting user may continue that chat, by the same check as for the history; Open WebUI's own linking checks only that the user may read the file.
+  - Open WebUI 0.9.6 and later check the images they put into the request themselves in the same way (and also allow files shared with the user). Open WebUI 0.9.0 to 0.9.5 put the image of any file id named in a user message into the request before the pipeline runs, so update Open WebUI if users must not reach each other's files.
 - Earlier images are sent as parts of your message, which is how Gemini takes input images for editing. Earlier answers are not replayed as model turns, so no thought signatures are needed.
 
 ## Video Generation Configuration
@@ -759,7 +768,7 @@ Gemini 3 requires the thought signatures of its function calls back in the follo
 - In a turn with tool calls, Gemini's thinking appears as Open WebUI's own "Thought for N seconds" block. The duration can read 0 seconds, because the thoughts of a round arrive together with its tool calls. With `GOOGLE_INCLUDE_THOUGHTS=false` Gemini 3 still sends thought signatures, so the block appears without content for every tool round.
 - Answers without tool calls show the thinking as a `<details type="reasoning">` block in the answer, which Open WebUI renders as the same localized block (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 - The answer after a tool call is streamed as it arrives. It has no inline `[1]` citation markers; its Google Search sources are still attached.
-- For a chat request with `stream=false`, the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
+- For a chat request with `stream=false` (**Stream Chat Response** off in the chat's Controls, which Open WebUI 0.12 honours per chat, or in the model's Advanced Params), the pipeline answers a round with tool calls as a stream, because Open WebUI runs tools only for streamed answers. Open WebUI 0.12 saves a non-streamed reply with tool calls as finished, but still does not run its tools (0.11 left it generating). With `GOOGLE_STREAMING_ENABLED=false` the pipeline still calls Gemini without streaming.
 
 ### API clients
 
@@ -780,9 +789,23 @@ Requests to `/api/chat/completions` without a chat pass the client's `tools` to 
 
 Gemini accepts function names of up to 64 characters (letters, digits, `_` and `-`, starting with a letter or `_`). Other tool names, for example an OpenAPI operation `lookup.v2`, are declared with the invalid characters replaced and a short hash appended (`lookup_v2_<hash>`), and Gemini's calls are mapped back to the original name. Parameter schemas are sent as JSON Schema (`parameters_json_schema`) after a light clean-up: `$schema`, `$id`, `$comment`, `examples`, `deprecated`, `readOnly`, `writeOnly` and `x-*` keys and boolean `exclusiveMinimum` / `exclusiveMaximum` are removed, tuple `items` become `prefixItems`, and `required` only lists existing properties. Tools without parameters are declared without a schema.
 
+### Tool Search (Open WebUI 0.12)
+
+With **Tool Search** on (experimental, **Admin Settings → Interface**, `ENABLE_TOOL_SEARCH`), Open WebUI leaves tools whose definition is longer than the **Deferral Threshold** (`TOOL_SEARCH_DEFER_THRESHOLD`, characters) out of the request, unless they match **Always Loaded Tools** (`TOOL_SEARCH_ALWAYS_LOADED`); with **Defer Built-in Tools** (`TOOL_SEARCH_DEFER_BUILTIN_TOOLS`, default on) its built-in tools count too. It lists them by name and a short description in an `<available_tools>` block of the system prompt and adds its `search_tools` tool, which returns the full definitions of the tools that match a query. The model is then expected to call a found tool by name.
+
+Gemini only calls functions that are declared in the request. From version 1.20.0 the pipeline therefore also declares every deferred tool that a `search_tools` result in the conversation names, with the definition Open WebUI runs. A tool found in one round can be called in the next round, and in later turns of the chat while its search result is in the history. Without this (1.19.1 and older) Gemini could not call the found tool. Names Gemini does not accept are mapped as for any other tool (see [Names and schemas](#names-and-schemas)).
+
+### Context compaction during tool runs
+
+With context compaction on (**Admin Settings → Interface**, `ENABLE_CONTEXT_COMPACTION`) Open WebUI replaces older messages with a summary once the chat passes the token threshold. Open WebUI 0.12 also does this between the rounds of a long tool run: the next request then holds the system prompt with a `[CONVERSATION SUMMARY]` block, the current user message and the most recent tool rounds. Open WebUI keeps every tool call together with its results and keeps their `reasoning_details`, so the pipeline sends Gemini 3 each remaining call with its thought signature. Rounds that were compacted away are only in the summary.
+
+The summary itself comes from the compaction model, by default the chat's model, i.e. this pipeline. That request carries no tools and gets no thinking block. When it fails (for example HTTP 429 or 500) or Gemini returns no text (for example because its thinking used up the task's `max_tokens`, 1000 unless the task model parameters set another value), the pipeline answers it with an empty text from version 1.20.0, and Open WebUI uses its own summary of the compacted messages. Up to 1.19.1 the pipeline's error text or `[No content generated]` became the conversation summary; when Open WebUI compacts before a reply, it saves that summary with the chat, so later turns saw the error text in place of the earlier messages.
+
+Open WebUI may move the current user message before tool rounds of an earlier turn when the compaction boundary falls into that turn. The pipeline still sends a valid request; the order is Open WebUI's.
+
 ### Requests without tools
 
-Image generation models, background tasks (title, tag and follow-up generation) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
+Image generation models, background tasks (title, tag and follow-up generation, context compaction) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
 
 ### Open WebUI's image generation and code interpreter
 
@@ -817,7 +840,7 @@ Gemini then calls `generate_image` with a prompt, or `edit_image` with a prompt 
 
 - Open WebUI ends the tool loop after `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS` rounds (default 256). The pipeline adds no limit of its own.
 - Tool approval on Open WebUI 0.11.4: after an approved call the saved message loses the tool result, and when Gemini calls several tools at once, only the first call is asked for and run.
-- Tool calling was verified with Open WebUI 0.11.3 and 0.11.4. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
+- Tool calling was verified with Open WebUI 0.11.3, 0.11.4 and 0.12.0. To check it against the Gemini API with your own key, for example with a new Gemini model, run the real-API smoke test in a clone of this repository (see the [testing guide](./testing.md#real-api-smoke-test-manual-needs-a-key)).
 
 ## Default System Prompt
 
@@ -874,7 +897,11 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 
 Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
-- **Most Gemini 3 models**: support **`"low"`** and **`"high"`**.
+- **Gemini 3 text models**, per [Google's thinking documentation](https://ai.google.dev/gemini-api/docs/thinking) (with or without a `-preview` / `-latest` suffix):
+  - `gemini-3-pro`: **`"low"`** and **`"high"`**.
+  - `gemini-3-flash`, `gemini-3.5-flash-lite` and `gemini-3.6-flash`: **`"minimal"`**, **`"low"`**, **`"medium"`** and **`"high"`**.
+  - `gemini-3.1-pro` and `gemini-3.8-flash`: **`"low"`**, **`"medium"`** and **`"high"`**.
+  - Other Gemini 3 text models: **`"low"`** and **`"high"`**, which every model above supports.
 - **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-preview`** and **`gemini-3.1-flash-lite-image`**: support **`"minimal"`** and **`"high"`** (model default: `"minimal"`).
 - **`gemini-nano-banana-2.1`**: supports **`"minimal"`**, **`"medium"`** and **`"high"`** (model default: `"medium"`).
 - **Other Nano Banana IDs and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: the configured level is sent unchanged, because the pipeline does not know their supported levels.
@@ -882,7 +909,7 @@ Gemini 3 models support the `thinking_level` parameter, which controls the depth
 > [!Note]
 > Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
 
-If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request.
+If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request (for example `"medium"` becomes `"high"` on `gemini-3-pro`, `"minimal"` becomes `"low"` on `gemini-3.1-pro`).
 
 Set via environment variable:
 
@@ -899,7 +926,7 @@ GOOGLE_THINKING_LEVEL="minimal"
 
 #### Per-Chat Override (Reasoning Effort)
 
-The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (for example, `"low"`, `"minimal"`, or `"high"`), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (for example, `"low"`, `"minimal"`, or `"high"`), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis. A value that is not one of the four level names (for example a number) is ignored with a warning, and the other thinking settings of the request still apply.
 
 **Example API Usage:**
 
@@ -946,7 +973,7 @@ GOOGLE_THINKING_BUDGET=1024
 
 #### Per-Chat Override (thinking_budget)
 
-Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis. A number sent as a string (`"1024"`) is accepted; a value that is not a number is ignored with a warning, and `GOOGLE_THINKING_BUDGET` applies.
 
 **Example API Usage:**
 
@@ -986,6 +1013,20 @@ response = client.models.generate_content(
 )
 print(response.text)
 ```
+
+### Setting the per-chat values in Open WebUI
+
+The pipeline reads three request parameters:
+
+| Parameter | Models | Effect |
+| --- | --- | --- |
+| `reasoning_effort` | Gemini 3 and Nano Banana | thinking level, checked against the model's levels as above; overrides `GOOGLE_THINKING_LEVEL` |
+| `thinking_budget` | Gemini 2.5 and other models without thinking levels | overrides `GOOGLE_THINKING_BUDGET` |
+| `include_thoughts` | all thinking models | `false` hides the thoughts; `GOOGLE_INCLUDE_THOUGHTS=false` always wins |
+
+Set them as **Advanced Params** of a model (**Workspace → Models** or **Admin Settings → Models**: **Reasoning Effort** has its own field, the others go under **Custom Parameters**) or in a chat's **Controls**, whose values win over the model's. `reasoning_effort` does not change the thinking budget of Gemini 2.5 models.
+
+The **model controls** of Open WebUI 0.12 (named controls in the model editor whose options set custom parameters) cannot be used for this pipeline: Open WebUI refuses them for pipe models and for workspace models based on one ("Model controls require a server-managed provider model.").
 
 ## Token Usage Tracking
 
