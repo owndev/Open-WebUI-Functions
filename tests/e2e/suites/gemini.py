@@ -747,6 +747,62 @@ async def thinking(t: Suite, mock) -> None:
         f"pro3={think_pro} image={think_img}",
     )
 
+    # thinking levels per model (https://ai.google.dev/gemini-api/docs/thinking)
+    await _set(
+        t,
+        THINKING_LEVEL="",
+        MODEL_ADDITIONAL="gemini-3-flash-preview,gemini-3.1-pro-preview",
+    )
+    levels = {}
+    for name, effort in (
+        ("gemini-3-flash-preview", "medium"),
+        ("gemini-3-flash-preview", "minimal"),
+        ("gemini-3.1-pro-preview", "medium"),
+        ("gemini-3.1-pro-preview", "minimal"),
+    ):
+        await mock.reset()
+        await t.owui.chat(f"{FID}.{name}", "Hi", stream=False, reasoning_effort=effort)
+        think = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+        levels[f"{name}:{effort}"] = str(think.get("thinkingLevel", "")).upper()
+    t.check(
+        "thinking.level-models",
+        "levels per model: gemini-3-flash medium -> MEDIUM, minimal -> MINIMAL; "
+        "gemini-3.1-pro medium -> MEDIUM, minimal -> LOW (closest supported)",
+        levels
+        == {
+            "gemini-3-flash-preview:medium": "MEDIUM",
+            "gemini-3-flash-preview:minimal": "MINIMAL",
+            "gemini-3.1-pro-preview:medium": "MEDIUM",
+            "gemini-3.1-pro-preview:minimal": "LOW",
+        },
+        f"levels={levels}",
+    )
+
+    # invalid per-chat values are ignored one by one, the rest of the thinking
+    # config stays (API clients can send any JSON type)
+    await mock.reset()
+    await t.owui.chat(PRO3, "Hi", stream=False, reasoning_effort=5)
+    think_num = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    await mock.reset()
+    await t.owui.chat(TEXT, "Hi", stream=False, thinking_budget="2048")
+    think_str = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    await mock.reset()
+    await t.owui.chat(TEXT, "Hi", stream=False, thinking_budget="lots")
+    think_bad = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    await _set(t, MODEL_ADDITIONAL="")
+    t.check(
+        "thinking.params-robust",
+        "reasoning_effort=5 -> model default level, thoughts still included; "
+        "thinking_budget='2048' -> 2048; thinking_budget='lots' -> THINKING_BUDGET "
+        "(-1), thoughts still included",
+        think_num.get("includeThoughts") is True
+        and "thinkingLevel" not in think_num
+        and think_str.get("thinkingBudget") == 2048
+        and think_bad.get("thinkingBudget") == -1
+        and think_bad.get("includeThoughts") is True,
+        f"effort5={think_num} budget_str={think_str} budget_bad={think_bad}",
+    )
+
     await _set(t, THINKING_LEVEL="", INCLUDE_THOUGHTS=False)
     await mock.reset()
     r = await t.owui.chat(TEXT, "Hi", stream=False)

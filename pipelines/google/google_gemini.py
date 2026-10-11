@@ -467,9 +467,12 @@ class Pipe:
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
-            description="Thinking level for Gemini 3 models. Most Gemini 3 models support 'low'/'high', "
-            "while gemini-3.1-flash-image and gemini-3.1-flash-lite-image support 'minimal'/'high' "
-            "and gemini-nano-banana-2.1 supports 'minimal'/'medium'/'high'. "
+            description="Thinking level for Gemini 3 models ('minimal', 'low', 'medium' or 'high'). "
+            "The supported levels depend on the model: gemini-3-pro 'low'/'high', gemini-3-flash "
+            "all four, gemini-3.1-pro 'low'/'medium'/'high', gemini-3.1-flash-image and "
+            "gemini-3.1-flash-lite-image 'minimal'/'high', gemini-nano-banana-2.1 "
+            "'minimal'/'medium'/'high', other Gemini 3 models 'low'/'high'. An unsupported "
+            "level is mapped to the closest supported one. "
             "Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
@@ -1382,6 +1385,19 @@ class Pipe:
     # e.g. gemini-nano-banana-2.10.
     _NANO_BANANA_2_1_RE = re.compile(r"gemini-nano-banana-2\.1(?:[-@]|$)")
 
+    # thinking_level values per Gemini 3 text model, by the model name without a
+    # "-preview" / "-latest" suffix (https://ai.google.dev/gemini-api/docs/thinking).
+    # Other Gemini 3 text models get "low"/"high", which every listed one supports.
+    _THINKING_LEVELS = {
+        "gemini-3-pro": ["low", "high"],
+        "gemini-3-flash": ["minimal", "low", "medium", "high"],
+        "gemini-3.1-pro": ["low", "medium", "high"],
+        "gemini-3.5-flash-lite": ["minimal", "low", "medium", "high"],
+        "gemini-3.6-flash": ["minimal", "low", "medium", "high"],
+        "gemini-3.8-flash": ["low", "medium", "high"],
+    }
+    _MODEL_SUFFIX_RE = re.compile(r"-(?:preview|latest)(?:-[\w.-]*)?$")
+
     # Image models whose model pages list Search grounding as "Not supported"
     # (https://ai.google.dev/gemini-api/docs/models), incl. their preview IDs.
     _NO_SEARCH_GROUNDING_MODELS = (
@@ -1579,6 +1595,12 @@ class Pipe:
             return ["minimal", "high"]
 
         if self._is_gemini_3_family_model(model_id):
+            if "image" not in model_lower:
+                levels = self._THINKING_LEVELS.get(
+                    self._MODEL_SUFFIX_RE.sub("", model_lower)
+                )
+                if levels:
+                    return list(levels)
             return ["low", "high"]
 
         return []
@@ -1631,6 +1653,12 @@ class Pipe:
         """
         if not level:
             return None
+        if not isinstance(level, str):
+            self.log.warning(
+                f"Invalid thinking level {level!r}: expected a string. "
+                "Falling back to model default."
+            )
+            return None
 
         normalized = level.strip().lower()
         valid_levels = ["minimal", "low", "medium", "high"]
@@ -1660,16 +1688,33 @@ class Pipe:
         )
         return None
 
-    def _validate_thinking_budget(self, budget: int) -> int:
+    def _validate_thinking_budget(self, budget: Any) -> Optional[int]:
         """
         Validate and normalize the thinking budget value.
 
         Args:
-            budget: The thinking budget integer to validate
+            budget: The thinking budget to validate: an integer, or a number
+                given as float or string (e.g. "1024" from an API client)
 
         Returns:
-            Validated budget: -1 for dynamic, 0 to disable, or 1-32768 for fixed limit
+            Validated budget: -1 for dynamic, 0 to disable, or 1-32768 for fixed
+            limit; None for a value that is not a number
         """
+        if isinstance(budget, str):
+            try:
+                budget = float(budget.strip())
+            except ValueError:
+                budget = None
+        try:
+            if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+                raise ValueError
+            budget = int(budget)  # ValueError / OverflowError for nan / inf
+        except (ValueError, OverflowError):
+            self.log.warning(
+                f"Invalid thinking budget {budget!r}: expected a number. Ignoring it."
+            )
+            return None
+
         # -1 means dynamic thinking (let the model decide)
         if budget == -1:
             return -1

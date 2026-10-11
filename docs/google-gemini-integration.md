@@ -59,10 +59,10 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
 > Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 Pro ("low"/"high") and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 models (the levels each model supports, see [Thinking Levels](#thinking-levels-gemini-3-models)) and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 
   > [!Note]
-  > **Thinking Levels vs Thinking Budgets**: Gemini 3 Pro models use `thinking_level` ("low" or "high"), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
+  > **Thinking Levels vs Thinking Budgets**: Gemini 3 models use `thinking_level` ("minimal", "low", "medium" or "high", depending on the model), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
 
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions with configurable image optimization.
@@ -220,7 +220,9 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=true
 GOOGLE_THINKING_BUDGET=-1
 
 # Thinking level for Gemini 3 models only
-# Most Gemini 3 models accept "low" or "high"
+# gemini-3-pro accepts "low" or "high"; gemini-3-flash all four ("minimal", "low",
+# "medium", "high"); gemini-3.1-pro "low", "medium" or "high"; other Gemini 3 text
+# models "low" or "high" (see "Thinking Levels" below for the full list)
 # gemini-3.1-flash-image(-preview) and gemini-3.1-flash-lite-image accept "minimal" or "high"
 # gemini-nano-banana-2.1 accepts "minimal", "medium" or "high"
 # The pipeline automatically maps unsupported values to the closest supported level
@@ -893,7 +895,11 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 
 Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
-- **Most Gemini 3 models**: support **`"low"`** and **`"high"`**.
+- **Gemini 3 text models**, per [Google's thinking documentation](https://ai.google.dev/gemini-api/docs/thinking) (with or without a `-preview` / `-latest` suffix):
+  - `gemini-3-pro`: **`"low"`** and **`"high"`**.
+  - `gemini-3-flash`, `gemini-3.5-flash-lite` and `gemini-3.6-flash`: **`"minimal"`**, **`"low"`**, **`"medium"`** and **`"high"`**.
+  - `gemini-3.1-pro` and `gemini-3.8-flash`: **`"low"`**, **`"medium"`** and **`"high"`**.
+  - Other Gemini 3 text models: **`"low"`** and **`"high"`**, which every model above supports.
 - **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-preview`** and **`gemini-3.1-flash-lite-image`**: support **`"minimal"`** and **`"high"`** (model default: `"minimal"`).
 - **`gemini-nano-banana-2.1`**: supports **`"minimal"`**, **`"medium"`** and **`"high"`** (model default: `"medium"`).
 - **Other Nano Banana IDs and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: the configured level is sent unchanged, because the pipeline does not know their supported levels.
@@ -901,7 +907,7 @@ Gemini 3 models support the `thinking_level` parameter, which controls the depth
 > [!Note]
 > Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
 
-If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request.
+If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request (for example `"medium"` becomes `"high"` on `gemini-3-pro`, `"minimal"` becomes `"low"` on `gemini-3.1-pro`).
 
 Set via environment variable:
 
@@ -918,7 +924,7 @@ GOOGLE_THINKING_LEVEL="minimal"
 
 #### Per-Chat Override (Reasoning Effort)
 
-The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (for example, `"low"`, `"minimal"`, or `"high"`), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis.
+The per-chat `reasoning_effort` value can override the environment-level `GOOGLE_THINKING_LEVEL` setting. When a chat specifies a `reasoning_effort` value (for example, `"low"`, `"minimal"`, or `"high"`), it takes precedence over the global environment setting. This allows users to customize reasoning depth on a per-conversation basis. A value that is not one of the four level names (for example a number) is ignored with a warning, and the other thinking settings of the request still apply.
 
 **Example API Usage:**
 
@@ -965,7 +971,7 @@ GOOGLE_THINKING_BUDGET=1024
 
 #### Per-Chat Override (thinking_budget)
 
-Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis.
+Similar to `reasoning_effort` for Gemini 3 models, the per-chat `thinking_budget` value can override the environment-level `GOOGLE_THINKING_BUDGET` setting. When a chat request includes a `thinking_budget` value, it takes precedence over the global environment setting. This allows users to customize the thinking budget on a per-conversation basis. A number sent as a string (`"1024"`) is accepted; a value that is not a number is ignored with a warning, and `GOOGLE_THINKING_BUDGET` applies.
 
 **Example API Usage:**
 
