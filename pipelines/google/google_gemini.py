@@ -4,9 +4,9 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.20.0
+version: 1.21.0
 required_open_webui_version: 0.9.0
-requirements: google-genai>=1.68.0, google-genai<3
+requirements: google-genai>=2.31.0, google-genai<3
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
 features:
@@ -47,7 +47,8 @@ features:
   - Optimized payload creation for image generation models
   - Configurable image processing parameters (size, quality, compression)
   - Flexible upload fallback options and optimization controls
-  - Configurable thinking levels for Gemini 3 models with model-specific validation
+  - Configurable thinking levels for Gemini 3 and Gemini 4 models with model-specific validation
+  - Gemini 4 Argon thinking levels (low, medium, high) and streaming thought summaries
   - Thinking shown as Open WebUI's native reasoning block, live while Gemini thinks, with a title in the user's language
   - Thinking summaries stripped from replayed history to save tokens (configurable)
   - Configurable thinking budgets (0-32768 tokens) for Gemini 2.5 models
@@ -200,7 +201,7 @@ except importlib.metadata.PackageNotFoundError:
     raise ImportError(
         "google-genai is not installed. Open WebUI 0.11.4+ no longer bundles it: "
         "keep ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS enabled or install "
-        "'google-genai>=1.68.0,<3' into the Open WebUI environment."
+        "'google-genai>=2.31.0,<3' into the Open WebUI environment."
     ) from None
 
 from google import genai  # noqa: E402
@@ -498,17 +499,17 @@ class Pipe:
         THINKING_BUDGET: int = Field(
             default=int(os.getenv("GOOGLE_THINKING_BUDGET", "-1")),
             description="Thinking budget for Gemini 2.5 models (0=disabled, -1=dynamic, 1-32768=fixed token limit). "
-            "Not used for Gemini 3 models which use THINKING_LEVEL instead.",
+            "Not used for Gemini 3 and Gemini 4 models, which use THINKING_LEVEL instead.",
         )
         THINKING_LEVEL: str = Field(
             default=os.getenv("GOOGLE_THINKING_LEVEL", ""),
-            description="Thinking level for Gemini 3 models ('minimal', 'low', 'medium' or 'high'). "
-            "The supported levels depend on the model: gemini-3-pro 'low'/'high', gemini-3-flash "
-            "all four, gemini-3.1-pro 'low'/'medium'/'high', gemini-3.1-flash-image and "
-            "gemini-3.1-flash-lite-image 'minimal'/'high', gemini-nano-banana-2.1 "
-            "'minimal'/'medium'/'high', other Gemini 3 models 'low'/'high'. An unsupported "
-            "level is mapped to the closest supported one. "
-            "Ignored for other models. Empty string means use model default.",
+            description="Thinking level for Gemini 3 and Gemini 4 models ('minimal', 'low', 'medium' or 'high'). "
+            "The supported levels depend on the model: gemini-4-argon 'low'/'medium'/'high', "
+            "gemini-3-pro 'low'/'high', gemini-3-flash all four, gemini-3.1-pro "
+            "'low'/'medium'/'high', gemini-3.1-flash-image and gemini-3.1-flash-lite-image "
+            "'minimal'/'high', gemini-nano-banana-2.1 'minimal'/'medium'/'high', other "
+            "Gemini 3 models 'low'/'high'. An unsupported level is mapped to the closest "
+            "supported one. Ignored for other models. Empty string means use model default.",
         )
         USE_VERTEX_AI: bool = Field(
             default=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true",
@@ -1681,6 +1682,16 @@ class Pipe:
             "gemini-3."
         )
 
+    def _is_gemini_3_or_later_model(self, model_id: str) -> bool:
+        """Return True for Gemini 3.x and Gemini 4.x model IDs.
+
+        These models use thinking_level instead of thinking_budget. Kept apart
+        from _is_gemini_3_family_model: Gemini 4 text models must not inherit
+        the Gemini 3 image-model detection and ImageConfig rules.
+        """
+        model_lower = model_id.lower()
+        return bool(re.match(r"^gemini-(?:3|4)[.-]", model_lower))
+
     def _is_gemini_3_image_model(self, model_id: str) -> bool:
         """Return True for image models with the features of Gemini 3 image models.
 
@@ -1750,9 +1761,10 @@ class Pipe:
         """
         Check if a model supports the thinking_level parameter.
 
-        Gemini 3 models (and image models with Gemini 3 image features, such as
-        the Nano Banana IDs) support thinking_level and should NOT use
-        thinking_budget. Other models (like Gemini 2.5) use thinking_budget instead.
+        Gemini 3 and Gemini 4 models (and image models with Gemini 3 image
+        features, such as the Nano Banana IDs) support thinking_level and must
+        NOT use thinking_budget. Gemini 4 rejects thinking_budget with HTTP 400.
+        Other models (like Gemini 2.5) use thinking_budget instead.
 
         Args:
             model_id: The model ID to check
@@ -1760,12 +1772,12 @@ class Pipe:
         Returns:
             True if the model supports thinking_level, False otherwise
         """
-        return self._is_gemini_3_family_model(
+        return self._is_gemini_3_or_later_model(
             model_id
         ) or self._is_gemini_3_image_model(model_id)
 
     def _get_supported_thinking_levels(self, model_id: str) -> List[str]:
-        """Return the supported thinking levels for a specific Gemini 3 model.
+        """Return the supported thinking levels for a Gemini 3 or 4 model.
 
         An empty list means the levels are not known; the configured level is
         then sent unchanged (e.g. other Nano Banana IDs, IMAGE_GENERATION_MODELS).
@@ -1781,13 +1793,17 @@ class Pipe:
         ):
             return ["minimal", "high"]
 
-        if self._is_gemini_3_family_model(model_id):
+        if self._is_gemini_3_or_later_model(model_id):
             if "image" not in model_lower:
                 levels = self._THINKING_LEVELS.get(
                     self._MODEL_SUFFIX_RE.sub("", model_lower)
                 )
                 if levels:
                     return list(levels)
+            # Gemini 4 Argon (and its cyber-permissive variant) supports all
+            # three non-minimal levels; MINIMAL is rejected by Gemini 4.
+            if not self._is_gemini_3_family_model(model_id):
+                return ["low", "medium", "high"]
             return ["low", "high"]
 
         return []
@@ -4492,9 +4508,9 @@ class Pipe:
                     )
                 thinking_config_params["include_thoughts"] = include_thoughts
 
-                # Check if model supports thinking_level (Gemini 3 models)
+                # Check if model supports thinking_level (Gemini 3 and later)
                 if self._check_thinking_level_support(model_id):
-                    # For Gemini 3 models, use thinking_level (not thinking_budget)
+                    # For Gemini 3 and 4, use thinking_level (not thinking_budget)
                     # Per-chat reasoning_effort overrides environment-level THINKING_LEVEL
                     reasoning_effort = body.get("reasoning_effort")
                     validated_level = None
@@ -4529,7 +4545,7 @@ class Pipe:
                             f"Using default thinking level for model {model_id}"
                         )
                 else:
-                    # For non-Gemini 3 models (e.g., Gemini 2.5), use thinking_budget
+                    # For Gemini 2.5 and earlier, use thinking_budget
                     # Body-level thinking_budget overrides environment-level THINKING_BUDGET
                     body_thinking_budget = body.get("thinking_budget")
                     validated_budget = None
@@ -5044,15 +5060,18 @@ class Pipe:
                 ):
                     last_finish_reason = response_chunk.candidates[0].finish_reason
 
-                # Check for safety feedback or empty chunks
+                # A chunk without candidates is not necessarily blocked: Gemini
+                # 4 (and automatic continuation) can send usage-only chunks at
+                # hop boundaries. Only an actual prompt block ends the stream.
                 if not response_chunk.candidates:
-                    # Check prompt feedback
                     feedback = response_chunk.prompt_feedback
-                    if feedback and feedback.block_reason:
-                        block_reason = feedback.block_reason.name
-                        message = f"[Blocked due to Prompt Safety: {block_reason}]"
-                    else:
-                        message = "[Blocked by safety settings]"
+                    if not (feedback and feedback.block_reason):
+                        self.log.debug(
+                            "Skipping Gemini response chunk without candidates"
+                        )
+                        continue
+                    block_reason = feedback.block_reason.name
+                    message = f"[Blocked due to Prompt Safety: {block_reason}]"
                     await emit_chat_event(
                         "chat:finish",
                         {

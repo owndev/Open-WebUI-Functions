@@ -1207,12 +1207,12 @@ class Smoke:
     async def r11(self) -> Outcome:
         version = str(self.meta.get("google_genai"))
         numbers = tuple(int(n) for n in re.findall(r"\d+", version)[:3])
-        if numbers and numbers < (1, 68, 0):
+        if numbers and numbers < (2, 31, 0):
             return Outcome(
                 FAIL,
                 [
                     f"google-genai {version} after saving google_gemini.py: the "
-                    "requirement google-genai>=1.68.0 was not installed"
+                    "requirement google-genai>=2.31.0 was not installed"
                 ],
             )
         return Outcome(
@@ -1221,7 +1221,7 @@ class Smoke:
                 f"note only: Open WebUI {self.meta.get('owui_version')} "
                 f"({os.environ.get('E2E_IMAGE', '?')}), google-genai "
                 f"{self.meta.get('google_genai')} after saving google_gemini.py "
-                "(requirements google-genai>=1.68.0). Open WebUI 0.9.0-0.11.3 "
+                "(requirements google-genai>=2.31.0). Open WebUI 0.9.0-0.11.3 "
                 "bundle 1.66.0: run this test with --image v0.11.3-slim to see the "
                 "upgrade on save and the in-process reload work (every other risk "
                 "then runs on the upgraded SDK)."

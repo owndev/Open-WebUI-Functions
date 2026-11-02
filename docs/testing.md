@@ -912,7 +912,7 @@ How it works:
 | R8 | Gemini 2.5 with thinking: a tool turn, a second tool turn, a plain turn | Every request 200 (the evidence counts the signatures on thought parts that are not sent back) |
 | R9 | Vertex AI: a tool turn, a 64-character tool name, web search with tools, a Vertex AI Search data store (`--vertex-rag-store`) | Each turn done without an error. SKIP without credentials |
 | R10 | Gemini 2.5 with web search | `googleSearch` without `functionDeclarations`, 200 |
-| R11 | Note only: the installed `google-genai` version | SKIP with the note; FAIL when it is older than 1.68.0 after the function was saved |
+| R11 | Note only: the installed `google-genai` version | SKIP with the note; FAIL when it is older than 2.31.0 after the function was saved |
 | R12 | Streamed tool turn on Gemini 3 | No partial function call parts, the final text is not empty |
 | R13 | `--turns` API tool turns (default 4), plus every answer of the run | Counts the finish reasons, `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` and `default_api.` names. FAIL only when such an answer did not become the pipe's error text |
 | R14 | Tool approval (ask) with two calls, approve | The turn pauses, the continuation gets 200, also when Open WebUI 0.11.4 replays fewer calls than Gemini made |
