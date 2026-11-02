@@ -1449,13 +1449,13 @@ async def imgvalve(t: Suite, mock) -> None:
     t.check(
         "imgvalve.unlisted",
         "gemini-4-flash-image (MODEL_ADDITIONAL only): image model by its name, "
-        "no imageConfig, thinkingBudget instead of a level",
+        "no imageConfig, thinkingLevel HIGH without thinkingBudget (Gemini 4)",
         r.status == 200
         and _actions(reqs) == ["generateContent"]
         and "IMAGE" in (gc.get("responseModalities") or [])
         and "imageConfig" not in gc
-        and "thinkingBudget" in think
-        and "thinkingLevel" not in think,
+        and str(think.get("thinkingLevel", "")).upper() == "HIGH"
+        and "thinkingBudget" not in think,
         detail,
     )
     await _set(t, IMAGE_GENERATION_MODELS="gemini-4-flash-image")

@@ -198,9 +198,11 @@ GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
 # Comma-separated list of model IDs (e.g., a future "gemini-4-flash-image")
 # Listed models are called without streaming, their images are uploaded to the chat,
 # and they get the ImageConfig and thinking level settings of Gemini 3 image models.
-# List new image models whose IDs use neither Gemini 3 nor Nano Banana naming: without
-# an entry they get no ImageConfig and no thinking_level. Known Gemini 3 and Nano Banana
-# image models need not be listed. Imagen IDs (imagen-*) are ignored.
+# List new image models whose IDs use neither Gemini 3, Gemini 4 nor Nano Banana naming:
+# without an entry they get no ImageConfig and thinking_budget instead of thinking_level.
+# A Gemini 4 image ID already gets a thinking level, but needs this entry for ImageConfig.
+# Known Gemini 3, Gemini 4 and Nano Banana image models need not be listed for thinking.
+# Imagen IDs (imagen-*) are ignored.
 # Default: "" (empty, no extra models)
 GOOGLE_IMAGE_GENERATION_MODELS=""
 
@@ -409,13 +411,14 @@ for part in response.parts:
 | Models in `GOOGLE_IMAGE_GENERATION_MODELS` | ✅ Supported                                   |
 | gemini-2.5-flash-image-\*                  | ❌ Not supported (uses defaults)               |
 | Other gemini-3 / gemini-3.1                | ❌ Not image generation models                 |
+| Other gemini-4 image IDs, not listed       | ❌ Not supported without an entry (no ImageConfig) |
 | Other models                               | ❌ Not image generation models                 |
 
 ### Additional Image Generation Models
 
 Google releases new image models regularly. Gemini model IDs that contain `image` as their own segment (such as `gemini-3.1-flash-image`) or `nano-banana` (such as `gemini-nano-banana-2.1`) are detected as image models automatically: they are called without streaming and their images are uploaded. ImageConfig (aspect ratio, resolution) and `thinking_level` are only sent to Gemini 3/3.1 image models (such as `gemini-3-pro-image` or `gemini-3.1-flash-image`), Nano Banana models (`gemini-nano-banana-*`) and the listed models.
 
-List a new image model in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update when its ID uses neither Gemini 3 nor Nano Banana naming, for example a future `gemini-4-flash-image` (detected as an image model, but without an entry it gets no ImageConfig and `thinking_budget` instead of `thinking_level`), or when it is not detected at all. The known models in the table above need not be listed. Imagen IDs (`imagen-*`) use another API and are ignored even if listed.
+List a new image model in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update when its ID uses neither Gemini 3, Gemini 4 nor Nano Banana naming, for example a future `gemini-5-flash-image` (detected as an image model, but without an entry it gets no ImageConfig and `thinking_budget` instead of `thinking_level`), or when it is not detected at all. A Gemini 4 image ID such as `gemini-4-flash-image` already gets `thinking_level`; the entry adds ImageConfig. The known models in the table above need not be listed for thinking. Imagen IDs (`imagen-*`) use another API and are ignored even if listed.
 
 ```bash
 # Comma-separated model IDs to treat as Gemini 3 image models

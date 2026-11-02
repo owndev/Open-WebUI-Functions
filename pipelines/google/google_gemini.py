@@ -588,10 +588,12 @@ class Pipe:
             "image models: called without streaming, images uploaded to the chat, and "
             "given the aspect ratio/resolution (ImageConfig) and thinking level settings. "
             "List image models released after this pipeline version whose IDs use "
-            "neither Gemini 3 nor Nano Banana naming (e.g. a future gemini-4-flash-image); "
-            "without an entry they get no ImageConfig and no thinking_level. Known "
-            "Gemini 3 and Nano Banana image models need not be listed. Imagen IDs "
-            "(imagen-*) are ignored.",
+            "neither Gemini 3, Gemini 4 nor Nano Banana naming; without an entry they "
+            "get no ImageConfig and thinking_budget instead of thinking_level. A Gemini 4 "
+            "image ID such as gemini-4-flash-image already gets a thinking level, but "
+            "needs this entry for ImageConfig. Known Gemini 3, Gemini 4 and Nano Banana "
+            "image models need not be listed for thinking. Imagen IDs (imagen-*) are "
+            "ignored.",
         )
         IMAGE_MAX_SIZE_MB: float = Field(
             default=float(os.getenv("GOOGLE_IMAGE_MAX_SIZE_MB", "15.0")),
