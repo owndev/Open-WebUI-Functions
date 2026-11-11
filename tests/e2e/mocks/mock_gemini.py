@@ -21,6 +21,8 @@ Answers
     (``generationConfig.thinkingConfig.includeThoughts``; google-genai sends some
     nested keys in snake_case, both spellings are read), never for
     gemini-2.5-flash-image (no thinking)
+  - gemini-4-* rejects thinkingBudget and thinkingLevel MINIMAL with HTTP 400,
+    as the real API does
   - text models: a thought part ("Mock thinking." / "Mock pondering.") +
     "Hello from mock ..."; streaming sends the answer in three chunks, usage on
     the last chunk
@@ -74,6 +76,9 @@ part that is not Open WebUI's tool-image message, see ``_turn_text``)
                        parts 1.2 s apart (the first 0.15 s after the last thought)
   slow-thinking        streaming text models: twelve thought parts "Slow thought <i>."
                        0.5 s apart, then the answer "Slow answer."
+  argon-boundary       streaming text models: candidate-less usage chunks before,
+                       between and after the thought and answer chunks (as Gemini 4
+                       long decode / automatic continuation can send)
 
 Open WebUI's context compaction prompt ("Summarize the conversation history
 that will be compacted ..."; before a reply and, from Open WebUI 0.12, between
@@ -99,8 +104,8 @@ Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
     pipe's name mapping, copied) and must be declared, else the answer is the text
     "MOCK-ERROR undeclared function <name>; declared=[...]" (HTTP 200) unless
     ``allow_undeclared``
-  - ids "mock-call-<r>-<k>" (none with ``noid``); gemini-3* models get a
-    thoughtSignature on the first call of a round (not with ``nosig``):
+  - ids "mock-call-<r>-<k>" (none with ``noid``); gemini-3* and gemini-4* models
+    get a thoughtSignature on the first call of a round (not with ``nosig``):
     base64("mock-sig|<model>|<id or name>")
   - parts: thought (when requested), text_before, the server-side toolCall +
     toolResponse (``server_side`` and the request sets
@@ -117,9 +122,9 @@ Native tool calling: ``MOCKTOOLS:{json}`` in the turn's user message
   duplicate declaration names, invalid names, ``parameters`` together with
   ``parametersJsonSchema``, a model content with functionCall parts that is not
   directly followed by a user content with matching functionResponse parts
-  (count, names, ids), and for gemini-3* the first functionCall part of each
-  model content of the current turn without the issued signature (or
-  "skip_thought_signature_validator").
+  (count, names, ids), and for gemini-3* and gemini-4* the first functionCall
+  part of each model content of the current turn without the issued signature
+  (or "skip_thought_signature_validator").
 
 Each recorded request carries ``model``, ``action`` (generateContent,
 streamGenerateContent, predict, predictLongRunning, download), ``tool_kinds`` (keys of
@@ -154,6 +159,7 @@ from common import PNG_B64, REQUESTS_KEY, annotate, new_app, record, task_answer
 
 MODELS = [
     ("gemini-2.5-flash", "Gemini 2.5 Flash", ["generateContent", "countTokens"]),
+    ("gemini-4-argon", "Gemini 4 Argon", None),
     ("gemini-3-pro-preview", "Gemini 3 Pro Preview", None),
     ("gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image Preview", None),
     ("gemini-3.1-flash-image", "Gemini 3.1 Flash Image", None),
@@ -263,6 +269,11 @@ def normalize(value):
 
 def _is_image_model(model: str) -> bool:
     return "image" in model or "nano-banana" in model
+
+
+def _needs_thought_signature(model: str) -> bool:
+    """Gemini 3 and later check function-call thought signatures."""
+    return model.startswith(("gemini-3", "gemini-4"))
 
 
 def _thoughts(model: str, body) -> bool:
@@ -604,7 +615,7 @@ def _validate(model: str, body, view: dict) -> Optional[web.Response]:
             )
         ):
             return bad(FR_MISMATCH)
-    if model.startswith("gemini-3"):
+    if _needs_thought_signature(model):
         # current turn: the contents after the last user content with a part that
         # is not a function response
         start = max(
@@ -666,7 +677,7 @@ def _tool_plan(model: str, view: dict) -> Optional[dict]:
         if not directive.get("noid"):
             call["id"] = f"mock-call-{r}-{k}"
         part = {"functionCall": call}
-        if k == 0 and model.startswith("gemini-3") and not directive.get("nosig"):
+        if k == 0 and _needs_thought_signature(model) and not directive.get("nosig"):
             part["thoughtSignature"] = issued_signature(
                 model, call.get("id") or gemini_name
             )
@@ -825,6 +836,23 @@ def _reject(request: web.Request, model: str, body: dict) -> Optional[web.Respon
         return _error(500, "mock: force-500", "INTERNAL")
     if "force-503-once" in text and _first_since_reset(request, "force-503-once"):
         return _error(503, "mock: force-503-once", "UNAVAILABLE")
+    if model.startswith("gemini-4"):
+        thinking = (
+            normalize((body or {}).get("generationConfig") or {}).get("thinkingConfig")
+            or {}
+        )
+        if thinking.get("thinkingBudget") is not None:
+            return _error(
+                400,
+                "mock: thinking_budget is not supported by Gemini 4",
+                "INVALID_ARGUMENT",
+            )
+        if str(thinking.get("thinkingLevel") or "").upper() == "MINIMAL":
+            return _error(
+                400,
+                "mock: MINIMAL thinking level is not supported by Gemini 4",
+                "INVALID_ARGUMENT",
+            )
     # "imagegen": stands for an image model the pipe does not recognise
     if _is_image_model(model) and "imagegen" not in model:
         kinds = _tool_kinds(body)
@@ -964,6 +992,20 @@ def _stream_chunks(model: str, body) -> list:
     summary = _compaction_summary(text)
     if summary is not None:
         return [_summary_answer(model, body, summary, USAGE_STREAM)]
+    if "argon-boundary" in text:
+        usage_only = {"usageMetadata": USAGE_STREAM}
+        return [
+            usage_only,
+            _chunk([{"text": "Argon boundary thinking.", "thought": True}], body),
+            usage_only,
+            _chunk(
+                [{"text": "Argon answer across continuation."}],
+                body,
+                True,
+                USAGE_STREAM,
+            ),
+            usage_only,
+        ]
     task = task_answer(text)
     paced = next((key for key in PACED if key in text), None)
     if paced and not task:

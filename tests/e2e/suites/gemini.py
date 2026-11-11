@@ -7,6 +7,7 @@ Groups (``--only gemini.<group>``)
   api          API path (no websocket): non-stream, stream (thinking in a
                <details type="reasoning" done="true" duration="N"> block)
   thinking     summaries not replayed (#176, old and 1.19.0 shapes), budget / level /
+               Gemini 4 Argon levels and candidate-less continuation chunks,
                include / strip valves; browser: live done="false" block, duration
                up to the answer, Stop while thinking
   browser      browser path: saved answer + usage, stream and non-stream
@@ -123,6 +124,7 @@ PATH = "pipelines/google/google_gemini.py"
 KEY = "mock-gemini-key"
 TEXT = f"{FID}.gemini-2.5-flash"
 PRO3 = f"{FID}.gemini-3-pro-preview"
+ARGON = f"{FID}.gemini-4-argon"
 IMAGE_PREVIEW = f"{FID}.gemini-3.1-flash-image-preview"
 IMAGE_GA = f"{FID}.gemini-3.1-flash-image"
 IMAGE_LITE = f"{FID}.gemini-3.1-flash-lite-image"
@@ -573,7 +575,17 @@ async def run(t: Suite) -> None:
 # ------------------------------------------------------------------ models
 async def models(t: Suite, mock) -> None:
     listed = {m["id"]: m.get("name", "") for m in await t.owui.models()}
-    wanted = {TEXT, PRO3, IMAGE_PREVIEW, IMAGE_GA, IMAGE_LITE, IMAGE_25, NANO, VEO}
+    wanted = {
+        TEXT,
+        ARGON,
+        PRO3,
+        IMAGE_PREVIEW,
+        IMAGE_GA,
+        IMAGE_LITE,
+        IMAGE_25,
+        NANO,
+        VEO,
+    }
     t.check(
         "models",
         "models listed (gemini-*, veo-*; embedding models filtered out)",
@@ -753,6 +765,45 @@ async def thinking(t: Suite, mock) -> None:
     )
 
     # thinking levels per model (https://ai.google.dev/gemini-api/docs/thinking)
+    # Gemini 4 uses thinking_level too, rejects thinking_budget, and supports
+    # low/medium/high. Candidate-less usage chunks from continuation must not be
+    # mistaken for a safety block (they precede/between/after the thought chunks).
+    await _set(t, THINKING_LEVEL="")
+    await mock.reset()
+    r = await t.owui.chat(ARGON, "Hi", stream=False, reasoning_effort="medium")
+    think_argon = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    await mock.reset()
+    r_boundary = await t.owui.chat(
+        ARGON, "argon-boundary please", stream=True, reasoning_effort="medium"
+    )
+    think_boundary = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    await mock.reset()
+    await t.owui.chat(ARGON, "Hi", stream=False, reasoning_effort="minimal")
+    think_minimal = _gc(await mock.last(_gen)).get("thinkingConfig") or {}
+    t.check(
+        "thinking.gemini-4",
+        "gemini-4-argon reasoning_effort=medium -> thinkingLevel MEDIUM without "
+        "thinkingBudget; minimal -> LOW (not rejected MINIMAL); streamed thought "
+        "summary survives candidate-less usage chunks before, between and after",
+        _block_ok(r.content, "Mock thinking.", "Hello from mock (non-stream).")
+        and _block_ok(
+            r_boundary.content,
+            "Argon boundary thinking.",
+            "Argon answer across continuation.",
+        )
+        and _usage(r_boundary.usage) == USAGE_STREAM
+        and "Blocked by safety" not in r_boundary.content
+        and think_argon.get("includeThoughts") is True
+        and str(think_argon.get("thinkingLevel", "")).upper() == "MEDIUM"
+        and "thinkingBudget" not in think_argon
+        and str(think_boundary.get("thinkingLevel", "")).upper() == "MEDIUM"
+        and str(think_minimal.get("thinkingLevel", "")).upper() == "LOW"
+        and "thinkingBudget" not in think_minimal,
+        f"config={think_argon} boundary_config={think_boundary} "
+        f"minimal={think_minimal} nonstream={r.brief()} "
+        f"boundary={r_boundary.brief()} {_block_report(r_boundary.content)}",
+    )
+
     await _set(
         t,
         THINKING_LEVEL="",
@@ -1398,13 +1449,13 @@ async def imgvalve(t: Suite, mock) -> None:
     t.check(
         "imgvalve.unlisted",
         "gemini-4-flash-image (MODEL_ADDITIONAL only): image model by its name, "
-        "no imageConfig, thinkingBudget instead of a level",
+        "no imageConfig, thinkingLevel HIGH without thinkingBudget (Gemini 4)",
         r.status == 200
         and _actions(reqs) == ["generateContent"]
         and "IMAGE" in (gc.get("responseModalities") or [])
         and "imageConfig" not in gc
-        and "thinkingBudget" in think
-        and "thinkingLevel" not in think,
+        and str(think.get("thinkingLevel", "")).upper() == "HIGH"
+        and "thinkingBudget" not in think,
         detail,
     )
     await _set(t, IMAGE_GENERATION_MODELS="gemini-4-flash-image")
@@ -1761,11 +1812,17 @@ async def errors(t: Suite, mock) -> None:
     )
     await mock.reset()
     r = await t.owui.chat(TEXT, "prompt-blocked now", stream=False)
+    await mock.reset()
+    r_stream = await t.owui.chat(TEXT, "prompt-blocked now", stream=True)
     t.check(
         "errors.prompt-blocked",
-        "blocked prompt: '[Blocked due to Prompt Safety: SAFETY]'",
-        r.status == 200 and "[Blocked due to Prompt Safety: SAFETY]" in r.content,
-        r.brief(),
+        "blocked prompt: '[Blocked due to Prompt Safety: SAFETY]', also when "
+        "Gemini streams it as a candidate-less chunk",
+        r.status == 200
+        and "[Blocked due to Prompt Safety: SAFETY]" in r.content
+        and r_stream.status == 200
+        and "[Blocked due to Prompt Safety: SAFETY]" in r_stream.content,
+        r.brief() + " stream=" + r_stream.brief(),
     )
     await mock.reset()
     r = await t.owui.chat(TEXT, "finish-safety now", stream=False)

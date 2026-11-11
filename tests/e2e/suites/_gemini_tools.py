@@ -1176,6 +1176,7 @@ async def toolsapi(t: Suite, mock) -> None:
     await api_default_api(ctx)
     await api_schema(ctx)
     await api_noid(ctx)
+    await api_hidden_context(ctx)
     await api_unchanged(ctx)
 
 
@@ -1813,6 +1814,83 @@ async def api_noid(ctx: Ctx) -> None:
             f"ids={ids} continuation={_req_tokens(req)} "
             f"synthetic_ids_upstream={req.get('synthetic_ids_upstream')} "
             f"answer2={short(r2.content, 80)}",
+        ),
+    )
+
+
+async def api_hidden_context(ctx: Ctx) -> None:
+    """Open WebUI 0.13+ synthetic hidden tool context (recall_memories,
+    list_available_skills, list_attached_knowledge): folded into
+    systemInstruction and deduplicated across turns instead of sent as
+    undeclared functionCall / functionResponse turns."""
+
+    def hidden_pair(call_id: str, name: str, text: str) -> list:
+        return [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": text},
+        ]
+
+    skills_xml = "<available_skills>\n<skill>\n<id>s1</id>\n</skill>\n</available_skills>"
+    kb_xml = '<attached_knowledge>\n<knowledge type="collection" id="kb1"/>\n</attached_knowledge>'
+    messages = [
+        {"role": "system", "content": "Base system prompt."},
+        {"role": "user", "content": "Turn 1 user prompt."},
+        *hidden_pair(
+            "fc_mem_1",
+            "recall_memories",
+            "<memory_context>\n[User Memory]\n- old memory\n</memory_context>",
+        ),
+        *hidden_pair("fc_sk_1", "list_available_skills", skills_xml),
+        *_history("old-call-1", sig=False, content='{"y": 0}'),
+        {"role": "assistant", "content": "Turn 1 answer."},
+        {"role": "user", "content": "Turn 2 user prompt."},
+        *hidden_pair(
+            "fc_mem_2",
+            "recall_memories",
+            "<memory_context>\n[User Memory]\n- updated memory\n</memory_context>",
+        ),
+        *hidden_pair("fc_sk_2", "list_available_skills", skills_xml),
+        *hidden_pair("fc_kb_2", "list_attached_knowledge", kb_xml),
+    ]
+    await ctx.mock.reset()
+    r = await ctx.t.owui.chat(PRO3, messages, stream=False, tools=[CLIENT_FN])
+    reqs = await ctx.requests()
+    req = reqs[-1] if reqs else {}
+    system = " ".join(_strings(_body(req).get("systemInstruction")))
+    ctx.check(
+        "toolsapi.hidden-context",
+        "Open WebUI 0.13+ synthetic hidden tool calls (recall_memories, "
+        "list_available_skills, list_attached_knowledge) are deduplicated across "
+        "turns and folded into systemInstruction instead of sent as undeclared "
+        "functionCall / functionResponse rounds",
+        r.status == 200
+        and req.get("status") == 200
+        and _fcs(req) == [("old-call-1", "client_fn", "none")]
+        and [(i, n) for i, n, _ in _frs(req)] == [("old-call-1", "client_fn")]
+        and req.get("kinds")
+        == ["user:text", "model:fc", "user:fr", "model:text", "user:text"]
+        and "Base system prompt." in system
+        and "updated memory" in system
+        and "old memory" not in system
+        and system.count("<memory_context>") == 1
+        and system.count("<available_skills>") == 1
+        and system.count("<attached_knowledge>") == 1,
+        _adetail(
+            r,
+            reqs,
+            f"{_req_tokens(req)} mem={system.count('<memory_context>')} "
+            f"skills={system.count('<available_skills>')} "
+            f"kb={system.count('<attached_knowledge>')}",
         ),
     )
 

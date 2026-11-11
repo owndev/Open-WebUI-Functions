@@ -13,15 +13,15 @@ This integration enables **Open WebUI** to interact with **Google Gemini** model
 The pipeline uses the official [`google-genai`](https://pypi.org/project/google-genai/) Python SDK. Open WebUI bundled it up to version 0.11.3, but **Open WebUI 0.11.4 no longer ships it** (see "Undeclared package imports" under **Changed** in the [Open WebUI 0.11.4 release notes](https://github.com/open-webui/open-webui/releases/tag/v0.11.4)). The pipeline therefore declares it in its header:
 
 ```text
-requirements: google-genai>=1.68.0, google-genai<3
+requirements: google-genai>=2.31.0, google-genai<3
 ```
 
-Version 1.68.0 is the first `google-genai` release that can send Google Search grounding together with function declarations to Gemini 3 (server-side tool invocations, see [Native tool calling](#native-tool-calling)).
+Version 1.68.0 first allowed Google Search grounding together with function declarations to Gemini 3 (server-side tool invocations, see [Native tool calling](#native-tool-calling)). Version 2.31.0 is the minimum for Gemini 4 Argon: it adds automatic continuation for long decodes (thinking-only hops), the corrected handling of continuation streams and their final usage, and the Gemini 4 fixes for continuation responses.
 
 Open WebUI runs `pip` for this requirement when the function is saved and again at every startup for active functions. Once the package is installed this is a no-op, but after the container is recreated (for example on an image upgrade) it is downloaded again, so Open WebUI needs access to PyPI or to a mirror configured via `PIP_OPTIONS` / `PIP_PACKAGE_INDEX_OPTIONS`. On Open WebUI 0.9.0 to 0.11.3, pip upgrades the bundled `google-genai` 1.66.0 when the function is saved. The pipeline reloads `google.genai` itself, so it uses the new version without a restart; other functions or tools that use `google.genai` only see the new version after a restart.
 
 > [!WARNING]
-> Without access to PyPI or a mirror (air-gapped or proxied instances), that upgrade fails on Open WebUI 0.9.0 to 0.11.3: saving version 1.18.0 then fails, Open WebUI switches the function off, and the Gemini models disappear. Before you update, either install `google-genai>=1.68.0,<3` yourself (see [Manual Installation](#manual-installation)), or set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`. In the second case the pipeline runs on the bundled 1.66.0 without Google Search grounding together with function calling: Gemini 3 with web search then uses grounding only and declares no tools in that request.
+> Without access to PyPI or a mirror (air-gapped or proxied instances), that upgrade fails on Open WebUI 0.9.0 to 0.11.3: saving version 1.18.0 then fails, Open WebUI switches the function off, and the Gemini models disappear. Before you update, either install `google-genai>=2.31.0,<3` yourself (see [Manual Installation](#manual-installation)), or set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`. In the second case the pipeline runs on the bundled SDK: with 1.66.0 there is no Search grounding together with function calling, and Gemini 4 long decodes cannot follow continuation tokens; Gemini 3 with web search then uses grounding only and declares no tools in that request.
 
 > [!NOTE]
 > `google-genai` currently requires `websockets<17` ([googleapis/python-genai#2835](https://github.com/googleapis/python-genai/issues/2835)), so pip downgrades the `websockets` 17.1 shipped with Open WebUI 0.11.4 to the newest 16.x (16.1.1, the version Open WebUI 0.11.3 shipped with the same uvicorn). The downgrade applies to the whole Open WebUI environment. The pipeline reloads the affected modules itself, so Open WebUI does not need a restart after the install. Other tools or functions that imported `websockets` before the downgrade only see a consistent version again after a restart.
@@ -33,10 +33,10 @@ Open WebUI skips the automatic install when `ENABLE_PIP_INSTALL_FRONTMATTER_REQU
 ```dockerfile
 # Use the same tag you deploy, e.g. v0.12.0, v0.12.0-slim or main
 FROM ghcr.io/open-webui/open-webui:v0.12.0
-RUN pip install --no-cache-dir "google-genai>=1.68.0,<3"
+RUN pip install --no-cache-dir "google-genai>=2.31.0,<3"
 ```
 
-For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68.0,<3"` (or `uv pip install ...`) in Open WebUI's virtual environment and restart Open WebUI. Environments created without pip (for example by uv) cannot use the automatic install at all: saving the function fails with `No module named pip`, so set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` and install the SDK manually.
+For a pip or uv installation of Open WebUI, run `pip install "google-genai>=2.31.0,<3"` (or `uv pip install ...`) in Open WebUI's virtual environment and restart Open WebUI. Environments created without pip (for example by uv) cannot use the automatic install at all: saving the function fails with `No module named pip`, so set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` and install the SDK manually.
 
 > [!TIP]
 > Pipeline versions before 1.16.1 cannot import `google.genai` on Open WebUI 0.11.4, and Open WebUI switches off a function that fails to load. Paste version 1.16.1 or later, save it, and switch it back on under **Admin Panel → Functions**.
@@ -59,10 +59,10 @@ For a pip or uv installation of Open WebUI, run `pip install "google-genai>=1.68
 > Streaming is automatically disabled for image generation models to prevent chunk size issues. Image models are recognized by their preview and released IDs (for example `gemini-3.1-flash-image-preview`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`) and by Nano Banana IDs such as `gemini-nano-banana-2.1`; Imagen models (`imagen-*`) are not Gemini image models. Newer image models can be added without a code change via `GOOGLE_IMAGE_GENERATION_MODELS` (see [Additional image generation models](#additional-image-generation-models)). If a model that is not recognized still returns an image while streaming, the image is uploaded and attached once the stream ends.
 
 - **Thinking Support**  
-  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 models (the levels each model supports, see [Thinking Levels](#thinking-levels-gemini-3-models)) and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
+  Support reasoning and thinking steps, allowing models to break down complex tasks. Includes configurable thinking levels for Gemini 3 and Gemini 4 models (the levels each model supports, see [Thinking Levels](#thinking-levels-gemini-3-and-gemini-4-models)) and thinking budgets (0-32768 tokens) for other thinking-capable models. The thoughts are shown as Open WebUI's own reasoning block, titled in each user's language (see [Thinking Summaries in Conversation History](#thinking-summaries-in-conversation-history)).
 
   > [!Note]
-  > **Thinking Levels vs Thinking Budgets**: Gemini 3 models use `thinking_level` ("minimal", "low", "medium" or "high", depending on the model), while other models like Gemini 2.5 use `thinking_budget` (token count). See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
+  > **Thinking Levels vs Thinking Budgets**: Gemini 3 and Gemini 4 models use `thinking_level` ("minimal", "low", "medium" or "high", depending on the model), while models like Gemini 2.5 use `thinking_budget` (token count). Gemini 4 rejects `thinking_budget` and `"minimal"` with HTTP 400. See [Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking) for details.
 
 - **Multimodal Input Support**  
   Accepts both text and image data for more expressive interactions with configurable image optimization.
@@ -198,9 +198,11 @@ GOOGLE_IMAGE_GENERATION_RESOLUTION="2K"
 # Comma-separated list of model IDs (e.g., a future "gemini-4-flash-image")
 # Listed models are called without streaming, their images are uploaded to the chat,
 # and they get the ImageConfig and thinking level settings of Gemini 3 image models.
-# List new image models whose IDs use neither Gemini 3 nor Nano Banana naming: without
-# an entry they get no ImageConfig and no thinking_level. Known Gemini 3 and Nano Banana
-# image models need not be listed. Imagen IDs (imagen-*) are ignored.
+# List new image models whose IDs use neither Gemini 3, Gemini 4 nor Nano Banana naming:
+# without an entry they get no ImageConfig and thinking_budget instead of thinking_level.
+# A Gemini 4 image ID already gets a thinking level, but needs this entry for ImageConfig.
+# Known Gemini 3, Gemini 4 and Nano Banana image models need not be listed for thinking.
+# Imagen IDs (imagen-*) are ignored.
 # Default: "" (empty, no extra models)
 GOOGLE_IMAGE_GENERATION_MODELS=""
 
@@ -213,13 +215,14 @@ GOOGLE_INCLUDE_THOUGHTS=true
 # Default: true
 GOOGLE_STRIP_THINKING_FROM_HISTORY=true
 
-# Thinking budget for Gemini 2.5 models (not used for Gemini 3 models)
+# Thinking budget for Gemini 2.5 models (not used for Gemini 3 or 4 models)
 # -1 = dynamic (model decides), 0 = disabled, 1-32768 = fixed token limit
 # Default: -1 (dynamic)
-# Note: Gemini 3 models use GOOGLE_THINKING_LEVEL instead
+# Note: Gemini 3 and Gemini 4 models use GOOGLE_THINKING_LEVEL instead
 GOOGLE_THINKING_BUDGET=-1
 
-# Thinking level for Gemini 3 models only
+# Thinking level for Gemini 3 and Gemini 4 models only
+# gemini-4-argon accepts "low", "medium" or "high" ("minimal" is rejected)
 # gemini-3-pro accepts "low" or "high"; gemini-3-flash all four ("minimal", "low",
 # "medium", "high"); gemini-3.1-pro "low", "medium" or "high"; other Gemini 3 text
 # models "low" or "high" (see "Thinking Levels" below for the full list)
@@ -227,7 +230,7 @@ GOOGLE_THINKING_BUDGET=-1
 # gemini-nano-banana-2.1 accepts "minimal", "medium" or "high"
 # The pipeline automatically maps unsupported values to the closest supported level
 # Default: "" (empty, uses model default)
-# Note: This setting is ignored for non-Gemini 3 models
+# Note: This setting is ignored for non-Gemini 3 / Gemini 4 models
 GOOGLE_THINKING_LEVEL=""
 
 # Enable streaming responses globally
@@ -408,13 +411,14 @@ for part in response.parts:
 | Models in `GOOGLE_IMAGE_GENERATION_MODELS` | ✅ Supported                                   |
 | gemini-2.5-flash-image-\*                  | ❌ Not supported (uses defaults)               |
 | Other gemini-3 / gemini-3.1                | ❌ Not image generation models                 |
+| Other gemini-4 image IDs, not listed       | ❌ Not supported without an entry (no ImageConfig) |
 | Other models                               | ❌ Not image generation models                 |
 
 ### Additional Image Generation Models
 
 Google releases new image models regularly. Gemini model IDs that contain `image` as their own segment (such as `gemini-3.1-flash-image`) or `nano-banana` (such as `gemini-nano-banana-2.1`) are detected as image models automatically: they are called without streaming and their images are uploaded. ImageConfig (aspect ratio, resolution) and `thinking_level` are only sent to Gemini 3/3.1 image models (such as `gemini-3-pro-image` or `gemini-3.1-flash-image`), Nano Banana models (`gemini-nano-banana-*`) and the listed models.
 
-List a new image model in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update when its ID uses neither Gemini 3 nor Nano Banana naming, for example a future `gemini-4-flash-image` (detected as an image model, but without an entry it gets no ImageConfig and `thinking_budget` instead of `thinking_level`), or when it is not detected at all. The known models in the table above need not be listed. Imagen IDs (`imagen-*`) use another API and are ignored even if listed.
+List a new image model in `GOOGLE_IMAGE_GENERATION_MODELS` (or the `IMAGE_GENERATION_MODELS` valve) instead of waiting for a pipeline update when its ID uses neither Gemini 3, Gemini 4 nor Nano Banana naming, for example a future `gemini-5-flash-image` (detected as an image model, but without an entry it gets no ImageConfig and `thinking_budget` instead of `thinking_level`), or when it is not detected at all. A Gemini 4 image ID such as `gemini-4-flash-image` already gets `thinking_level`; the entry adds ImageConfig. The known models in the table above need not be listed for thinking. Imagen IDs (`imagen-*`) use another API and are ignored even if listed.
 
 ```bash
 # Comma-separated model IDs to treat as Gemini 3 image models
@@ -781,7 +785,7 @@ Requests to `/api/chat/completions` without a chat pass the client's `tools` to 
 
 ### Grounding together with tools
 
-- Gemini 3 on the Gemini API: Google Search and URL context grounding are sent together with the function declarations (server-side tool invocations). This needs `google-genai` 1.68.0 or later; with an older SDK grounding takes precedence as below.
+- Gemini 3 on the Gemini API: Google Search and URL context grounding are sent together with the function declarations (server-side tool invocations). This needs `google-genai` 1.68.0 or later (the pipeline requires 2.31.0); with an older SDK grounding takes precedence as below.
 - Gemini 2.x and other models, Vertex AI (including Vertex AI with `VERTEX_AI_RAG_STORE`) and Enterprise Web Search: grounding takes precedence, and the request declares no functions.
 - A round with Gemini's own Search calls is sent back complete (the search calls, their results and the function calls, stored as an extra `reasoning_details` item) only within its turn. Later turns get the round's function calls with their signatures and results, without the search parts, so a later message with web search switched off, or a switch to Vertex AI, still works.
 
@@ -806,6 +810,8 @@ Open WebUI may move the current user message before tool rounds of an earlier tu
 ### Requests without tools
 
 Image generation models, background tasks (title, tag and follow-up generation, context compaction) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
+
+In Open WebUI 0.13+, Native mode injects automatic user memory (`recall_memories`), skill manifests (`list_available_skills`) and attached knowledge manifests (`list_attached_knowledge`) as synthetic hidden tool calls in every turn's `output` without declaring those tool names in `body["tools"]`. The pipeline deduplicates those synthetic context blocks across turns (keeping the latest turn's copy of each) and folds them into Gemini's `system_instruction` instead of sending undeclared `functionCall` / `functionResponse` rounds.
 
 ### Open WebUI's image generation and code interpreter
 
@@ -893,10 +899,11 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 > [!Note]
 > For detailed information about thinking capabilities, see the [Google Gemini Thinking Documentation](https://ai.google.dev/gemini-api/docs/thinking).
 
-### Thinking Levels (Gemini 3 models)
+### Thinking Levels (Gemini 3 and Gemini 4 models)
 
-Gemini 3 models support the `thinking_level` parameter, which controls the depth of reasoning:
+Gemini 3 and Gemini 4 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
+- **`gemini-4-argon`**, **`gemini-4-argon-cyber-permissive`** and **`gemini-4-carbon`**: **`"low"`**, **`"medium"`** and **`"high"`** (default: `"medium"`, or `"high"` for the cyber-permissive variant). `"minimal"` and `thinking_budget` are rejected by Gemini 4; the pipeline maps `"minimal"` to `"low"` and never sends a budget.
 - **Gemini 3 text models**, per [Google's thinking documentation](https://ai.google.dev/gemini-api/docs/thinking) (with or without a `-preview` / `-latest` suffix):
   - `gemini-3-pro`: **`"low"`** and **`"high"`**.
   - `gemini-3-flash`, `gemini-3.5-flash-lite` and `gemini-3.6-flash`: **`"minimal"`**, **`"low"`**, **`"medium"`** and **`"high"`**.
@@ -907,14 +914,14 @@ Gemini 3 models support the `thinking_level` parameter, which controls the depth
 - **Other Nano Banana IDs and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: the configured level is sent unchanged, because the pipeline does not know their supported levels.
 
 > [!Note]
-> Gemini 3 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for Gemini 3 models.
+> Gemini 3 and Gemini 4 models use `thinking_level` and do **not** use `thinking_budget`. The thinking budget setting is ignored for them. Gemini 4 returns HTTP 400 when a thinking budget is sent.
 
-If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request (for example `"medium"` becomes `"high"` on `gemini-3-pro`, `"minimal"` becomes `"low"` on `gemini-3.1-pro`).
+If you configure an unsupported value for a specific model, the pipeline automatically falls back to the closest supported thinking level instead of sending an invalid API request (for example `"medium"` becomes `"high"` on `gemini-3-pro`, `"minimal"` becomes `"low"` on `gemini-3.1-pro` or `gemini-4-argon`).
 
 Set via environment variable:
 
 ```bash
-# Use low thinking level for most Gemini 3 models
+# Use low thinking level for most Gemini 3 and Gemini 4 models
 GOOGLE_THINKING_LEVEL="low"
 
 # Use high thinking level for complex reasoning
@@ -956,7 +963,7 @@ For Gemini 2.5 models, you can control the maximum number of tokens used during 
 - **`1-32768`**: Fixed token limit for reasoning
 
 > [!Note]
-> Gemini 3 models do **not** use `thinking_budget`. Use `GOOGLE_THINKING_LEVEL` for Gemini 3 models instead.
+> Gemini 3 and Gemini 4 models do **not** use `thinking_budget`. Use `GOOGLE_THINKING_LEVEL` for them instead.
 
 Set via environment variable:
 
@@ -1020,7 +1027,7 @@ The pipeline reads three request parameters:
 
 | Parameter | Models | Effect |
 | --- | --- | --- |
-| `reasoning_effort` | Gemini 3 and Nano Banana | thinking level, checked against the model's levels as above; overrides `GOOGLE_THINKING_LEVEL` |
+| `reasoning_effort` | Gemini 3, Gemini 4 and Nano Banana | thinking level, checked against the model's levels as above; overrides `GOOGLE_THINKING_LEVEL` |
 | `thinking_budget` | Gemini 2.5 and other models without thinking levels | overrides `GOOGLE_THINKING_BUDGET` |
 | `include_thoughts` | all thinking models | `false` hides the thoughts; `GOOGLE_INCLUDE_THOUGHTS=false` always wins |
 
@@ -1115,6 +1122,7 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=false
 - **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-*`** and **`gemini-3.1-flash-lite-image`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-nano-banana-2.1`**: `thinking_level` supports `"minimal"`, `"medium"` and `"high"`; `thinking_budget` is not used.
 - **Other `gemini-nano-banana-*` models and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: `thinking_level` is sent as configured, without remapping; `thinking_budget` is not used.
+- **`gemini-4-argon`**, **`gemini-4-argon-cyber-permissive`** and **`gemini-4-carbon`**: `thinking_level` supports `"low"`, `"medium"` and `"high"`; `"minimal"` and `thinking_budget` are rejected by the API, so the pipeline sends the closest supported level and no budget.
 - **Other `gemini-3-*` models**: `thinking_level` supports `"low"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-2.5-*` models**: `thinking_level` is not used; `thinking_budget` supports `0-32768`.
 - **`gemini-2.5-flash-image-*`**: neither `thinking_level` nor `thinking_budget` is supported.
