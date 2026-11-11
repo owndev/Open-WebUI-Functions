@@ -222,12 +222,12 @@ fixes of 1.20.0, which run on 0.12 only):
 
 | Suite | Checks on v0.12.0 | Checks on v0.11.4 / v0.11.3 | PASS / KNOWN |
 | --- | ---: | ---: | ---: |
-| `gemini` | 198 | 183 | all / 0 |
+| `gemini` | 199 | 184 | all / 0 |
 | `azure` | 199 | 199 | all / 0 |
 | `n8n` | 51 | 51 | all / 0 |
 | `infomaniak` | 32 | 32 | all / 0 |
 | `filters` | 101 | 101 | all / 0 |
-| **all** | **580** | **565** | **all / 0** |
+| **all** | **581** | **566** | **all / 0** |
 
 No FAIL and no obsolete marker on any of the three versions. The `gemini.shared` group
 has 17 checks on 0.12 and two before (`shared.unsupported`, `shared.legacy`), see

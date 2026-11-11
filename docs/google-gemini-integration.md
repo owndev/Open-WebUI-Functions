@@ -811,6 +811,8 @@ Open WebUI may move the current user message before tool rounds of an earlier tu
 
 Image generation models, background tasks (title, tag and follow-up generation, context compaction) and chats with **Function Calling** set to **Legacy** declare no functions. Legacy mode remains available: Open WebUI then selects and runs the tools itself before it calls the pipeline.
 
+In Open WebUI 0.13+, Native mode injects automatic user memory (`recall_memories`), skill manifests (`list_available_skills`) and attached knowledge manifests (`list_attached_knowledge`) as synthetic hidden tool calls in every turn's `output` without declaring those tool names in `body["tools"]`. The pipeline deduplicates those synthetic context blocks across turns (keeping the latest turn's copy of each) and folds them into Gemini's `system_instruction` instead of sending undeclared `functionCall` / `functionResponse` rounds.
+
 ### Open WebUI's image generation and code interpreter
 
 In Native mode Open WebUI 0.11 offers its own image generation, image editing and code interpreter as built-in tools: `generate_image`, `edit_image` and `execute_code`. The pipeline declares them to a Gemini text model like any other tool; Gemini decides when to call them and Open WebUI runs them. No separate tool or function is needed.
@@ -901,7 +903,7 @@ The Google Gemini pipeline supports advanced thinking configuration to control h
 
 Gemini 3 and Gemini 4 models support the `thinking_level` parameter, which controls the depth of reasoning:
 
-- **`gemini-4-argon`** and **`gemini-4-argon-cyber-permissive`**: **`"low"`**, **`"medium"`** and **`"high"`** (default: `"medium"`, or `"high"` for the cyber-permissive variant). `"minimal"` and `thinking_budget` are rejected by Gemini 4; the pipeline maps `"minimal"` to `"low"` and never sends a budget.
+- **`gemini-4-argon`**, **`gemini-4-argon-cyber-permissive`** and **`gemini-4-carbon`**: **`"low"`**, **`"medium"`** and **`"high"`** (default: `"medium"`, or `"high"` for the cyber-permissive variant). `"minimal"` and `thinking_budget` are rejected by Gemini 4; the pipeline maps `"minimal"` to `"low"` and never sends a budget.
 - **Gemini 3 text models**, per [Google's thinking documentation](https://ai.google.dev/gemini-api/docs/thinking) (with or without a `-preview` / `-latest` suffix):
   - `gemini-3-pro`: **`"low"`** and **`"high"`**.
   - `gemini-3-flash`, `gemini-3.5-flash-lite` and `gemini-3.6-flash`: **`"minimal"`**, **`"low"`**, **`"medium"`** and **`"high"`**.
@@ -1120,7 +1122,7 @@ GOOGLE_STRIP_THINKING_FROM_HISTORY=false
 - **`gemini-3.1-flash-image`**, **`gemini-3.1-flash-image-*`** and **`gemini-3.1-flash-lite-image`**: `thinking_level` supports `"minimal"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-nano-banana-2.1`**: `thinking_level` supports `"minimal"`, `"medium"` and `"high"`; `thinking_budget` is not used.
 - **Other `gemini-nano-banana-*` models and models in `GOOGLE_IMAGE_GENERATION_MODELS`**: `thinking_level` is sent as configured, without remapping; `thinking_budget` is not used.
-- **`gemini-4-argon`** and **`gemini-4-argon-cyber-permissive`**: `thinking_level` supports `"low"`, `"medium"` and `"high"`; `"minimal"` and `thinking_budget` are rejected by the API, so the pipeline sends the closest supported level and no budget.
+- **`gemini-4-argon`**, **`gemini-4-argon-cyber-permissive`** and **`gemini-4-carbon`**: `thinking_level` supports `"low"`, `"medium"` and `"high"`; `"minimal"` and `thinking_budget` are rejected by the API, so the pipeline sends the closest supported level and no budget.
 - **Other `gemini-3-*` models**: `thinking_level` supports `"low"` and `"high"`; `thinking_budget` is not used.
 - **`gemini-2.5-*` models**: `thinking_level` is not used; `thinking_budget` supports `0-32768`.
 - **`gemini-2.5-flash-image-*`**: neither `thinking_level` nor `thinking_budget` is supported.

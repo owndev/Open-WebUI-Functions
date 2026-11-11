@@ -231,6 +231,15 @@ TOOL_IMAGES_TEXT = (
     "Here are the images from the tool results above. Please analyze them."
 )
 
+# Synthetic hidden tool calls Open WebUI 0.13+ injects before a turn (and saves
+# into message.output) to pass memory, skills and attached knowledge without
+# declaring those tools in body["tools"]. Mapped to their XML wrapper tags.
+OWUI_HIDDEN_CONTEXT_TOOLS: Dict[str, Tuple[str, str]] = {
+    "recall_memories": ("<memory_context>", "</memory_context>"),
+    "list_available_skills": ("<available_skills>", "</available_skills>"),
+    "list_attached_knowledge": ("<attached_knowledge>", "</attached_knowledge>"),
+}
+
 # Chat ids Open WebUI does not save: temporary chats (also the legacy "local:"
 # prefix) and channel messages. Their history exists only in the request.
 UNSAVED_CHAT_ID_PREFIXES = ("temporary:", "local:", "channel:")
@@ -2684,7 +2693,10 @@ class Pipe:
         return content
 
     def _prepare_content(
-        self, messages: List[Dict[str, Any]], model_id: str = ""
+        self,
+        messages: List[Dict[str, Any]],
+        model_id: str = "",
+        declared_tool_names: Optional[set] = None,
     ) -> Tuple[List[Union[Dict[str, Any], types.Content]], Optional[str]]:
         """
         Prepare messages content for the API and extract system message if present.
@@ -2692,10 +2704,14 @@ class Pipe:
         An assistant message with tool_calls and the tool messages after it
         become a model content with function_call parts followed by one user
         content with function_response parts (see _convert_tool_round).
+        Synthetic hidden context tool calls injected by Open WebUI 0.13+
+        (`recall_memories`, `list_available_skills`, `list_attached_knowledge`)
+        are deduplicated across turns and folded into the system instruction.
 
         Args:
             messages: List of message objects from the request
             model_id: The model ID (decides whether thought signatures are required)
+            declared_tool_names: Tool names declared in this request (if any)
 
         Returns:
             Tuple of (prepared content list, system message string or None)
@@ -2720,6 +2736,7 @@ class Pipe:
 
         # Prepare contents for the API
         contents: List[Union[Dict[str, Any], types.Content]] = []
+        hidden_context: Dict[str, str] = {}
         index = 0
         while index < len(messages):
             message = messages[index]
@@ -2737,12 +2754,29 @@ class Pipe:
                 end = start
                 while end < len(messages) and messages[end].get("role") == "tool":
                     end += 1
+                tool_calls, tool_messages = self._split_hidden_context_round(
+                    message if tool_calls else None,
+                    tool_calls,
+                    messages[start:end],
+                    declared_tool_names,
+                    hidden_context,
+                )
+                if not tool_calls and not tool_messages:
+                    text = (
+                        self._tool_call_message_text(message.get("content"))
+                        if message
+                        else ""
+                    )
+                    if text:
+                        contents.append({"role": "model", "parts": [{"text": text}]})
+                    index = end
+                    continue
                 current_turn = index > turn_start
                 contents.extend(
                     self._convert_tool_round(
                         message if tool_calls else None,
                         tool_calls,
-                        messages[start:end],
+                        tool_messages,
                         placeholder=strict and current_turn,
                         # Stored server-side parts only within their own turn:
                         # a later request may have no Search grounding (web
@@ -2790,7 +2824,88 @@ class Pipe:
             if parts:  # Only add if there are parts
                 contents.append({"role": api_role, "parts": parts})
 
+        if hidden_context:
+            blocks = [
+                hidden_context[name]
+                for name in OWUI_HIDDEN_CONTEXT_TOOLS
+                if name in hidden_context
+                and hidden_context[name] not in (system_message or "")
+            ]
+            if blocks:
+                joined = "\n\n".join(blocks)
+                system_message = (
+                    f"{system_message}\n\n{joined}" if system_message else joined
+                )
+
         return contents, system_message
+
+    def _split_hidden_context_round(
+        self,
+        message: Optional[Dict[str, Any]],
+        tool_calls: List[Dict[str, Any]],
+        tool_messages: List[Dict[str, Any]],
+        declared_tool_names: Optional[set],
+        hidden_context: Dict[str, str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Strip Open WebUI 0.13+ synthetic hidden context tool calls from a round.
+
+        Open WebUI 0.13+ injects undeclared `hidden_tool_result` calls
+        (`recall_memories`, `list_available_skills`, `list_attached_knowledge`)
+        into every turn's `initial_output` and saves them in `message.output`.
+        Folding their XML payloads into `hidden_context` (keyed by tool name so
+        the latest turn wins) avoids sending undeclared functionCall turns with
+        placeholder thought signatures or repeating static context on every turn.
+        """
+        if not tool_calls or not tool_messages:
+            return tool_calls, tool_messages
+
+        details = self._message_reasoning_details(message) if message else []
+        signed_ids = {
+            call_id
+            for item in details
+            if item.get("format")
+            in (REASONING_FORMAT_SIGNATURE, REASONING_FORMAT_CONTENT)
+            and (call_id := self._tool_call_id(item.get("id")))
+        }
+        responses_by_id: Dict[str, List[Dict[str, Any]]] = {}
+        for tool_message in tool_messages:
+            call_id = self._tool_call_id(tool_message.get("tool_call_id"))
+            if call_id:
+                responses_by_id.setdefault(call_id, []).append(tool_message)
+
+        consumed_call_ids: set = set()
+        kept_calls: List[Dict[str, Any]] = []
+        for tool_call in tool_calls:
+            function = self._tool_call_function(tool_call)
+            name = str(function.get("name") or "")
+            tags = OWUI_HIDDEN_CONTEXT_TOOLS.get(name)
+            call_id = self._tool_call_id(tool_call.get("id"))
+            matched = responses_by_id.get(call_id or "", [])
+            if (
+                tags is not None
+                and not (declared_tool_names and name in declared_tool_names)
+                and call_id
+                and call_id not in signed_ids
+                and len(matched) == 1
+            ):
+                text = self._tool_result_text(matched[0].get("content")).strip()
+                open_tag, close_tag = tags
+                if text.startswith(open_tag) and text.endswith(close_tag):
+                    hidden_context[name] = text
+                    consumed_call_ids.add(call_id)
+                    continue
+            kept_calls.append(tool_call)
+
+        if not consumed_call_ids:
+            return tool_calls, tool_messages
+
+        kept_messages = [
+            tool_message
+            for tool_message in tool_messages
+            if self._tool_call_id(tool_message.get("tool_call_id"))
+            not in consumed_call_ids
+        ]
+        return kept_calls, kept_messages
 
     @staticmethod
     def _requires_thought_signatures(model_id: str) -> bool:
@@ -6174,6 +6289,13 @@ class Pipe:
             is_chat = self._is_chat_message(__metadata__)
             continuation = self._is_tool_continuation(messages)
 
+            # Configure generation parameters and safety settings
+            self.log.debug(f"Supports image generation: {supports_image_generation}")
+            function_declarations, name_map = self._build_function_declarations(
+                body, __metadata__, supports_image_generation, model_id
+            )
+            declared_tool_names = set(name_map.values()) | set(name_map.keys())
+
             # For image generation models, gather ALL images from the last user turn
             if supports_image_generation:
                 try:
@@ -6193,18 +6315,15 @@ class Pipe:
             else:
                 # For non-image generation models, use the full conversation history
                 # Prepare content and extract system message normally
-                contents, system_instruction = self._prepare_content(messages, model_id)
+                contents, system_instruction = self._prepare_content(
+                    messages, model_id, declared_tool_names=declared_tool_names
+                )
                 if not contents:
                     return "Error: No valid message content found"
                 self.log.debug(
                     f"Text generation mode: system instruction separate (value: {system_instruction})"
                 )
 
-            # Configure generation parameters and safety settings
-            self.log.debug(f"Supports image generation: {supports_image_generation}")
-            function_declarations, name_map = self._build_function_declarations(
-                body, __metadata__, supports_image_generation, model_id
-            )
             generation_config = self._configure_generation(
                 body,
                 system_instruction,
